@@ -1845,6 +1845,12 @@ async function startServerWithDatabaseTeardown(
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
+        // After resume, so a claimable run starts instead of expiring; before the
+        // stranded-issue reconciler, so a released issue is re-woken this pass.
+        const expiredQueuedRuns = await heartbeat.expireStaleQueuedRuns();
+        if (expiredQueuedRuns.expired > 0 || expiredQueuedRuns.pageCapReached) {
+          logger.warn({ ...expiredQueuedRuns }, "startup queued-run age bound expired never-started runs");
+        }
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
         if (
           recoveredGoalActions.enqueued > 0 ||
@@ -2209,6 +2215,10 @@ async function startServerWithDatabaseTeardown(
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
+              const expiredQueuedRuns = await heartbeat.expireStaleQueuedRuns();
+              if (expiredQueuedRuns.expired > 0 || expiredQueuedRuns.pageCapReached) {
+                logger.warn({ ...expiredQueuedRuns }, "periodic queued-run age bound expired never-started runs");
+              }
               const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
               if (
                 promotion.promoted > 0 ||

@@ -125,7 +125,11 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  OWNER_LIVE_HOLD_RECOVERY_KINDS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
@@ -219,6 +223,7 @@ import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, resolveCanonicalWikiM
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
+  gateProjectExecutionWorkspacePolicy,
   parseProjectExecutionWorkspacePolicy,
 } from "../execution-workspace-policy.js";
 import {
@@ -4426,9 +4431,35 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
-      source: "recovery.reconcile_stranded_recovery_issue",
-      previousStatus: input.previousStatus,
+    // The caller's snapshot can predate an accepted close. Recheck the status under the
+    // issue-row lock and write through the same transaction so a terminal card is never
+    // parked `blocked` (which would also stamp `blockedTransitionAt` and invite a re-open).
+    const updated = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const [current] = await tx
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+        .for("update")
+        .limit(1);
+      if (!current) return null;
+      if (current.status === "done" || current.status === "cancelled") {
+        logger.info(
+          {
+            issueId: input.issue.id,
+            identifier: input.issue.identifier,
+            status: current.status,
+            previousStatus: input.previousStatus,
+          },
+          "skipping stranded recovery issue escalation: recovery issue is already terminal",
+        );
+        return null;
+      }
+      return blockIssueWithUnresolvedBlockers(db, input.issue, {
+        source: "recovery.reconcile_stranded_recovery_issue",
+        previousStatus: input.previousStatus,
+        tx: txDb,
+      });
     });
     if (!updated) return null;
 
@@ -9981,6 +10012,27 @@ export function recoveryService(
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
 
+    // The issue write boundary refuses ANY explicit workspace preference on a
+    // project whose policy sets allowIssueOverride=false while isolated
+    // workspaces are on (SUP-13058). Naming `agent_default` there would make
+    // this card un-mintable, which is worse than the inherited-workspace
+    // failure it exists to avoid. Such a project keeps the policy-resolved
+    // workspace (no preference) and relies on the skip flag below; the card
+    // is then not the no-binding exemption shape and keeps every workspace
+    // check, as before this change.
+    const sourceProjectPolicy = input.issue.projectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, input.issue.projectId), eq(projects.companyId, input.issue.companyId)))
+          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null)
+      : null;
+    const overrideDisallowedByProject =
+      gateProjectExecutionWorkspacePolicy(
+        parseProjectExecutionWorkspacePolicy(sourceProjectPolicy),
+        (await instanceSettings.getExperimental()).enableIsolatedWorkspaces === true,
+      )?.allowIssueOverride === false;
+
     const titleSource = input.issue.identifier ?? input.issue.title;
     let recoveryIssue: typeof issues.$inferSelect;
     try {
@@ -9997,6 +10049,12 @@ export function recoveryService(
         priority: "high",
         parentId: input.issue.id,
         projectId: input.issue.projectId,
+        // A null projectWorkspaceId is refilled from the project default, and
+        // that binding is itself a git-workspace expectation. agent_default is
+        // the create-time normalization that drops it, so the board card is
+        // not dispatched against the source checkout (SUP-23493). Omitted for a
+        // project that disallows issue-level overrides (see above).
+        ...(overrideDisallowedByProject ? {} : { executionWorkspacePreference: "agent_default" as const }),
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
@@ -10005,6 +10063,12 @@ export function recoveryService(
         // The card records a board decision and never ships code, so its owner
         // must be able to close it without a repository delivery.
         deliveryRequirement: "record_only",
+        // A record-only board card has no adapter workspace of its own. Passing
+        // the source as parentId would otherwise copy that issue's
+        // executionWorkspaceId, including a workspace_validation failure the
+        // next dispatch cannot reuse (SUP-23493). Ordinary parent-child
+        // inheritance is unchanged: this flag is set only on this mint.
+        skipExecutionWorkspaceInheritance: true,
         billingCode: input.issue.billingCode,
       });
     } catch (error) {
@@ -11530,6 +11594,32 @@ export function recoveryService(
     return readNonEmptyString(parseObject(action.wakePolicy).type);
   }
 
+  // SUP-24251 (redo of SUP-22273): bound on the live-owner hold below. A held
+  // row is never written, so its `updatedAt` stays fixed and the hold lapses
+  // two live windows after it even when the owner keeps running elsewhere.
+  const OWNER_LIVE_HOLD_MAX_MS = 2 * REVIEW_PARTICIPANT_LIVE_WINDOW_MS;
+
+  // SUP-24251 (redo of SUP-22273): a live owner is not a wedge. True when the
+  // action is a stranded-participant kind and its owner agent (or, on a
+  // board-owned row, the pending participant it was minted for) has a run that
+  // started or finished after `lastAttemptAt` inside the participant live
+  // window, and the hold bound has not lapsed.
+  async function recoveryOwnerRanSinceLastAttempt(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now: Date,
+  ) {
+    const agentId = action.ownerAgentId ?? action.previousOwnerAgentId;
+    if (!agentId || !OWNER_LIVE_HOLD_RECOVERY_KINDS.has(action.kind)) return false;
+    if (action.updatedAt.getTime() + OWNER_LIVE_HOLD_MAX_MS <= now.getTime()) return false;
+    return participantRanSince(
+      db,
+      action.companyId,
+      agentId,
+      action.lastAttemptAt?.getTime() ?? 0,
+      REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+    );
+  }
+
   // Level-triggered backstop for stranded recovery actions.
   //
   // The owner wake fires exactly once, at action creation
@@ -11543,6 +11633,10 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
+  //   - SUP-24251: stranded-participant kinds whose owner (or pending
+  //     participant) ran after `lastAttemptAt` are held: no attempt burn, no
+  //     reroute, no ceiling escalation, until the live window or hold bound
+  //     lapses
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -11564,6 +11658,7 @@ export function recoveryService(
       skippedTerminalSource: 0,
       skippedBackoff: 0,
       skippedPauseHold: 0,
+      skippedOwnerLive: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -11588,20 +11683,27 @@ export function recoveryService(
       await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
-      if (candidate.attemptCount >= effectiveMaxAttempts) {
-        result.maxAttemptsReached += 1;
-        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        return;
-      }
-
       const sourceIssue = await db
         .select()
         .from(issues)
         .where(eq(issues.id, candidate.sourceIssueId))
         .then((rows) => rows[0] ?? null);
-
       // Nothing left to recover: the source issue is gone or already terminal.
-      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
+      const sourceTerminal = !sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled";
+
+      if (candidate.attemptCount >= effectiveMaxAttempts) {
+        // SUP-24251: a live owner holds the ceiling instead of walking the
+        // action to the board. A terminal source has nothing to hold for.
+        if (!sourceTerminal && (await recoveryOwnerRanSinceLastAttempt(candidate, now))) {
+          result.skippedOwnerLive += 1;
+          return;
+        }
+        result.maxAttemptsReached += 1;
+        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        return;
+      }
+
+      if (sourceTerminal) {
         result.skippedTerminalSource += 1;
         return;
       }
@@ -11669,6 +11771,14 @@ export function recoveryService(
           result.skippedBackoff += 1;
           return;
         }
+      }
+
+      // SUP-24251: checked last, so every guard above keeps its precedence,
+      // and before both attempt-burning writes below (the no-owner reroute burn
+      // and the compare-and-swap re-fire).
+      if (await recoveryOwnerRanSinceLastAttempt(candidate, now)) {
+        result.skippedOwnerLive += 1;
+        return;
       }
 
       // `board_escalation` means action creation could not find an invokable

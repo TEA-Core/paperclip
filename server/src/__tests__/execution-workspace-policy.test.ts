@@ -20,6 +20,7 @@ import {
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
   canAgentSatisfyIssueWorkspaceSettings,
+  isProtectedDeliveryBranch,
 } from "../services/execution-workspace-policy.ts";
 
 describe("execution workspace policy helpers", () => {
@@ -1027,5 +1028,54 @@ describe("operator default isolated execution workspaces", () => {
         resolvedStrategy: resolveEffectiveWorkspaceStrategyType(mode, config),
       }),
     ).toBe(false);
+  });
+});
+
+// SUP-24409 (RA round 2 on PR 1214): the branches no card may claim as its own delivery branch.
+// The standard protected classes hold with NO configuration at all; configured default refs only add to them.
+describe("isProtectedDeliveryBranch", () => {
+  it.each([
+    "main", "Main", "MASTER", "master", "refs/heads/main", " main ", "main/",
+    "release/1.2", "release/2026.11", "release/1.2/", "releases/v1", "hotfix/urgent", "Hotfix/x",
+    "fold/tea-patches-v2026.722.0", "fold/anything", "refs/heads/fold/x", "fold-sync/2026.11",
+  ])("protects %s without any configuration", (branch) => {
+    expect(isProtectedDeliveryBranch({ branch })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [] })).toBe(true);
+  });
+
+  it.each([
+    "SUP-24405-own-work", "fm/paperclip-1067-residuals-followup", "feature/main", "mainline", "main-fix",
+    "release", "releases", "hotfix", "folder/x", "fold-syncx/1", "my-fold/x", "develop",
+  ])("leaves the feature branch %s alone", (branch) => {
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [null, undefined, ""] })).toBe(false);
+  });
+
+  it.each([
+    ["trunk", "trunk"],
+    ["trunk", "origin/trunk"],
+    ["trunk", "upstream/trunk"],
+    ["trunk", "refs/heads/trunk"],
+    ["trunk", "refs/remotes/origin/trunk"],
+    ["trunk", " Trunk "],
+    ["Trunk", "trunk"],
+    ["refs/heads/trunk", "trunk/"],
+  ])("protects %s when the repo's default ref is stored as %j", (branch, ref) => {
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [null, ref] })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch })).toBe(false);
+  });
+
+  it("protects every branch on a project_primary row, and only there", () => {
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: "project_primary" })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: "isolated_workspace" })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: null })).toBe(false);
+  });
+
+  it("reads a refs/heads/<x> ref as exactly the local branch x, not its last segment", () => {
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(true);
+    // A bare ref with a slash may be a remote-tracking name or a namespaced local branch: both read as protected.
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["team/trunk"] })).toBe(true);
   });
 });

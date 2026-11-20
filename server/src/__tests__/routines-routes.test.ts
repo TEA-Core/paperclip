@@ -655,7 +655,27 @@ describe("routine routes", () => {
       agentId: null,
       userId: "board-user",
       boardApiKeyId: null,
+      runId: null,
     });
+  });
+
+  it("forwards the calling agent's run id when an agent manually runs a routine", async () => {
+    const callerRunId = "88888888-8888-4888-8888-888888888888";
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: callerRunId,
+    });
+
+    const res = await request(app).post(`/api/routines/${routineId}/run`).send({});
+
+    expect(res.status).toBe(202);
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledWith(
+      routineId,
+      { source: "manual" },
+      expect.objectContaining({ agentId, userId: null, runId: callerRunId }),
+    );
   });
 
   it("allows routine creation when the board user has tasks:assign", async () => {

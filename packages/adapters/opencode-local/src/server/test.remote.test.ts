@@ -18,11 +18,11 @@ const {
     ensureAdapterExecutionTargetDirectory: vi.fn(async () => {}),
     ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
     maybeRunSandboxInstallCommand: vi.fn(async () => null),
-    runAdapterExecutionTargetProcess: vi.fn(async () => ({
+    runAdapterExecutionTargetProcess: vi.fn(async (_runId: string, _target: unknown, _command: string, args: string[]) => ({
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: [
+      stdout: args.includes("--version") ? "1.17.9\n" : [
         JSON.stringify({ type: "step_start", sessionID: "session-1" }),
         JSON.stringify({ type: "text", sessionID: "session-1", part: { text: "hello" } }),
         JSON.stringify({
@@ -207,5 +207,49 @@ describe("opencode remote environment diagnostics", () => {
     expect(probeCall?.[4].env.XDG_CONFIG_HOME).toBe(
       "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
     );
+  });
+
+  it("refuses a remote binary whose --version cannot be determined and runs no hello probe", async () => {
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "cloudflare",
+      remoteCwd: "/remote/workspace",
+      runner: {
+        execute: async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        }),
+      },
+    };
+    runAdapterExecutionTargetProcess.mockImplementationOnce(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    }));
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: { command: "opencode", model: "anthropic/claude-sonnet-4-5" },
+      executionTarget: remoteTarget,
+      environmentName: "QA Cloudflare",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "opencode_cli_version_unknown", level: "error" }),
+    ]));
+    expect(result.checks.map((check) => check.code)).not.toContain("opencode_hello_probe_passed");
+    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
   });
 });
