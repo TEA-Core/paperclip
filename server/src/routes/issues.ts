@@ -508,6 +508,7 @@ import {
 import {
   CLOSE_ON_ACCEPT_DECISION_BODY,
   closeIssueOnAcceptIneligibleReason,
+  closeOnAcceptCardBindingIneligibleReason,
   isCloseOnAcceptReconciliationAllowlisted,
   resolveSelectedSuggestedTasks,
   type CloseOnAcceptResult,
@@ -5965,24 +5966,10 @@ export function issueRoutes(
     });
   }
 
-  // A close-on-accept that decided an execution stage is an approval door, so it
-  // runs the shared post-commit merge-arming hook like the other doors.
-  async function runCloseOnAcceptMergeArming(closeOnAccept: CloseOnAcceptResult | undefined) {
-    if (!closeOnAccept?.decision) return;
-    await runApprovalMergeArming({
-      issue: closeOnAccept.issue,
-      decision: {
-        stageId: closeOnAccept.decision.stageId,
-        stageType: closeOnAccept.decision.stageType,
-        outcome: closeOnAccept.decision.outcome,
-        body: CLOSE_ON_ACCEPT_DECISION_BODY,
-      },
-      closingTransition: true,
-    });
-  }
-
   // SUP-24788: a close-on-accept is a close, so dependents blocked on the issue
   // and a parent waiting on its children get the same wakes PATCH done emits.
+  // It never runs the merge-arming hook: a publication accept is not a head
+  // approval, even when it records the final review stage decision.
   // Post-commit and non-fatal, like the recovery-action close path.
   async function runCloseOnAcceptCompletionWakes(
     closeOnAccept: CloseOnAcceptResult | undefined,
@@ -25293,7 +25280,8 @@ export function issueRoutes(
           issue,
           interaction: current,
           acceptingUserId: req.actor.userId ?? null,
-        }) === null;
+        }) === null &&
+        (await closeOnAcceptCardBindingIneligibleReason(db, issue, current)) === null;
       let closeOnAcceptGuardSnapshot: string | undefined;
       if (closeIssueOnAccept) {
         closeOnAcceptGuardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
@@ -25378,7 +25366,6 @@ export function issueRoutes(
           : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
-      await runCloseOnAcceptMergeArming(closeOnAccept);
       await runCloseOnAcceptCompletionWakes(closeOnAccept, actor);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
@@ -25733,7 +25720,6 @@ export function issueRoutes(
         guardSnapshot,
       );
       if (reconciled.outcome === "applied") {
-        await runCloseOnAcceptMergeArming(reconciled.closeOnAccept);
         await runCloseOnAcceptCompletionWakes(reconciled.closeOnAccept, getActorInfo(req));
       }
       res.json({

@@ -7,6 +7,7 @@ import { isUniqueViolation } from "../db-errors.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
+import { randomUUID } from "node:crypto";
 import {
   and,
   asc,
@@ -32,6 +33,7 @@ import {
   runIdentityContexts,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
   issueRelations,
@@ -46,6 +48,7 @@ import {
 import type {
   AcceptIssueThreadInteraction,
   IssueExecutionDecisionOutcome,
+  IssueExecutionPolicy,
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
@@ -897,6 +900,87 @@ export function closeIssueOnAcceptIneligibleReason(args: {
   return null;
 }
 
+export type CloseOnAcceptCardBindingIneligibleReason =
+  | "card_title_not_canonical"
+  | "card_report_document_missing"
+  | "card_maintainer_unresolved"
+  | "card_not_assigned_to_maintainer"
+  | "interaction_not_created_by_maintainer"
+  | "addressee_not_review_participant";
+
+/** The canonical weekly-report handoff card title for one report date. */
+export function weeklyReportHandoffTitle(reportDate: string) {
+  return `[PPC ER] Weekly Report — ${reportDate} — handoff to Wiki Maintainer`;
+}
+
+/**
+ * SUP-24788 (B1-b): bind close authority to the publication card itself, not to
+ * the free target key. The card must carry the canonical handoff title and the
+ * report document for the key's date, be assigned to the plugin-managed
+ * canonical Wiki Maintainer, and seat the addressed human on a review stage.
+ * The confirmation must be created by that Maintainer: a plugin-managed seat
+ * that an ordinary agent cannot act as. Call after
+ * `closeIssueOnAcceptIneligibleReason` returned null (the key is valid).
+ */
+export async function closeOnAcceptCardBindingIneligibleReason(
+  dbOrTx: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    title: string;
+    description?: string | null;
+    assigneeAgentId: string | null;
+    executionPolicy: unknown;
+    executionState?: unknown;
+  },
+  interaction: Pick<RequestConfirmationInteraction, "payload" | "addresseeUserId" | "createdByAgentId">,
+): Promise<CloseOnAcceptCardBindingIneligibleReason | null> {
+  const key = interaction.payload.target?.type === "custom" ? interaction.payload.target.key : "";
+  const reportDate = WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN.exec(key)?.slice(1, 4).join("-") ?? null;
+  if (!reportDate || issue.title !== weeklyReportHandoffTitle(reportDate)) {
+    return "card_title_not_canonical";
+  }
+  const [reportDocument] = await dbOrTx
+    .select({ id: issueDocuments.id })
+    .from(issueDocuments)
+    .where(
+      and(
+        eq(issueDocuments.companyId, issue.companyId),
+        eq(issueDocuments.issueId, issue.id),
+        eq(issueDocuments.key, reportDate),
+      ),
+    )
+    .limit(1);
+  if (!reportDocument) return "card_report_document_missing";
+  // Loaded lazily, like the other approval helpers this module reaches.
+  const { resolveCanonicalWikiMaintainerAgentId } = await import("./issue-assignee-review-gate.js");
+  const maintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(dbOrTx, issue.companyId, issue);
+  if (!maintainerAgentId) return "card_maintainer_unresolved";
+  // A started review stage reassigns the card to its human participant and
+  // records the Maintainer as the return assignee, so that shape still is the
+  // Maintainer's card.
+  const state = parseIssueExecutionState(issue.executionState ?? null);
+  const handedToAddressedReviewer =
+    state?.status === "pending" &&
+    state.currentParticipant?.type === "user" &&
+    state.currentParticipant.userId === interaction.addresseeUserId &&
+    state.returnAssignee?.type === "agent" &&
+    state.returnAssignee.agentId === maintainerAgentId;
+  if (issue.assigneeAgentId !== maintainerAgentId && !handedToAddressedReviewer) {
+    return "card_not_assigned_to_maintainer";
+  }
+  if (interaction.createdByAgentId !== maintainerAgentId) return "interaction_not_created_by_maintainer";
+  const stages = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.stages ?? [];
+  const addresseeSeated = stages.some(
+    (stage) =>
+      stage.type === "review" &&
+      stage.participants.some(
+        (participant) => participant.type === "user" && participant.userId === interaction.addresseeUserId,
+      ),
+  );
+  return addresseeSeated ? null : "addressee_not_review_participant";
+}
+
 function closeOnAcceptRefusedError(reason: string, message: string) {
   return conflict(message, { code: "close_on_accept_refused", reason });
 }
@@ -986,13 +1070,72 @@ export type CloseOnAcceptResult = {
   decision: CloseOnAcceptDecision | null;
 };
 
+function closeOnAcceptStageRefusedError(reason: string, message: string) {
+  return unprocessable(message, { code: "close_on_accept_stage_refused", reason });
+}
+
+/**
+ * SUP-24788 (B2-ii): the humans who may not approve this card's review stage
+ * through a close-on-accept, read from stored rows under the issue lock: the
+ * issue creator, the user who created the confirmation, every self-approval
+ * principal of the ladder (return assignee, delivery author), a previous user
+ * assignee, a participant of an earlier stage of the ladder, and the owner of
+ * the run executing the issue. The current user assignee is not one: a started
+ * review stage assigns the card to its participant.
+ */
+async function closeOnAcceptSelfApprovalUserIds(
+  tx: Db,
+  locked: typeof issues.$inferSelect,
+  interaction: { createdByUserId: string | null },
+  policy: IssueExecutionPolicy,
+) {
+  // Loaded lazily, like the stage-decision engine below.
+  const { resolveSelfApprovalPrincipals } = await import("./approval-status-reconciler.js");
+  const userIds = new Set(
+    resolveSelfApprovalPrincipals(
+      (locked.executionPolicy ?? {}) as Record<string, unknown>,
+      (locked.executionState ?? {}) as Record<string, unknown>,
+      locked.createdByAgentId ?? null,
+    ).userIds,
+  );
+  if (locked.createdByUserId) userIds.add(locked.createdByUserId);
+  if (interaction.createdByUserId) userIds.add(interaction.createdByUserId);
+  for (const stage of policy.stages.slice(0, -1)) {
+    for (const participant of stage.participants) {
+      if (participant.type === "user" && participant.userId) userIds.add(participant.userId);
+    }
+  }
+  const previousAssignees = await tx
+    .select({ userId: sql<string | null>`${activityLog.details}->'_previous'->>'assigneeUserId'` })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, locked.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, locked.id),
+        eq(activityLog.action, "issue.updated"),
+      ),
+    );
+  for (const row of previousAssignees) if (row.userId) userIds.add(row.userId);
+  if (locked.executionRunId) {
+    const [run] = await tx
+      .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, locked.companyId), eq(heartbeatRuns.id, locked.executionRunId)));
+    if (run?.responsibleUserId) userIds.add(run.responsibleUserId);
+  }
+  return userIds;
+}
+
 /**
  * The one done transition shared by close-on-accept and its reconciliation.
- * It runs inside the caller's transaction under the issue row lock. A pending
- * execution stage is decided as the accepting human through the shared
- * stage-decision engine and must complete the ladder; with no pending stage
- * the execution policy must not redirect the close. Any refusal throws, so the
- * caller's transaction rolls back every write.
+ * It runs inside the caller's transaction under the issue row lock, against
+ * the stored policy and state. A stage decision is written only when the
+ * pending stage is the LAST stage of the stored policy, is a review stage
+ * whose only participant is the addressed human, and that human is not a
+ * self-approval principal (B2-ii); every other staged shape refuses with 422
+ * and writes no decision. Any refusal throws, so the caller's transaction
+ * rolls back every write.
  */
 async function closeIssueForAcceptedConfirmation(args: {
   db: Db;
@@ -1000,6 +1143,7 @@ async function closeIssueForAcceptedConfirmation(args: {
   issueId: string;
   companyId: string;
   userId: string;
+  interaction: { id: string; addresseeUserId: string | null; createdByUserId: string | null };
   deferredPostCommit: {
     activityPublications: ActivityPublication[];
     postCommitActions: IssuePostCommitAction[];
@@ -1017,63 +1161,107 @@ async function closeIssueForAcceptedConfirmation(args: {
   const actor = { agentId: null, userId: args.userId, runId: null };
   const policy = normalizeIssueExecutionPolicy(locked.executionPolicy ?? null);
   const executionState = parseIssueExecutionState(locked.executionState);
+  // The decision body names its origin so an audit or the stamp ladder can tell
+  // it from a review-comment approval.
+  const decisionBody = `${CLOSE_ON_ACCEPT_DECISION_BODY} Interaction ${args.interaction.id}.`;
   const transition = applyIssueExecutionPolicyTransition({
     issue: locked,
     policy,
     requestedStatus: "done",
     requestedAssigneePatch: {},
     actor,
-    commentBody: CLOSE_ON_ACCEPT_DECISION_BODY,
+    commentBody: decisionBody,
   });
   if (transition.decision) {
-    if (!policy || !executionState || !approvingCurrentStageCompletesLadder({ policy, executionState })) {
-      throw closeOnAcceptRefusedError(
-        "execution_ladder_incomplete",
-        "Approving the current execution stage does not complete the issue's ladder",
-      );
-    }
-    // A close-on-accept never lets a human approve their own work: the issue
-    // creator, the assignee, and every self-approval principal of the ladder are
-    // refused, as on the other approval doors.
-    const { resolveSelfApprovalPrincipals } = await import("./approval-status-reconciler.js");
-    const selfPrincipals = resolveSelfApprovalPrincipals(
-      (locked.executionPolicy ?? {}) as Record<string, unknown>,
-      (locked.executionState ?? {}) as Record<string, unknown>,
-      locked.createdByAgentId ?? null,
-    );
+    const lastStage = policy?.stages.at(-1) ?? null;
     if (
-      args.userId === locked.createdByUserId ||
-      args.userId === locked.assigneeUserId ||
-      selfPrincipals.userIds.has(args.userId)
+      !policy ||
+      !executionState ||
+      !lastStage ||
+      executionState.status !== "pending" ||
+      executionState.currentStageId !== lastStage.id ||
+      lastStage.type !== "review" ||
+      !approvingCurrentStageCompletesLadder({ policy, executionState })
     ) {
-      throw closeOnAcceptRefusedError(
-        "self_approval",
-        "The accepting human cannot approve the execution stage of their own work",
+      throw closeOnAcceptStageRefusedError(
+        "stage_not_final_review",
+        "Close-on-accept decides only the pending final review stage of the issue",
       );
     }
-    // Loaded lazily: these modules import the services barrel, and a static
-    // import here pulls that barrel into this module's load and breaks the cycle order.
-    const { applyReviewEscalationDecision } = await import("./issue-stage-decision.js");
-    const decided = await applyReviewEscalationDecision({
-      db: args.tx,
-      issue: locked,
-      requestedStatus: "done",
-      decisionBody: CLOSE_ON_ACCEPT_DECISION_BODY,
-      actor,
-      finalStageDisposition: "done",
-      deferredPostCommit: args.deferredPostCommit,
+    const [onlyParticipant, ...otherParticipants] = lastStage.participants;
+    if (
+      !args.interaction.addresseeUserId ||
+      args.userId !== args.interaction.addresseeUserId ||
+      otherParticipants.length > 0 ||
+      onlyParticipant?.type !== "user" ||
+      onlyParticipant.userId !== args.interaction.addresseeUserId ||
+      executionState.currentParticipant?.type !== "user" ||
+      executionState.currentParticipant.userId !== args.interaction.addresseeUserId
+    ) {
+      throw closeOnAcceptStageRefusedError(
+        "participant_not_addressee",
+        "The final review stage's only participant must be the addressed human",
+      );
+    }
+    const selfApprovalUserIds = await closeOnAcceptSelfApprovalUserIds(args.tx, locked, args.interaction, policy);
+    if (selfApprovalUserIds.has(args.userId)) {
+      throw closeOnAcceptStageRefusedError(
+        "self_approval",
+        "The accepting human cannot approve the review stage of their own work",
+      );
+    }
+    // Record the decision and close in this transaction, under the lock taken
+    // above. The card goes back to its return assignee as it closes, as a
+    // final-stage approval on the board door does, so a Wiki handoff card
+    // closes on its canonical Maintainer instead of the reviewer seat.
+    const decision = transition.decision;
+    const decisionId = randomUUID();
+    const nextExecutionState = transition.patch.executionState;
+    if (!nextExecutionState || typeof nextExecutionState !== "object") {
+      throw closeOnAcceptRefusedError("done_transition_refused", "The stage decision did not produce an execution state");
+    }
+    await args.tx.insert(issueExecutionDecisions).values({
+      id: decisionId,
+      companyId: locked.companyId,
+      issueId: locked.id,
+      stageId: decision.stageId,
+      stageType: decision.stageType,
+      actorAgentId: null,
+      actorUserId: args.userId,
+      outcome: decision.outcome,
+      body: decision.body,
+      createdByRunId: null,
     });
-    if (!decided || decided.issue.status !== "done") {
+    const returnAssignee = executionState.returnAssignee;
+    const closed = await issueSvc.update(
+      locked.id,
+      {
+        ...transition.patch,
+        executionState: { ...(nextExecutionState as Record<string, unknown>), lastDecisionId: decisionId },
+        status: "done",
+        ...(returnAssignee?.type === "agent"
+          ? { assigneeAgentId: returnAssignee.agentId ?? null, assigneeUserId: null }
+          : returnAssignee?.type === "user"
+            ? { assigneeAgentId: null, assigneeUserId: returnAssignee.userId ?? null }
+            : {}),
+        actorAgentId: null,
+        actorUserId: args.userId,
+      },
+      args.tx,
+      args.deferredPostCommit.activityPublications,
+      args.deferredPostCommit.postCommitActions,
+    );
+    if (!closed || closed.status !== "done") {
       throw closeOnAcceptRefusedError("done_transition_refused", "The execution stage decision did not close the issue");
     }
     return {
-      issue: decided.issue,
+      issue: closed,
       previous: locked,
       decision: {
-        decisionId: decided.decisionId,
-        stageId: decided.stageId,
-        stageType: decided.stageType,
-        outcome: decided.outcome,
+        decisionId,
+        stageId: decision.stageId,
+        stageType: decision.stageType,
+        outcome: decision.outcome,
       },
     };
   }
@@ -1081,9 +1269,11 @@ async function closeIssueForAcceptedConfirmation(args: {
     executionState?.status === "pending" ||
     (transition.patch.status !== undefined && transition.patch.status !== "done")
   ) {
-    throw closeOnAcceptRefusedError(
-      "execution_policy_redirects_close",
-      "The issue's execution policy routes this close to a review stage",
+    // A parked card whose done would start its review stage: the stage decision
+    // stays a separate action, so the accept refuses.
+    throw closeOnAcceptStageRefusedError(
+      "stage_not_started",
+      "The issue's execution policy routes this close to a review stage that has not started",
     );
   }
   const closed = await issueSvc.update(
@@ -2632,22 +2822,37 @@ export function issueThreadInteractionService(
       if (closeIssueOnAccept) {
         // SUP-24788: re-derive eligibility from the locked rows, never from the
         // route's earlier read or the request. A failure refuses the accept.
-        const [lockedDelivery] = await tx
-          .select({ deliveryRequirement: issues.deliveryRequirement })
+        const [lockedCard] = await tx
+          .select({
+            deliveryRequirement: issues.deliveryRequirement,
+            title: issues.title,
+            description: issues.description,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionPolicy: issues.executionPolicy,
+            executionState: issues.executionState,
+          })
           .from(issues)
           .where(eq(issues.id, issueContext.id));
         const ineligible = closeIssueOnAcceptIneligibleReason({
           issue: {
             status: issueContext.status,
-            deliveryRequirement: lockedDelivery?.deliveryRequirement ?? null,
+            deliveryRequirement: lockedCard?.deliveryRequirement ?? null,
           },
           interaction,
           acceptingUserId:
             args.actor.agentId || args.actor.systemId ? null : (args.actor.userId ?? null),
         });
-        if (ineligible) {
+        const unbound =
+          ineligible || !lockedCard || interaction.kind !== "request_confirmation"
+            ? null
+            : await closeOnAcceptCardBindingIneligibleReason(
+                tx as unknown as Db,
+                { ...lockedCard, id: issueContext.id, companyId: issueContext.companyId },
+                interaction,
+              );
+        if (ineligible || unbound || !lockedCard) {
           throw closeOnAcceptRefusedError(
-            ineligible,
+            ineligible ?? unbound ?? "issue_not_found",
             "The confirmation is no longer eligible to close the issue on accept",
           );
         }
@@ -2722,6 +2927,11 @@ export function issueThreadInteractionService(
           issueId: issueContext.id,
           companyId: issueContext.companyId,
           userId: args.actor.userId as string,
+          interaction: {
+            id: lockedCurrent.id,
+            addresseeUserId: lockedCurrent.addresseeUserId ?? null,
+            createdByUserId: lockedCurrent.createdByUserId ?? null,
+          },
           deferredPostCommit: {
             activityPublications: postCommitActivityPublications,
             postCommitActions,
@@ -4469,6 +4679,11 @@ export function issueThreadInteractionService(
           issueId: issue.id,
           companyId: issue.companyId,
           userId: row.resolvedByUserId,
+          interaction: {
+            id: row.id,
+            addresseeUserId: row.addresseeUserId ?? null,
+            createdByUserId: row.createdByUserId ?? null,
+          },
           deferredPostCommit: { activityPublications, postCommitActions },
         });
         await logActivityInTransaction(

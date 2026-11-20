@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 import type * as DoneTransitionGuardModule from "../services/done-transition-guard.js";
+import type * as IssueThreadInteractionsModule from "../services/issue-thread-interactions.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const UNRELATED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -182,6 +183,14 @@ vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
   const actual = await importOriginal<typeof DoneTransitionGuardModule>();
   mockDoneTransitionGuard.actual = actual.evaluateDoneTransitionGuard as (...args: unknown[]) => unknown;
   return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
+});
+
+// SUP-24788 (B1-b): the publication-card binding reads plugin and document rows;
+// the service suite proves it on a real database. Route tests steer its result.
+const mockCloseOnAcceptCardBinding = vi.hoisted(() => vi.fn(async () => null as string | null));
+vi.mock("../services/issue-thread-interactions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof IssueThreadInteractionsModule>();
+  return { ...actual, closeOnAcceptCardBindingIneligibleReason: mockCloseOnAcceptCardBinding };
 });
 
 function registerModuleMocks() {
@@ -4057,6 +4066,23 @@ describe("issue thread interaction routes", () => {
       for (const call of mockInteractionService.acceptInteraction.mock.calls) {
         expect(call).toHaveLength(4);
       }
+    });
+
+    it("keeps the ordinary accept when the confirmation is not bound to the Maintainer's publication card (RA A2/A4)", async () => {
+      const current = publicationInteraction();
+      mockIssueService.getById.mockResolvedValue(publicationIssue());
+      mockInteractionService.getForIssue.mockResolvedValue(current);
+      mockCloseOnAcceptCardBinding.mockResolvedValue("interaction_not_created_by_maintainer");
+      mockInteractionService.acceptInteraction.mockResolvedValue(acceptedPublication(current, "in_review"));
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockCloseOnAcceptCardBinding).toHaveBeenCalledTimes(1);
+      expect(mockEvaluateDoneTransitionGuard).not.toHaveBeenCalled();
+      expect(mockInteractionService.acceptInteraction.mock.calls[0]).toHaveLength(4);
     });
 
     it("keeps an ordinary eligible-shape accept on the four-argument path when the flag is missing", async () => {
