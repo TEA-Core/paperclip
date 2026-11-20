@@ -6207,7 +6207,7 @@ describe("delivery seating never seats the delivery author and records the seat"
     });
   });
 
-  it("keeps who seated a participant when that participant re-seats itself, and records a first self-seat as one", () => {
+  it("records a participant that re-seats itself as its own seater, whoever seated it before (no held seat survives)", () => {
     const policy = reviewOnlyPolicy();
     const qa = { type: "agent" as const, agentId: qaAgentId, userId: null };
     const coder = { type: "agent" as const, agentId: coderAgentId, userId: null };
@@ -6224,13 +6224,15 @@ describe("delivery seating never seats the delivery author and records the seat"
       lastDecisionId: null,
       lastDecisionOutcome: null,
     });
-    // The issue drifted out of in_review; the seated reviewer moves it back,
-    // which re-seats the same participant.
+    // The issue drifted out of in_review (here: unassigned and rewritten); the
+    // seated reviewer moves it back, which re-seats the same participant. The
+    // seat it held from another agent's delivery must not carry over to work
+    // the participant itself moved back into review (SUP-24563 round 4, F2).
     const reseatByParticipant = (executionState: Record<string, unknown>) =>
       applyIssueExecutionPolicyTransition({
         issue: {
           status: "in_progress",
-          assigneeAgentId: qaAgentId,
+          assigneeAgentId: null,
           assigneeUserId: null,
           executionPolicy: policy,
           executionState,
@@ -6242,7 +6244,7 @@ describe("delivery seating never seats the delivery author and records the seat"
       }).patch.executionState as IssueExecutionState;
 
     expect(reseatByParticipant(pendingState({ participant: qa, seatedBy: coder })).participantSeat)
-      .toEqual({ participant: qa, seatedBy: coder });
+      .toEqual({ participant: qa, seatedBy: qa });
     expect(reseatByParticipant(pendingState(undefined)).participantSeat)
       .toEqual({ participant: qa, seatedBy: qa });
   });

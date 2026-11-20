@@ -1262,6 +1262,52 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(row?.status).toBe("approved");
   });
 
+  it("stamps the plugin on the requester wake a relayed approval decision raises (SUP-24563)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const humanUserId = randomUUID();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: humanUserId, status: "active", membershipRole: "owner",
+    });
+    // As in the comment-relay test: a full per-agent slot keeps the woken run queued.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "running", invocationSource: "assignment", contextSnapshot: {},
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      requestedByAgentId: agentId,
+      payload: { title: "Ship it" },
+    });
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.gateway",
+      createEventBusStub(),
+      undefined,
+      { heartbeatRuntimeEnv: {} },
+    );
+
+    const result = await services.approvals.decide({ approvalId, companyId, action: "approve", actorUserId: humanUserId });
+    expect(result.applied).toBe(true);
+
+    // The requester wake is fire-and-forget.
+    await expect.poll(async () => (
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)))
+    )[0]).toMatchObject({
+      reason: "approval_approved",
+      requestedByActorType: "user",
+      requestedByActorId: humanUserId,
+      payload: expect.objectContaining({ pluginId: "plugin-record-id", pluginKey: "paperclip.gateway" }),
+    });
+  });
+
   it("approvals.list redacts payloads and is company-scoped", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const otherCompany = randomUUID();

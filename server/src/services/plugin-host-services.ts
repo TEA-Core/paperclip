@@ -2749,6 +2749,9 @@ export function buildHostServices(
             payload: {
               approvalId: approval.id,
               approvalStatus: approval.status,
+              // SUP-24563: relayed, so not a human/board wake for the live-run cap.
+              pluginId,
+              pluginKey,
             },
             requestedByActorType: "user",
             requestedByActorId: params.actorUserId,

@@ -1122,6 +1122,145 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     expect(await statusOf(newer!.id)).toBe("running");
   });
 
+  // ─── (r) round 4: an agent's own writes never reach the reserved lane ─────
+
+  /**
+   * An agent's own card with an external-service monitor that has already
+   * timed out, as an agent writes it (the route stamps `scheduledBy:
+   * "assignee"` for an agent, `"board"` for a board user).
+   */
+  async function seedTimedOutMonitorCard(agentId: string, scheduledBy: "assignee" | "board") {
+    const issueId = randomUUID();
+    const dueAt = new Date(Date.now() - 60_000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Waiting on a deploy",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      createdByAgentId: scheduledBy === "assignee" ? agentId : null,
+      originKind: "manual",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: dueAt.toISOString(),
+          timeoutAt: new Date(Date.now() - 30_000).toISOString(),
+          recoveryPolicy: "create_recovery_issue",
+          scheduledBy,
+          notes: "Check the deploy",
+        },
+      },
+      monitorNextCheckAt: dueAt,
+      monitorScheduledBy: scheduledBy,
+    });
+    return issueId;
+  }
+
+  async function recoveryCardsFor(sourceIssueId: string) {
+    return db.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.originKind, "stranded_issue_recovery"),
+      eq(issues.originId, sourceIssueId),
+    ));
+  }
+
+  async function runsOf(agentId: string) {
+    return db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+  }
+
+  it("(r) F1: an agent's own monitor (create_recovery_issue, then check-now) mints no recovery card, and its run stays in the general lane", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const agent = await seedAgent("SelfMonitor");
+    const sourceId = await seedTimedOutMonitorCard(agent, "assignee");
+
+    // POST /issues/:id/monitor/check-now as the assignee agent.
+    await heartbeat.triggerIssueMonitor(sourceId, { actorType: "agent", actorId: agent, agentId: agent });
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await recoveryCardsFor(sourceId)).toEqual([]);
+    expect(await statusOf(olderGeneral)).toBe("queued");
+    expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
+
+    // The next general slot goes to the older general run.
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusOf(olderGeneral)).toBe("running");
+    expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
+  });
+
+  it("(r) F1: the scheduled sweep of an agent-scheduled monitor mints no recovery card either", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const agent = await seedAgent("SelfMonitorSweep");
+    const sourceId = await seedTimedOutMonitorCard(agent, "assignee");
+
+    await heartbeat.tickTimers(new Date());
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await recoveryCardsFor(sourceId)).toEqual([]);
+    expect(await statusOf(olderGeneral)).toBe("queued");
+    expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
+  });
+
+  it("(r) F1 control: a board-scheduled monitor's scheduled sweep still mints the recovery card, and that recovery run takes a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const agent = await seedAgent("BoardMonitor");
+    const sourceId = await seedTimedOutMonitorCard(agent, "board");
+
+    await heartbeat.tickTimers(new Date());
+    await heartbeat.resumeQueuedRuns();
+
+    const cards = await recoveryCardsFor(sourceId);
+    expect(cards).toHaveLength(1);
+    expect(await statusOf(olderGeneral)).toBe("queued");
+    const running = (await runsOf(agent)).filter((run) => run.status === "running");
+    expect(running).toHaveLength(1);
+  });
+
+  it("(r) F2: a reviewer that moves an unassigned, rewritten card back into review itself does not keep the seat another agent gave it", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const author = await seedAgent("EarlierAuthor");
+    const reviewer = await seedAgent("Rewriter");
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewer }] }],
+    })!;
+    // A genuine earlier round: the author's delivery seated the reviewer.
+    const heldState = {
+      ...pendingReviewStage(reviewer, author),
+      currentStageId: policy.stages[0]!.id,
+    };
+    // The reviewer unassigned and rewrote the card, then moves it back into
+    // review itself: the engine re-seats the reviewer with the reviewer as actor.
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: heldState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: reviewer },
+    });
+    const patch = transition.patch as { status?: string; executionState?: Record<string, unknown> };
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Rewritten work",
+      status: patch.status ?? "in_review",
+      assigneeAgentId: reviewer,
+      originKind: "manual",
+      executionPolicy: policy as unknown as Record<string, unknown>,
+      executionState: patch.executionState ?? null,
+    });
+
+    await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(reviewer, issueId, reviewer));
+  });
+
   // ─── (d) router input ─────────────────────────────────────────────────────
 
   it("(d) a router sample of 1 cannot pin the fleet below the floor of 6", async () => {

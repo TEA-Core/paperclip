@@ -12743,7 +12743,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: input.activitySource,
     });
 
-    if (input.recoveryPolicy === "create_recovery_issue") {
+    // SUP-24563 round 4: a stranded_issue_recovery card takes a reserved
+    // live-run slot, so no agent's own writes may mint one. The card is minted
+    // only for a monitor a board user scheduled, and only when the check that
+    // exhausted it was not triggered by an agent. Otherwise the recovery falls
+    // back to waking the owner on the source card (the default `wake_owner`).
+    const recoveryIssueRefused =
+      input.recoveryPolicy !== "create_recovery_issue"
+        ? null
+        : input.monitor?.scheduledBy !== "board"
+          ? "agent_scheduled_monitor"
+          : input.actorType === "agent"
+            ? "agent_triggered_check"
+            : null;
+
+    if (input.recoveryPolicy === "create_recovery_issue" && !recoveryIssueRefused) {
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(
         input.claimed,
       );
@@ -12886,7 +12900,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       action: "issue.monitor_recovery_wake_queued",
       entityType: "issue",
       entityId: input.claimed.id,
-      details,
+      details: recoveryIssueRefused ? { ...details, recoveryIssueRefused } : details,
     });
   }
 

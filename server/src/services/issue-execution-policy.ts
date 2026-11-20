@@ -1677,23 +1677,16 @@ function toStagePrincipal(principal: IssueExecutionStagePrincipal): IssueExecuti
 }
 
 /**
- * SUP-24563: the record of who seated `participant`. The actor of the seating
- * transition is recorded, except that a participant re-seating itself keeps
- * the seat record it already holds: it can neither create a seat for itself
- * nor erase who seated it.
+ * SUP-24563: the record of who seated `participant`: always the actor of the
+ * seating transition. A participant that re-seats itself is recorded as its
+ * own seater, whoever seated it before, so a seat another principal gave it
+ * never carries over to work the participant itself moved back into review.
  */
 function buildParticipantSeat(
-  previous: IssueExecutionState | null,
   participant: IssueExecutionStagePrincipal,
   seatedBy: IssueExecutionStagePrincipal | null,
 ): IssueExecutionParticipantSeat {
-  const seated = toStagePrincipal(participant);
-  const actor = seatedBy ? toStagePrincipal(seatedBy) : null;
-  const held = previous?.participantSeat ?? null;
-  if (actor && principalsEqual(actor, seated) && held && principalsEqual(held.participant, seated)) {
-    return held;
-  }
-  return { participant: seated, seatedBy: actor };
+  return { participant: toStagePrincipal(participant), seatedBy: seatedBy ? toStagePrincipal(seatedBy) : null };
 }
 
 function buildPendingState(input: {
@@ -1715,7 +1708,7 @@ function buildPendingState(input: {
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
     deliveryAuthor: input.deliveryAuthor ?? input.previous?.deliveryAuthor ?? null,
-    participantSeat: buildParticipantSeat(input.previous, input.participant, input.seatedBy),
+    participantSeat: buildParticipantSeat(input.participant, input.seatedBy),
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
     skippedStageIds: mergeSkippedStageIds(input.previous),
