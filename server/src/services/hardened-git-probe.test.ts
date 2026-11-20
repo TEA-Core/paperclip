@@ -705,6 +705,37 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
       expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
     });
+
+    // A live shared exclude seen in production: the git template, then rules an
+    // agent harness (Claude Code's `# claude-code-runtime` block) and a person
+    // appended. No Paperclip operation writes these, so the close refuses; the
+    // recovery is an operator cleanup of the file, not a wider allowlist, since
+    // an agent-side rule could hide undelivered work from the clean-tree check.
+    it("refuses agent-harness and hand-made rules in the shared exclude, even with the server's line present", async () => {
+      const layout = managedLayout();
+      const file = sharedExclude(layout);
+      const agentAndHandMade = [
+        "# claude-code-runtime",
+        "**/.claude/scheduled_tasks.lock",
+        "**/.claude/scheduled_tasks.json",
+        "**/.claude/routines/.state/",
+        "**/.claude/worktrees/",
+        "**/.claude/checkpoints/",
+        "**/.claude/mailbox/",
+        "**/.claude/agent-registry.json",
+        "**/.claude/agent-memory-local",
+        "**/.claude/first-run",
+        "**/.claude/assistant-daemon-state.json",
+        "node_modules.broken-nodeuser/",
+      ].join("\n");
+      appendFileSync(file, `${agentAndHandMade}\n`);
+      mkdirSync(path.join(layout.worktree, ".claude", "worktrees"), { recursive: true });
+      writeFileSync(path.join(layout.worktree, ".claude", "worktrees", "deliverable.md"), "undelivered\n");
+      expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
+      appendFileSync(file, `\n${SERVER_LINE}\n`);
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
+    });
   });
 
   describe("ignored entries (ignored-file dirt)", () => {
