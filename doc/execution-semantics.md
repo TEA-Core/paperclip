@@ -206,14 +206,15 @@ different issue still wake the assignee.
 
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
-its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
-first and cancellation is then attempted only for a run the route's existing
-lookup finds: the execution-lock holder or the assignee's issue-scoped active
-run. The route does not cancel an issuer that this lookup cannot find.
-A cancellation attempt can throw or leave the run running. The handoff stays
-saved; the route logs a warning and a `heartbeat.cancel_failed` activity. A
-terminal approval keeps the confirmed stop before the write: an unconfirmed stop
-returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
+its own handoff PATCH's cancellation. For any other issuer, and for every
+terminal approval issuer, the update is saved first and cancellation is then
+attempted only for a run the route's existing lookup finds before the update:
+the execution-lock holder or the assignee's issue-scoped active run. The route
+does not cancel an issuer that this lookup cannot find, and it does not cancel a
+different run that takes ownership later. A refused final-delivery preflight or
+a failed update cancels nothing. A cancellation attempt can throw or leave the
+run running. The update stays saved; the route logs a warning and a
+`heartbeat.cancel_failed` activity.
 
 Under the issue row lock, a non-terminal assignee change retains a running
 holder identified by the issue's existing execution or checkout binding. It

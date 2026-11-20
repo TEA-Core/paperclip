@@ -4779,6 +4779,51 @@ describe("issue execution policy routes", () => {
       return { stage1Id, stage2Id, insertedRows };
     }
 
+    async function mockTerminalApproval() {
+      const handoff = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      const approvalIssue = {
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: handoff.stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(approvalIssue);
+      return { ...handoff, approvalIssue };
+    }
+
+    async function sendTerminalApproval() {
+      return request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+    }
+
+    // The runner-goal stop is the first step of the reassignment stop sequence,
+    // so a read after it is the post-stop re-read and the reads that follow.
+    const reassignmentStopStarted = () => mockRunnerGoalService.projection.mock.calls.length > 0;
+
     it("does not cancel the issuing run on a workflow-controlled non-final stage approval", async () => {
       const { stage1Id, stage2Id, insertedRows } = mockStageHandoff();
       const res = await request(await createApp({
@@ -4816,53 +4861,25 @@ describe("issue execution policy routes", () => {
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
 
-    it("refuses terminal approval when cancellation does not confirm the run stopped", async () => {
-      const { stage1Id } = mockStageHandoff();
-      const issue = await mockIssueService.getById();
-      mockIssueService.getById.mockResolvedValue({
-        ...issue,
-        executionPolicy: normalizeIssueExecutionPolicy({
-          stages: [{
-            id: stage1Id,
-            type: "approval",
-            participants: [{ type: "agent", agentId: reviewerAgentId }],
-          }],
-        }),
-        executionState: {
-          ...issue.executionState,
-          currentStageType: "approval",
-          returnAssignee: { type: "agent", agentId: nextAgentId },
-        },
-      });
+    it("keeps a committed terminal approval when the post-commit cancellation is unconfirmed", async () => {
+      await mockTerminalApproval();
       mockHeartbeatService.cancelRun.mockResolvedValue(runningRun);
 
-      const res = await request(await createApp({
-        type: "agent",
-        agentId: reviewerAgentId,
-        companyId: "company-1",
-        runId,
-      }))
-        .patch(`/api/issues/${issueId}`)
-        .send({
-          status: "done",
-          assigneeAgentId: nextAgentId,
-          comment: "Final approval passed.",
-          doneTier: {
-            tier: "tier2",
-            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
-          },
-        });
+      const res = await sendTerminalApproval();
 
-      expect(res.status, JSON.stringify(res.body)).toBe(409);
-      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
-        runId,
-        "Cancelled before issue reassignment",
-        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "heartbeat.cancel_failed",
+          entityType: "heartbeat_run",
+          entityId: runId,
+          details: { source: "issue_reassigned", issueId },
+        }),
       );
-      expect(res.body).toMatchObject({
-        details: { code: "runner_goal_reassignment_stop_unconfirmed", runId },
-      });
-      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("cancels the outgoing run when a workflow hand-off comes from a different run", async () => {
@@ -4986,43 +5003,29 @@ describe("issue execution policy routes", () => {
       );
     });
 
-    it("suppresses immediate recovery on the pre-commit terminal-approval reassignment cancel", async () => {
-      const { stage1Id } = mockStageHandoff();
-      const issue = await mockIssueService.getById();
-      mockIssueService.getById.mockResolvedValue({
-        ...issue,
-        executionPolicy: normalizeIssueExecutionPolicy({
-          stages: [{
-            id: stage1Id,
-            type: "approval",
-            participants: [{ type: "agent", agentId: reviewerAgentId }],
-          }],
-        }),
-        executionState: {
-          ...issue.executionState,
-          currentStageType: "approval",
-          returnAssignee: { type: "agent", agentId: nextAgentId },
-        },
-      });
+    it("cancels the issuing run only after the terminal approval reassignment commits", async () => {
+      const { stage1Id, insertedRows } = await mockTerminalApproval();
 
-      const res = await request(await createApp({
-        type: "agent",
-        agentId: reviewerAgentId,
-        companyId: "company-1",
-        runId,
-      }))
-        .patch(`/api/issues/${issueId}`)
-        .send({
-          status: "done",
-          assigneeAgentId: nextAgentId,
-          comment: "Final approval passed.",
-          doneTier: {
-            tier: "tier2",
-            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
-          },
-        });
+      const res = await sendTerminalApproval();
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // The issuing run is still live when its decision is written, so it
+      // writes with its own credentials and no request-owned stop id.
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({
+        status: "done",
+        assigneeAgentId: nextAgentId,
+        actorRunId: runId,
+        actorRunStopId: null,
+      });
+      expect(insertedRows).toContainEqual(expect.objectContaining({
+        issueId,
+        stageId: stage1Id,
+        stageType: "approval",
+        actorAgentId: reviewerAgentId,
+        outcome: "approved",
+      }));
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
       expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
         runId,
         "Cancelled before issue reassignment",
@@ -5031,113 +5034,90 @@ describe("issue execution policy routes", () => {
           suppressImmediateRecovery: true,
         }),
       );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     });
 
-    // RA NO-GO on PR 1196: the pre-commit cancel is suppressed because the
-    // reassignment is expected to commit. When the update then fails before
-    // commit, the card is unchanged and the participant must be re-woken
-    // through the unsuppressed release, exactly as the base cancel did.
-    it("re-wakes the participant when the update fails after a suppressed pre-commit reassignment cancel", async () => {
-      const { stage1Id } = mockStageHandoff();
-      const issue = await mockIssueService.getById();
-      mockIssueService.getById.mockResolvedValue({
-        ...issue,
-        executionPolicy: normalizeIssueExecutionPolicy({
-          stages: [{
-            id: stage1Id,
-            type: "approval",
-            participants: [{ type: "agent", agentId: reviewerAgentId }],
-          }],
-        }),
-        executionState: {
-          ...issue.executionState,
-          currentStageType: "approval",
-          returnAssignee: { type: "agent", agentId: nextAgentId },
-        },
-      });
+    it("leaves the issuing run alive when the terminal approval update fails", async () => {
+      await mockTerminalApproval();
       mockIssueService.update.mockRejectedValue(new Error("simulated update failure"));
 
-      const res = await request(await createApp({
-        type: "agent",
-        agentId: reviewerAgentId,
-        companyId: "company-1",
-        runId,
-      }))
-        .patch(`/api/issues/${issueId}`)
-        .send({
-          status: "done",
-          assigneeAgentId: nextAgentId,
-          comment: "Final approval passed.",
-          doneTier: {
-            tier: "tier2",
-            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
-          },
-        });
+      const res = await sendTerminalApproval();
 
       expect(res.status, JSON.stringify(res.body)).toBe(500);
-      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
-        runId,
-        "Cancelled before issue reassignment",
-        expect.objectContaining({
-          errorCode: "issue_reassigned",
-          suppressImmediateRecovery: true,
-        }),
-      );
-      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
-      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
-        expect.objectContaining({ id: runId, status: "cancelled" }),
-      );
+      expect(mockIssueService.update).toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     });
 
-    it("re-wakes the participant when the deferred preflight finds the card changed after the suppressed cancel", async () => {
-      const { stage1Id } = mockStageHandoff();
-      const issue = await mockIssueService.getById();
-      const approvedIssue = {
-        ...issue,
-        executionPolicy: normalizeIssueExecutionPolicy({
-          stages: [{
-            id: stage1Id,
-            type: "approval",
-            participants: [{ type: "agent", agentId: reviewerAgentId }],
-          }],
-        }),
-        executionState: {
-          ...issue.executionState,
-          currentStageType: "approval",
-          returnAssignee: { type: "agent", agentId: nextAgentId },
-        },
-      };
-      // Once the cancel has landed, the post-stop re-read sees a card that
-      // moved during the stop, so the deferred preflight refuses with 409.
+    it("leaves the issuing run alive when the terminal approval preflight refuses", async () => {
+      const { approvalIssue } = await mockTerminalApproval();
+      // The post-stop re-read sees a card that moved while the runner goal
+      // stopped, so the deferred final-delivery preflight refuses with 409.
       mockIssueService.getById.mockImplementation(async () =>
-        mockHeartbeatService.cancelRun.mock.calls.length > 0
-          ? { ...approvedIssue, title: "Changed during the stop" }
-          : approvedIssue);
+        reassignmentStopStarted()
+          ? { ...approvalIssue, title: "Changed before the preflight" }
+          : approvalIssue);
 
-      const res = await request(await createApp({
-        type: "agent",
-        agentId: reviewerAgentId,
-        companyId: "company-1",
-        runId,
-      }))
-        .patch(`/api/issues/${issueId}`)
-        .send({
-          status: "done",
-          assigneeAgentId: nextAgentId,
-          comment: "Final approval passed.",
-          doneTier: {
-            tier: "tier2",
-            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
-          },
-        });
+      const res = await sendTerminalApproval();
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
       expect(mockIssueService.update).not.toHaveBeenCalled();
-      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
-      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
-        expect.objectContaining({ id: runId, status: "cancelled" }),
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    });
+
+    it("refuses without cancelling when a replacement run owns the card at the terminal preflight", async () => {
+      const { approvalIssue } = await mockTerminalApproval();
+      const replacementRunId = "77777777-7777-4777-8777-777777777777";
+      mockIssueService.getById.mockImplementation(async () =>
+        reassignmentStopStarted()
+          ? { ...approvalIssue, executionRunId: replacementRunId }
+          : approvalIssue);
+
+      const res = await sendTerminalApproval();
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("cancels only the outgoing run when a replacement run takes ownership after the terminal preflight", async () => {
+      const { approvalIssue } = await mockTerminalApproval();
+      const replacementRunId = "77777777-7777-4777-8777-777777777777";
+      // The post-stop re-read still sees the outgoing run. Every later read,
+      // including the locked reads in the write transaction, sees the
+      // replacement run that took ownership while the preflight ran.
+      let postStopReadServed = false;
+      mockIssueService.getById.mockImplementation(async () => {
+        if (!reassignmentStopStarted()) return approvalIssue;
+        if (!postStopReadServed) {
+          postStopReadServed = true;
+          return approvalIssue;
+        }
+        return { ...approvalIssue, executionRunId: replacementRunId };
+      });
+
+      const res = await sendTerminalApproval();
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(postStopReadServed).toBe(true);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
       );
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalledWith(
+        replacementRunId,
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
     });
 
     it("still recovers after a terminalizing PATCH that changes neither assignee nor stage", async () => {
