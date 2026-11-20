@@ -464,7 +464,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -20306,45 +20306,57 @@ export function issueRoutes(
             : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
     }
-    await assertWikiHandoffWriteIntegrity({
-      db,
-      companyId: existing.companyId,
-      issue: {
-        title:
-          updateFields.title !== undefined ? updateFields.title : existing.title,
-        description:
-          updateFields.description !== undefined
-            ? updateFields.description
-            : existing.description,
-        executionPolicy: nextExecutionPolicy,
-        executionState: resultingExecutionState,
-      },
-      incomingAssigneeAgentId: resultingAssigneeAgentId,
-      actorAgentId: actor.agentId ?? null,
-      currentAssigneeAgentId: existing.assigneeAgentId,
-      checkReviewStage: false,
-      workflowControlledAssignment:
-        transition.workflowControlledAssignment === true &&
-        (normalizedAssigneeAgentId === undefined || (
-          resultingAssigneeAgentId === null &&
-          typeof normalizedAssigneeAgentId === "string" &&
-          normalizedAssigneeAgentId === actor.agentId &&
-          normalizedAssigneeAgentId === existing.assigneeAgentId
-        )),
-      cancellation: {
-        requestedStatus: updateFields.status,
-        // updateFields carries the request's assignee keys plus any assignee
-        // the workflow transition adds.
-        assigneeFieldWritten:
-          updateFields.assigneeAgentId !== undefined ||
-          updateFields.assigneeUserId !== undefined,
-        currentAssigneeUserId: existing.assigneeUserId,
-      },
-      refusalContext:
-        req.actor.type === "board"
-          ? undefined
-          : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
-    });
+    // SUP-24762: a field-less write (comment-only PATCH) cannot change who
+    // holds the handoff or what it is; judging the stored assignee would
+    // refuse a comment while a human reviewer holds the review seat.
+    // reviewRequest and deliveryIdentity add executionState after this check,
+    // so a request that carries either still runs the guard here: a refused
+    // write must not reach the closed-workspace reopen below.
+    if (
+      !isFieldlessIssueWrite(updateFields)
+      || reviewRequest !== undefined
+      || requestedDeliveryIdentity !== undefined
+    ) {
+      await assertWikiHandoffWriteIntegrity({
+        db,
+        companyId: existing.companyId,
+        issue: {
+          title:
+            updateFields.title !== undefined ? updateFields.title : existing.title,
+          description:
+            updateFields.description !== undefined
+              ? updateFields.description
+              : existing.description,
+          executionPolicy: nextExecutionPolicy,
+          executionState: resultingExecutionState,
+        },
+        incomingAssigneeAgentId: resultingAssigneeAgentId,
+        actorAgentId: actor.agentId ?? null,
+        currentAssigneeAgentId: existing.assigneeAgentId,
+        checkReviewStage: false,
+        workflowControlledAssignment:
+          transition.workflowControlledAssignment === true &&
+          (normalizedAssigneeAgentId === undefined || (
+            resultingAssigneeAgentId === null &&
+            typeof normalizedAssigneeAgentId === "string" &&
+            normalizedAssigneeAgentId === actor.agentId &&
+            normalizedAssigneeAgentId === existing.assigneeAgentId
+          )),
+        cancellation: {
+          requestedStatus: updateFields.status,
+          // updateFields carries the request's assignee keys plus any assignee
+          // the workflow transition adds.
+          assigneeFieldWritten:
+            updateFields.assigneeAgentId !== undefined ||
+            updateFields.assigneeUserId !== undefined,
+          currentAssigneeUserId: existing.assigneeUserId,
+        },
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+      });
+    }
 
     // SUP-15543: authorized in-place re-provision of a mis-provisioned card's
     // execution workspace. When an authorized actor corrects the card's
