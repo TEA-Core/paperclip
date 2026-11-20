@@ -69,14 +69,54 @@ async function ledgerCount(sql: postgres.Sql, file: string) {
   return row?.count;
 }
 
+// Every CHECK on either table that references head_sha, whatever its name, so
+// a leftover loose check under another name shows up in the comparison.
 async function headShaChecks(sql: postgres.Sql) {
   return sql<{ table_name: string; conname: string; def: string; validated: boolean }[]>`
-    SELECT "conrelid"::regclass::text AS table_name, "conname", pg_get_constraintdef("oid") AS def,
-      "convalidated" AS validated
-    FROM "pg_constraint"
-    WHERE "conname" IN ${sql(HEAD_SHA_CHECKS)}
-    ORDER BY "conname"
+    SELECT "c"."conrelid"::regclass::text AS table_name, "c"."conname", pg_get_constraintdef("c"."oid") AS def,
+      "c"."convalidated" AS validated
+    FROM "pg_constraint" AS "c"
+    JOIN "pg_class" AS "t" ON "t"."oid" = "c"."conrelid"
+    JOIN "pg_attribute" AS "a" ON "a"."attrelid" = "c"."conrelid" AND "a"."attnum" = ANY ("c"."conkey")
+    WHERE "c"."contype" = 'c' AND "t"."relname" IN (${RECEIPTS}, ${LINKS}) AND "a"."attname" = 'head_sha'
+    ORDER BY "c"."conname"
   `;
+}
+
+async function tableRows(sql: postgres.Sql) {
+  return {
+    receipts: await sql`SELECT "id", "head_sha" FROM ${sql(RECEIPTS)} ORDER BY "id"`,
+    links: await sql`SELECT "id", "head_sha" FROM ${sql(LINKS)} ORDER BY "id"`,
+  };
+}
+
+// Recreate the shape of a database that ran 0298 but not 0329. 0298's text is
+// unchanged, so its raw statements rebuild the {40,64} checks.
+async function rewindToLegacy0298(sql: postgres.Sql) {
+  await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(TIGHTEN_MIGRATION_FILE)}`;
+  await sql`DROP TABLE IF EXISTS ${sql(LINKS)} CASCADE`;
+  await sql`DROP TABLE IF EXISTS ${sql(RECEIPTS)} CASCADE`;
+  for (const statement of await migrationStatements(MIGRATION_FILE)) {
+    await sql.unsafe(statement);
+  }
+}
+
+async function insertLink(
+  sql: postgres.Sql,
+  values: { companyId: string; receiptId: string; issueId: string; objectId: string; headSha: string },
+) {
+  const [row] = await sql<{ id: string }[]>`
+    INSERT INTO ${sql(LINKS)} (
+      "company_id", "receipt_id", "source_issue_id", "external_object_id",
+      "provider", "owner", "repo", "pull_request_number", "head_sha"
+    )
+    VALUES (
+      ${values.companyId}, ${values.receiptId}, ${values.issueId}, ${values.objectId},
+      'github', 'acme', 'widgets', 579, ${values.headSha}
+    )
+    RETURNING "id"
+  `;
+  return row!.id;
 }
 
 type IndexRow = {
@@ -488,83 +528,164 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         expect(row.validated).toBe(true);
       }
 
-      // Rebuild the state of a database that ran 0298 before 0329 existed:
-      // 0298's text is unchanged, so its raw statements recreate that shape.
-      await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(TIGHTEN_MIGRATION_FILE)}`;
-      await sql`DROP TABLE IF EXISTS ${sql(LINKS)} CASCADE`;
-      await sql`DROP TABLE IF EXISTS ${sql(RECEIPTS)} CASCADE`;
-      for (const statement of await migrationStatements(MIGRATION_FILE)) {
-        await sql.unsafe(statement);
-      }
+      await rewindToLegacy0298(sql);
       expect(await ledgerCount(sql, MIGRATION_FILE)).toBe("1");
       expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
       for (const row of await headShaChecks(sql)) {
         expect(row.def).toContain("'^[0-9a-f]{40,64}$'");
       }
 
+      // Happy path: one valid receipt and its link.
       const { companyId, issueId } = await insertCompanyAndIssue(sql);
       const objectId = await insertExternalObject(sql, companyId, "acme/widgets#579");
       const validReceiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "legacy-valid" });
+      await insertLink(sql, { companyId, receiptId: validReceiptId, issueId, objectId, headSha: HEAD_SHA });
+      const rowsBefore = await tableRows(sql);
+
+      // A loose head_sha check recreated under another name (for example by a
+      // backup tool) must not survive next to the exact one.
       await sql`
-        INSERT INTO ${sql(LINKS)} (
-          "company_id", "receipt_id", "source_issue_id", "external_object_id",
-          "provider", "owner", "repo", "pull_request_number", "head_sha"
-        )
-        VALUES (
-          ${companyId}, ${validReceiptId}, ${issueId}, ${objectId},
-          'github', 'acme', 'widgets', 579, ${HEAD_SHA}
-        )
+        ALTER TABLE ${sql(RECEIPTS)} ADD CONSTRAINT "legacy_receipts_head_sha_loose"
+        CHECK ("head_sha" ~ '^[0-9a-f]{40,64}$')
       `;
-      const legacyLongReceiptId = await insertReceipt(sql, {
-        companyId,
-        sourceIssueId: issueId,
-        idempotencyKey: "legacy-41",
-        headSha: "c".repeat(41),
-      });
-
-      // A 41-character row blocks the migration. It deletes and rewrites
-      // nothing: the transaction rolls back and the old checks stay in place.
-      await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
-        code: "23514",
-        constraint_name: `${RECEIPTS}_head_sha_check`,
-      });
-      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
-      for (const row of await headShaChecks(sql)) {
-        expect(row.def).toContain("'^[0-9a-f]{40,64}$'");
-      }
-      const blockedRows = await sql<{ id: string; head_sha: string }[]>`
-        SELECT "id", "head_sha" FROM ${sql(RECEIPTS)} ORDER BY "idempotency_key"
+      await sql`
+        ALTER TABLE ${sql(LINKS)} ADD CONSTRAINT "legacy_links_head_sha_loose"
+        CHECK ("head_sha" ~ '^[0-9a-fA-F]{40,64}$')
       `;
-      expect(blockedRows).toEqual([
-        { id: legacyLongReceiptId, head_sha: "c".repeat(41) },
-        { id: validReceiptId, head_sha: HEAD_SHA },
-      ]);
 
-      // Once the operator removes the offending row, the same migration
-      // converges this database onto the fresh-install definitions.
-      await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${legacyLongReceiptId}`;
       await applyPendingMigrations(database.connectionString);
       expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
       expect(await headShaChecks(sql)).toEqual(fresh);
-
-      const [survivor] = await sql<{ head_sha: string }[]>`
-        SELECT "head_sha" FROM ${sql(RECEIPTS)} WHERE "id" = ${validReceiptId}
-      `;
-      expect(survivor?.head_sha).toBe(HEAD_SHA);
-      const [survivingLink] = await sql<{ head_sha: string }[]>`
-        SELECT "head_sha" FROM ${sql(LINKS)} WHERE "receipt_id" = ${validReceiptId}
-      `;
-      expect(survivingLink?.head_sha).toBe(HEAD_SHA);
+      expect(await tableRows(sql)).toEqual(rowsBefore);
 
       // Re-running the migrator is a no-op: one ledger row, same checks.
       await applyPendingMigrations(database.connectionString);
       expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
       expect(await headShaChecks(sql)).toEqual(fresh);
 
+      // Re-running 0329's raw statements is also safe on the tightened tables.
+      for (const statement of await migrationStatements(TIGHTEN_MIGRATION_FILE)) {
+        await sql.unsafe(statement);
+      }
+      expect(await headShaChecks(sql)).toEqual(fresh);
+      expect(await tableRows(sql)).toEqual(rowsBefore);
+
       await expect(
         insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "post-upgrade-41", headSha: "d".repeat(41) }),
       ).rejects.toMatchObject({ code: "23514", constraint_name: `${RECEIPTS}_head_sha_check` });
     },
     120_000,
+  );
+
+  it(
+    "refuses each non-conforming legacy head_sha with a named pre-flight error and changes nothing",
+    async () => {
+      const database = await startEmbeddedPostgresTestDatabase("paperclip-delivery-receipt-preflight-");
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1 });
+      cleanups.push(async () => sql.end());
+      const fresh = await headShaChecks(sql);
+
+      await rewindToLegacy0298(sql);
+      const { companyId, issueId } = await insertCompanyAndIssue(sql);
+      const objectId = await insertExternalObject(sql, companyId, "acme/widgets#579");
+      const validReceiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "valid" });
+      await insertLink(sql, { companyId, receiptId: validReceiptId, issueId, objectId, headSha: HEAD_SHA });
+
+      const expectBlocked = async (table: string, offendingIds: string[], hiddenValue: string) => {
+        const checksBefore = await headShaChecks(sql);
+        const rowsBefore = await tableRows(sql);
+        const error = await applyPendingMigrations(database.connectionString).then(
+          () => null,
+          (caught: unknown) => caught as { code?: string; message?: string },
+        );
+        expect(error?.code).toBe("23514");
+        expect(error?.message).toMatch(/^0329_head_sha_preflight: /);
+        expect(error?.message).toContain(`${table}: ${offendingIds.length} row(s)`);
+        for (const id of offendingIds) expect(error?.message).toContain(id);
+        if (hiddenValue) expect(error?.message).not.toContain(hiddenValue);
+        expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
+        expect(await headShaChecks(sql)).toEqual(checksBefore);
+        expect(await tableRows(sql)).toEqual(rowsBefore);
+      };
+
+      // 41 and 64 characters pass the 0298 checks, so these rows can exist on a
+      // database that only ran 0298.
+      for (const [label, headSha] of [["41", "c".repeat(41)], ["64", "d".repeat(64)]] as const) {
+        const receiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: `receipt-${label}`, headSha });
+        await expectBlocked(RECEIPTS, [receiptId], headSha);
+        await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${receiptId}`;
+
+        const linkReceiptId = await insertReceipt(sql, {
+          companyId,
+          sourceIssueId: issueId,
+          idempotencyKey: `link-${label}`,
+          headSha: "e".repeat(40),
+        });
+        const linkId = await insertLink(sql, { companyId, receiptId: linkReceiptId, issueId, objectId, headSha });
+        await expectBlocked(LINKS, [linkId], headSha);
+        await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${linkReceiptId}`;
+      }
+
+      // A database restored from a Paperclip backup has no head_sha CHECK, so
+      // any text can be stored there.
+      await sql`ALTER TABLE ${sql(RECEIPTS)} DROP CONSTRAINT ${sql(`${RECEIPTS}_head_sha_check`)}`;
+      await sql`ALTER TABLE ${sql(LINKS)} DROP CONSTRAINT ${sql(`${LINKS}_head_sha_check`)}`;
+      for (const [label, headSha] of [
+        ["upper", "C".repeat(40)],
+        ["non-hex", "g".repeat(40)],
+        ["empty", ""],
+      ] as const) {
+        const receiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: `receipt-${label}`, headSha });
+        await expectBlocked(RECEIPTS, [receiptId], headSha);
+        await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${receiptId}`;
+
+        const linkReceiptId = await insertReceipt(sql, {
+          companyId,
+          sourceIssueId: issueId,
+          idempotencyKey: `link-${label}`,
+          headSha: "f".repeat(40),
+        });
+        const linkId = await insertLink(sql, { companyId, receiptId: linkReceiptId, issueId, objectId, headSha });
+        await expectBlocked(LINKS, [linkId], headSha);
+        await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${linkReceiptId}`;
+      }
+
+      // The message names both tables, gives the full count, and lists at most
+      // 20 ids per table.
+      const manyIds: string[] = [];
+      for (let index = 0; index < 21; index += 1) {
+        manyIds.push(await insertReceipt(sql, {
+          companyId,
+          sourceIssueId: issueId,
+          idempotencyKey: `many-${index}`,
+          headSha: index.toString(16).padStart(2, "0").repeat(32),
+        }));
+      }
+      const manyLinkReceiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "many-link", headSha: "9".repeat(40) });
+      const manyLinkId = await insertLink(sql, { companyId, receiptId: manyLinkReceiptId, issueId, objectId, headSha: "A".repeat(40) });
+      const manyError = await applyPendingMigrations(database.connectionString).then(
+        () => null,
+        (caught: unknown) => caught as { message?: string },
+      );
+      expect(manyError?.message).toContain(`${RECEIPTS}: 21 row(s)`);
+      expect(manyError?.message).toContain(`${LINKS}: 1 row(s)`);
+      expect(manyError?.message).toContain(manyLinkId);
+      const listedReceiptIds = manyIds.filter((id) => manyError?.message?.includes(id));
+      expect(listedReceiptIds).toHaveLength(20);
+      expect(listedReceiptIds.sort()).toEqual([...manyIds].sort().slice(0, 20));
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
+
+      // After cleanup the restored database gets the exact checks.
+      await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ANY(${sql.array([...manyIds, manyLinkReceiptId])}::uuid[])`;
+      await applyPendingMigrations(database.connectionString);
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
+      expect(await headShaChecks(sql)).toEqual(fresh);
+      const [survivor] = await sql<{ head_sha: string }[]>`
+        SELECT "head_sha" FROM ${sql(RECEIPTS)} WHERE "id" = ${validReceiptId}
+      `;
+      expect(survivor?.head_sha).toBe(HEAD_SHA);
+    },
+    240_000,
   );
 });
