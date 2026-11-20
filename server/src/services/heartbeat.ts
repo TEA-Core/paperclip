@@ -19540,8 +19540,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       { runId: run.id, issueId, claimStaleReason: reason },
       "claimQueuedRun: atomic claim left the run queued",
     );
-    // A missing run has no row to attach an event to.
-    if (reason === "run_not_found") return;
+    // A missing run has no row to attach an event to; a run another claimer
+    // already took is a routine race, not a stuck gate.
+    if (reason === "run_not_found" || reason === "run_not_queued") return;
     const alreadyRecorded = await db
       .select({ id: heartbeatRunEvents.id })
       .from(heartbeatRunEvents)
@@ -20385,7 +20386,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
     if (atomicClaim?.kind === "stale") {
-      await recordAtomicClaimStale(run, issueId, atomicClaim.reason);
+      await recordAtomicClaimStale(run, issueId, atomicClaim.reason).catch((err) => {
+        logger.warn(
+          { err, runId: run.id, issueId, claimStaleReason: atomicClaim.reason },
+          "claimQueuedRun: failed to record atomic claim stale event",
+        );
+      });
       return null;
     }
     if (atomicClaim?.kind === "cancelled") {
