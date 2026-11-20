@@ -4,7 +4,7 @@ import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, wr
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, PROJECT_REPOSITORIES_EXCLUDE_LINE } from "@paperclipai/adapter-utils/git-workspace-sync";
 
 // SUP-22880 / SUP-22570: the one Git runner for probes that read a workspace an
 // agent can write.
@@ -70,9 +70,23 @@ const FORCED_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["core.commitGraph", "false"],
 ];
 
-// The only info/exclude rule the server writes into a task workspace
-// (heartbeat prepareProjectRepositoryWorkspaces).
-const SERVER_WRITTEN_EXCLUDE_LINE = `/${PROJECT_REPOSITORIES_DIR}/`;
+// Every info/exclude line the server writes into a task workspace, as the
+// writers write it (heartbeat prepareProjectRepositoryWorkspaces; the sandbox
+// clone and SSH writers in adapter-utils append the same constant).
+const SERVER_WRITTEN_EXCLUDE_LINES: ReadonlySet<string> = new Set([PROJECT_REPOSITORIES_EXCLUDE_LINE]);
+
+/**
+ * Whether every line of an info/exclude file is one the server wrote, a blank
+ * line, or a comment (the `git init` template). Lines are compared byte for
+ * byte, never trimmed: Git keeps leading whitespace and does not read an
+ * indented `#` as a comment, so a trimmed lookalike is a rule the server did
+ * not write. The writers end lines with LF only, so a CR is refused too.
+ */
+function excludeHasOnlyServerWrittenRules(exclude: string): boolean {
+  return exclude.split("\n").every(
+    (line) => line.length === 0 || line.startsWith("#") || SERVER_WRITTEN_EXCLUDE_LINES.has(line),
+  );
+}
 
 export class HardenedGitError extends Error {
   constructor(
@@ -790,13 +804,7 @@ async function verifyCleanLinkedWorktree(
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  if (
-    exclude !== null &&
-    exclude.split(/\r?\n/).some((line) => {
-      const trimmed = line.trim();
-      return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed !== SERVER_WRITTEN_EXCLUDE_LINE;
-    })
-  ) {
+  if (exclude !== null && !excludeHasOnlyServerWrittenRules(exclude)) {
     return { ok: false, reason: "has info/exclude ignore rules the server did not write" };
   }
   try {
