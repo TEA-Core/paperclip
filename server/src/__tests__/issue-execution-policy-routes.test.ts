@@ -249,8 +249,7 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
-    logActivityInTransaction: mockLogActivity,
-    logActivityInTransactionBestEffort: mockLogActivity,
+    logActivityInTransaction: mockLogActivity, logActivityInTransactionBestEffort: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
