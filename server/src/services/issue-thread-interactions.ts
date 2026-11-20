@@ -796,7 +796,20 @@ function isTerminalIssueStatus(status: string) {
  * inferred from prompt, label, or title text.
  */
 export const WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN =
-  /^wiki-report-\d{4}-\d{2}-\d{2}-publication$/;
+  /^wiki-report-(\d{4})-(\d{2})-(\d{2})-publication$/;
+
+/** The key names a real calendar date (2026-13-99 does not) and matches exactly. */
+export function isWikiReportPublicationTargetKey(key: string): boolean {
+  const match = WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN.exec(key);
+  if (!match) return false;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
 
 export const CLOSE_ON_ACCEPT_DECISION_BODY =
   "Publication approved by the addressed human on the close-on-accept confirmation.";
@@ -877,7 +890,7 @@ export function closeIssueOnAcceptIneligibleReason(args: {
   if (
     target?.type !== "custom" ||
     typeof target.key !== "string" ||
-    !WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN.test(target.key)
+    !isWikiReportPublicationTargetKey(target.key)
   ) {
     return "target_not_publication";
   }
@@ -908,6 +921,7 @@ export async function readCloseOnAcceptGuardSnapshot(
       executionState: issues.executionState,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
+      projectId: issues.projectId,
       projectWorkspaceId: issues.projectWorkspaceId,
       executionWorkspaceId: issues.executionWorkspaceId,
     })
@@ -928,11 +942,21 @@ export async function readCloseOnAcceptGuardSnapshot(
     .select({ id: issues.id, status: issues.status })
     .from(issues)
     .where(and(eq(issues.companyId, issue.companyId), eq(issues.parentId, issue.id)));
+  // The tier guard reads the latest comments, so a comment written between the
+  // preflight and the lock must also refuse the close.
+  const [comments] = await dbOrTx
+    .select({
+      count: sql<number>`count(*)::int`,
+      latestId: sql<string | null>`(array_agg(${issueComments.id} order by ${issueComments.createdAt} desc, ${issueComments.id} desc))[1]`,
+    })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id)));
   const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
   return JSON.stringify({
     issue: row ?? null,
     blockers: [...blockers].sort(byId),
     children: [...children].sort(byId),
+    comments: comments ?? null,
   });
 }
 
@@ -1008,7 +1032,26 @@ async function closeIssueForAcceptedConfirmation(args: {
         "Approving the current execution stage does not complete the issue's ladder",
       );
     }
-    // Loaded lazily: issue-stage-decision imports the services barrel, and a static
+    // A close-on-accept never lets a human approve their own work: the issue
+    // creator, the assignee, and every self-approval principal of the ladder are
+    // refused, as on the other approval doors.
+    const { resolveSelfApprovalPrincipals } = await import("./approval-status-reconciler.js");
+    const selfPrincipals = resolveSelfApprovalPrincipals(
+      (locked.executionPolicy ?? {}) as Record<string, unknown>,
+      (locked.executionState ?? {}) as Record<string, unknown>,
+      locked.createdByAgentId ?? null,
+    );
+    if (
+      args.userId === locked.createdByUserId ||
+      args.userId === locked.assigneeUserId ||
+      selfPrincipals.userIds.has(args.userId)
+    ) {
+      throw closeOnAcceptRefusedError(
+        "self_approval",
+        "The accepting human cannot approve the execution stage of their own work",
+      );
+    }
+    // Loaded lazily: these modules import the services barrel, and a static
     // import here pulls that barrel into this module's load and breaks the cycle order.
     const { applyReviewEscalationDecision } = await import("./issue-stage-decision.js");
     const decided = await applyReviewEscalationDecision({

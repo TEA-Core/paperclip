@@ -3924,6 +3924,51 @@ describe("issue thread interaction routes", () => {
       };
     }
 
+    it("wakes blocked dependents after an accept closes the issue, like PATCH done (RA minor 5)", async () => {
+      const interaction = publicationInteraction();
+      mockIssueService.getById.mockResolvedValue(publicationIssue());
+      mockInteractionService.getForIssue.mockResolvedValue(interaction);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(ALLOWED_GUARD);
+      // The dependency wake reads the attributed-landing discharge with
+      // select().from().where().limit(); the shared stub has no limit().
+      mockDbSelectWhere.mockImplementation(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve(mockRunAttribution.value ? [mockRunAttribution.value] : []).then(onFulfilled, onRejected),
+        orderBy: () => ({ limit: () => Promise.resolve([]) }),
+        limit: () => Promise.resolve([]),
+      }) as never);
+      mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+        {
+          id: OTHER_ISSUE_ID,
+          assigneeAgentId: CREATED_AGENT_ID,
+          blockerIssueIds: [ISSUE_ID],
+          blockedTransitionAt: null,
+        },
+      ] as never);
+      mockInteractionService.acceptInteraction.mockResolvedValue({
+        ...acceptedPublication(interaction, "done"),
+        closeOnAccept: {
+          issue: { ...publicationIssue(), status: "done" },
+          previous: publicationIssue(),
+          decision: null,
+        },
+      });
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.listWakeableBlockedDependents).toHaveBeenCalledWith(ISSUE_ID);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        CREATED_AGENT_ID,
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          payload: expect.objectContaining({ issueId: OTHER_ISSUE_ID, resolvedBlockerIssueId: ISSUE_ID }),
+        }),
+      );
+    });
+
     it("runs the done-transition preflight and requests the atomic close for an eligible confirmation", async () => {
       const interaction = publicationInteraction();
       mockIssueService.getById.mockResolvedValue(publicationIssue());

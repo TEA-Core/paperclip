@@ -5995,7 +5995,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await db.update(issues).set({
         status: "in_review",
         assigneeAgentId: null,
-        assigneeUserId: REVIEWER_ID,
+        assigneeUserId: null,
         deliveryRequirement: "record_only",
         ...overrides,
       }).where(eq(issues.id, issueId));
@@ -6120,6 +6120,49 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect((await readInteractionRow(created.id)).status).toBe("accepted");
     });
 
+    it("refuses a close-on-accept stage approval by the issue's own creator (RA C5)", async () => {
+      const stageId = randomUUID();
+      const seeded = await seedPublicationIssue({
+        createdByUserId: REVIEWER_ID,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "user", userId: REVIEWER_ID }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", userId: REVIEWER_ID },
+          returnAssignee: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      });
+      const created = await createPublicationConfirmation(seeded);
+      const issueBefore = await readIssueRow(seeded.issueId);
+      const interactionBefore = await readInteractionRow(created.id);
+
+      await expect(interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+        await closeOptions(seeded),
+      )).rejects.toMatchObject(refused("self_approval"));
+
+      expect(await readIssueRow(seeded.issueId)).toEqual(issueBefore);
+      expect(await readInteractionRow(created.id)).toEqual(interactionBefore);
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
     type RollbackCase = {
       label: string;
       issue?: Partial<typeof issues.$inferInsert>;
@@ -6139,6 +6182,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { label: "another human accepts", actor: "other_user", refusal: { status: 403, details: { code: "interaction_addressee_mismatch" } } },
       { label: "an agent accepts", actor: "agent", refusal: { status: 422 } },
       { label: "the target key is not a publication", confirmation: { payload: { target: { type: "custom", key: "wiki-report-latest-publication" } } }, refusal: refused("target_not_publication") },
+      { label: "the target date is not a calendar date", confirmation: { payload: { target: { type: "custom", key: "wiki-report-2026-13-99-publication" } } }, refusal: refused("target_not_publication") },
+      { label: "the target date is February 30", confirmation: { payload: { target: { type: "custom", key: "wiki-report-2026-02-30-publication" } } }, refusal: refused("target_not_publication") },
+      { label: "the target key has an extra segment", confirmation: { payload: { target: { type: "custom", key: "wiki-report-2026-11-16-publication-x" } } }, refusal: refused("target_not_publication") },
       { label: "the target is missing", confirmation: { payload: { target: null } }, refusal: refused("target_not_publication") },
       { label: "the issue is repository_delivery", issue: { deliveryRequirement: "repository_delivery" }, refusal: refused("issue_not_record_only") },
       {
@@ -6226,6 +6272,26 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         label: "the issue status changes",
         mutate: async (seeded) => {
           await db.update(issues).set({ status: "blocked", updatedAt: new Date() }).where(eq(issues.id, seeded.issueId));
+        },
+      },
+      {
+        label: "a comment is added",
+        mutate: async (seeded) => {
+          await db.insert(issueComments).values({
+            companyId: seeded.companyId,
+            issueId: seeded.issueId,
+            authorType: "user",
+            authorUserId: OTHER_USER_ID,
+            body: "Late comment after the preflight.",
+          });
+        },
+      },
+      {
+        label: "the project changes",
+        mutate: async (seeded) => {
+          const projectId = randomUUID();
+          await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Late project", status: "in_progress" });
+          await db.update(issues).set({ projectId }).where(eq(issues.id, seeded.issueId));
         },
       },
     ])("rolls back the issue and interaction when $label between preflight and the lock", async ({ mutate }) => {

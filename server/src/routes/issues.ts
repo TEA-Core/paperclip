@@ -5981,6 +5981,80 @@ export function issueRoutes(
     });
   }
 
+  // SUP-24788: a close-on-accept is a close, so dependents blocked on the issue
+  // and a parent waiting on its children get the same wakes PATCH done emits.
+  // Post-commit and non-fatal, like the recovery-action close path.
+  async function runCloseOnAcceptCompletionWakes(
+    closeOnAccept: CloseOnAcceptResult | undefined,
+    actor: ReturnType<typeof getActorInfo>,
+  ) {
+    if (!closeOnAccept || closeOnAccept.issue.status !== "done") return;
+    const issue = closeOnAccept.issue;
+    try {
+      const dependents = await svc.listWakeableBlockedDependents(issue.id);
+      for (const dependent of dependents) {
+        const wakeup = await prepareIssueBlockersResolvedWakeup({
+          companyId: issue.companyId,
+          dependentIssueId: dependent.id,
+          resolvedBlockerIssueId: issue.id,
+          blockerIssueIds: dependent.blockerIssueIds,
+          blockedTransitionAt: dependent.blockedTransitionAt,
+          source: "issue.blockers_resolved",
+          mutation: "blocker_done",
+          actor,
+          dedupeContext: "close-on-accept wake",
+        });
+        if (!wakeup) continue;
+        const wakeRun = await heartbeat.wakeup(dependent.assigneeAgentId, wakeup);
+        await logIssueBlockersResolvedWakeEmitted({
+          companyId: issue.companyId,
+          emittedBy: "issue_close_on_accept",
+          agentId: dependent.assigneeAgentId,
+          actor,
+          wakeup,
+          wakeupRunId: wakeRun?.id ?? null,
+          fallbackDependentIssueId: dependent.id,
+          defaultSource: "issue.close_on_accept",
+        }).catch((err) =>
+          logger.warn({ err, issueId: dependent.id }, "failed to audit dependency wake after close-on-accept"),
+        );
+      }
+      if (issue.parentId) {
+        const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
+        if (parent) {
+          await heartbeat.wakeup(parent.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_children_completed",
+            payload: {
+              issueId: parent.id,
+              completedChildIssueId: issue.id,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: parent.id,
+              taskId: parent.id,
+              wakeReason: "issue_children_completed",
+              source: "issue.children_completed",
+              completedChildIssueId: issue.id,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to wake dependents after close-on-accept");
+    }
+  }
+
   // Every route that can resolve a blocker routes its dependent wake through these
   // two helpers: one builds the wake (deduping against an already-enqueued one),
   // the other emits the matching audit record once the enqueue resolves. Keeping
@@ -25305,6 +25379,7 @@ export function issueRoutes(
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
       await runCloseOnAcceptMergeArming(closeOnAccept);
+      await runCloseOnAcceptCompletionWakes(closeOnAccept, actor);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
       // a decision instead of vanishing. The interaction's own resolution leaves
@@ -25659,6 +25734,7 @@ export function issueRoutes(
       );
       if (reconciled.outcome === "applied") {
         await runCloseOnAcceptMergeArming(reconciled.closeOnAccept);
+        await runCloseOnAcceptCompletionWakes(reconciled.closeOnAccept, getActorInfo(req));
       }
       res.json({
         outcome: reconciled.outcome,
