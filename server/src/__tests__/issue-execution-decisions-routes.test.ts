@@ -1586,29 +1586,59 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
+  // The final-delivery concurrency fence: a concurrent change that lands
+  // between the external preflight and the write refuses the final approval.
+  // The terminal-approval stop of the outgoing run happens only after the
+  // write commits, so a refused approval leaves that run alive.
   it.each([
-    ["title", "NEW.title := 'Renamed while the run was cancelled';"],
-    ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
-    ["execution state", `NEW.execution_state := NEW.execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb;`],
-  ])("refuses a final PATCH when a concurrent %s change lands during its own run cancellation", async (_label, mutation) => {
-    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
-    await holdAgentRun(fixture);
-    let response!: request.Response;
-    await withIssueTrigger(
-      "sup20467_concurrent_change",
-      "OLD.execution_run_id is not null and NEW.execution_run_id is null",
-      `${mutation} return NEW;`,
-      async () => { response = await fixture.approve(reassignToBoardUser); },
-    );
-    expect(response.status).toBe(409);
+    ["title", "title = 'Renamed before the final write'"],
+    ["execution policy", `execution_policy = execution_policy || '{"commentRequired": false}'::jsonb`],
+    ["execution state", `execution_state = execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb`],
+  ])("refuses a final PATCH when a concurrent %s change lands before the write", async (_label, assignment) => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const run = await holdAgentRun(fixture);
+    const approval = fixture.approve(reassignToBoardUser).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, () =>
+      db.execute(sql.raw(`update issues set ${assignment} where id = '${fixture.issue.id}'`)));
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
     expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
     const stored = await fixture.read();
     expect(stored.status).toBe("in_review");
+    expect(stored.executionRunId).toBe(run.id);
     expect(stored.executionState?.completedStageIds).toEqual([]);
     expect(stored.executionState?.approvalStatus).toBeUndefined();
     expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(held?.status).toBe("running");
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("keeps a committed final PATCH when a concurrent change lands after the commit, during the run stop", async () => {
+    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
+    const run = await holdAgentRun(fixture);
+    const name = "sup23801_change_after_commit";
+    // The outgoing run is cancelled only after the approval commits; a card
+    // change that lands inside that cancellation cannot undo the approval.
+    await db.execute(sql.raw(`create or replace function ${name}() returns trigger language plpgsql as $$ begin update issues set title = 'Renamed after the commit' where id = '${fixture.issue.id}'; return NEW; end $$`));
+    await db.execute(sql.raw(`create trigger ${name} before update on heartbeat_runs for each row when (OLD.status <> 'cancelled' and NEW.status = 'cancelled') execute function ${name}()`));
+    let response!: request.Response;
+    try {
+      response = await fixture.approve(reassignToBoardUser);
+    } finally {
+      await db.execute(sql.raw(`drop trigger if exists ${name} on heartbeat_runs`));
+      await db.execute(sql.raw(`drop function if exists ${name}()`));
+    }
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.title).toBe("Renamed after the commit");
+    expect(stored.status).toBe("done");
+    expect(stored.executionState?.completedStageIds).toEqual([fixture.stageId]);
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+    const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(cancelled?.status).toBe("cancelled");
   });
 
   it("publishes nothing and keeps the escalation pending when the accept transaction fails after the decision", async () => {
