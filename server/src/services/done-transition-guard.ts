@@ -25,6 +25,7 @@ import {
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
   probeZeroDeltaWorktree,
+  localRefOutsideRemoteBaseRefusal,
   recheckRecordedWorktree,
   runHardenedGit,
 } from "./hardened-git-probe.js";
@@ -483,6 +484,41 @@ async function resolveGitHubRefHeadSha(
     throw new Error("GitHub commits API returned no commit sha");
   }
   return sha.toLowerCase();
+}
+
+/** Branch tips on the forge. A second page refuses: an unlisted tip could hide work. */
+async function listGitHubBranchTips(
+  hostname: string,
+  owner: string,
+  repo: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<Array<{ name: string; sha: string }>> {
+  const apiBase = gitHubApiBase(hostname);
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  const response = await ghFetch(url, { headers, signal });
+  if (!response.ok) throw new Error(`GitHub branches API returned ${response.status}`);
+  if (response.headers.get("link")?.includes('rel="next"')) {
+    throw new Error("GitHub branches API returned more than one page");
+  }
+  const body = await response.json().catch(() => null);
+  if (!Array.isArray(body)) throw new Error("GitHub branches API returned no branch list");
+  return body.flatMap((entry) => {
+    const row = entry as Record<string, unknown>;
+    const commit = row.commit as Record<string, unknown> | undefined;
+    const name = row.name;
+    const sha = commit?.sha;
+    if (typeof name !== "string" || typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
+      throw new Error("GitHub branches API returned a branch without a commit sha");
+    }
+    return [{ name, sha: sha.toLowerCase() }];
+  });
 }
 
 // SUP-22880: the local-worktree probes below read an agent-writable workspace.
@@ -2327,16 +2363,18 @@ const ZERO_DELTA_CLOSE_CONDITIONS =
   "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only through " +
   "PATCH /api/issues/{id}, and only when the server proves its own recorded worktree, on its recorded branch, has " +
   "zero commits ahead of the base ref, a HEAD that is an ancestor of the base ref (in the worktree and on the " +
-  "remote), no tracked changes, no untracked files, no ignored entries outside the regenerated-artefact " +
-  "directories and no stash; that no other branch naming this card has commits the base lacks and no other " +
-  "worktree on a branch naming this card (or with a detached HEAD) holds uncommitted work; that every other local " +
-  "branch is a project branch, another card's registered branch or another card's rescue branch; and the " +
-  "declaration's probe head names that HEAD.";
+  "remote), a local base ref whose commit is the remote base commit, no tracked changes, no untracked files, no " +
+  "ignored entries outside the regenerated-artefact directories and no stash; that every local ref is an ancestor " +
+  "of that remote base commit; that no remote branch carries commits the base lacks; that no other worktree on a " +
+  "branch naming this card (or with a detached HEAD) holds uncommitted work; and the declaration's probe head names " +
+  "that HEAD.";
 
 /** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
 export interface ZeroDeltaCloseMeasurement {
   executionWorkspaceId: string;
   workspaceProjectWorkspaceId: string;
+  /** The issue row's project workspace at measurement. The close write requires it unchanged. */
+  issueProjectWorkspaceId: string | null;
   repository: string;
   /** The workspace row's recorded path, verbatim; the close write compares its re-read against this. */
   recordedWorktreePath: string;
@@ -2364,7 +2402,7 @@ type ZeroDeltaCloseProof =
 
 async function proveZeroDeltaRepositoryClose(
   db: Db,
-  issue: { id: string; companyId: string; identifier: string | null },
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
   executionWorkspaceId: string | null,
   deliveryRepository: { hostname: string; owner: string; repo: string },
 ): Promise<ZeroDeltaCloseProof> {
@@ -2522,6 +2560,45 @@ async function proveZeroDeltaRepositoryClose(
     },
   });
   if (!probe.ok) return refuse(probe.reason);
+  let remoteBaseSha: string | null;
+  try {
+    remoteBaseSha = await resolveGitHubRefHeadSha(hostname, owner, repo, baseBranch, token);
+  } catch {
+    remoteBaseSha = null;
+  }
+  if (!remoteBaseSha) return refuse(`the remote base ${baseBranch} could not be read`);
+  if (remoteBaseSha !== probe.baseSha.toLowerCase()) {
+    return refuse(`the local base ref ${probe.baseRef} is not the remote base ${baseBranch}`);
+  }
+  try {
+    const outside = await localRefOutsideRemoteBaseRefusal(path.dirname(probe.commonDir), remoteBaseSha);
+    if (outside) return refuse(outside);
+  } catch (err) {
+    return refuse(`the local refs could not be compared with the remote base (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  try {
+    const tips = await listGitHubBranchTips(
+      hostname, owner, repo, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+    );
+    const seen = new Set<string>([remoteBaseSha]);
+    for (const tip of tips) {
+      if (seen.has(tip.sha)) continue;
+      if (seen.size >= 5) {
+        return refuse("too_many_branch_tips: the remote has more than 5 distinct branch tips to compare with the base branch");
+      }
+      seen.add(tip.sha);
+      const ahead = await githubCompareAheadBy(
+        hostname, owner, repo, baseBranch, tip.sha, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead === null) return refuse(`the remote branch ${tip.name} could not be compared with ${baseBranch}`);
+      if (ahead !== 0) {
+        return refuse(`the remote branch ${tip.name} carries ${ahead} commit(s) that ${baseBranch} lacks`);
+      }
+    }
+  } catch (err) {
+    return refuse(`the remote branches could not be listed (${err instanceof Error ? err.message : "unknown"})`);
+  }
+
 
   let headAheadBy: number | null;
   try {
@@ -2568,6 +2645,7 @@ async function proveZeroDeltaRepositoryClose(
     measurement: {
       executionWorkspaceId,
       workspaceProjectWorkspaceId: workspace.projectWorkspaceId,
+      issueProjectWorkspaceId: issue.projectWorkspaceId ?? null,
       repository: `${hostname}/${owner}/${repo}`,
       recordedWorktreePath: worktreePath,
       worktreePath: probe.worktreePath,
@@ -2588,7 +2666,7 @@ async function proveZeroDeltaRepositoryClose(
 
 async function proveZeroDeltaTier2Live(
   db: Db,
-  issue: { id: string; companyId: string; identifier: string | null },
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
   executionWorkspaceId: string | null,
   deliveryRepository: { hostname: string; owner: string; repo: string },
   evidence: string,
@@ -2682,6 +2760,9 @@ export async function verifyZeroDeltaCloseAtTransition(
   if ((lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId) {
     return refuse("the issue's execution workspace changed after the close was measured");
   }
+  if ((lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId) {
+    return refuse("the issue's project workspace changed after the close was measured");
+  }
   try {
     const linkedPrs = await resolveLinkedPullRequestsWithState(tx, lockedIssue.companyId, lockedIssue.id, { includeDrafts: true });
     if (linkedPrs.length > 0) {
@@ -2768,8 +2849,35 @@ export async function verifyZeroDeltaCloseAtTransition(
     branch: measurement.branch,
     headSha: measurement.headSha,
     siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
   });
   if (!recheck.ok) return refuse(`refused at the close write: ${recheck.reason}`);
+  try {
+    const { token } = await resolveGitHubToken(tx, lockedIssue.companyId);
+    if (!token) return refuse("the remote could not be re-read at the close write");
+    const [hostname, owner, repo] = measurement.repository.split("/");
+    if (!hostname || !owner || !repo) return refuse("the measured repository could not be re-read at the close write");
+    const remoteBase = await resolveGitHubRefHeadSha(hostname, owner, repo, measurement.baseBranch, token);
+    if (remoteBase !== measurement.baseSha.toLowerCase()) {
+      return refuse("the remote base commit changed after the close was measured");
+    }
+    if (measurement.remoteBranchAheadBy === null) {
+      const presence = await githubBranchExists(hostname, owner, repo, measurement.branch, token);
+      if (presence.outcome !== "absent") {
+        return refuse(`the card's branch ${measurement.branch} could not be confirmed absent on the remote at the close write`);
+      }
+    } else {
+      const ahead = await githubCompareAheadBy(
+        hostname, owner, repo, measurement.baseBranch, measurement.branch, token,
+        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead !== 0) {
+        return refuse(`the card's branch ${measurement.branch} on the remote carries commits that ${measurement.baseBranch} lacks at the close write`);
+      }
+    }
+  } catch (err) {
+    return refuse(`the remote could not be re-read at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
   return { ok: true };
 }
 

@@ -1,6 +1,6 @@
 import { execFileSync, type SpawnOptions } from "node:child_process";
 import type * as ChildProcess from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +15,7 @@ import {
 import * as doneTransitionGuard from "./done-transition-guard.js";
 import { zeroDeltaWorktreeRefusal } from "./hardened-git-probe.js";
 import type * as MergeArming from "./merge-arming.js";
+import { resolveGitHubToken } from "./github-credential.js";
 
 // SUP-24402: the zero-delta repository_delivery Tier 2 close, measured with
 // real git against a real worktree. GitHub is a bare "origin" repository the
@@ -80,6 +81,7 @@ interface Rows {
   executionWorkspace: Record<string, unknown>;
   projectWorkspace: Record<string, unknown>;
   workProducts: Array<Record<string, unknown>>;
+  otherCards: string[];
 }
 let rows: Rows;
 
@@ -92,7 +94,7 @@ const db = {
       where: () => {
         if (table === executionWorkspaces) return Promise.resolve([rows.executionWorkspace]);
         if (table === projectWorkspaces) return Promise.resolve([rows.projectWorkspace]);
-        if (table === issues) return Promise.resolve([]);
+        if (table === issues) return Promise.resolve(rows.otherCards.map((identifier) => ({ identifier })));
         if (table === issueWorkProducts) {
           return Promise.resolve(
             columns && "type" in columns
@@ -156,6 +158,14 @@ function answerGitHub(url: string): Response {
     return originResolves(`refs/heads/${decodeURIComponent(ref[1]!)}`)
       ? json({ ref: `refs/heads/${decodeURIComponent(ref[1]!)}` })
       : json({ message: "Not Found" }, 404);
+  }
+  if (u.pathname === `${repoPath}/branches`) {
+    const listed = originGit("for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads");
+    const branches = listed.length === 0 ? [] : listed.split("\n").map((line) => {
+      const space = line.indexOf(" ");
+      return { name: line.slice(0, space), commit: { sha: line.slice(space + 1) } };
+    });
+    return json(branches);
   }
   return json({ message: "Not Found" }, 404);
 }
@@ -229,6 +239,7 @@ beforeEach(() => {
     },
     projectWorkspace: { id: "pw-1", defaultRef: "main", repoRef: "main", repoUrl: REPO_URL },
     workProducts: [],
+    otherCards: [],
   };
   mockGhFetch.mockReset();
   mockGhFetch.mockImplementation(async (url: string) => answerGitHub(String(url)));
@@ -441,7 +452,7 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     git(worktree, "commit", "-qm", "SUP-24395 work");
     git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
     git(repoRoot, "update-ref", "refs/remotes/origin/main", headSha());
-    expectZeroDeltaRefusal(await close(), `HEAD ${headSha()} carries 1 commit(s) that main on the remote lacks`);
+    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
   });
 
   it("refuses when the card's branch on the remote carries commits the base lacks", async () => {
@@ -450,7 +461,7 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     git(worktree, "commit", "-qm", "SUP-24395 work");
     git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
     git(worktree, "reset", "-q", "--hard", "HEAD~1");
-    expectZeroDeltaRefusal(await close(), `the card's branch ${BRANCH} on the remote carries 1 commit(s) that main lacks`);
+    expectZeroDeltaRefusal(await close(), `refs/remotes/origin/${BRANCH} holds a commit the remote base lacks`);
   });
 
   it("refuses a workspace the card does not own", async () => {
@@ -886,6 +897,202 @@ describe("zero-delta review regressions (PR 1213 round 2)", () => {
     const result = await close();
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("too_many_branch_tips");
+  });
+});
+
+describe("zero-delta remote-base authority (RA 1213 still open)", () => {
+  function plantUndelivered(): string {
+    writeFileSync(path.join(worktree, "work.txt"), "undelivered-canary\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "undelivered");
+    const planted = headSha();
+    git(worktree, "reset", "--hard", "HEAD~1");
+    return planted;
+  }
+
+  async function measured() {
+    const result = await close();
+    expect(result.allowed, result.reason).toBe(true);
+    return result.zeroDeltaMeasurement!;
+  }
+
+  async function verify(measurement: unknown, locked: Record<string, unknown> = {}) {
+    const verdict = await doneTransitionGuard.verifyZeroDeltaCloseAtTransition(
+      db,
+      { ...CARD, deliveryRequirement: "repository_delivery" as const, status: "in_progress", ...locked },
+      measurement as never,
+    );
+    return verdict.ok ? { ok: true as const } : { ok: false as const, reason: verdict.reason };
+  }
+
+  it("refuses when the agent moves the local base ref onto undelivered work", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", "refs/remotes/origin/main", planted);
+    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
+  });
+
+  it("refuses when packed-refs points the local base at undelivered work", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "pack-refs", "--all");
+    const packedPath = path.join(repoRoot, ".git", "packed-refs");
+    const packed = readFileSync(packedPath, "utf8").replace(
+      /^[0-9a-f]+ refs\/remotes\/origin\/main$/m,
+      `${planted} refs/remotes/origin/main`,
+    );
+    writeFileSync(packedPath, packed);
+    rmSync(path.join(repoRoot, ".git", "refs", "remotes", "origin", "main"), { force: true });
+    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
+  });
+
+  it("refuses when the agent retargets origin and fetches a forged base", async () => {
+    const planted = plantUndelivered();
+    const attacker = path.join(root, "attacker.git");
+    git(root, "init", "-q", "--bare", "-b", "main", attacker);
+    git(worktree, "push", "-q", attacker, `${planted}:refs/heads/main`);
+    git(repoRoot, "remote", "set-url", "origin", attacker);
+    git(repoRoot, "fetch", "-q", "origin");
+    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
+  });
+
+  it("refuses when an alternates file makes a forged base resolvable", async () => {
+    const planted = plantUndelivered();
+    const alt = path.join(root, "alt-objects");
+    mkdirSync(alt, { recursive: true });
+    writeFileSync(path.join(repoRoot, ".git", "objects", "info", "alternates"), `${alt}\n`);
+    git(repoRoot, "update-ref", "refs/remotes/origin/main", planted);
+    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
+  });
+
+  it("refuses at the close write when the local base ref is deleted", async () => {
+    const measurement = await measured();
+    git(repoRoot, "update-ref", "-d", "refs/remotes/origin/main");
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("local base ref");
+  });
+
+  it("refuses at the close write when the local base ref is moved onto undelivered work", async () => {
+    const measurement = await measured();
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", "refs/remotes/origin/main", planted);
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("local base ref");
+  });
+
+  it("refuses a broken loose refs/stash that hides a packed stash", async () => {
+    writeFileSync(path.join(worktree, "a.txt"), "stashed-canary\n");
+    git(worktree, "stash", "push", "-qm", "packed stash");
+    git(repoRoot, "pack-refs", "--all");
+    writeFileSync(path.join(repoRoot, ".git", "refs", "stash"), "not-a-sha\n");
+    expectZeroDeltaRefusal(await close(), "the recorded worktree has a stash that could not be read (refs/stash)");
+  });
+
+  it("refuses a fork remote tracking the recorded branch name with undelivered work", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", `refs/remotes/fork/${BRANCH}`, planted);
+    expectZeroDeltaRefusal(await close(), `refs/remotes/fork/${BRANCH} holds a commit the remote base lacks`);
+  });
+
+  it("refuses a forge branch that has no local tracking ref", async () => {
+    writeFileSync(path.join(seed, "other.txt"), "undelivered\n");
+    git(seed, "add", "other.txt");
+    git(seed, "commit", "-qm", "other work");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    expectZeroDeltaRefusal(await close(), "the remote branch other-work carries");
+  });
+
+  it("refuses undelivered work parked on the local project branch", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", "refs/heads/main", planted);
+    expectZeroDeltaRefusal(await close(), "refs/heads/main holds a commit the remote base lacks");
+  });
+
+  it("refuses undelivered work parked on a hidden ref", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", "refs/hidden/work", planted);
+    expectZeroDeltaRefusal(await close(), "refs/hidden/work holds a commit the remote base lacks");
+  });
+
+  it("refuses undelivered work parked on another card's rescue branch", async () => {
+    const planted = plantUndelivered();
+    rows.otherCards = ["SUP-9999"];
+    git(repoRoot, "update-ref", "refs/heads/paperclip/rescue/SUP-9999/1", planted);
+    expectZeroDeltaRefusal(await close(), "refs/heads/paperclip/rescue/SUP-9999/1 holds a commit the remote base lacks");
+  });
+
+  it("refuses at the close write when the card's remote branch gains a commit", async () => {
+    const measurement = await measured();
+    writeFileSync(path.join(seed, "later-branch.txt"), "ahead\n");
+    git(seed, "add", "later-branch.txt");
+    git(seed, "commit", "-qm", "ahead of main");
+    git(seed, "push", "-q", origin, `HEAD:refs/heads/${BRANCH}`);
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("on the remote");
+  });
+
+  it("refuses at the close write when the issue's project workspace changed", async () => {
+    const measurement = await measured();
+    const verdict = await verify(measurement, { projectWorkspaceId: "pw-other" });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("project workspace");
+  });
+
+  it("refuses a CRLF copy of the server exclude line at measurement", async () => {
+    writeFileSync(path.join(repoRoot, ".git", "info", "exclude"), "/.paperclip-repositories/\r\n");
+    expectZeroDeltaRefusal(await close(), "the recorded worktree has info/exclude ignore rules the server did not write");
+  });
+
+  it("refuses when no GitHub credential is configured", async () => {
+    vi.mocked(resolveGitHubToken).mockResolvedValueOnce({ token: "", scope: "company", secretName: "GITHUB_TOKEN" });
+    expectZeroDeltaRefusal(await close(), "no GitHub credential is configured");
+  });
+
+  it("refuses at the close write when the issue is already done", async () => {
+    const measurement = await measured();
+    const verdict = await verify(measurement, { status: "done" });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("status changed");
+  });
+
+  it("refuses at the close write when the delivery requirement changed", async () => {
+    const measurement = await measured();
+    const verdict = await verify(measurement, { deliveryRequirement: "record_only" });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("repository_delivery");
+  });
+
+  it("refuses at the close write when a merge-commit work product appears", async () => {
+    const measurement = await measured();
+    rows.workProducts = [{ type: "note", status: "done", metadata: { mergeCommitSha: "a".repeat(40) } }];
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("merge commit");
+  });
+
+  it("refuses at the close write when the execution workspace is no longer this card's", async () => {
+    const measurement = await measured();
+    rows.executionWorkspace = { ...rows.executionWorkspace, sourceIssueId: "other-issue" };
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("execution workspace");
+  });
+
+  it("refuses at the close write when the project repository URL changed", async () => {
+    const measurement = await measured();
+    rows.projectWorkspace = { ...rows.projectWorkspace, repoUrl: "https://github.com/TEA-Core/other" };
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("repository");
+  });
+
+  it("refuses at the close write when the project defaultRef changed", async () => {
+    const measurement = await measured();
+    rows.projectWorkspace = { ...rows.projectWorkspace, defaultRef: "release" };
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("base branch settings");
   });
 });
 

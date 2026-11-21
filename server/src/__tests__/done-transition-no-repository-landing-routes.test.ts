@@ -1977,10 +1977,18 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   function answerZeroDeltaGitHub() {
     mockGhFetch.mockImplementation(async (url: string) => {
       const text = String(url);
-      const commit = /\/commits\/([0-9a-f]{40})$/.exec(text);
+      if (/\/branches(?:\?|$)/.test(text)) {
+        const listed = git(currentOrigin, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads");
+        const body = listed.length === 0 ? [] : listed.split("\n").map((line) => {
+          const space = line.indexOf(" ");
+          return { name: line.slice(0, space), commit: { sha: line.slice(space + 1) } };
+        });
+        return new Response(JSON.stringify(body), { status: 200 });
+      }
+      const commit = /\/commits\/([^/?]+)$/.exec(text);
       if (commit) {
         try {
-          return new Response(JSON.stringify({ sha: git(currentOrigin, "rev-parse", "--verify", "--quiet", `${commit[1]}^{commit}`) }), { status: 200 });
+          return new Response(JSON.stringify({ sha: git(currentOrigin, "rev-parse", "--verify", "--quiet", `${decodeURIComponent(commit[1]!)}^{commit}`) }), { status: 200 });
         } catch {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }

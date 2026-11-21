@@ -769,15 +769,9 @@ async function worktreeShapeRefusal(worktreePath: string, options: HardenedGitOp
   return null;
 }
 
-/** Info/exclude rules other than the one the server writes: they can hide untracked work from status. */
+/** Info/exclude rules other than the ones the server writes, compared byte for byte. */
 function hasForeignExcludeRules(exclude: string | null): boolean {
-  return (
-    exclude !== null &&
-    exclude.split(/\r?\n/).some((line) => {
-      const trimmed = line.trim();
-      return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed !== PROJECT_REPOSITORIES_EXCLUDE_LINE;
-    })
-  );
+  return exclude !== null && !excludeHasOnlyServerWrittenRules(exclude);
 }
 
 /** Why an index entry hides or blocks a status check; null for a plain stage-0 tracked file. */
@@ -791,16 +785,46 @@ function indexEntryRefusal(entry: IndexEntry): string | null {
 
 /**
  * Why the repository's stash is not provably empty; null only when
- * `refs/stash` is confirmed absent. Any object there (not only a commit)
- * refuses, and so does a failed read.
+ * `refs/stash` is confirmed absent. A broken loose ref (git warns and omits
+ * it from `for-each-ref` while still exiting 0) is unreadable, not absent:
+ * it can hide a packed stash. Any object there refuses, and so does a failed
+ * read.
  */
 async function stashRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
+  let commonDir: string;
+  try {
+    const raw = (await runHardenedGit(["-C", worktreePath, "rev-parse", "--git-common-dir"], options)).trim();
+    commonDir = path.isAbsolute(raw) ? raw : path.resolve(worktreePath, raw);
+  } catch {
+    return "has a stash that could not be read (refs/stash)";
+  }
+  let loose: string | null;
+  try {
+    loose = await readOptionalRegularFile(path.join(commonDir, "refs", "stash"), 256);
+  } catch {
+    return "has a stash that could not be read (refs/stash)";
+  }
+  if (loose !== null) {
+    const sha = loose.trim();
+    if (!SHA_RE.test(sha)) return "has a stash that could not be read (refs/stash)";
+    return "has a stash of uncommitted work (refs/stash)";
+  }
+  let packed: string | null;
+  try {
+    packed = await readOptionalRegularFile(path.join(commonDir, "packed-refs"), MAX_EXCLUDE_FILE_BYTES);
+  } catch {
+    return "has a stash that could not be read (refs/stash)";
+  }
+  if (packed !== null && packed.split("\n").some((line) => /^[0-9a-f]{40,64} refs\/stash$/.test(line.trim()))) {
+    return "has a stash of uncommitted work (refs/stash)";
+  }
   let stash: string;
   try {
     stash = (await runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname)", "refs/stash"], options)).trim();
   } catch {
     return "has a stash that could not be read (refs/stash)";
   }
+  if (stash.length > 0 && !SHA_RE.test(stash)) return "has a stash that could not be read (refs/stash)";
   return stash.length > 0 ? "has a stash of uncommitted work (refs/stash)" : null;
 }
 
@@ -1071,6 +1095,8 @@ export async function recheckRecordedWorktree(input: {
   branch: string;
   headSha: string;
   siblings?: { issueIdentifier: string; refsDigest: string };
+  /** The measured local base ref. A move or delete after measurement refuses. */
+  base?: { ref: string; sha: string; headSha: string };
   budgetMs?: number;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
@@ -1088,11 +1114,27 @@ export async function recheckRecordedWorktree(input: {
   if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
+  if (input.base) {
+    const resolved = (
+      await runHardenedGit(
+        ["-C", input.worktreePath, "rev-parse", "--verify", "--quiet", `${input.base.ref}^{commit}`],
+        options,
+      ).catch(() => "")
+    ).trim();
+    if (resolved !== input.base.sha) {
+      return { ok: false, reason: "the local base ref moved or disappeared after the close was measured" };
+    }
+    const ancestor = await runHardenedGit(
+      ["-C", input.worktreePath, "merge-base", "--is-ancestor", input.base.headSha, resolved],
+      options,
+    ).then(() => true, () => false);
+    if (!ancestor) return { ok: false, reason: "the measured HEAD is no longer an ancestor of the local base ref" };
+  }
   if (!input.siblings) return { ok: true };
   const { issueIdentifier, refsDigest } = input.siblings;
   let siblingRefusal: string | null;
   try {
-    siblingRefusal = siblingRefsDigest(await readSiblingRefs(repoRoot, options), issueIdentifier) !== refsDigest
+    siblingRefusal = siblingRefsDigest(await readSiblingRefs(repoRoot, options)) !== refsDigest
       ? "the repository's branches changed after the close was measured"
       : await siblingWorktreeRefusal(issueIdentifier, {
         repoRoot,
@@ -1201,7 +1243,7 @@ interface SiblingRef {
 
 async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): Promise<SiblingRef[]> {
   return (await runHardenedGit(
-    ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/"],
+    ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/"],
     options,
   )).split("\n").filter((line) => line.length > 0).map((line) => {
     const space = line.indexOf(" ");
@@ -1210,21 +1252,37 @@ async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): P
 }
 
 /**
- * Digest of what the sibling scan's branch verdicts rest on: every local
- * branch, and every remote-tracking branch naming the card. Remote-tracking
- * branches of other cards and the base are left out, so a routine fetch by
- * another card does not refuse this close.
+ * Digest of every ref the close write must see unchanged. Leaving the base
+ * or a non-card ref out is how an agent parks undelivered work on a ref the
+ * sibling scan used to skip.
  */
-function siblingRefsDigest(refs: readonly SiblingRef[], issueIdentifier: string): string {
+function siblingRefsDigest(refs: readonly SiblingRef[]): string {
   const hash = createHash("sha256");
-  for (const ref of refs) {
-    if (ref.refname.startsWith("refs/remotes/")) {
-      const remoteRef = ref.refname.slice("refs/remotes/".length);
-      if (!branchNamesIssue(remoteRef.slice(remoteRef.indexOf("/") + 1), issueIdentifier)) continue;
-    }
+  for (const ref of [...refs].sort((left, right) => left.refname.localeCompare(right.refname))) {
     hash.update(`${ref.sha} ${ref.refname}\n`);
   }
   return hash.digest("hex");
+}
+
+/** Why a local ref holds a commit the remote base lacks; null when every tip is that commit or its ancestor. */
+export async function localRefOutsideRemoteBaseRefusal(
+  repoRoot: string,
+  remoteBaseSha: string,
+): Promise<string | null> {
+  if (!SHA_RE.test(remoteBaseSha)) return "the remote base commit could not be read";
+  const options: HardenedGitOptions = { cwd: repoRoot };
+  const refs = await readSiblingRefs(repoRoot, options);
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    if (!SHA_RE.test(ref.sha) || ref.sha === remoteBaseSha || seen.has(ref.sha)) continue;
+    seen.add(ref.sha);
+    const ancestor = await runHardenedGit(
+      ["-C", repoRoot, "merge-base", "--is-ancestor", ref.sha, remoteBaseSha],
+      options,
+    ).then(() => true, () => false);
+    if (!ancestor) return `${ref.refname} holds a commit the remote base lacks`;
+  }
+  return null;
 }
 
 /**
@@ -1487,7 +1545,7 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
       headSha: head.headSha,
       baseRef,
       baseSha,
-      refsDigest: siblingRefsDigest(refs, input.issueIdentifier),
+      refsDigest: siblingRefsDigest(refs),
     };
   } catch (error) {
     return refuse(`the recorded worktree could not be measured (${error instanceof Error ? error.message : "unknown"})`);
