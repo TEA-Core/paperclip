@@ -657,6 +657,8 @@ escalated/exhausted board-owned action without wake/monitor policy, current
 decision and blocker snapshots, and no carrier-subtree execution, queued work,
 execution locks or scheduled monitor. A source with a scheduled monitor must
 settle that schedule before parking; this operation never clears it.
+Deferred issue-execution receipts count as queued work, including verified
+interaction input; park admission must not silently abandon that input.
 
 The acceptance binding, ordinary manual pause hold and audit event commit
 together. Source and recovery-action rows are read-only: no resolution,
@@ -671,6 +673,9 @@ liveness. Terminal blocker history is retained; the ordinary all-done re-block
 PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
 rejection never create acceptance. A stale binding surfaces attention and keeps
 the manual execution hold; it cannot grant a fresh run.
+Deferred promotion rechecks the typed park under the issue lock. The ordinary
+pause's verified-interaction exception cannot bypass a carrier park: a legacy
+deferred receipt is cancelled without a run and cannot replay on release.
 
 A typed park intentionally excludes comment delivery. Existing manual-pause
 admission rejects ordinary issue-comment writes, and the composer stays disabled.

@@ -31560,7 +31560,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issue.id,
         );
         const treeHoldInteractionWake =
-          activePauseHold &&
+          activePauseHold && !activePauseHold.recoveryCarrierPark &&
           (await isVerifiedIssueTreeControlInteractionWake(tx, {
             companyId: issue.companyId,
             issueId: issue.id,

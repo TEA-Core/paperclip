@@ -95,7 +95,7 @@ export function recoveryCarrierParkService(db: Db) {
         ),
       )).limit(1);
       const [wake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["pending", "queued", "claimed"]), or(
+        eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["pending", "queued", "claimed", "deferred_issue_execution"]), or(
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'taskId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,issueId}'`, treeIds),
