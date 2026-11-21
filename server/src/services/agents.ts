@@ -1110,8 +1110,17 @@ export function agentService(db: Db) {
               sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
             ),
           ));
+        const agentRuns = await tx
+          .select({ nativeIssueId: heartbeatRuns.nativeIssueId, contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, id));
+        const runIssues = agentRuns.map((run) => {
+          const context = run.contextSnapshot as Record<string, unknown> | null;
+          const contextIssueId = context && typeof context.issueId === "string" ? context.issueId : null;
+          return { issueId: run.nativeIssueId ?? contextIssueId };
+        });
         const erasedIssueIds = [...new Set(
-          [...commentIssues, ...activityIssues].map((row) => row.issueId).filter((issueId): issueId is string => Boolean(issueId)),
+          [...commentIssues, ...activityIssues, ...runIssues].map((row) => row.issueId).filter((issueId): issueId is string => Boolean(issueId)),
         )];
         for (const issueId of erasedIssueIds) {
           await logActivityInTransaction(tx as unknown as Db, {

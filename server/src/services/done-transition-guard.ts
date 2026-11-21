@@ -2752,22 +2752,22 @@ function unparseableStructuredText(text: string): boolean {
   });
 }
 
-function namesWorkspace(value: unknown): boolean {
+function namesWorkspace(value: unknown, evidenceColumn = false): boolean {
   if (typeof value === "string") {
     const text = value.trim();
-    if (unparseableStructuredText(text)) return true;
+    if (evidenceColumn && unparseableStructuredText(text)) return true;
     if (text.startsWith("{") || text.startsWith("[")) {
       try {
-        if (namesWorkspace(JSON.parse(text))) return true;
+        if (namesWorkspace(JSON.parse(text), evidenceColumn)) return true;
       } catch {
-        return true;
+        if (evidenceColumn) return true;
       }
     }
     return textNamesWorkspaceKey(text);
   }
   return forEachJsonEntry(value, (key, item) => {
     if (key !== null && normalizedWorkspaceKey(key) && item !== null && item !== "") return true;
-    return typeof item === "string" && namesWorkspace(item);
+    return typeof item === "string" && namesWorkspace(item, evidenceColumn);
   });
 }
 
@@ -2927,7 +2927,7 @@ async function noWorkspaceHistoryRefusal(
     .where(and(eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.issueId, issue.id)));
   const surfaces: unknown[] = [...runs, ...events, ...receipts, ...nativeResults];
   if (issueRow) surfaces.push({ billingCode: issueRow.billingCode, executionPolicy: issueRow.executionPolicy });
-  if (surfaces.some((surface) => namesWorkspace(surface) || jsonRepositoryReference(surface) !== null)) {
+  if (surfaces.some((surface) => namesWorkspace(surface, true) || jsonRepositoryReference(surface) !== null)) {
     return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
   }
 

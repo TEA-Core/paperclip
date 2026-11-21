@@ -2334,6 +2334,38 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await statusOf(fixture.issueId)).toBe("in_progress");
     });
 
+    it("closes a card whose title starts with [ and whose description starts with {", async () => {
+      const fixture = await seedAdmissible();
+      await db.update(activityLog).set({
+        details: {
+          title: "[Routine] weekly check",
+          identifier: fixture.identifier,
+          projectId: null,
+          projectWorkspaceId: null,
+          description: "{weekly} notes",
+        },
+      }).where(and(eq(activityLog.entityId, fixture.issueId), eq(activityLog.action, "issue.created")));
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("done");
+    });
+
+    it("refuses a never-had close after a board agent-delete erases a run that named a workspace and left no comment or activity", async () => {
+      const fixture = await seedAdmissible();
+      const helperId = await insertAgent(fixture.companyId, "Helper");
+      await db.insert(heartbeatRuns).values({
+        companyId: fixture.companyId,
+        agentId: helperId,
+        status: "succeeded",
+        nativeIssueId: fixture.issueId,
+        contextSnapshot: { executionWorkspaceId: randomUUID() },
+      });
+      await agentService(db).remove(helperId);
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    });
+
     it("refuses a never-had close after a board agent-delete erases a pull-URL comment", async () => {
       const fixture = await seedAdmissible();
       const helperId = await insertAgent(fixture.companyId, "Helper");
