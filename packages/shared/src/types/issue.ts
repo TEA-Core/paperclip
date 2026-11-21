@@ -1,3 +1,4 @@
+import type { RecoveryCarrierParkSummary } from "./issue-tree-control.js";
 import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
 import type {
   IssueCommentAuthorType,
@@ -427,6 +428,7 @@ export interface IssueBlockerAttentionIssueSummary {
 }
 
 export interface IssueBlockerAttention {
+  carrierPark?: RecoveryCarrierParkSummary | null;
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;
   /** Whether the blocker-attention fields were computed for this issue. `false` for non-`blocked` issues where attention is a placeholder. */

@@ -1,0 +1,2 @@
+ALTER TABLE "issue_tree_holds" ADD COLUMN "recovery_carrier_park" jsonb;--> statement-breakpoint
+CREATE INDEX "issue_tree_holds_active_park_action_idx" ON "issue_tree_holds" USING btree ("company_id",("recovery_carrier_park" ->> 'recoveryActionId')) WHERE "issue_tree_holds"."status" = 'active' and "issue_tree_holds"."mode" = 'pause' and "issue_tree_holds"."recovery_carrier_park" is not null;

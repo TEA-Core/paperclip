@@ -643,6 +643,48 @@ Use an issue-backed recovery action only when the recovery is genuinely independ
 
 A comment or system notice can be evidence for a recovery action, but it is not a recovery action by itself. Comment-only recovery is not a healthy liveness path because it does not define a typed owner, wake or monitor policy, retry bound, timeout, escalation path, or resolution outcome.
 
+#### Board-accepted unresolved recovery carrier park
+
+The board can explicitly accept an intentionally unresolved carrier disposition
+with `POST /api/issues/:id/recovery-carrier-park`. The read-only
+`GET /api/issues/:id/recovery-carrier-park/candidate` supplies current identity,
+ownership, status-version and terminal-blocker expectations; the board chooses
+the historical rejected confirmation and supplies its acceptance reason.
+The rejected confirmation is provenance, not consent by itself.
+
+Admission requires the exact same-company source/action/carrier linkage, an
+escalated/exhausted board-owned action without wake/monitor policy, current
+decision and blocker snapshots, and no carrier-subtree execution, queued work,
+execution locks or scheduled monitor. A source with a scheduled monitor must
+settle that schedule before parking; this operation never clears it.
+
+The acceptance binding, ordinary manual pause hold and audit event commit
+together. Source and recovery-action rows are read-only: no resolution,
+cancellation, attempt/evidence refresh, supersession, replacement action, monitor
+or wake is authorized. Repeated identical acceptance returns the same hold.
+An active exact-action binding gates automatic action upserts and source recovery
+re-arm, including exhaustion drain. It is not a general source-task pause.
+
+The carrier stays visible and nonterminal. Its accepted park is separate from
+the source's unresolved escalation and from actual dependency counts/tree
+liveness. Terminal blocker history is retained; the ordinary all-done re-block
+PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
+rejection never create acceptance. A stale binding surfaces attention and keeps
+the manual execution hold; it cannot grant a fresh run.
+
+A typed park intentionally excludes comment delivery. Existing manual-pause
+admission rejects ordinary issue-comment writes, and the composer stays disabled.
+Internal wake attempts do not create a deferred delivery queue. Board release
+does not replay those attempts or start work.
+
+Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/release`
+retires the acceptance and releases this hold. It checks the bound action ID,
+audits atomically and repeats idempotently. It changes no source/action row,
+starts no work, and does not approve a review stage or authorize repair.
+Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
+sentinel blocker or consent backfill exists. Rollback retains the pause and audit
+evidence; it must not release holds or revive source recovery as cleanup.
+
 #### Recovery action freshness
 
 Source-scoped recovery actions are snapshots of the source issue's liveness state at the time the action was opened. They must be revalidated after newer durable source activity, including source issue status changes, assignee changes, blocker changes, execution policy or monitor changes, document or work-product updates that define a valid waiting path, and structured resume or disposition updates.

@@ -732,6 +732,7 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import { isRecoveryActionBoardParked } from "./recovery-carrier-park-state.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -32732,6 +32733,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const recoveryActionId = readNonEmptyString(enrichedContextSnapshot.recoveryActionId) ?? readNonEmptyString(payload?.recoveryActionId);
+    if (recoveryActionId && await isRecoveryActionBoardParked(db, agent.companyId, recoveryActionId)) return null;
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
@@ -33327,6 +33330,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
       );
       if (activePauseHold) {
+        if (activePauseHold.recoveryCarrierPark) return null;
         const treeHoldInteractionWake =
           await isVerifiedIssueTreeControlInteractionWake(db, {
             companyId: agent.companyId,
@@ -33391,6 +33395,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          const runner = tx as unknown as Db;
+          if ((recoveryActionId && await isRecoveryActionBoardParked(runner, agent.companyId, recoveryActionId)) ||
+              (await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, issueId))?.recoveryCarrierPark) {
+            return { kind: "deferred" as const };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(

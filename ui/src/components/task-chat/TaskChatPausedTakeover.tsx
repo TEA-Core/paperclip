@@ -9,6 +9,7 @@ export interface TaskComposerPause {
   resumeHref?: string;
   pending?: boolean;
   error?: string | null;
+  carrierPark?: { state: "accepted" | "stale"; reason: string } | null;
 }
 
 /** Replaces all input controls until the effective pause hold is released. */
@@ -18,6 +19,7 @@ export function TaskChatPausedTakeover({
   hasDraft = false,
   pending = false,
   error,
+  carrierPark,
   onResume,
 }: {
   hasDraft?: boolean;
@@ -35,12 +37,12 @@ export function TaskChatPausedTakeover({
         <Pause aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-(--status-task-icon-todo)" />
         <div className="flex min-w-0 flex-col gap-1">
           <h2 id={headingId} className="text-sm font-medium text-foreground">
-            {subtree ? "Subtree is paused." : "Task is paused."}
+            {carrierPark ? carrierPark.state === "accepted" ? "Parked by board — recovery intentionally unresolved" : "Board park needs attention" : subtree ? "Subtree is paused." : "Task is paused."}
           </h2>
           <p className="text-sm text-muted-foreground">
-            {subtree
-              ? "Resume this subtree to send a message."
-              : "Resume this task to send a message."}
+            {carrierPark
+              ? `${carrierPark.reason} Automatic recovery is stopped. Manual board release only; release does not repair or re-arm the source action.`
+              : subtree ? "Resume this subtree to send a message." : "Resume this task to send a message."}
           </p>
         </div>
       </div>
@@ -65,7 +67,7 @@ export function TaskChatPausedTakeover({
             className="bg-(--status-agent-paused) text-foreground hover:bg-(--status-agent-paused)/80 dark:text-background"
           >
             {pending ? <Loader2 aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}
-            {pending ? "Resuming…" : subtree ? "Resume subtree" : "Resume task"}
+            {pending ? carrierPark ? "Releasing…" : "Resuming…" : carrierPark ? "Release board park" : subtree ? "Resume subtree" : "Resume task"}
           </Button>
         )}
       </div>

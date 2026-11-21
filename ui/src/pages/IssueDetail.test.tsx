@@ -45,6 +45,7 @@ import { getRecentTasksStorageKey, readRecentTasks } from "../lib/recent-tasks";
 import { getLastProjectId, trackRecentProject } from "../lib/recent-projects";
 import { ApiError } from "../api/client";
 import type { issuesApi } from "../api/issues";
+import { recoveryCarrierParkFixture } from "@/fixtures/recoveryCarrierParkFixture";
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -70,6 +71,8 @@ const mockIssuesApi = vi.hoisted(() => ({
   listTreeHolds: vi.fn(),
   createTreeHold: vi.fn(),
   releaseTreeHold: vi.fn(),
+  recoveryCarrierParkCandidate: vi.fn(),
+  releaseRecoveryCarrierPark: vi.fn(),
   archiveFromInbox: vi.fn(),
   unarchiveFromInbox: vi.fn(),
   addComment: vi.fn(),
@@ -1366,6 +1369,8 @@ describe("IssueDetail", () => {
       activePauseHold: null,
     });
     mockIssuesApi.listTreeHolds.mockResolvedValue([]);
+    mockIssuesApi.recoveryCarrierParkCandidate.mockReset().mockResolvedValue(null);
+    mockIssuesApi.releaseRecoveryCarrierPark.mockReset();
     mockActivityApi.forIssue.mockResolvedValue([]);
     mockActivityApi.runsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
@@ -4587,6 +4592,81 @@ describe("IssueDetail", () => {
       container.querySelector('[data-status-icon-state="covered"]')
         ?.textContent,
     ).toBe("blocked");
+  });
+
+  it.each(["menu", "composer"])("keeps the ordinary Resume menu separate from explicit carrier park release via %s", async control => {
+    const { decisions, ...expectations } = recoveryCarrierParkFixture;
+    const binding: NonNullable<IssueTreeHold["recoveryCarrierPark"]> = {
+      version: 1, ...expectations, expectedAssigneeUserId: "user-1",
+      decisionInteractionId: decisions[0]!.id, expectedDecisionUpdatedAt: decisions[0]!.updatedAt,
+      reason: "Intentionally unresolved; manual board release only",
+    };
+    const activeHold = createPauseHold({ recoveryCarrierPark: binding, reason: binding.reason, releasePolicy: { strategy: "manual" } });
+    let parked = true;
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "blocked", assigneeAgentId: null, assigneeUserId: "user-1",
+      originKind: "stranded_issue_recovery", originId: binding.sourceIssueId,
+      blockerAttention: {
+        state: "none", reason: null, unresolvedBlockerCount: 0, explicitBlockerCount: 1, childBlockerCount: 0,
+        computed: true, coveredBlockerCount: 0, stalledBlockerCount: 0, attentionBlockerCount: 0,
+        sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null, blockingTreeLive: false,
+        carrierPark: { state: "accepted", holdId: activeHold.id, sourceIssueId: binding.sourceIssueId,
+          recoveryActionId: binding.recoveryActionId, decisionInteractionId: binding.decisionInteractionId, reason: binding.reason },
+      },
+    }));
+    mockIssuesApi.list.mockImplementation((_companyId, filters?: { descendantOf?: string }) =>
+      Promise.resolve(filters?.descendantOf === "issue-1"
+        ? [createIssue({ id: "child-1", parentId: "issue-1", identifier: "PAP-2", issueNumber: 2, title: "Held child" })]
+        : []));
+    mockIssuesApi.getTreeControlState.mockImplementation(() => Promise.resolve({
+      activePauseHold: parked ? {
+        holdId: activeHold.id, rootIssueId: "issue-1", issueId: "issue-1", isRoot: true,
+        mode: "pause", reason: binding.reason, releasePolicy: { strategy: "manual" }, recoveryCarrierPark: binding,
+      } : null,
+    }));
+    mockIssuesApi.listTreeHolds.mockResolvedValue([activeHold]);
+    mockIssuesApi.previewTreeControl.mockResolvedValue(createResumePreview());
+    mockIssuesApi.releaseTreeHold.mockReset().mockRejectedValue(new Error("Carrier parks require their explicit board release."));
+    mockIssuesApi.releaseRecoveryCarrierPark.mockImplementation(async () => {
+      parked = false;
+      return { ...activeHold, status: "released", releasedAt: new Date() };
+    });
+    mockAgentsApi.list.mockResolvedValue([createAgent()]);
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    });
+    await waitForAssertion(() => expect(container.textContent).toContain("Parked by board — recovery intentionally unresolved"));
+
+    if (control === "menu") {
+      const more = container.querySelector<HTMLButtonElement>('button[aria-label="More task actions"]');
+      await act(async () => { more!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); });
+      await flushReact();
+      const resume = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.trim() === "Resume subtree");
+      expect(resume).toBeTruthy();
+      await act(async () => { resume!.click(); });
+      await flushReact();
+      const apply = Array.from(container.querySelectorAll("button")).filter(button => button.textContent?.trim() === "Resume subtree").at(-1);
+      expect(apply).toBeTruthy();
+      await act(async () => { apply!.click(); });
+      await waitForAssertion(() => {
+        expect(container.textContent).toContain("Carrier parks require their explicit board release.");
+        expect(container.textContent).toContain("Parked by board — recovery intentionally unresolved");
+      });
+      expect(mockIssuesApi.releaseRecoveryCarrierPark).not.toHaveBeenCalled();
+    } else {
+      const release = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.trim() === "Release board park");
+      expect(release).toBeTruthy();
+      await act(async () => { release!.click(); });
+      await waitForAssertion(() => expect(container.textContent).not.toContain("Parked by board — recovery intentionally unresolved"));
+      expect(mockIssuesApi.releaseRecoveryCarrierPark).toHaveBeenCalledTimes(1);
+      expect(mockIssuesApi.releaseRecoveryCarrierPark).toHaveBeenCalledWith(
+        "PAP-1",
+        activeHold.id,
+        { recoveryActionId: binding.recoveryActionId, reason: expect.any(String) },
+      );
+      expect(mockIssuesApi.releaseTreeHold).not.toHaveBeenCalled();
+    }
   });
 
   it.each([false, true])(
