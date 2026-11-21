@@ -27,6 +27,7 @@ import type {
   PluginIssueAssigneeSummary,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
+  PluginIssueUpdatePatch,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
@@ -93,6 +94,32 @@ import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumenta
 
 /** Maximum time (ms) a plugin fetch request may take before being aborted. */
 const PLUGIN_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * The patch keys `issues.update` forwards to the issue service, taken from the
+ * SDK's declared `PluginIssueUpdatePatch`. The record is exhaustive over that
+ * type, so the SDK and this list cannot drift. Anything else in a plugin's
+ * patch, including the service's internal flags (`workflowControlledAssignment`,
+ * `boardStageDecision`, `companyGuard`, `expectedUpdatedAt`), is dropped.
+ */
+const PLUGIN_ISSUE_UPDATE_PATCH_FIELDS: Record<keyof PluginIssueUpdatePatch, true> = {
+  title: true,
+  description: true,
+  status: true,
+  priority: true,
+  assigneeAgentId: true,
+  assigneeUserId: true,
+  billingCode: true,
+  originKind: true,
+  originId: true,
+  originRunId: true,
+  requestDepth: true,
+  executionWorkspaceId: true,
+  executionWorkspacePreference: true,
+  blockedByIssueIds: true,
+  labelIds: true,
+  executionWorkspaceSettings: true,
+};
 
 /** Maximum time (ms) to wait for a DNS lookup before aborting. */
 const DNS_LOOKUP_TIMEOUT_MS = 5_000;
@@ -1954,13 +1981,14 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const patch = { ...(params.patch as Record<string, unknown>) };
-        const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
-        const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
-        const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
-        delete patch.actorAgentId;
-        delete patch.actorUserId;
-        delete patch.actorRunId;
+        const rawPatch = params.patch as Record<string, unknown>;
+        const actorAgentId = typeof rawPatch.actorAgentId === "string" ? rawPatch.actorAgentId : null;
+        const actorUserId = typeof rawPatch.actorUserId === "string" ? rawPatch.actorUserId : null;
+        const actorRunId = typeof rawPatch.actorRunId === "string" ? rawPatch.actorRunId : null;
+        const patch: Record<string, unknown> = {};
+        for (const key of Object.keys(PLUGIN_ISSUE_UPDATE_PATCH_FIELDS)) {
+          if (Object.hasOwn(rawPatch, key)) patch[key] = rawPatch[key];
+        }
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }

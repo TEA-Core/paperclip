@@ -70,8 +70,12 @@ export function normalizeDeliveryReceiptRecoveryInput(body: RecoveryBody): Deliv
   const owner = requiredString(body.owner, "owner").toLowerCase();
   const repo = requiredString(body.repo, "repo").toLowerCase();
   const pullRequestNumber = requiredPositiveInteger(body.pullRequestNumber, "pullRequestNumber");
-  const headSha = requiredString(body.headSha, "headSha");
-  if (!/^[0-9a-f]{40,64}$/.test(headSha)) throw new Error("headSha must be lowercase hexadecimal");
+  // Untrimmed: the head SHA is an exact coordinate and must satisfy the
+  // `^[0-9a-f]{40}$` CHECK on both receipt tables.
+  const headSha = body.headSha;
+  if (typeof headSha !== "string" || !/^[0-9a-f]{40}$/.test(headSha)) {
+    throw new Error("headSha must be exactly 40 lowercase hexadecimal characters");
+  }
   const reason = requiredString(body.reason, "reason");
   const idempotencyKey = requiredString(body.idempotencyKey, "idempotencyKey");
   if (idempotencyKey.length > 255) throw new Error("idempotencyKey is too long");

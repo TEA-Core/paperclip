@@ -16,7 +16,9 @@ import {
 import {
   agentInstructionsChangeTargetKey,
   changeConsentGateService,
+  redeemConsumedChangeConsent,
   REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
+  type ConsumedChangeConsent,
 } from "./change-consent-gate.js";
 
 type Connection = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -155,11 +157,16 @@ export async function authorizeInstructionRead(
   return bound;
 }
 
-/** Current target edit access + agent containment + protected-change consent, shared by all writers. */
+/**
+ * Current target edit access + agent containment + protected-change consent, shared by all writers.
+ * `consent` is the receipt a route door got when it consumed the accepted confirmation earlier in
+ * this request; it stands in for a second consumption only when it redeems for this actor and target.
+ */
 export async function authorizeInstructionCommit(
   db: Connection,
   actor: AuthorizationActor,
   target: { companyId: string; id: string },
+  consent?: ConsumedChangeConsent,
 ) {
   const bound = await resolveInstructionActor(db, actor);
   const access = authorizationService(db);
@@ -179,22 +186,31 @@ export async function authorizeInstructionCommit(
     decision.reason === "deny_missing_consent" &&
     bound.type === "agent"
   ) {
-    try {
-      await changeConsentGateService(db).assertConsented({
-        companyId: target.companyId,
-        actorAgentId: bound.agentId,
-        actorRunId: bound.runId,
-        targetKeys: [agentInstructionsChangeTargetKey(target.id)],
-      });
-    } catch (err) {
-      // Same masking as the route's protected-change gate: only the adoption-carrier
-      // refusal is surfaced; any other consent refusal stays the generic denial.
-      if (err instanceof HttpError && err.status === 403) {
-        const details = err.details as { code?: unknown } | null | undefined;
-        if (details?.code === REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED) throw err;
-        throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    const targetKey = agentInstructionsChangeTargetKey(target.id);
+    const consentedEarlier = consent !== undefined && redeemConsumedChangeConsent(consent, {
+      companyId: target.companyId,
+      actorAgentId: bound.agentId,
+      actorRunId: bound.runId,
+      targetKey,
+    });
+    if (!consentedEarlier) {
+      try {
+        await changeConsentGateService(db).assertConsented({
+          companyId: target.companyId,
+          actorAgentId: bound.agentId,
+          actorRunId: bound.runId,
+          targetKeys: [targetKey],
+        });
+      } catch (err) {
+        // Same masking as the route's protected-change gate: only the adoption-carrier
+        // refusal is surfaced; any other consent refusal stays the generic denial.
+        if (err instanceof HttpError && err.status === 403) {
+          const details = err.details as { code?: unknown } | null | undefined;
+          if (details?.code === REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED) throw err;
+          throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+        }
+        throw err;
       }
-      throw err;
     }
     decision = await access.decide({
       ...input,

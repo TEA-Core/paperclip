@@ -563,6 +563,29 @@ describe("openapi routes", () => {
     expect(identity.description).toContain("in_review");
   });
 
+  it("pins the delivery-receipt-recovery headSha to exactly 40 lowercase hex characters (M6)", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/delivery-receipt-recovery"].post;
+    const headSha = operation.requestBody.content["application/json"].schema.properties.headSha;
+    expect(headSha.pattern).toBe("^[0-9a-f]{40}$");
+    expect(headSha.type).toBe("string");
+    const mirror = new RegExp(headSha.pattern);
+    expect(mirror.test("a".repeat(40))).toBe(true);
+    for (const value of [
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(64),
+      "a".repeat(65),
+      "A".repeat(40),
+      "g".repeat(40),
+      `${"a".repeat(40)}\n`,
+      "",
+    ]) {
+      expect(mirror.test(value), JSON.stringify(value)).toBe(false);
+    }
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["400", "201"]));
+  });
+
   it("documents the deliveryIdentity.headSha pattern the live delivery write applies", () => {
     const { spec } = loadSpecRoutes();
     const headSha =
