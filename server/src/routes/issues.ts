@@ -455,6 +455,7 @@ import {
   redactIssueMonitorExternalRef,
   REVIEW_STALL_ESCALATED_ACTION,
   resolvePatchExecutionPolicy,
+  resolveDisplacedParticipantPendingState,
   isSeatedStallArbiter,
   setIssueExecutionPolicyMonitorScheduledBy,
   assertExecutionDecisionSnapshotCurrent,
@@ -12865,7 +12866,12 @@ export function issueRoutes(
    */
   class BoardDecisionRejection extends Error {
     constructor(
-      readonly reason: "terminal_status" | "not_in_review" | "no_undecided_stage" | "self_approval",
+      readonly reason:
+        | "terminal_status"
+        | "not_in_review"
+        | "no_undecided_stage"
+        | "self_approval"
+        | "displacement_reason_required",
       message: string,
     ) {
       super(message);
@@ -12924,11 +12930,14 @@ export function issueRoutes(
     // Gate 3: body. `decision` must be a known outcome and a non-empty comment is
     // required (a decision without reasoning is not auditable). A ZodError here
     // surfaces as the generic 400 via the global error handler.
+    // `displacementReason` (SUP-24612) is the board's reason for displacing a
+    // participant still pending on the decided stage; blank after trim = absent.
     const boardStageDecisionBody = z.object({
       decision: z.enum(["approved", "changes_requested"]),
       comment: z.string().trim().min(1),
+      displacementReason: z.string().trim().max(2_000).optional(),
     });
-    const { decision, comment } = boardStageDecisionBody.parse(req.body);
+    const { decision, comment, displacementReason } = boardStageDecisionBody.parse(req.body);
 
     const actor = getActorInfo(req);
     const decisionId = randomUUID();
@@ -13042,6 +13051,21 @@ export function issueRoutes(
           throw err;
         }
 
+        // SUP-24612: deciding a stage while its participant is still pending on it
+        // makes that participant's verdict inert (it arrives after the stage
+        // closed). The board must say why. Refused before any write.
+        const displacedPendingState = resolveDisplacedParticipantPendingState(
+          previousState,
+          result.targetStage,
+          result.displacedParticipant,
+        );
+        if (displacedPendingState && !displacementReason) {
+          throw new BoardDecisionRejection(
+            "displacement_reason_required",
+            "This decision displaces a participant whose verdict on the stage is still pending; supply a non-empty displacementReason to proceed",
+          );
+        }
+
         const rawExecutionState = result.patch.executionState;
         if (!rawExecutionState || typeof rawExecutionState !== "object") {
           throw new Error("Board stage decision patch is missing executionState");
@@ -13147,6 +13171,9 @@ export function issueRoutes(
               decision: result.decision.outcome,
               displacedParticipant: result.displacedParticipant,
               commentId: commentRow.id,
+              ...(displacedPendingState
+                ? { pendingState: displacedPendingState, reason: displacementReason }
+                : {}),
             },
           },
           postCommitActivityPublications,

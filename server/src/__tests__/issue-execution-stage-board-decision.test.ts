@@ -47,6 +47,11 @@ if (!embeddedPostgresSupport.supported) {
 const STAGE_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_STAGE_ID = "22222222-2222-4222-8222-222222222222";
 const USER_ID = "cloud-user-1";
+/**
+ * SUP-24612: overriding a stage whose participant is still pending on it needs
+ * the board's stated reason; the default seed is such a stage.
+ */
+const PENDING_REVIEWER_REASON = "board: the pending reviewer has been unresponsive";
 
 describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-15805)", () => {
   let db: Db;
@@ -152,6 +157,10 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     deliveryAuthorUserId?: string;
     /** Seed a changes_requested card parked on this current stage (A2: current-stage precedence). */
     changesRequestedStageId?: string;
+    /** Seed the review-stage participant as this board user (a pending user participant). */
+    reviewerUserId?: string;
+    /** Seed a review stage whose only participant is the return assignee (no eligible participant to displace). */
+    noEligibleParticipant?: boolean;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -205,7 +214,11 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         id: STAGE_ID,
         type: "review" as const,
         approvalsNeeded: 1,
-        participants: [{ type: "agent" as const, agentId: reviewerAgentId }],
+        participants: opts.reviewerUserId
+          ? [{ type: "user" as const, userId: opts.reviewerUserId }]
+          : opts.noEligibleParticipant
+            ? [{ type: "agent" as const, agentId: returnAssigneeAgentId }]
+            : [{ type: "agent" as const, agentId: reviewerAgentId }],
       },
       ...(opts.twoStages
         ? [
@@ -273,7 +286,9 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             currentStageId: STAGE_ID,
             currentStageIndex: 0,
             currentStageType: "review",
-            currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+            currentParticipant: opts.reviewerUserId
+              ? { type: "user", agentId: null, userId: opts.reviewerUserId }
+              : { type: "agent", agentId: reviewerAgentId, userId: null },
             returnAssignee: returnAssigneePrincipal,
             deliveryAuthor: opts.deliveryAuthorUserId
               ? { type: "user", agentId: null, userId: opts.deliveryAuthorUserId }
@@ -293,7 +308,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       title: "Board stage decision target",
       status: opts.issueStatus ?? "in_review",
       priority: "medium",
-      assigneeAgentId: reviewerAgentId,
+      assigneeAgentId: opts.reviewerUserId ? null : reviewerAgentId,
+      assigneeUserId: opts.reviewerUserId ?? null,
       createdByUserId: USER_ID,
       executionPolicy: {
         mode: "normal",
@@ -408,7 +424,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status).toBe(200);
     expect(res.body.outcome).toBe("approved");
@@ -451,7 +467,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "changes_requested", comment: "board: needs more error handling" });
+      .send({ decision: "changes_requested", comment: "board: needs more error handling", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status).toBe(200);
     expect(res.body.outcome).toBe("changes_requested");
@@ -484,7 +500,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving the active stage" });
+      .send({ decision: "approved", comment: "board: approving the active stage", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -540,7 +556,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const approved = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
     expect(approved.status, JSON.stringify(approved.body)).toBe(200);
 
     const closed = await request(app)
@@ -578,7 +594,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
       const approved = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: note });
+        .send({ decision: "approved", comment: note, displacementReason: PENDING_REVIEWER_REASON });
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
 
       const closed = await request(app)
@@ -602,7 +618,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
       const approved = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: note });
+        .send({ decision: "approved", comment: note, displacementReason: PENDING_REVIEWER_REASON });
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
 
       const closed = await request(app)
@@ -624,7 +640,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
       const approved = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: note });
+        .send({ decision: "approved", comment: note, displacementReason: PENDING_REVIEWER_REASON });
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       // Seeded directly: the comments route wakes the return assignee, and the real
       // heartbeat service would leave agent_runtime_state rows behind for cleanup.
@@ -659,7 +675,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
       const approved = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: note });
+        .send({ decision: "approved", comment: note, displacementReason: PENDING_REVIEWER_REASON });
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
       await db
@@ -918,7 +934,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     const [decisionRow] = await db
@@ -1068,7 +1084,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     expect(calls).toHaveLength(1);
@@ -1123,7 +1139,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "changes_requested", comment: "board: needs more error handling" });
+      .send({ decision: "changes_requested", comment: "board: needs more error handling", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     expect(calls).toHaveLength(1);
@@ -1149,7 +1165,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: final stage approved" });
+      .send({ decision: "approved", comment: "board: final stage approved", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     // The ladder completed, so no execution-stage wake exists. The handback must
@@ -1176,7 +1192,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: final stage approved, no owner" });
+      .send({ decision: "approved", comment: "board: final stage approved, no owner", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -1209,7 +1225,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     try {
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
       expect(res.status).toBe(500);
     } finally {
       await db.execute(sql.raw(`
@@ -1247,7 +1263,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "changes_requested", comment: "board: needs more error handling" });
+      .send({ decision: "changes_requested", comment: "board: needs more error handling", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const commentId = res.body.commentId as string;
 
@@ -1339,7 +1355,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     }
     for (const stageId of [STAGE_ID, SECOND_STAGE_ID]) {
       const response = await request(localApp).post(`/api/issues/${controlIssueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: `board: sequential ${stageId}` });
+        .send({ decision: "approved", comment: `board: sequential ${stageId}`, displacementReason: PENDING_REVIEWER_REASON });
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(response.body.stageId).toBe(stageId);
     }
@@ -1366,10 +1382,10 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       const [first, second] = await Promise.all([
         request(localApp)
           .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-          .send({ decision: "approved", comment: "board: concurrent A" }),
+          .send({ decision: "approved", comment: "board: concurrent A", displacementReason: PENDING_REVIEWER_REASON }),
         request(localApp)
           .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-          .send({ decision: "approved", comment: "board: concurrent B" }),
+          .send({ decision: "approved", comment: "board: concurrent B", displacementReason: PENDING_REVIEWER_REASON }),
       ]);
       expect([first, second].filter((response) => response.status === 200 && response.body.stageId === STAGE_ID))
         .toHaveLength(1);
@@ -1391,7 +1407,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
           expect(wakes).toHaveLength(1);
           const retry = await request(localApp)
             .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-            .send({ decision: "approved", comment: "board: concurrent retry" });
+            .send({ decision: "approved", comment: "board: concurrent retry", displacementReason: PENDING_REVIEWER_REASON });
           expect(retry.status, JSON.stringify(retry.body)).toBe(200);
           successes.push(retry);
         } else {
@@ -1479,7 +1495,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: re-decide the bounced stage" });
+      .send({ decision: "approved", comment: "board: re-decide the bounced stage", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.stageId).toBe(STAGE_ID);
@@ -1541,7 +1557,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approve the approval stage" });
+      .send({ decision: "approved", comment: "board: approve the approval stage", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.stageId).toBe(SECOND_STAGE_ID);
@@ -1572,7 +1588,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(localApp)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: final stage approved on a blocked card" });
+      .send({ decision: "approved", comment: "board: final stage approved on a blocked card", displacementReason: PENDING_REVIEWER_REASON });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -1613,7 +1629,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     try {
       const res = await request(localApp)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf", displacementReason: PENDING_REVIEWER_REASON });
       // The override audit write shares the decision's transaction. Failing it
       // must roll the whole mutation back. This is what pins the post-commit
       // relocation mutant: moving the override audit write AFTER commit would let
@@ -1647,5 +1663,316 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(comments).toHaveLength(0);
 
     expect(calls).toHaveLength(0);
+  });
+
+  describe("displacing a mid-flight review participant needs a board reason (SUP-24612)", () => {
+    const REVIEWER_RUN_ID = "00000000-0000-4000-8000-000000000000";
+    const REVIEWER_USER_ID = "cloud-reviewer-user";
+
+    async function overrideRows(issueId: string) {
+      const decisions = await db
+        .select()
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId));
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      const activity = await db
+        .select()
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_override")));
+      return { decisions, comments, activity };
+    }
+
+    async function expectRefusedUntouched(
+      res: request.Response,
+      issueId: string,
+      before: typeof issues.$inferSelect,
+    ) {
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.outcome).toBe("rejected");
+      expect(res.body.reason).toBe("displacement_reason_required");
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after!.status).toBe(before.status);
+      expect(after!.assigneeAgentId).toBe(before.assigneeAgentId);
+      expect(after!.assigneeUserId).toBe(before.assigneeUserId);
+      expect(after!.executionState).toEqual(before.executionState);
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.comments).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    }
+
+    // The return assignee is a user in the tests where the displaced reviewer
+    // writes: its verdict hands the card back to the return assignee, and a user
+    // assignee keeps the real heartbeat service from waking a seeded agent.
+    const AUTHOR_USER_ID = "cloud-author-user";
+
+    async function seedWithUserReturnAssignee() {
+      const seeded = await seedIssue({ returnAssigneeUserId: AUTHOR_USER_ID });
+      await db.insert(companyMemberships).values({
+        companyId: seeded.companyId,
+        principalType: "user",
+        principalId: AUTHOR_USER_ID,
+        status: "active",
+        membershipRole: "member",
+        updatedAt: new Date(),
+      });
+      return seeded;
+    }
+
+    it("refuses an override without a reason while the agent reviewer is pending, so its verdict still lands", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedWithUserReturnAssignee();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      await expectRefusedUntouched(res, issueId, before!);
+
+      // The lockout shape: at base the override closed the stage, so the
+      // displaced reviewer's verdict arriving afterwards was refused and the stage
+      // closed with no reviewer decision on the record. With the override refused,
+      // the reviewer is still the pending participant and its own verdict lands.
+      await db.insert(heartbeatRuns).values({ id: REVIEWER_RUN_ID, companyId, agentId: reviewerAgentId, status: "running" });
+      currentActor = agentActor(companyId, reviewerAgentId);
+      const verdict = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Request changes: the guard misses the empty-head case." });
+      expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
+      const { decisions } = await overrideRows(issueId);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.actorAgentId).toBe(reviewerAgentId);
+      expect(decisions[0]!.outcome).toBe("changes_requested");
+    });
+
+    it("treats a whitespace-only reason as missing", async () => {
+      const { companyId, issueId } = await seedIssue();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "changes_requested", comment: "board: needs work", displacementReason: " \n\t " });
+      await expectRefusedUntouched(res, issueId, before!);
+    });
+
+    it("refuses an override without a reason while a board-user reviewer is pending", async () => {
+      const { companyId, issueId } = await seedIssue({ reviewerUserId: REVIEWER_USER_ID });
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      await expectRefusedUntouched(res, issueId, before!);
+    });
+
+    it("accepts an override with a reason and records the pending state and reason on the one audit row", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedIssue();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({
+          decision: "approved",
+          comment: "board: approving on the reviewer's behalf",
+          displacementReason: "  Reviewer run has been silent for two days; owner accepts the delivery.  ",
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(1);
+      expect(rows.activity).toHaveLength(1);
+      const beforeState = before!.executionState as Record<string, unknown>;
+      expect(rows.activity[0]!.details).toEqual({
+        stageId: STAGE_ID,
+        stageType: "review",
+        decision: "approved",
+        displacedParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        commentId: res.body.commentId,
+        pendingState: {
+          status: "pending",
+          stageId: STAGE_ID,
+          stageIndex: 0,
+          stageType: "review",
+          participant: { type: "agent", agentId: reviewerAgentId, userId: null },
+          pendingSince: (beforeState.pendingSince as string | undefined) ?? null,
+        },
+        reason: "Reviewer run has been silent for two days; owner accepts the delivery.",
+      });
+    });
+
+    it("leaves an override that displaces nobody unchanged", async () => {
+      const { companyId, issueId, returnAssigneeAgentId } = await seedIssue({
+        noEligibleParticipant: true,
+        noExecutionState: true,
+      });
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "changes_requested", comment: "board: needs work" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "stageId", "stageType"]);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("todo");
+      expect(row!.assigneeAgentId).toBe(returnAssigneeAgentId);
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(1);
+      expect(rows.activity).toHaveLength(1);
+      expect(rows.activity[0]!.details).toEqual({
+        stageId: STAGE_ID,
+        stageType: "review",
+        decision: "changes_requested",
+        displacedParticipant: null,
+        commentId: res.body.commentId,
+      });
+    });
+
+    it("leaves an override of a participant who already decided unchanged", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedIssue({ changesRequestedStageId: STAGE_ID });
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "board: the requested changes landed" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "stageId", "stageType"]);
+
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(1);
+      expect(rows.activity).toHaveLength(1);
+      expect(rows.activity[0]!.details).toEqual({
+        stageId: STAGE_ID,
+        stageType: "review",
+        decision: "approved",
+        displacedParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        commentId: res.body.commentId,
+      });
+    });
+
+    it("still refuses an agent caller at the board-only gate even with a reason", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedIssue();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId);
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "lgtm", displacementReason: "I am the reviewer" });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Board access required");
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after!.executionState).toEqual(before!.executionState);
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    });
+
+    it("still refuses a non-owner/admin board caller and an unopted route even with a reason", async () => {
+      const { companyId, issueId } = await seedIssue({ membershipRole: "operator" });
+      currentActor = boardActor(companyId);
+      const body = { decision: "approved", comment: "lgtm", displacementReason: "board reason" };
+
+      const notAdmin = await request(app).post(`/api/issues/${issueId}/execution-stage/board-decision`).send(body);
+      expect(notAdmin.status).toBe(403);
+      expect(notAdmin.body.error).toBe("Company owner or admin required to decide an execution stage");
+
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "0";
+      const flagOff = await request(app).post(`/api/issues/${issueId}/execution-stage/board-decision`).send(body);
+      expect(flagOff.status).toBe(404);
+
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.comments).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    });
+
+    it("does not accept displacementReason on the PATCH path from a board user or the reviewer agent", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedWithUserReturnAssignee();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+      // The PATCH body schema rejects the field outright, so it can neither
+      // satisfy nor bypass any PATCH-path guard.
+      const boardClose = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
+          comment: "Closed at Tier 2 (live): board close attempt on a pending stage.",
+          displacementReason: "board reason",
+        });
+      expect(boardClose.status, JSON.stringify(boardClose.body)).toBe(400);
+
+      await db.insert(heartbeatRuns).values({ id: REVIEWER_RUN_ID, companyId, agentId: reviewerAgentId, status: "running" });
+      currentActor = agentActor(companyId, reviewerAgentId);
+      const agentVerdict = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Request changes: missing test.", displacementReason: "agent reason" });
+      expect(agentVerdict.status, JSON.stringify(agentVerdict.body)).toBe(400);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after!.status).toBe(before!.status);
+      expect(after!.executionState).toEqual(before!.executionState);
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.comments).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    });
+
+    it("keeps the displaced reviewer's late verdict refused and its later comment on the closed card a plain comment", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedWithUserReturnAssignee();
+      // The reviewer filed the card, so it keeps the creator's comment grant after
+      // the board hands the card back and closes it.
+      await db.update(issues).set({ createdByAgentId: reviewerAgentId }).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({
+          decision: "approved",
+          comment: "board: approving on the reviewer's behalf",
+          displacementReason: "Owner accepts the delivery without the pending review.",
+        });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+
+      await db.insert(heartbeatRuns).values({ id: REVIEWER_RUN_ID, companyId, agentId: reviewerAgentId, status: "running" });
+      // Unchanged: once the board decided the stage, the displaced reviewer's own
+      // request-changes verdict has no machine consequence: no decision row, and
+      // the completed ladder is not re-opened.
+      currentActor = agentActor(companyId, reviewerAgentId);
+      await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Request changes: the guard misses the empty-head case." });
+      expect((await overrideRows(issueId)).decisions).toHaveLength(1);
+      const [afterVerdict] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect((afterVerdict!.executionState as Record<string, unknown>).status).toBe("completed");
+
+      currentActor = boardActor(companyId);
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
+          comment: "Closed at Tier 2 (live): board accepted the delivery.",
+        });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      const issueCountBefore = (await db.select().from(issues).where(eq(issues.companyId, companyId))).length;
+
+      // Unchanged: the displaced reviewer's later comment is a plain comment. It
+      // neither reopens the card nor writes a decision row nor spawns a redo child.
+      currentActor = agentActor(companyId, reviewerAgentId);
+      const comment = await request(app)
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Request changes: the guard misses the empty-head case in server/src/x.ts." });
+      expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("done");
+      const { decisions } = await overrideRows(issueId);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]!.actorUserId).toBe(USER_ID);
+      expect((await db.select().from(issues).where(eq(issues.companyId, companyId))).length).toBe(issueCountBefore);
+    });
   });
 });

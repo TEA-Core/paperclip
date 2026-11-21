@@ -3050,6 +3050,48 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
 }
 
 /**
+ * SUP-24612: the pending state of a stage participant a board decision would
+ * displace while it is still being asked for its verdict. Recorded on the
+ * `issue.board_stage_override` audit row beside the board's stated reason.
+ */
+export interface DisplacedParticipantPendingState {
+  status: "pending";
+  stageId: string;
+  stageIndex: number | null;
+  stageType: IssueExecutionStage["type"];
+  participant: IssueExecutionStagePrincipal;
+  pendingSince: string | null;
+}
+
+/**
+ * SUP-24612: a displaced participant is mid-flight when the (locked) execution
+ * state is still `pending` on the very stage the board is deciding AND that
+ * stage's current participant is the one being displaced. The state row is the
+ * record's own statement that the stage still awaits this participant's verdict,
+ * it covers agent and user participants alike, and it costs no extra read.
+ * Returns null when the board displaces nobody or a participant who already
+ * decided (any non-pending state, or a pending state on another stage).
+ */
+export function resolveDisplacedParticipantPendingState(
+  previous: IssueExecutionState | null,
+  targetStage: IssueExecutionStage,
+  displaced: IssueExecutionStagePrincipal | null,
+): DisplacedParticipantPendingState | null {
+  if (!previous || previous.status !== PENDING_STATUS) return null;
+  if (previous.currentStageId !== targetStage.id) return null;
+  const participant = previous.currentParticipant;
+  if (!participant || !principalsEqual(participant, displaced)) return null;
+  return {
+    status: "pending",
+    stageId: targetStage.id,
+    stageIndex: previous.currentStageIndex ?? null,
+    stageType: targetStage.type,
+    participant,
+    pendingSince: previous.pendingSince ?? null,
+  };
+}
+
+/**
  * SUP-15878: the typed error code for a `done` transition refused on the
  * parent-close ladder gap (laddered children + no `approval` stage).
  */

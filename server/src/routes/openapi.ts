@@ -8565,13 +8565,17 @@ registry.registerPath({
     "PAPERCLIP_BOARD_STAGE_OVERRIDE is true/1 the route responds 404 before any read. `approved` " +
     "completes the stage (and re-pends the next stage when one exists) without closing the card; " +
     "`changes_requested` returns it to the return assignee and resets the round counter. A policy " +
-    "with no undecided stage returns 409 reason no_undecided_stage.",
+    "with no undecided stage returns 409 reason no_undecided_stage. When the decided stage is still " +
+    "pending on its participant (agent or user), a non-empty `displacementReason` is required " +
+    "(409 reason displacement_reason_required otherwise, nothing written); the participant's " +
+    "pending state and the reason are recorded on the issue.board_stage_override activity row.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(
       z.object({
         decision: z.enum(["approved", "changes_requested"]),
         comment: z.string().trim().min(1),
+        displacementReason: z.string().trim().max(2_000).optional(),
       }),
     ),
   },
