@@ -265,6 +265,17 @@ export interface IssueBlockerDiagnosticsResponse {
   };
 }
 
+/**
+ * Read-only answer for GET /api/issues/{id}/publication-close-eligibility.
+ * Every key is present. true means the accept path would refuse the card for
+ * that binding. None of the values is null.
+ */
+export interface PublicationCloseEligibility {
+  deliveryIdentity: boolean;
+  deliveryReceipt: boolean;
+  linkedPullRequest: boolean;
+}
+
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";
 
 export interface IssueWakeDiagnosticWakeRequest {

@@ -405,7 +405,7 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
       "linkedPullRequest",
     ]));
     for (const name of ["deliveryIdentity", "deliveryReceipt", "linkedPullRequest"]) {
-      expect(properties[name]).toMatchObject({ type: "boolean", nullable: undefined });
+      expect(properties[name]).toMatchObject({ type: "boolean" });
       expect(properties[name].nullable).not.toBe(true);
     }
   });
