@@ -5964,9 +5964,9 @@ export function issueRoutes(
       return { ok: true, overrideAccepted, noRepositoryLanding: true, recordGuardSkipDisposition, closeRowAudits };
     }
     // A zero-delta close is likewise re-checked inside the write transaction,
-    // so its measurement and skip row are handed to the caller the same way.
+    // so its measurement, close rows and skip row are handed to the caller the same way.
     if (tierResult.zeroDeltaMeasurement) {
-      return { ok: true, overrideAccepted, zeroDeltaMeasurement: tierResult.zeroDeltaMeasurement, recordGuardSkipDisposition };
+      return { ok: true, overrideAccepted, zeroDeltaMeasurement: tierResult.zeroDeltaMeasurement, recordGuardSkipDisposition, closeRowAudits };
     }
     recordGuardSkipDisposition();
     return { ok: true, overrideAccepted, noRepositoryLanding: false, closeRowAudits };
