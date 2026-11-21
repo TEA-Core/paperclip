@@ -2535,7 +2535,7 @@ type NoRepositoryLandingRefusal = Extract<NoRepositoryLandingVerdict, { ok: fals
 const NO_WORKSPACE_HISTORY_RECORDS = [
   "execution_workspaces, workspace_operations, environment_leases, workspace_runtime_services, execution_workspace_runtime_leases, tool_runtime_slots (any row tied to the issue)",
   "issue_work_products (only artifact or document, no project or workspace, no repository reference)",
-  "heartbeat_runs whose context names the issue by id or identifier in any key (no project, workspace, repository, branch or worktree key)",
+  "heartbeat_runs linked by native_issue_id or whose context names the issue by id or identifier (no project, workspace, repository, branch, worktree or pull request key in context, result_json, usage_json, stdout/stderr excerpts or error), and native_run_results.result_json of the issue",
   "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference)",
   "issue_comments (none deleted, no repository reference)",
   "documents of the issue (every revision, no repository reference)",
