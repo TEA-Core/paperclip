@@ -7,9 +7,9 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns,
+  activityLog, agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns,
   issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
-  type Db, type EmbeddedPostgresTestDatabase,
+  nativeRunFinalizations, nativeRunResults, workAssessments, type Db, type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import { parkRecoveryCarrierSchema } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
@@ -24,6 +24,8 @@ import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
 import type { StorageService } from "../storage/types.js";
+import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
 
 interface Fixture {
   companyId: string; sourceId: string; carrierId: string; blockerId: string;
@@ -807,6 +809,62 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(after.actions).toEqual(before.actions);
     expect(after.cards).toEqual(before.cards);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual([]);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["dependency", "child"] as const)("persists native %s suppression before dispatch so release cannot revive it", async shape => {
+    const f = await fixture(), completedIssueId = randomUUID(), runId = randomUUID(), contractId = randomUUID();
+    const resultId = randomUUID(), assessmentId = randomUUID();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    await db.insert(issues).values({ id: completedIssueId, companyId: f.companyId, title: "Late native finalization",
+      status: "in_progress", assigneeAgentId: f.agentId, deliveryRequirement: "record_only",
+      parentId: shape === "child" ? f.carrierId : null });
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: completedIssueId,
+      revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v1", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "park-native", criteria: [] }, canonicalSha256: contractId,
+      createdByActorType: "system", createdByActorId: "park-test" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      status: "succeeded", runtimeMode: "native", nativeIssueId: completedIssueId,
+      runtimeModeResolvedAt: new Date(), completionContractId: contractId, completionContractSha256: contractId,
+      contextSnapshot: { issueId: completedIssueId } });
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: completedIssueId, runId,
+      completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted",
+      resultJson: { result: { summary: "Already assessed completed work" } }, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId: f.companyId, issueId: completedIssueId,
+      runId, contractId, resultId, triggerKind: "native_result", triggerActorCompanyId: f.companyId,
+      priorIssueStatus: "in_progress", priorStatusVersion: 0, policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: completedIssueId,
+      phase: "assessing", resultId, assessmentId });
+    const parked = await park(f);
+    expect(parked.status).toBe(201);
+    if (shape === "dependency") await db.insert(issueRelations).values({
+      companyId: f.companyId, issueId: completedIssueId, relatedIssueId: f.carrierId, type: "blocks",
+    });
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: completedIssueId, runId, assessmentId,
+      priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "done", toStatus: "done",
+        reasonCode: "completion_contract_satisfied", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] } });
+    const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(intent).toMatchObject({ reason: shape === "child" ? "issue_children_completed" : "issue_blockers_resolved",
+      status: "skipped", runId: null });
+    expect(intent.finishedAt).not.toBeNull();
+    const assertNoAdmission = await protectWakeAdmission(f);
+    expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "Do not dispatch work suppressed before release" })).status).toBe(200);
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const after = await snapshot(f);
+    expect(after.source).toEqual(before.source);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.wakes).toEqual([intent]);
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .toEqual([{ id: runId }]);
     await assertNoAdmission();
     await assertNoProtectedWrites();
   });
