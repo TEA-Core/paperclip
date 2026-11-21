@@ -4659,6 +4659,12 @@ describe("IssueDetail", () => {
       expect(release).toBeTruthy();
       await act(async () => { release!.click(); });
       await waitForAssertion(() => expect(container.textContent).not.toContain("Parked by board — recovery intentionally unresolved"));
+      expect(mockIssuesApi.releaseRecoveryCarrierPark).toHaveBeenCalledTimes(1);
+      expect(mockIssuesApi.releaseRecoveryCarrierPark).toHaveBeenCalledWith(
+        "PAP-1",
+        activeHold.id,
+        { recoveryActionId: binding.recoveryActionId, reason: expect.any(String) },
+      );
       expect(mockIssuesApi.releaseTreeHold).not.toHaveBeenCalled();
     }
   });
