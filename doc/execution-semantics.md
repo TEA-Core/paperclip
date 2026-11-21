@@ -188,7 +188,7 @@ The active-lock lifecycle is part of the checkout contract:
 - checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
 - the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
 - the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
-- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership. A current typed review or approval participant can take over an adopted issue-less author's stamp; it cannot displace a normal issue-scoped worker.
 - external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
@@ -214,13 +214,13 @@ agent on the card (assignment, monitor, comment, stage, recovery) is held behind
 it instead of starting a second run, the run is stamped as the card's execution
 holder, a queued run for the card is not claimed, and checkout by another run is
 refused. A held wake is never merged into that run, because merging would scope
-the run to the card. Held wakes are promoted when the run finishes, including
-wakes on cards whose lock a status write cleared while the run was live, and
-when the silent-run hard-stop, the stale-lock sweep, a checkout self-heal, an
-issue release, or an admin force-release clears the lock. A lock cleared by
-any other write (a hook-less service update, checkout, release, or a plugin
-host write) is caught by the stale-lock sweep, which promotes the held wake
-on the already-unlocked card once no live holder remains. The stale-lock sweep
+the run to the card. Held wakes on open cards are promoted when the run finishes,
+including wakes on cards whose lock a status write cleared while the run was
+live, and when the silent-run hard-stop, stale-lock sweep, checkout self-heal,
+issue release, or admin force-release clears the lock. A promotion-only visit
+does not reopen a `done` or `cancelled` card. The stale-lock sweep also visits
+already-unlocked open cards with held wakes and promotes eligible work once no
+live holder remains. The stale-lock sweep
 also lapses a stamped hold whose issue-less author has produced no output for
 90 minutes while a wake is held behind it or a successor run for the card is
 already queued; a run with recent output never lapses there, and the lapse
@@ -232,18 +232,24 @@ unauthenticated header, which is never copied into either proof. A plugin
 call never stores a supplied run as `originRunId`. A plugin interaction
 drops a supplied `sourceRunId`, so accepting it does not copy that run onto
 the child. The host holds no authenticated run for that call, so a claimed
-agent and run pair is not proof. Other
-actions keep their attribution. A reassignment drops `originRunId`. A later
+agent and run pair is not proof. An agent API key cannot release an adopted
+author hold by naming its run in a header; that release requires the
+authenticated author run or board authority. Other activity actions keep their
+attribution. A reassignment drops `originRunId`. A later
 self-assign proves itself only through the latest assignee-change row, not
 an older row that names the same assignee. An adopted stamp
 never makes the issue-less author the card's interruptible run, including
 when its recorded context is null or names no issue; a checked-out run that
 did not author the card remains interruptible. A reassignment also drops an
 adopted author's stamped hold, so the new assignee's wakes are not held
-behind the previous author. A wake for a different agent on a card this run
-holds does not start while the author holds the card. A review wake can be
-queued and then cancelled by the assignee gate. Wakes after the run has
-finished start normally. A
+behind the previous author. A wake for the current review or approval
+participant of a different agent does not wait behind an adopted issue-less
+author. Native reviewers still require their authenticated, current review
+assignment and committer wake. The claim takes the execution stamp under the
+issue row lock without cancelling the author's unrelated run. While the
+reviewer holds the card, the old author's PATCH and checkout are refused.
+A same-agent wake still waits behind its live author. Wakes after the run has
+finished use the normal admission gates. A
 run whose context names a different issue does not own the cards it creates or
 assigns.
 

@@ -303,6 +303,7 @@ import {
   releasedSilentAuthorDoesNotOccupyDispatchSlot,
   findReleasedSilentAuthorRunId,
   listUnlockedIssuesWithDeferredWakesForRun,
+  runIsIssueAuthor,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
 } from "./issue-execution-lease.js";
@@ -19942,14 +19943,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
 
-    type ClaimIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "assigneeAgentId" | "executionRunId">;
+    type ClaimIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "assigneeAgentId" | "executionRunId" | "status" | "executionState">;
+    const isReviewParticipant = (issue: ClaimIssue) => {
+      const participant = issue.status === "in_review"
+        ? parseIssueExecutionState(issue.executionState)?.currentParticipant
+        : null;
+      return participant?.type === "agent" && participant.agentId === run.agentId;
+    };
     const bindsExecution = (issue: ClaimIssue | null): issue is ClaimIssue =>
-      !nativeReviewContext && issue !== null && issue.assigneeAgentId === run.agentId &&
+      !nativeReviewContext && issue !== null &&
+      (issue.assigneeAgentId === run.agentId || isReviewParticipant(issue)) &&
       readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action";
     const deferForLiveIssueHolder = async (txDb: Db, issue: ClaimIssue | null) => {
       if (!bindsExecution(issue)) return null;
       const holder = await findLiveIssueExecutionHolder(txDb, issue.companyId, issue.id);
       if (!holder || holder.status !== "running" || holder.runId === run.id) return null;
+      if (holder.agentId !== run.agentId && isReviewParticipant(issue)) {
+        const [owner] = await txDb.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, holder.runId),
+          ));
+        if (
+          !readNonEmptyString(owner?.contextSnapshot?.issueId) &&
+          await runIsIssueAuthor(txDb, issue.companyId, issue.id, holder.runId)
+        ) return null;
+      }
       if (issue.executionRunId !== holder.runId) {
         await txDb.update(issues).set({
           executionRunId: holder.runId,
@@ -19972,7 +19990,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }).where(and(
         eq(issues.id, issue.id),
         eq(issues.companyId, issue.companyId),
-        eq(issues.assigneeAgentId, claimedRun.agentId),
+        isReviewParticipant(issue)
+          ? issue.assigneeAgentId ? eq(issues.assigneeAgentId, issue.assigneeAgentId) : isNull(issues.assigneeAgentId)
+          : eq(issues.assigneeAgentId, claimedRun.agentId),
         claimedRun.scheduledRetryReason === "native_safe_replacement"
           ? and(
               or(isNull(issues.executionRunId), eq(issues.executionRunId, claimedRun.id)),
@@ -20465,6 +20485,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .select({
                   id: issues.id, companyId: issues.companyId,
                   assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId,
+                  status: issues.status, executionState: issues.executionState,
                 })
                 .from(issues)
                 .where(
@@ -20848,6 +20869,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const lockedIssue = await tx.select({
               id: issues.id, companyId: issues.companyId,
               assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId,
+              status: issues.status, executionState: issues.executionState,
             }).from(issues)
               .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
               .for("update").then((rows) => rows[0] ?? null);
@@ -33767,6 +33789,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
               executionRunId: issues.executionRunId,
+              checkoutRunId: issues.checkoutRunId,
+              executionState: issues.executionState,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
             })
@@ -34306,6 +34330,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   .where(eq(issues.id, issue.id));
               }
             }
+          }
+
+          const reviewParticipant = issue.status === "in_review"
+            ? parseIssueExecutionState(issue.executionState)?.currentParticipant
+            : null;
+          const isStageHandoff = reviewParticipant?.type === "agent" && reviewParticipant.agentId === agentId;
+          if (
+            activeExecutionRun?.status === "running" &&
+            activeExecutionRun.agentId !== agentId &&
+            activeExecutionRun.agentId === issue.assigneeAgentId &&
+            !readNonEmptyString(activeExecutionRun.contextSnapshot?.issueId) &&
+            (isStageHandoff || await getNativeReviewAssignment(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, agentId,
+              contextSnapshot: enrichedContextSnapshot,
+            })) &&
+            await runIsIssueAuthor(tx as unknown as Db, issue.companyId, issue.id, activeExecutionRun.id)
+          ) {
+            // Handoff releases only an adopted author's stamp. A real
+            // issue-scoped worker and every authorization gate remain intact.
+            await tx.update(issues).set({
+              executionRunId: null,
+              checkoutRunId: issue.checkoutRunId === activeExecutionRun.id ? null : undefined,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: new Date(),
+            }).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+            issue.executionRunId = null;
+            activeExecutionRun = null;
           }
 
           // SUP-20121: the woken agent's live run may own the card without

@@ -190,6 +190,43 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect((await cardRow(issueId)).executionRunId).toBe(authorRunId);
   }
 
+  it("concurrent keyed creators preserve one held comment wake and one successor", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const body = { title: "Concurrent author card", status: "in_progress", assigneeAgentId: writerAgentId, idempotencyKey: "concurrent-author" };
+    const responses = await Promise.all([
+      request(writer).post(`/api/companies/${companyId}/issues`).send(body),
+      request(writer).post(`/api/companies/${companyId}/issues`).send(body),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 201]);
+    expect(responses[0]!.body.id).toBe(responses[1]!.body.id);
+    const issueId = responses[0]!.body.id as string;
+    const comment = await request(appFor(boardActor(companyId))).post(`/api/issues/${issueId}/comments`).send({ body: "Follow-up." });
+    expect(comment.status).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+    const heldWakes = await wakesForCard(issueId, writerAgentId);
+    expect(heldWakes).toHaveLength(1);
+    runningProcesses.delete(writerRunId);
+    const [finished] = await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, writerRunId)).returning();
+    await heartbeat.releaseIssueExecutionAndPromote(finished!, { suppressImmediateRecovery: true });
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, heldWakes[0]!.id);
+  });
+
+  it("a finish promotion racing the stale-lock sweep claims the held wake once", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    await Promise.all([
+      heartbeat.releaseIssueExecutionAndPromote(finished!, { suppressImmediateRecovery: true }),
+      heartbeat.sweepStaleIssueLocks(),
+    ]);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.id).toBe(wakeId);
+  });
+
   it("create + self-assign by a live run: a later wake for the card waits behind the creator", async () => {
     const { companyId, writerAgentId, writerRunId } = await seed();
     const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
@@ -887,6 +924,47 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     return app;
   }
 
+  it("an API-key run header cannot release an adopted author hold (DOOR-release)", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const token = `release-test-${randomUUID()}`;
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Responsible",
+      email: "responsible@example.com",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+    await db.insert(agentApiKeys).values({
+      companyId,
+      agentId: writerAgentId,
+      name: "release-test",
+      keyHash: createHash("sha256").update(token).digest("hex"),
+      responsibleUserId: "responsible-user",
+    });
+    const rejected = await request(authApp({ deploymentMode: "authenticated", resolveSession: async () => null }))
+      .post(`/api/issues/${issueId}/release`)
+      .set("authorization", `Bearer ${token}`)
+      .set("x-paperclip-run-id", writerRunId)
+      .send({});
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(403);
+    expect(await cardRow(issueId)).toMatchObject({
+      assigneeAgentId: writerAgentId,
+      executionRunId: writerRunId,
+    });
+
+    const released = await request(appFor(agentActor(companyId, writerAgentId, writerRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send({});
+    expect(released.status, JSON.stringify(released.body)).toBe(200);
+  });
+
   async function seedForgedHeaderCard() {
     const seeded = await seed();
     const { companyId, issuePrefix, writerAgentId, writerRunId } = seeded;
@@ -1384,7 +1462,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
   });
 
   it("recent output keeps a stamped hold even when the run started long ago (M24b)", async () => {
-    const { writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const { companyId, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running" });
     await db.update(heartbeatRuns).set({
       startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
       lastOutputAt: new Date(),
@@ -1393,6 +1471,16 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const swept = await heartbeat.sweepStaleIssueLocks({ now: new Date() });
     expect(swept.issueIds).not.toContain(issueId);
     expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).toBe("deferred_issue_execution");
+    expect(wake?.runId).toBeNull();
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toEqual([]);
+    const author = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const patched = await request(author).patch(`/api/issues/${issueId}`).send({ title: "Author still owns this card" });
+    expect(patched.status).toBe(200);
+    const checkedOut = await request(author).post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: writerAgentId, expectedStatuses: ["in_progress"] });
+    expect(checkedOut.status).toBe(200);
   });
 
   it("a non-proof action keeps a user-supplied run id (M30)", async () => {
