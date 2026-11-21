@@ -11,6 +11,7 @@ import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 import {
   applyRuntimePortSelectionToConfig,
   maybePersistWorktreeRuntimePorts,
@@ -28,6 +29,7 @@ const ORIGINAL_CWD = process.cwd();
 // resolve paths from these, so a test that forgets to override one would
 // otherwise rewrite the machine's real config/env files.
 beforeEach(() => {
+  resetBootEnvForTests();
   for (const key of Object.keys(process.env)) {
     if (key.startsWith("PAPERCLIP_")) {
       delete process.env[key];
@@ -2166,9 +2168,8 @@ describe("worktree config repair", () => {
     process.chdir(worktreeRoot);
     process.env.PAPERCLIP_IN_WORKTREE = "true";
     process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
-    // dotenv already loaded the refused file (override: false, operator unset).
-    process.env.PAPERCLIP_WORKTREE_NAME = "steered-sibling";
-    process.env.PAPERCLIP_WORKTREES_DIR = steeredHome;
+    delete process.env.PAPERCLIP_WORKTREE_NAME;
+    delete process.env.PAPERCLIP_WORKTREES_DIR;
     delete process.env.PAPERCLIP_HOME;
     delete process.env.PAPERCLIP_INSTANCE_ID;
     delete process.env.PORT;

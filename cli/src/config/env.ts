@@ -1,8 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { config as loadDotenv, parse as parseEnvFileContents } from "dotenv";
+import { parse as parseEnvFileContents } from "dotenv";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
+import {
+  captureOperatorEnv,
+  commitBootEnv,
+  currentBootEnvPlan,
+  refuseBootEnv,
+  resolveBootEnvPlan,
+  stageEnvSource,
+} from "@paperclipai/shared/boot-env";
 import { resolveConfigPath } from "./store.js";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
@@ -54,15 +62,25 @@ export function resolveAgentJwtEnvFile(configPath?: string): string {
 }
 
 export function loadPaperclipEnvFile(configPath?: string): void {
-  loadAgentJwtEnvFile(resolveEnvFilePath(configPath));
+  captureOperatorEnv();
+  const plan = resolveBootEnvPlan({ cwd: process.cwd(), configOverride: configPath });
+  for (const source of plan.sources) {
+    const staged = stageEnvSource(source);
+    if (staged.status === "refused" && staged.refusal && plan.mode === "worktree") {
+      refuseBootEnv(staged.refusal);
+    }
+  }
+  commitBootEnv();
 }
 
 export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
-  if (loadedEnvFiles.has(filePath)) return;
-
-  if (!fs.existsSync(filePath)) return;
-  loadedEnvFiles.add(filePath);
-  loadDotenv({ path: filePath, override: false, quiet: true });
+  captureOperatorEnv();
+  const plan = currentBootEnvPlan() ?? resolveBootEnvPlan({ cwd: process.cwd() });
+  const staged = stageEnvSource({ kind: "own", path: filePath });
+  if (staged.status === "refused" && staged.refusal && plan.mode === "worktree") {
+    refuseBootEnv(staged.refusal);
+  }
+  commitBootEnv();
 }
 
 export function readAgentJwtSecretFromEnv(configPath?: string): string | null {

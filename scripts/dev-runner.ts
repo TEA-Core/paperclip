@@ -14,6 +14,7 @@ import { applyDevRunnerOptions } from "./dev-runner-options.ts";
 import { collectWatchedSnapshot as collectDevServerWatchedSnapshot, diffSnapshots } from "./dev-runner-snapshot.mjs";
 import { createDevServiceIdentity, repoRoot } from "./dev-service-profile.ts";
 import { bootstrapDevRunnerWorktreeEnv, resolveWorktreeSeedGate } from "../server/src/dev-runner-worktree.ts";
+import { captureOperatorEnv, operatorEnvForChild } from "@paperclipai/shared/boot-env";
 import {
   readDevServerRestartRequest,
   removeDevServerRestartRequest,
@@ -42,6 +43,8 @@ try {
   process.exit(1);
 }
 
+captureOperatorEnv(process.env);
+const childOperatorEnv = operatorEnvForChild();
 const worktreeEnvBootstrap = bootstrapDevRunnerWorktreeEnv(repoRoot, process.env);
 if (worktreeEnvBootstrap.missingEnv) {
   console.error(
@@ -173,7 +176,7 @@ if (bindMode === "custom" && !bindHost) {
 const explicitUiDevMiddleware = process.env.PAPERCLIP_UI_DEV_MIDDLEWARE;
 const serveBuiltUiForManagedRuntime = managedRuntimeExposure && explicitUiDevMiddleware === undefined;
 const env: NodeJS.ProcessEnv = {
-  ...process.env,
+  ...childOperatorEnv,
   PAPERCLIP_UI_DEV_MIDDLEWARE: explicitUiDevMiddleware ?? (serveBuiltUiForManagedRuntime ? "false" : "true"),
 };
 

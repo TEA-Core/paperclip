@@ -1,12 +1,16 @@
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { config as loadDotenv } from "dotenv";
-import { resolvePaperclipEnvPath } from "./paths.js";
-import { captureOperatorEnvBeforeDotenv, maybeRepairLegacyWorktreeConfigAndEnvFiles, readWorktreeBootIsolation } from "./worktree-config.js";
-import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
+import {
+  bootEnvOrigin,
+  captureOperatorEnv,
+  commitBootEnv,
+  currentBootEnvPlan,
+  refuseBootEnv,
+  resolveBootEnvPlan,
+  stageEnvSource,
+} from "@paperclipai/shared/boot-env";
+import { maybeRepairLegacyWorktreeConfigAndEnvFiles, readWorktreeBootIsolation } from "./worktree-config.js";
 import {
   AUTH_BASE_URL_MODES,
   BIND_MODES,
@@ -31,24 +35,17 @@ import {
   resolveHomeAwarePath,
 } from "./home-paths.js";
 
-captureOperatorEnvBeforeDotenv(process.env);
-
-const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
-if (existsSync(PAPERCLIP_ENV_FILE_PATH) && statSync(PAPERCLIP_ENV_FILE_PATH).isFile()) {
-  loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+captureOperatorEnv(process.env);
+const bootPlan = resolveBootEnvPlan({ cwd: process.cwd() });
+for (const source of bootPlan.sources) {
+  const staged = stageEnvSource(source);
+  if (staged.status === "refused" && staged.refusal && bootPlan.mode === "worktree") {
+    refuseBootEnv(staged.refusal);
+  } else if (staged.status === "refused" && staged.refusal) {
+    console.warn(`Could not use env file ${source.path} (${staged.refusal.kind}): ${staged.refusal.message}`);
+  }
 }
-
-const CWD_ENV_PATH = resolve(process.cwd(), ".env");
-const cwdEnvExists = existsSync(CWD_ENV_PATH);
-const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
-  ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
-  : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
-if (shouldLoadWorkingDirectoryEnv({
-  cwdEnvExists: cwdEnvExists && statSync(CWD_ENV_PATH).isFile(),
-  isPaperclipEnvFile: isSameFile,
-})) {
-  loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
-}
+commitBootEnv();
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
@@ -149,6 +146,20 @@ export function pendingReviewRearmWindowMsFromEnv(): number {
 // Env-only, mirrors pendingReviewRearmWindowMsFromEnv.
 export function pendingReviewParticipantGraceMsFromEnv(): number {
   return Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_PARTICIPANT_GRACE_MS) || 30 * 60 * 1000);
+}
+
+function worktreeDatabaseUrl(fileDbUrl: string | undefined, isolation: boolean): string | undefined {
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree") {
+    return bootEnvOrigin("DATABASE_URL") === "operator" ? process.env.DATABASE_URL : undefined;
+  }
+  return process.env.DATABASE_URL ?? (isolation ? undefined : fileDbUrl);
+}
+
+function worktreeMigrationUrl(): string | undefined {
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree" && bootEnvOrigin("DATABASE_MIGRATION_URL") !== "operator") return undefined;
+  return process.env.DATABASE_MIGRATION_URL;
 }
 
 export function loadConfig(): Config {
@@ -424,8 +435,8 @@ export function loadConfig(): Config {
     ),
     authDisableSignUp,
     databaseMode: fileDatabaseMode,
-    databaseUrl: process.env.DATABASE_URL ?? (isolation ? undefined : fileDbUrl),
-    databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    databaseUrl: worktreeDatabaseUrl(fileDbUrl, isolation !== null),
+    databaseMigrationUrl: worktreeMigrationUrl(),
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -454,7 +465,9 @@ export function loadConfig(): Config {
     secretsStrictMode,
     secretsMasterKeyFilePath:
       resolveHomeAwarePath(
-        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE ??
+        (currentBootEnvPlan()?.mode === "worktree" && bootEnvOrigin("PAPERCLIP_SECRETS_MASTER_KEY_FILE") !== "operator"
+          ? undefined
+          : process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE) ??
           fileSecrets?.localEncrypted.keyFilePath ??
           resolveDefaultSecretsKeyFilePath(),
       ),

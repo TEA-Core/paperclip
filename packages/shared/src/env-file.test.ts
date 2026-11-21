@@ -511,4 +511,9 @@ describe("env file editor", () => {
     expect(fs.existsSync(deadOrphan)).toBe(false);
     expect(fs.existsSync(liveOrphan)).toBe(true);
   });
+
+  it("keeps a trailing comment when a backslash escapes the comment marker (SUP-24365)", () => {
+    expect(updateEnvFileContents("KEY=a\\# note\n", { KEY: "new" })).toBe('KEY="new"# note\n');
+    expect(updateEnvFileContents("KEY='a\\' # note\n", { KEY: "new" })).toBe('KEY="new" # note\n');
+  });
 });

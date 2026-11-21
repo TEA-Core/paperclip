@@ -7,6 +7,19 @@ import { isDeepStrictEqual } from "node:util";
 // repair read exactly the values the server booted with.
 import { parse as parseEnvFile } from "dotenv";
 import {
+  adoptCurrentProcessEnv,
+  bootEnvReport,
+  captureOperatorEnv,
+  commitBootEnv,
+  currentBootEnvPlan,
+  operatorEnvValue,
+  refuseBootEnv,
+  resolveBootEnvPlan,
+  setBootDerivedEnv,
+  stagedOwnValue,
+  stageEnvSource,
+} from "@paperclipai/shared/boot-env";
+import {
   mergePaperclipConfig,
   paperclipConfigSchema,
   type PaperclipConfig,
@@ -48,6 +61,15 @@ function readEnvEntries(envPath: string): Record<string, string> {
   return parseEnvFile(fs.readFileSync(envPath, "utf8"));
 }
 
+function parsedSigningSecret(envPath: string): string | null {
+  try {
+    if (!fs.existsSync(envPath) || !fs.statSync(envPath).isFile()) return null;
+    return nonEmpty(parseEnvFile(fs.readFileSync(envPath, "utf8")).PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+  } catch {
+    return null;
+  }
+}
+
 function emptyWorktreeEnvFileContents(): string {
   return [
     "# Paperclip environment variables",
@@ -77,85 +99,33 @@ type WorktreeRuntimeContext = {
   secretsKeyFilePath: string;
 };
 
-// Keys a refused env file must not steer. config.ts loads the paperclip
-// file and then the working-directory file after this snapshot, so a live
-// value is operator-owned only when it was already set before either load.
-const STEERING_ENV_KEYS = [
-  "PAPERCLIP_WORKTREE_NAME",
-  "PAPERCLIP_WORKTREES_DIR",
-  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
-  "PAPERCLIP_SECRETS_MASTER_KEY",
-  "PAPERCLIP_AGENT_JWT_SECRET",
-  "BETTER_AUTH_SECRET",
-  "DATABASE_URL",
-] as const;
-
-type SteeringEnvKey = (typeof STEERING_ENV_KEYS)[number];
-
-let operatorEnvBeforeDotenv: Partial<Record<SteeringEnvKey, string | undefined>> | null = null;
 let worktreeBootIsolation: PaperclipConfig | null = null;
-
-export function captureOperatorEnvBeforeDotenv(env: NodeJS.ProcessEnv): void {
-  if (operatorEnvBeforeDotenv) return;
-  operatorEnvBeforeDotenv = {};
-  for (const key of STEERING_ENV_KEYS) {
-    operatorEnvBeforeDotenv[key] = env[key];
-  }
-}
-
-function restoreOperatorSnapshot(): void {
-  if (!operatorEnvBeforeDotenv) return;
-  for (const key of STEERING_ENV_KEYS) {
-    const snapped = operatorEnvBeforeDotenv[key];
-    if (typeof snapped === "string" && snapped.length > 0) process.env[key] = snapped;
-    else delete process.env[key];
-  }
-}
 
 export function readWorktreeBootIsolation(): PaperclipConfig | null {
   return worktreeBootIsolation;
 }
 
-function operatorProvenValue(key: SteeringEnvKey, live: string | undefined): string | null {
-  if (!operatorEnvBeforeDotenv) return null;
-  const snapped = nonEmpty(operatorEnvBeforeDotenv[key]);
-  if (snapped && snapped === nonEmpty(live)) return snapped;
-  return null;
+function ensureRepairLedger(): { refused: boolean } {
+  adoptCurrentProcessEnv(process.cwd());
+  captureOperatorEnv();
+  const plan = resolveBootEnvPlan({ cwd: process.cwd() });
+  if (bootEnvReport().refusals.length === 0) {
+    for (const source of plan.sources) {
+      const staged = stageEnvSource(source);
+      if (staged.status === "refused" && staged.refusal && plan.mode === "worktree") {
+        refuseBootEnv(staged.refusal);
+        break;
+      }
+    }
+    commitBootEnv();
+  }
+  return { refused: bootEnvReport().refusals.length > 0 };
 }
 
-function valueNotClaimedByFile(
-  key: SteeringEnvKey,
-  env: NodeJS.ProcessEnv,
-  fileEnv: Record<string, string>,
-): string | null {
-  const proven = operatorProvenValue(key, env[key]);
-  if (proven) return proven;
-  const live = nonEmpty(env[key]);
-  if (!live) return null;
-  const fromFile = nonEmpty(fileEnv[key]);
-  if (fromFile !== null && fromFile === live) return null;
-  return live;
+function operatorOrLayout(key: string): string | null {
+  return nonEmpty(operatorEnvValue(key));
 }
 
-function dropRefusedFileSteering(
-  fileEnv: Record<string, string>,
-  context: WorktreeRuntimeContext,
-): void {
-  if (
-    fileEnv.DATABASE_URL !== undefined
-    && process.env.DATABASE_URL === fileEnv.DATABASE_URL
-    && !operatorProvenValue("DATABASE_URL", process.env.DATABASE_URL)
-  ) {
-    delete process.env.DATABASE_URL;
-  }
-  if (
-    fileEnv.PAPERCLIP_SECRETS_MASTER_KEY_FILE !== undefined
-    && process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === fileEnv.PAPERCLIP_SECRETS_MASTER_KEY_FILE
-    && !operatorProvenValue("PAPERCLIP_SECRETS_MASTER_KEY_FILE", process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE)
-  ) {
-    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = context.secretsKeyFilePath;
-  }
-}
 
 function publishWorktreeBootIsolation(context: WorktreeRuntimeContext): PaperclipConfig | null {
   if (!fs.existsSync(context.configPath)) return worktreeBootIsolation;
@@ -174,8 +144,6 @@ function publishWorktreeBootIsolation(context: WorktreeRuntimeContext): Papercli
 // ignored, so the file cannot point this boot at a sibling or main instance.
 function resolveWorktreeIsolatedFallbackContext(
   context: WorktreeRuntimeContext,
-  env: NodeJS.ProcessEnv,
-  fileEnv: Record<string, string> = {},
 ): WorktreeRuntimeContext {
   const worktreeStateDir = path.dirname(context.configPath);
   const isUidScopedWorktreeState =
@@ -184,11 +152,10 @@ function resolveWorktreeIsolatedFallbackContext(
   const worktreeRoot = isUidScopedWorktreeState
     ? path.resolve(worktreeStateDir, "..", "..")
     : path.resolve(worktreeStateDir, "..");
-  const worktreeName = valueNotClaimedByFile("PAPERCLIP_WORKTREE_NAME", env, fileEnv)
-    ?? path.basename(worktreeRoot);
+  const worktreeName = operatorOrLayout("PAPERCLIP_WORKTREE_NAME") ?? path.basename(worktreeRoot);
   const instanceId = sanitizeWorktreeInstanceId(worktreeName);
   const homeDir = resolveHomeAwarePath(
-    valueNotClaimedByFile("PAPERCLIP_WORKTREES_DIR", env, fileEnv) ?? "~/.paperclip-worktrees",
+    operatorOrLayout("PAPERCLIP_WORKTREES_DIR") ?? "~/.paperclip-worktrees",
   );
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
 
@@ -208,16 +175,11 @@ function resolveWorktreeIsolatedFallbackContext(
   };
 }
 
-function contextFromWorktreeLayout(env: NodeJS.ProcessEnv): WorktreeRuntimeContext | null {
-  if (env.PAPERCLIP_IN_WORKTREE !== "true") return null;
-  let configPath: string;
-  let envPath: string;
-  try {
-    configPath = resolvePaperclipConfigPath();
-    envPath = resolvePaperclipEnvPath(configPath);
-  } catch {
-    return null;
-  }
+function contextFromWorktreeLayout(_env: NodeJS.ProcessEnv): WorktreeRuntimeContext | null {
+  const plan = currentBootEnvPlan();
+  if (!plan || plan.mode !== "worktree") return null;
+  const configPath = plan.configPath;
+  const envPath = plan.sources.find((source) => source.kind === "own")?.path ?? path.join(plan.stateDir, ".env");
   const worktreeStateDir = path.dirname(configPath);
   const isCanonicalWorktreeState = path.basename(worktreeStateDir) === ".paperclip";
   const isUidScopedWorktreeState =
@@ -237,7 +199,7 @@ function contextFromWorktreeLayout(env: NodeJS.ProcessEnv): WorktreeRuntimeConte
     logDir: "",
     storageDir: "",
     secretsKeyFilePath: "",
-  }, env, {});
+  });
 }
 
 function findWorktreeStateDir(startDir: string): string | null {
@@ -272,50 +234,39 @@ function resolveWorktreeRuntimeContext(
   env: NodeJS.ProcessEnv,
   overrideConfigPath?: string,
 ): WorktreeRuntimeContext | null {
-  if (env.PAPERCLIP_IN_WORKTREE !== "true") return null;
+  const plan = currentBootEnvPlan() ?? resolveBootEnvPlan({ cwd: process.cwd(), configOverride: overrideConfigPath });
+  if (plan.mode !== "worktree") return null;
 
-  const configPath = resolveWorktreeConfigPath(env, overrideConfigPath);
-  const envPath = resolvePaperclipEnvPath(configPath);
-  const persistedEnv = readEnvEntries(envPath);
+  const configPath = overrideConfigPath ? path.resolve(overrideConfigPath) : plan.configPath;
+  const envPath = plan.sources.find((source) => source.kind === "own")?.path ?? path.join(path.dirname(configPath), ".env");
+  const refused = bootEnvReport().refusals.length > 0;
+  const staged = (key: string) => (refused ? null : nonEmpty(stagedOwnValue(key)));
+  const operator = (key: string) => nonEmpty(operatorEnvValue(key));
 
-  // PAPERCLIP_IN_WORKTREE can leak in from a parent process or a sourced env
-  // file while config resolution still points at a non-worktree target (for
-  // example the default instance under <home>/instances/default). Only adopt
-  // a target as a worktree when its config sits in a `<root>/.paperclip/`
-  // layout, or in the uid-scoped cross-uid variant `<root>/.paperclip/uid-<uid>/`
-  // (SUP-14087), and its own persisted env already declares it a worktree;
-  // otherwise the repair would rewrite main-instance config and env files.
   const worktreeStateDir = path.dirname(configPath);
-  const isCanonicalWorktreeState = path.basename(worktreeStateDir) === ".paperclip";
   const isUidScopedWorktreeState =
     /^uid-\d+$/.test(path.basename(worktreeStateDir))
     && path.basename(path.dirname(worktreeStateDir)) === ".paperclip";
-  if (!isCanonicalWorktreeState && !isUidScopedWorktreeState) return null;
-  const configMissing = !fs.existsSync(configPath);
-  const envMissing = !fs.existsSync(envPath);
-  if (persistedEnv.PAPERCLIP_IN_WORKTREE !== "true" && !(configMissing && envMissing)) return null;
-
-  const persistedConfigPath = nonEmpty(persistedEnv.PAPERCLIP_CONFIG);
+  const persistedConfigPath = staged("PAPERCLIP_CONFIG");
   const persistedConfigLooksStale =
     persistedConfigPath !== null &&
     path.resolve(expandHomePrefix(persistedConfigPath)) !== path.resolve(configPath) &&
     !fs.existsSync(resolveHomeAwarePath(persistedConfigPath));
-  const stablePersistedEnv = persistedConfigLooksStale ? {} : persistedEnv;
   const worktreeRoot = isUidScopedWorktreeState
     ? path.resolve(worktreeStateDir, "..", "..")
     : path.resolve(worktreeStateDir, "..");
   const worktreeName =
-    nonEmpty(stablePersistedEnv.PAPERCLIP_WORKTREE_NAME) ??
-    nonEmpty(env.PAPERCLIP_WORKTREE_NAME) ??
+    (persistedConfigLooksStale ? null : staged("PAPERCLIP_WORKTREE_NAME")) ??
+    operator("PAPERCLIP_WORKTREE_NAME") ??
     path.basename(worktreeRoot);
   const instanceId =
-    nonEmpty(stablePersistedEnv.PAPERCLIP_INSTANCE_ID) ??
-    nonEmpty(env.PAPERCLIP_INSTANCE_ID) ??
+    (persistedConfigLooksStale ? null : staged("PAPERCLIP_INSTANCE_ID")) ??
+    operator("PAPERCLIP_INSTANCE_ID") ??
     sanitizeWorktreeInstanceId(worktreeName);
   const homeDir = resolveHomeAwarePath(
-    nonEmpty(stablePersistedEnv.PAPERCLIP_HOME) ??
-      nonEmpty(env.PAPERCLIP_HOME) ??
-      nonEmpty(env.PAPERCLIP_WORKTREES_DIR) ??
+    (persistedConfigLooksStale ? null : staged("PAPERCLIP_HOME")) ??
+      operator("PAPERCLIP_HOME") ??
+      operator("PAPERCLIP_WORKTREES_DIR") ??
       "~/.paperclip-worktrees",
   );
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
@@ -628,10 +579,11 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   // this boot uses an isolated config even when that config cannot be
   // persisted.
   worktreeBootIsolation = null;
-  let refused = false;
+  const ledger = ensureRepairLedger();
+  let refused = ledger.refused;
   let fileEnv: Record<string, string> = {};
   let context: WorktreeRuntimeContext | null;
-  let skipEnvRepair = false;
+  let skipEnvRepair = refused;
   try {
     context = resolveWorktreeRuntimeContext(process.env);
   } catch (error) {
@@ -644,7 +596,14 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     console.warn(
       `Skipping worktree env repair for ${envPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
-    restoreOperatorSnapshot();
+    const refusal = bootEnvReport().refusals[0];
+    if (!refusal) {
+      refuseBootEnv({
+        kind: "content",
+        path: envPath,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     context = contextFromWorktreeLayout(process.env);
     if (!context) {
       return { repairedConfig: false, repairedEnv: false };
@@ -656,30 +615,22 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     return { repairedConfig: false, repairedEnv: false };
   }
 
-  // Compute the env repair before anything else is touched.
   let effectiveContext: WorktreeRuntimeContext = context;
   let existingContents: string | null = null;
-  let toolActionSigningSecret = "";
   let repairedContents: string | null = null;
-  if (skipEnvRepair) {
-    toolActionSigningSecret =
-      nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ?? randomBytes(32).toString("hex");
-  } else {
+  const fileToolActionSigningSecret = nonEmpty(stagedOwnValue("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"))
+    ?? parsedSigningSecret(context.envPath);
+  const inheritedToolActionSigningSecret = nonEmpty(operatorEnvValue("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"));
+  let toolActionSigningSecret =
+    fileToolActionSigningSecret ??
+    inheritedToolActionSigningSecret ??
+    randomBytes(32).toString("hex");
+  if (!skipEnvRepair) {
     try {
       existingContents = fs.existsSync(context.envPath)
         ? fs.readFileSync(context.envPath, "utf8")
         : null;
       fileEnv = parseEnvFile(existingContents ?? "");
-      // The worktree file wins. An inherited value is used for this boot only
-      // and never persisted, so a parent shell's secret cannot become the
-      // worktree's own (SUP-24365).
-      const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-      const fileToolActionSigningSecret = nonEmpty(fileEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-      toolActionSigningSecret =
-        fileToolActionSigningSecret ??
-        inheritedToolActionSigningSecret ??
-        randomBytes(32).toString("hex");
-
       const managedEnvEntries: Record<string, string> = {
         PAPERCLIP_HOME: context.homeDir,
         PAPERCLIP_INSTANCE_ID: context.instanceId,
@@ -704,25 +655,29 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
       );
       repairedContents = null;
       refused = true;
-      restoreOperatorSnapshot();
-      effectiveContext = resolveWorktreeIsolatedFallbackContext(context, process.env, fileEnv);
-      if (!toolActionSigningSecret) {
-        toolActionSigningSecret =
-          nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ?? randomBytes(32).toString("hex");
+      if (bootEnvReport().refusals.length === 0) {
+        refuseBootEnv({
+          kind: "content",
+          path: context.envPath,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
+      effectiveContext = resolveWorktreeIsolatedFallbackContext(context);
+      toolActionSigningSecret =
+        inheritedToolActionSigningSecret ?? randomBytes(32).toString("hex");
     }
+  } else {
+    effectiveContext = resolveWorktreeIsolatedFallbackContext(context);
   }
   let repairedEnv = repairedContents !== null && existingContents !== repairedContents;
 
-  if (refused) {
-    dropRefusedFileSteering(fileEnv, effectiveContext);
-  }
+  setBootDerivedEnv("PAPERCLIP_HOME", effectiveContext.homeDir);
+  setBootDerivedEnv("PAPERCLIP_INSTANCE_ID", effectiveContext.instanceId);
+  setBootDerivedEnv("PAPERCLIP_CONFIG", effectiveContext.configPath);
+  setBootDerivedEnv("PAPERCLIP_CONTEXT", effectiveContext.contextPath);
+  setBootDerivedEnv("PAPERCLIP_WORKTREE_NAME", effectiveContext.worktreeName);
 
-  process.env.PAPERCLIP_HOME = effectiveContext.homeDir;
-  process.env.PAPERCLIP_INSTANCE_ID = effectiveContext.instanceId;
-  process.env.PAPERCLIP_CONFIG = effectiveContext.configPath;
-  process.env.PAPERCLIP_CONTEXT = effectiveContext.contextPath;
-  process.env.PAPERCLIP_WORKTREE_NAME = effectiveContext.worktreeName;
+
 
   let repairedConfig = false;
   if (fs.existsSync(effectiveContext.configPath)) {
@@ -788,7 +743,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
         && Number.isInteger(runtimeConfig.server.port)
         && runtimeConfig.server.port > 0
       ) {
-        process.env.PORT = String(runtimeConfig.server.port);
+        setBootDerivedEnv("PORT", String(runtimeConfig.server.port));
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -807,8 +762,8 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     }
   }
 
-  process.env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
-  process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = toolActionSigningSecret;
+  setBootDerivedEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", toolActionSigningSecret);
+  setBootDerivedEnv("PAPERCLIP_DB_BACKUP_ENABLED", "false");
 
   if (repairedEnv && repairedContents !== null) {
     try {

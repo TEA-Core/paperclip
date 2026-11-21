@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   expandHomePrefix,
@@ -6,6 +6,8 @@ import {
   resolvePaperclipConfigPathForInstance,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
+import { vetEnvFileContents } from "@paperclipai/shared/env-file";
+import { captureOperatorEnv, resolveBootEnvPlan, stageEnvSource, stagedOwnValue } from "@paperclipai/shared/boot-env";
 
 const CONFIG_BASENAME = "config.json";
 
@@ -100,6 +102,22 @@ function readEnvEntries(envPath: string): Record<string, string> {
   if (!existsSync(envPath)) return {};
   return parseEnvFile(readFileSync(envPath, "utf8"));
 }
+function vettedEnvEntries(envPath: string): Record<string, string> | null {
+  if (!existsSync(envPath)) return {};
+  try {
+    if (!statSync(envPath).isFile()) return null;
+    vetEnvFileContents(readFileSync(envPath, "utf8"));
+  } catch {
+    return null;
+  }
+  captureOperatorEnv();
+  resolveBootEnvPlan({ cwd: process.cwd() });
+  const staged = stageEnvSource({ kind: "own", path: envPath });
+  if (staged.status !== "staged") return null;
+  const databaseUrl = stagedOwnValue("DATABASE_URL");
+  return databaseUrl ? { DATABASE_URL: databaseUrl } : {};
+}
+
 
 function migrateLegacyConfig(raw: unknown): PartialConfig | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -184,7 +202,7 @@ function readConfig(configPath: string): PartialConfig | null {
 export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
   const configPath = resolvePaperclipConfigPath();
   const envPath = resolvePaperclipEnvPath(configPath);
-  const envEntries = readEnvEntries(envPath);
+  const vettedEntries = vettedEnvEntries(envPath);
 
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) {
@@ -197,7 +215,7 @@ export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
     };
   }
 
-  const fileEnvUrl = envEntries.DATABASE_URL?.trim();
+  const fileEnvUrl = vettedEntries?.DATABASE_URL?.trim();
   if (fileEnvUrl) {
     return {
       mode: "postgres",

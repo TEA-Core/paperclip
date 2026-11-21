@@ -417,22 +417,16 @@ function assertRewriteMatchesLoader(
     }
   }
 }
-
-export function updateEnvFileContents(
+export function vetEnvFileContents(
   contents: string,
-  entries: Record<string, string>,
-  options: UpdateEnvFileContentsOptions = {},
-): string {
-  const valueEncoding = options.valueEncoding ?? "json";
-  const missingEntries = new Map(Object.entries(entries));
+  entries: Record<string, string> = {},
+): void {
   if (/\r(?!\n)/.test(contents)) {
     throw new Error("Refusing to update env file: bare carriage return in env file");
   }
   const lines = splitEnvLines(contents);
   const segments = groupEnvSegments(lines);
-  const parsedByLoader = parseDotenv(contents);
-  assertLoaderAgreement(parsedByLoader, lines, segments, entries);
-
+  assertLoaderAgreement(parseDotenv(contents), lines, segments, entries);
   for (const segment of segments) {
     if (segment.quoted && !segment.quoteClosed) {
       throw new Error(
@@ -446,6 +440,20 @@ export function updateEnvFileContents(
       );
     }
   }
+}
+
+
+export function updateEnvFileContents(
+  contents: string,
+  entries: Record<string, string>,
+  options: UpdateEnvFileContentsOptions = {},
+): string {
+  const valueEncoding = options.valueEncoding ?? "json";
+  const missingEntries = new Map(Object.entries(entries));
+  vetEnvFileContents(contents, entries);
+  const lines = splitEnvLines(contents);
+  const segments = groupEnvSegments(lines);
+  const parsedByLoader = parseDotenv(contents);
 
   for (const segment of segments) {
     if (segment.end > segment.start || !segment.key) continue;
@@ -509,7 +517,7 @@ export function writeEnvFileAtomicallyIfChanged(
     for (const entry of fs.readdirSync(directory)) {
       if (!entry.startsWith(temporaryPrefix) || !entry.endsWith(".tmp")) continue;
       const ownerPid = Number(entry.slice(temporaryPrefix.length).split(".")[0]);
-      if (!Number.isInteger(ownerPid) || ownerPid === process.pid) continue;
+      if (!Number.isInteger(ownerPid)) continue;
       try {
         process.kill(ownerPid, 0);
       } catch (error) {
