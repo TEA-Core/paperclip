@@ -296,6 +296,61 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(await findLiveIssueExecutionHolder(db, companyId, issue.id)).toBeNull();
   });
 
+  it("does not store a plugin update originRunId as the ownership proof", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unassigned card",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix(companyId)}-1`,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await services.issues.update({
+      companyId,
+      issueId,
+      patch: {
+        assigneeAgentId: victimAgentId,
+        originRunId: victimRunId,
+        actorAgentId: victimAgentId,
+        actorRunId: victimRunId,
+      },
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // A plugin update can name any run. The supplied originRunId is never
+    // stored, so the named run does not become the holder and does not
+    // defer the assignee's wakes.
+    expect(stored?.originRunId).toBeNull();
+    expect(stored?.executionRunId).toBeNull();
+    expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+  });
+
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();
