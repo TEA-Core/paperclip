@@ -4,17 +4,19 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns,
   issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
   type Db, type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
+import { parkRecoveryCarrierSchema } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { recoveryCarrierParkService } from "../services/recovery-carrier-park.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -77,11 +79,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return result;
   }
 
-  async function fixture(): Promise<Fixture> {
-    const companyId = randomUUID(), sourceId = randomUUID(), carrierId = randomUUID();
+  async function fixture(existingCompanyId?: string): Promise<Fixture> {
+    const companyId = existingCompanyId ?? randomUUID(), sourceId = randomUUID(), carrierId = randomUUID();
     const blockerId = randomUUID(), actionId = randomUUID(), decisionId = randomUUID(), agentId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Park fixture", issuePrefix: `P${companyId.slice(0, 6)}` });
-    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "park-operator", status: "active", membershipRole: "operator" });
+    if (!existingCompanyId) {
+      await db.insert(companies).values({ id: companyId, name: "Park fixture", issuePrefix: `P${companyId.slice(0, 6)}` });
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "park-operator", status: "active", membershipRole: "operator" });
+    }
     await db.insert(agents).values({ id: agentId, companyId, name: "Fixture owner", role: "engineer", adapterType: "process", status: "idle" });
     const old = new Date("2026-01-01T00:00:00Z");
     await db.insert(issues).values([
@@ -120,6 +124,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return response.body.blockerAttention;
   }
 
+  async function parkRecords(f: Fixture) {
+    return {
+      holds: await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, f.companyId)).orderBy(issueTreeHolds.id),
+      audit: await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id),
+    };
+  }
+
   async function protectSourceRows(f: Fixture) {
     // Sequences survive transaction rollback, including a sweep's caught error.
     const counter = `park_write_attempts_${f.actionId.replaceAll("-", "")}`;
@@ -140,6 +151,48 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       return blockedPid;
     }, { timeout: 10_000 }).not.toBeNull();
     return blockedPid!;
+  }
+
+  async function blockParkAdmission(f: Fixture) {
+    const barrierKey = Number.parseInt(f.companyId.slice(0, 8), 16);
+    await db.execute(sql`create or replace function wait_for_park_barrier() returns trigger language plpgsql as $$
+      begin perform pg_advisory_xact_lock(TG_ARGV[0]::bigint); return new; end $$`);
+    await db.execute(sql.raw(`create trigger park_barrier_${f.carrierId.replaceAll("-", "")}
+      before insert on issue_tree_holds for each row when (new.root_issue_id = '${f.carrierId}')
+      execute function wait_for_park_barrier('${barrierKey}')`));
+    // This test project targets a pre-ES2024 Promise library.
+    let releaseBarrier!: () => void;
+    const released = new Promise<void>(resolve => { releaseBarrier = resolve; });
+    let markReady!: (pid: number) => void;
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    const barrier = db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${barrierKey}::bigint)`);
+      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      markReady(Number(row.pid));
+      await released;
+    });
+    const blockerPid = await ready;
+    const acceptance = park(f).then(response => response);
+    try {
+      const parkPid = await waitForBlockedPid(blockerPid);
+      return { parkPid, acceptance, barrier, releaseBarrier };
+    } catch (error) {
+      releaseBarrier();
+      await Promise.allSettled([barrier, acceptance]);
+      throw error;
+    }
+  }
+
+  async function protectWakeAdmission(f: Fixture) {
+    const suffix = f.actionId.replaceAll("-", ""), counter = `park_wake_attempts_${suffix}`;
+    await db.execute(sql.raw(`create sequence ${counter}`));
+    await db.execute(sql`create or replace function reject_park_wake_insert() returns trigger language plpgsql as $$
+      begin perform nextval(TG_ARGV[0]); raise exception 'parked carrier wake admitted'; end $$`);
+    for (const table of ["agent_wakeup_requests", "heartbeat_runs"]) {
+      await db.execute(sql.raw(`create trigger protect_${table}_${suffix} before insert on ${table}
+        for each row when (new.company_id = '${f.companyId}') execute function reject_park_wake_insert('${counter}')`));
+    }
+    return async () => expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
   }
 
   async function deferredInteraction(f: Fixture) {
@@ -211,6 +264,155 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
+  it.each(["park", "release"] as const)("enforces board authority at the direct %s service boundary", async operation => {
+    const f = await fixture(), service = recoveryCarrierParkService(db);
+    let holdId = "";
+    if (operation === "release") {
+      const response = await park(f);
+      expect(response.status).toBe(201);
+      holdId = response.body.hold.id;
+    }
+    const before = await snapshot(f), records = await parkRecords(f);
+    const actor = { actorType: "agent" as const, actorId: f.agentId, boardApiKeyId: null, runId: null };
+    const result = operation === "park"
+      ? service.park(f.companyId, f.carrierId, parkRecoveryCarrierSchema.parse(f.body), actor)
+      : service.release(f.companyId, f.carrierId, holdId, { recoveryActionId: f.actionId, reason: "Agent cannot release" }, actor);
+    await expect(result).rejects.toMatchObject({ status: 403 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+  });
+
+  it("keeps the direct park service carrier lookup company-scoped", async () => {
+    const f = await fixture(), other = await fixture();
+    const before = await snapshot(f), otherBefore = await snapshot(other);
+    await expect(recoveryCarrierParkService(db).park(other.companyId, f.carrierId,
+      parkRecoveryCarrierSchema.parse(other.body),
+      { actorType: "user", actorId: "park-operator", boardApiKeyId: null, runId: null },
+    )).rejects.toMatchObject({ status: 404 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await snapshot(other)).toEqual(otherBefore);
+    expect(await parkRecords(f)).toEqual({ holds: [], audit: [] });
+    expect(await parkRecords(other)).toEqual({ holds: [], audit: [] });
+  });
+
+  it.each(["source monitor", "child monitor", "child checkout", "child execution"] as const)(
+    "refuses %s without a live run or wake row", async shape => {
+      const f = await fixture();
+      if (shape === "source monitor") {
+        await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, f.sourceId));
+      } else {
+        const childId = randomUUID();
+        await db.insert(issues).values({ id: childId, companyId: f.companyId, parentId: f.carrierId,
+          title: "Paused descendant", status: "blocked", assigneeUserId: "park-operator" });
+        if (shape === "child monitor") {
+          await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, childId));
+        } else {
+          const [terminal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+            status: "succeeded", contextSnapshot: { issueId: childId } }).returning();
+          await db.update(issues).set(shape === "child checkout"
+            ? { checkoutRunId: terminal!.id } : { executionRunId: terminal!.id }).where(eq(issues.id, childId));
+        }
+      }
+      const before = await snapshot(f);
+      expect((await park(f)).status).toBe(409);
+      expect(await snapshot(f)).toEqual(before);
+      expect(await parkRecords(f)).toEqual({ holds: [], audit: [] });
+    },
+  );
+
+  it.each(["ordinary pause", "different acceptance"])("does not convert an existing %s into new consent", async kind => {
+    const f = await fixture();
+    const existing = kind === "ordinary pause"
+      ? await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/tree-holds`).send({ mode: "pause", reason: "Existing ordinary pause" })
+      : await park(f);
+    expect(existing.status).toBe(201);
+    const before = await snapshot(f), records = await parkRecords(f);
+    expect((await park(f, { ...f.body, reason: "A different board disposition" })).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+  });
+
+  it("rejects a typed release with a different action identity atomically", async () => {
+    const f = await fixture(), response = await park(f);
+    expect(response.status).toBe(201);
+    const before = await snapshot(f), records = await parkRecords(f);
+    const rejected = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/recovery-carrier-park/${response.body.hold.id}/release`)
+      .send({ recoveryActionId: randomUUID(), reason: "Wrong action must not release" });
+    expect(rejected.status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+  });
+
+  it("surfaces action timestamp drift without granting a run or retiring the hold", async () => {
+    const f = await fixture(), response = await park(f);
+    expect(response.status).toBe(201);
+    // Fixture-only independent drift; the park/release implementation never writes this row.
+    await db.update(issueRecoveryActions).set({ updatedAt: new Date("2026-01-02T00:00:00Z") }).where(eq(issueRecoveryActions.id, f.actionId));
+    expect(await attention(f)).toMatchObject({ state: "needs_attention", unresolvedBlockerCount: 0,
+      blockingTreeLive: false, carrierPark: { state: "stale", holdId: response.body.hold.id } });
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, response.body.hold.id)))[0].status).toBe("active");
+    expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "issue_comment_added",
+      payload: { issueId: f.carrierId } })).toBeNull();
+  });
+
+  it("refuses the server-side subtree resume operation while a typed park is active", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f), records = await parkRecords(f);
+    const resume = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/tree-holds`)
+      .send({ mode: "resume", metadata: { wakeAgents: true } });
+    expect(resume.status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+  });
+
+  it("keeps a bare-source deferred queue outside the carrier execution scope", async () => {
+    const f = await fixture();
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", status: "deferred_issue_execution", payload: { issueId: f.sourceId } });
+    const before = await snapshot(f);
+    expect((await park(f)).status).toBe(201);
+    expect(await snapshot(f)).toEqual(before);
+  });
+
+  it("suppresses an action-only wake without relying on a carrier issue id", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { recoveryActionId: f.actionId } })).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
+
+  it("retires only the released action gate while another park in the same company remains protected", async () => {
+    const f = await fixture(), control = await fixture(f.companyId);
+    const protectedSource = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+    const protectedAction = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(201);
+    const parkedControl = await park(control);
+    expect(parkedControl.status).toBe(201);
+    const released = await request(app(control.companyId))
+      .post(`/api/issues/${control.carrierId}/recovery-carrier-park/${parkedControl.body.hold.id}/release`)
+      .send({ recoveryActionId: control.actionId, reason: "Release control before independent board resolution" });
+    expect(released.status).toBe(200);
+    const actions = issueRecoveryActionService(db);
+    // Independent authority applies only to the released control, never the protected action.
+    expect(await actions.resolveActiveForIssue({ companyId: control.companyId, sourceIssueId: control.sourceId,
+      actionId: control.actionId, status: "resolved", outcome: "restored", boardResolution: true,
+    })).toMatchObject({ id: control.actionId, status: "resolved", outcome: "restored" });
+    expect(await actions.resolveActiveForIssue({ companyId: f.companyId, sourceIssueId: f.sourceId,
+      actionId: f.actionId, status: "resolved", outcome: "restored", boardResolution: true,
+    })).toBeNull();
+    expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual(protectedSource);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId))).toEqual(protectedAction);
+    await assertNoProtectedWrites();
+  });
+
   it("accepts an exact board park without a source/action write or fake liveness, and repeats idempotently", async () => {
     const f = await fixture(), before = await snapshot(f);
     const assertNoProtectedWrites = await protectSourceRows(f);
@@ -257,30 +459,11 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.sourceId, relatedIssueId: dependentId, type: "blocks" });
     const before = await snapshot(f);
     const assertNoProtectedWrites = await protectSourceRows(f);
-    const barrierKey = Number.parseInt(f.companyId.slice(0, 8), 16);
-    await db.execute(sql`create or replace function wait_for_park_barrier() returns trigger language plpgsql as $$
-      begin perform pg_advisory_xact_lock(TG_ARGV[0]::bigint); return new; end $$`);
-    await db.execute(sql.raw(`create trigger park_barrier_${f.carrierId.replaceAll("-", "")}
-      before insert on issue_tree_holds for each row when (new.root_issue_id = '${f.carrierId}')
-      execute function wait_for_park_barrier('${barrierKey}')`));
-    // This test project targets a pre-ES2024 Promise library.
-    let releaseBarrier!: () => void;
-    const released = new Promise<void>(resolve => { releaseBarrier = resolve; });
-    let markReady!: (pid: number) => void;
-    const ready = new Promise<number>(resolve => { markReady = resolve; });
-    const barrier = db.transaction(async tx => {
-      await tx.execute(sql`select pg_advisory_xact_lock(${barrierKey}::bigint)`);
-      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
-      markReady(Number(row.pid));
-      await released;
-    });
-    const blockerPid = await ready;
-    const acceptance = park(f).then(response => response);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
     const wakes: string[] = [];
     const recovery = recoveryService(db, { enqueueWakeup: async agentId => { wakes.push(agentId); return null; } });
     let sweep: ReturnType<typeof recovery.reconcileStrandedAssignedIssues> | undefined;
     try {
-      const parkPid = await waitForBlockedPid(blockerPid);
       sweep = recovery.reconcileStrandedAssignedIssues();
       await waitForBlockedPid(parkPid);
     } finally {
@@ -292,6 +475,130 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(f)).toEqual(before);
     expect(wakes).toEqual([]);
   }, 30_000);
+
+  it("serializes board resolution behind park admission's source lock", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const actions = issueRecoveryActionService(db);
+    let resolution: ReturnType<typeof actions.resolveActiveForIssue> | undefined;
+    try {
+      resolution = actions.resolveActiveForIssue({ companyId: f.companyId, sourceIssueId: f.sourceId,
+        actionId: f.actionId, status: "resolved", outcome: "restored", boardResolution: true });
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, resolution]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await resolution).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("rechecks carrier parking after a wake passes the early read but waits on the issue lock", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const heartbeat = heartbeatService(db);
+    let wake: ReturnType<typeof heartbeat.wakeup> | undefined;
+    try {
+      wake = heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_assigned", payload: { issueId: f.carrierId } });
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, wake]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await wake).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("keeps automatic stale-lock cleanup from rewriting a parked action's source", async () => {
+    const f = await fixture();
+    const [terminal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "succeeded", contextSnapshot: { issueId: f.sourceId } }).returning();
+    await db.update(issues).set({ executionRunId: terminal!.id }).where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(201);
+    await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park must not wake"); } }).sweepStaleIssueLocks();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  });
+
+  it("rechecks monitor re-arm after a park commits while the exhaustion drain waits for the source lock", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park must not wake"); } });
+    let drain: ReturnType<typeof recovery.reconcileExhaustedRecoveryDrain> | undefined;
+    try {
+      drain = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, drain]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("does not remint a legacy carrier hidden after park acceptance while exhaustion waits for the source", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ status: "backlog", assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.sourceId));
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const counter = `park_carrier_attempts_${f.actionId.replaceAll("-", "")}`;
+    await db.execute(sql.raw(`create sequence ${counter}`));
+    await db.execute(sql`create or replace function reject_park_carrier_insert() returns trigger language plpgsql as $$
+      begin perform nextval(TG_ARGV[0]); raise exception 'parked carrier replacement admitted'; end $$`);
+    await db.execute(sql.raw(`create trigger protect_park_carrier_${f.actionId.replaceAll("-", "")}
+      before insert on issues for each row when (new.company_id = '${f.companyId}')
+      execute function reject_park_carrier_insert('${counter}')`));
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    let releaseSource!: () => void;
+    const sourceReleased = new Promise<void>(resolve => { releaseSource = resolve; });
+    let markSourceReady!: () => void;
+    const sourceReady = new Promise<void>(resolve => { markSourceReady = resolve; });
+    // Queue a source handoff before the drain so a later carrier change cannot race its recheck.
+    const handoff = db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.sourceId)).for("update");
+      markSourceReady();
+      await sourceReleased;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park must not wake"); } });
+    let drain: ReturnType<typeof recovery.reconcileExhaustedRecoveryDrain> | undefined;
+    let before: Awaited<ReturnType<typeof snapshot>> | undefined;
+    try {
+      const handoffPid = await waitForBlockedPid(parkPid);
+      drain = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      await waitForBlockedPid(handoffPid);
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, sourceReady]);
+      // Independent fixture drift makes acceptance stale; its manual hold must still fence remint.
+      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
+      before = await snapshot(f);
+    } finally {
+      releaseBarrier();
+      releaseSource();
+      await Promise.all([barrier, acceptance, handoff, drain]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
+    expect(await snapshot(f)).toEqual(before);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, (await acceptance).body.hold.id)))[0].status).toBe("active");
+    await assertNoProtectedWrites();
+  }, 45_000);
 
   it("requires attention when a stale park's changed blocker is otherwise covered", async () => {
     const f = await fixture();
@@ -397,6 +704,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     const repeat = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/recovery-carrier-park/${response.body.hold.id}/release`)
       .send({ recoveryActionId: f.actionId, reason: "Board releases this disposition; no repair authorized" });
     expect(repeat.status).toBe(200);
+    expect(repeat.body).toEqual(release.body);
+    expect(await db.select({ action: activityLog.action, entityId: activityLog.entityId, actorId: activityLog.actorId })
+      .from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
+        eq(activityLog.action, "issue.recovery_carrier_park_released")))).toEqual([
+      { action: "issue.recovery_carrier_park_released", entityId: f.carrierId, actorId: "park-operator" },
+    ]);
     expect(await snapshot(f)).toEqual(before);
     await assertNoProtectedWrites();
     expect(await attention(f)).toMatchObject({ state: "needs_attention" });
