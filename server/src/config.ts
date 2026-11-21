@@ -1,7 +1,7 @@
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
@@ -34,7 +34,7 @@ import {
 captureOperatorEnvBeforeDotenv(process.env);
 
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
-if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
+if (existsSync(PAPERCLIP_ENV_FILE_PATH) && statSync(PAPERCLIP_ENV_FILE_PATH).isFile()) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
 }
 
@@ -44,7 +44,7 @@ const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
   ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
   : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
 if (shouldLoadWorkingDirectoryEnv({
-  cwdEnvExists,
+  cwdEnvExists: cwdEnvExists && statSync(CWD_ENV_PATH).isFile(),
   isPaperclipEnvFile: isSameFile,
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });

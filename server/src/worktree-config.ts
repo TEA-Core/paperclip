@@ -77,13 +77,16 @@ type WorktreeRuntimeContext = {
   secretsKeyFilePath: string;
 };
 
-// Keys a refused env file must not steer. config.ts loads that file into
-// process.env before repair runs, so a live value is operator-owned only
-// when it was already set before that load.
+// Keys a refused env file must not steer. config.ts loads the paperclip
+// file and then the working-directory file after this snapshot, so a live
+// value is operator-owned only when it was already set before either load.
 const STEERING_ENV_KEYS = [
   "PAPERCLIP_WORKTREE_NAME",
   "PAPERCLIP_WORKTREES_DIR",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
   "DATABASE_URL",
 ] as const;
 
@@ -94,12 +97,19 @@ let worktreeBootIsolation: PaperclipConfig | null = null;
 
 export function captureOperatorEnvBeforeDotenv(env: NodeJS.ProcessEnv): void {
   if (operatorEnvBeforeDotenv) return;
-  operatorEnvBeforeDotenv = {
-    PAPERCLIP_WORKTREE_NAME: env.PAPERCLIP_WORKTREE_NAME,
-    PAPERCLIP_WORKTREES_DIR: env.PAPERCLIP_WORKTREES_DIR,
-    PAPERCLIP_SECRETS_MASTER_KEY_FILE: env.PAPERCLIP_SECRETS_MASTER_KEY_FILE,
-    DATABASE_URL: env.DATABASE_URL,
-  };
+  operatorEnvBeforeDotenv = {};
+  for (const key of STEERING_ENV_KEYS) {
+    operatorEnvBeforeDotenv[key] = env[key];
+  }
+}
+
+function restoreOperatorSnapshot(): void {
+  if (!operatorEnvBeforeDotenv) return;
+  for (const key of STEERING_ENV_KEYS) {
+    const snapped = operatorEnvBeforeDotenv[key];
+    if (typeof snapped === "string" && snapped.length > 0) process.env[key] = snapped;
+    else delete process.env[key];
+  }
 }
 
 export function readWorktreeBootIsolation(): PaperclipConfig | null {
@@ -604,6 +614,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     console.warn(
       `Skipping worktree env repair for ${envPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
+    restoreOperatorSnapshot();
     context = contextFromWorktreeLayout(process.env);
     if (!context) {
       return { repairedConfig: false, repairedEnv: false };
@@ -663,6 +674,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
       );
       repairedContents = null;
       refused = true;
+      restoreOperatorSnapshot();
       effectiveContext = resolveWorktreeIsolatedFallbackContext(context, process.env, fileEnv);
       if (!toolActionSigningSecret) {
         toolActionSigningSecret =
@@ -749,6 +761,10 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
         process.env.PORT = String(runtimeConfig.server.port);
       }
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `Could not persist isolated worktree config at ${effectiveContext.configPath}: ${reason}`,
+      );
       if (!worktreeBootIsolation) {
         publishWorktreeBootIsolation(effectiveContext);
       }

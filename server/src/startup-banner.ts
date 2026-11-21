@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { BindMode, DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 
@@ -80,7 +80,7 @@ function resolveAgentJwtSecretStatus(
     };
   }
 
-  if (existsSync(envFilePath)) {
+  if (existsSync(envFilePath) && statSync(envFilePath).isFile()) {
     const parsed = parseEnvFileContents(readFileSync(envFilePath, "utf-8"));
     const fileValue = typeof parsed.PAPERCLIP_AGENT_JWT_SECRET === "string" ? parsed.PAPERCLIP_AGENT_JWT_SECRET.trim() : "";
     if (fileValue) {

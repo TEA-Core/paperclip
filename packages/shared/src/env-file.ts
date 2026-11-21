@@ -133,6 +133,62 @@ function naiveClosingLine(lines: EnvLine[], start: number, quote: EnvQuote, star
   return -1;
 }
 
+const COLON_ONLY_PATTERN = /^(\s*(?:export\s+)?)([\w.-]+):\s*$/;
+const BARE_KEY_PATTERN = /^(\s*(?:export\s+)?)([\w.-]+)\s*$/;
+
+function closeQuotedSpan(
+  lines: EnvLine[],
+  lineIndex: number,
+  text: string,
+  quoteIndex: number,
+): { end: number; quoteClosed: boolean } | null {
+  const quote = text[quoteIndex] as EnvQuote | undefined;
+  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
+  if (closingQuoteIndex(text, quote, quoteIndex + 1) !== null) {
+    return { end: lineIndex, quoteClosed: true };
+  }
+  for (let next = lineIndex + 1; next < lines.length; next += 1) {
+    if (closingQuoteIndex(lines[next].contents, quote, 0) !== null) {
+      return { end: next, quoteClosed: true };
+    }
+  }
+  return { end: Math.max(lineIndex, lines.length - 1), quoteClosed: false };
+}
+
+function quoteSpanOnLine(lines: EnvLine[], lineIndex: number): { end: number; quoteClosed: boolean } | null {
+  if (lineIndex >= lines.length) return null;
+  const text = lines[lineIndex].contents;
+  const quoteIndex = text.length - text.trimStart().length;
+  return closeQuotedSpan(lines, lineIndex, text, quoteIndex);
+}
+
+function nextNonBlank(lines: EnvLine[], start: number): number {
+  let index = start;
+  while (index < lines.length && lines[index].contents.trim() === "") index += 1;
+  return index;
+}
+
+// `FOO:` or `FOO` on one line, with the quote or `=` on a later line. dotenv
+// treats the whitespace between them as part of one assignment.
+function splitLoaderOpener(lines: EnvLine[], index: number): { end: number; quoteClosed: boolean } | null {
+  const text = lines[index].contents;
+  const colonOnly = COLON_ONLY_PATTERN.test(text);
+  const bareKey = !colonOnly && BARE_KEY_PATTERN.test(text);
+  if (!colonOnly && !bareKey) return null;
+
+  const next = nextNonBlank(lines, index + 1);
+  if (next >= lines.length) return null;
+
+  if (colonOnly) return quoteSpanOnLine(lines, next);
+
+  const equals = lines[next].contents.match(/^\s*=\s*(.*)$/);
+  if (!equals) return null;
+  const rest = equals[1];
+  if (rest.trim() === "") return quoteSpanOnLine(lines, nextNonBlank(lines, next + 1));
+  const quoteIndex = rest.length - rest.trimStart().length;
+  return closeQuotedSpan(lines, next, rest, quoteIndex);
+}
+
 // Groups physical lines into logical assignments. A quoted value may span
 // physical lines; its continuation lines are part of the same assignment
 // and must never be treated as assignments of their own.
@@ -143,6 +199,12 @@ function groupEnvSegments(lines: EnvLine[]): EnvSegment[] {
     const canonical = lines[index].contents.match(ENV_ASSIGNMENT_PATTERN);
     const match = canonical ?? lines[index].contents.match(LOADER_ASSIGNMENT_PATTERN);
     if (!match) {
+      const split = splitLoaderOpener(lines, index);
+      if (split) {
+        segments.push({ key: null, start: index, end: split.end, quoted: true, quoteClosed: split.quoteClosed });
+        index = split.end;
+        continue;
+      }
       segments.push({ key: null, start: index, end: index, quoted: false, quoteClosed: true });
       continue;
     }

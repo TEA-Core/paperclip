@@ -399,6 +399,55 @@ describe("env file editor", () => {
     expect(parseDotenv(edited)[key]).toBeUndefined();
   });
 
+  it.each([
+    {
+      name: "colon next line",
+      file: [
+        "FOO:",
+        ' "alpha',
+        "PAPERCLIP_HOME=/hidden",
+        "BETTER_AUTH_SECRET=canary-auth-secret",
+        'omega"',
+        "FOO=final",
+        "BETTER_AUTH_SECRET=good-auth-secret",
+        "",
+      ].join("\n"),
+      key: "BETTER_AUTH_SECRET",
+      shadow: "BETTER_AUTH_SECRET=good-auth-secret",
+    },
+    {
+      name: "split equals",
+      file: [
+        "FOO",
+        '="alpha',
+        "PAPERCLIP_HOME=/hidden",
+        "DATABASE_URL=postgresql://canary.invalid/db",
+        'omega"',
+        "FOO=final",
+        "DATABASE_URL=postgresql://good.invalid/db",
+        "",
+      ].join("\n"),
+      key: "DATABASE_URL",
+      shadow: "DATABASE_URL=postgresql://good.invalid/db",
+    },
+  ])("does not plant a $name canary that loads after the shadowing line is deleted (SUP-24365)", ({ file, key, shadow }) => {
+    const managed = {
+      PAPERCLIP_HOME: "/managed/home",
+      PAPERCLIP_INSTANCE_ID: "wt",
+      PAPERCLIP_CONFIG: "/managed/config.json",
+      PAPERCLIP_CONTEXT: "/managed/context.json",
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_DB_BACKUP_ENABLED: "false",
+      PAPERCLIP_WORKTREE_NAME: "wt",
+    };
+
+    const updated = updateEnvFileContents(file, managed);
+    const edited = updated.split("\n").filter((line) => line !== shadow).join("\n");
+
+    expect(parseDotenv(edited)[key]).toBeUndefined();
+  });
+
+
   it("keeps an assignment hidden by an escaped quote from becoming a loader key (SUP-24365)", () => {
     const original = [
       'NOTE="alpha\\"',
