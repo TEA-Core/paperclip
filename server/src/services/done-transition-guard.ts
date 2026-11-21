@@ -745,18 +745,31 @@ export async function writeDoneTransitionRefusedAuditLog(
   });
 }
 
-async function writeLadderRefusalAuditLog(
+/**
+ * The shared repeat cap behind `writeLadderRefusalAuditLog` and
+ * `writeGuardSkippedAuditLog`. `signatureKey` names the `activity_log.details`
+ * field whose value identifies a repeat; the cap counts `action` rows and
+ * `repeatedAction` escalation rows with that signature inside the window.
+ */
+async function writeRepeatCappedAuditLog(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
-  details: Record<string, unknown> & { reason: string },
+  cap: {
+    action: string;
+    repeatedAction: string;
+    signatureKey: string;
+    signature: string;
+    details: Record<string, unknown>;
+  },
 ): Promise<void> {
+  const { action, repeatedAction, signatureKey, signature, details } = cap;
   let priorRefusals = 0;
   let priorEscalations = 0;
   try {
     const [counts] = await db
       .select({
-        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${LADDER_REFUSED_ACTION})`,
-        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${LADDER_REFUSAL_REPEATED_ACTION})`,
+        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${action})`,
+        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${repeatedAction})`,
       })
       .from(activityLog)
       .where(
@@ -764,8 +777,8 @@ async function writeLadderRefusalAuditLog(
           eq(activityLog.companyId, issue.companyId),
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, issue.id),
-          inArray(activityLog.action, [LADDER_REFUSED_ACTION, LADDER_REFUSAL_REPEATED_ACTION]),
-          sql`${activityLog.details} ->> 'reason' = ${details.reason}`,
+          inArray(activityLog.action, [action, repeatedAction]),
+          sql`${activityLog.details} ->> ${signatureKey}::text = ${signature}`,
           sql`${activityLog.createdAt} > now() - make_interval(secs => ${LADDER_REFUSAL_REPEAT_WINDOW_SECONDS})`,
         ),
       );
@@ -774,20 +787,87 @@ async function writeLadderRefusalAuditLog(
     if (Number.isFinite(refused)) priorRefusals = refused;
     if (Number.isFinite(escalated)) priorEscalations = escalated;
   } catch (err) {
-    logger.warn({ err, issueId: issue.id }, "failed to count prior ladder refusals; recording the refusal");
+    logger.warn({ err, issueId: issue.id, action }, "failed to count prior repeats; recording the row");
   }
   if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
-    await writeAuditLog(db, issue, LADDER_REFUSED_ACTION, details);
+    await writeAuditLog(db, issue, action, details);
     return;
   }
   if (priorEscalations === 0) {
-    await writeAuditLog(db, issue, LADDER_REFUSAL_REPEATED_ACTION, {
+    await writeAuditLog(db, issue, repeatedAction, {
       ...details,
       refusalCount: priorRefusals + 1,
       repeatLimit: LADDER_REFUSAL_REPEAT_LIMIT,
       windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
     });
   }
+}
+
+async function writeLadderRefusalAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown> & { reason: string },
+): Promise<void> {
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: LADDER_REFUSED_ACTION,
+    repeatedAction: LADDER_REFUSAL_REPEATED_ACTION,
+    signatureKey: "reason",
+    signature: details.reason,
+    details,
+  });
+}
+
+/**
+ * SUP-24557 (SUP-24216): the same cap for `issue.done_transition_guard_skipped`
+ * rows whose class is `branch_absent_on_remote`. The sweeps that re-run the
+ * guard every tick (stranded-summary reaper, merged-operator-merge-cards) wrote
+ * one such row per tick for a card whose branch stays absent from the remote.
+ * The signature is (issue, skip action, class, BRANCH): the branch is parsed
+ * out of the skipReason (`branch_absent_on_remote:<branch>[; <pr skip reason>]`,
+ * where the optional `; ` tail varies per tick and is excluded) or taken from
+ * the refusal row's `branch`, and is stored in `details.repeatSignature`. A
+ * second absent branch is its own signature and starts its own count. The
+ * refusal row (`reason: branch_absent_on_remote`, `allowed: false`) and the
+ * fail-open row (`skipReason: branch_absent_on_remote:<branch>`) keep separate
+ * signatures. The escalation row needs its own action name because
+ * `issue.done_transition_ladder_refusal_repeated` is ladder-specific.
+ *
+ * Every other skip row is written unchanged, in the same synchronous step.
+ */
+export const GUARD_SKIP_REPEATED_ACTION = "issue.done_transition_guard_skip_repeated";
+const GUARD_SKIPPED_ACTION = "issue.done_transition_guard_skipped";
+const BRANCH_ABSENT_SKIP_CLASS = "branch_absent_on_remote";
+
+function branchAbsentSkipSignature(details: Record<string, unknown>): string | null {
+  const skipReason = details.skipReason;
+  const prefix = `${BRANCH_ABSENT_SKIP_CLASS}:`;
+  if (typeof skipReason === "string" && skipReason.startsWith(prefix)) {
+    const branch = skipReason.slice(prefix.length).split("; ")[0];
+    return branch ? `${prefix}${branch}` : null;
+  }
+  if (details.reason === BRANCH_ABSENT_SKIP_CLASS && typeof details.branch === "string" && details.branch) {
+    return `refused:${prefix}${details.branch}`;
+  }
+  return null;
+}
+
+export async function writeGuardSkippedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown>,
+): Promise<void> {
+  const signature = branchAbsentSkipSignature(details);
+  if (signature === null) {
+    await writeAuditLog(db, issue, GUARD_SKIPPED_ACTION, details);
+    return;
+  }
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: GUARD_SKIPPED_ACTION,
+    repeatedAction: GUARD_SKIP_REPEATED_ACTION,
+    signatureKey: "repeatSignature",
+    signature,
+    details: { ...details, repeatSignature: signature },
+  });
 }
 
 /**
@@ -3727,6 +3807,9 @@ export async function resolveCitedCommits(
  *   stays countable in the ghost-PASS census and dies with the close on
  *   rollback.
  *
+ * Tier-close audit payloads retain the supplied caller actor/run provenance;
+ * omitted provenance defaults to the guard actor and no run.
+ *
  * Callers must invoke this BEFORE opening their close transaction on an
  * unlocked read: the delivery guard probes GitHub and the tier evaluator
  * reads the comment store, and running either under the sweep's row lock
@@ -3735,17 +3818,26 @@ export async function resolveCitedCommits(
 export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   db: Db;
   issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string };
-  actorId: string;
+  actorId?: string;
   runId?: string | null;
   closeComment: string | null;
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
 }): Promise<
-  | { allowed: true; closeComment: string | null; doneTierSkipAudit: null }
+  | {
+      allowed: true;
+      closeComment: string | null;
+      doneTierSkipAudit: null;
+      // SUP-23925: the tier close rows are returned, not written. The backstop
+      // caller persists them on the SAME transaction as its terminal write, so
+      // a refused or raced sweep close can never leave an orphan close row.
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+    }
   | {
       allowed: true;
       closeComment: string | null;
       doneTierSkipAudit: Parameters<typeof logActivity>[1];
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
     }
   | {
       allowed: false;
@@ -3756,7 +3848,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       reason: string;
     }
 > {
-  const { db, issue, actorId, runId = null, closeComment, structuredDoneTier, listComments } = input;
+  const { db, issue, actorId = "done-transition-guard", runId = null, closeComment, structuredDoneTier, listComments } = input;
   const guardIssue = {
     ...issue,
     doneTransitionAuditProvenance: { actorId, runId },
@@ -3785,20 +3877,51 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         reason: tierResult.reason,
       };
     }
+    // SUP-23925: the tier close rows are deferred to the caller's close
+    // transaction (they used to be fire-and-forget writes here, before and
+    // outside it, so a caller whose close later refused or lost the race left
+    // an orphan close row on a card that never wrote status→done).
+    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
-      void writeAuditLog(db, guardIssue, "issue.done_transition_tier1_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId,
+        agentId: null,
+        runId,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier1_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+        },
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, guardIssue, "issue.done_transition_tier2_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
-        ...tierResult.tier2Audit,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId,
+        agentId: null,
+        runId,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+          ...tierResult.tier2Audit,
+        },
       });
     }
-    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits };
   }
   return {
     allowed: true,
@@ -3821,6 +3944,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         systemBackstopActor: actorId,
       },
     },
+    closeRowAudits: [],
   };
 }
 
@@ -5526,7 +5650,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        await writeGuardSkippedAuditLog(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,

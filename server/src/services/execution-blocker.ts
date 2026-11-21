@@ -34,10 +34,15 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.
-  if (!restoreHold && conversation?.agentId && options?.conversationResetCommentId) {
+  // A malformed comment id names no comment; comparing it to the uuid column would throw.
+  const rawResetCommentId = options?.conversationResetCommentId;
+  const resetCommentId = rawResetCommentId && z.string().guid().safeParse(rawResetCommentId).success
+    ? rawResetCommentId
+    : null;
+  if (!restoreHold && conversation?.agentId && resetCommentId) {
     const [command] = await db.select().from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-      eq(issueComments.id, options.conversationResetCommentId),
+      eq(issueComments.id, resetCommentId),
     )).limit(1);
     if (command?.authorUserId && !command.deletedAt && command.body.trim() === "/new") return null;
   }

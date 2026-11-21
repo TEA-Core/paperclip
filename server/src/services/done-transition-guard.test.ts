@@ -7018,32 +7018,80 @@ describe("evaluateDoneTierDeclaration", () => {
       if (!verdict.allowed) return;
       expect(verdict.closeComment).toContain("Closed at Tier 2 (live): record-only probe");
       expect(ghFetchMock).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
+      // SUP-23925: the tier close row is RETURNED for the caller's close
+      // transaction, not written here — a caller whose close later refused or
+      // lost the race can never leave an orphan close row behind.
+      expect(verdict.closeRowAudits).toHaveLength(1);
+      expect(verdict.closeRowAudits[0]).toMatchObject({
+        action: "issue.done_transition_tier2_close",
+        actorId: "execution-control-reconciliation",
+        runId: "backstop-run-1",
+        entityType: "issue",
+        entityId: "issue-1",
+        details: {
+          identifier: "SUP-12345",
+          reason: expect.stringContaining("Tier 2 declaration found:"),
+          systemBackstopActor: "execution-control-reconciliation",
+          probeEvidence: RECORD_ONLY_EVIDENCE,
+          probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
+          probeTarget: "https://ops.example.com",
+          observed: "2026-11-04T09:15:00Z",
+          observedRangeEnd: null,
+          tierForm: "record-only",
+          probeHead: null,
+          mergeCommit: null,
+          // SUP-23490: the backstop door carries no run id, so the machine
+          // record says so instead of inventing a closing run.
+          closingRunId: null,
+          closingRunStartedAt: null,
+        },
+      });
+      expect(logActivity).not.toHaveBeenCalledWith(
         mockDb,
+        expect.objectContaining({ action: "issue.done_transition_tier2_close" }),
+      );
+    });
+
+    it.each([
+      { tier: "tier1" as const, provenance: { actorId: "test-backstop", runId: "test-run" }, actorId: "test-backstop", runId: "test-run" },
+      { tier: "tier2" as const, provenance: { actorId: "test-backstop", runId: "test-run" }, actorId: "test-backstop", runId: "test-run" },
+      { tier: "tier1" as const, provenance: {}, actorId: "done-transition-guard", runId: null },
+      { tier: "tier2" as const, provenance: {}, actorId: "done-transition-guard", runId: null },
+    ])("returns $tier close audit provenance ($actorId, $runId) without writing before the close", async ({ tier, provenance, actorId, runId }) => {
+      if (tier === "tier1") {
+        setupTier2OriginMocks();
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+        mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+          { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        ]);
+        ghFetchMock.mockImplementation(async (url: string) =>
+          String(url).includes("/compare/")
+            ? new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 })
+            : new Response(JSON.stringify({}), { status: 404 }),
+        );
+      }
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: tier === "tier1" ? "ew-1" : null },
+        ...provenance,
+        closeComment: null,
+        structuredDoneTier: tier === "tier1"
+          ? { tier: "tier1", reason: "Recorded delivery landed", landing: { mode: "landedAtTip", mergeCommit: T2_MERGE_SHA } }
+          : { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed, JSON.stringify(verdict)).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeRowAudits).toEqual([
         expect.objectContaining({
-          action: "issue.done_transition_tier2_close",
-          actorId: "execution-control-reconciliation",
-          runId: "backstop-run-1",
-          entityType: "issue",
-          entityId: "issue-1",
-          details: {
-            identifier: "SUP-12345",
-            reason: expect.stringContaining("Tier 2 declaration found:"),
-            systemBackstopActor: "execution-control-reconciliation",
-            probeEvidence: RECORD_ONLY_EVIDENCE,
-            probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
-            probeTarget: "https://ops.example.com",
-            observed: "2026-11-04T09:15:00Z",
-            observedRangeEnd: null,
-            tierForm: "record-only",
-            probeHead: null,
-            mergeCommit: null,
-            // SUP-23490: the backstop door carries no run id, so the machine
-            // record says so instead of inventing a closing run.
-            closingRunId: null,
-            closingRunStartedAt: null,
-          },
+          action: `issue.done_transition_${tier}_close`,
+          actorId,
+          runId,
+          details: expect.objectContaining({ systemBackstopActor: actorId }),
         }),
+      ]);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({ action: `issue.done_transition_${tier}_close` }),
       );
     });
 

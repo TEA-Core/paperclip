@@ -91,6 +91,7 @@ import {
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
+import { isProtectedDeliveryBranch } from "./execution-workspace-policy.js";
 import { logActivity } from "./activity-log.js";
 import {
   buildDivergenceAlertText,
@@ -5991,12 +5992,35 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
+  // SUP-24409: the refs a card's delivery branch may never equal: the remote's default branch, the
+  // project workspace's repo ref and the strategy's configured base ref.
+  const protectedBaseRefs = [
+    await detectRemoteDefaultBranch(repoRoot),
+    input.base.repoRef,
+    typeof rawStrategy.baseRef === "string" ? rawStrategy.baseRef : null,
+  ];
   let branchName: string;
   if (requestedExistingBranch) {
     // Exact-branch mode: attach the requested pre-existing branch verbatim.
     // The branch must already exist; realization never creates, renames, or
     // resets it, and any mismatch below fails closed instead of falling back
     // to a derived branch or the shared checkout.
+    // SUP-24409: the attached branch becomes the card's own delivery branch; an integration or
+    // release branch, or one of the repo's default/base refs, is never a card's delivery branch.
+    if (isProtectedDeliveryBranch({ branch: requestedExistingBranch, defaultRefs: protectedBaseRefs })) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is a protected branch `
+        + "(main, master, a release, hotfix or fold branch, or a default branch of the repository). A card cannot deliver on it; "
+        + "pin the card's own branch instead.",
+        {
+          workspaceValidation: {
+            reason: "existing_branch_is_protected",
+            requestedExistingBranch,
+            remoteDefaultBranch: protectedBaseRefs[0],
+          },
+        },
+      );
+    }
     const existingBranchSha = await runGit(
       ["rev-parse", "--verify", "--quiet", `refs/heads/${requestedExistingBranch}`],
       repoRoot,
@@ -6023,11 +6047,12 @@ export async function realizeExecutionWorkspace(input: {
       repoRef: input.base.repoRef,
     });
     branchName = sanitizeBranchName(renderedBranch);
-    const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
-    if (remoteDefaultBranch && branchName === remoteDefaultBranch) {
+    // SUP-24409: the same protected set as exact-branch mode, not only the default.
+    if (isProtectedDeliveryBranch({ branch: branchName, defaultRefs: protectedBaseRefs })) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Execution workspace branch name "${branchName}" matches the repo's default branch. `
-        + "Creating a worktree on the default branch would permanently strand the primary clone. "
+        `Execution workspace branch name "${branchName}" matches the repo's default branch or another protected branch `
+        + "(main, master, a release, hotfix or fold branch). Creating a worktree on it would strand the "
+        + "primary clone and make an integration branch a card's delivery branch. "
         + 'Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").',
         {
           workspaceValidation: {

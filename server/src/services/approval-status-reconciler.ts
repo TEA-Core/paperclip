@@ -33,6 +33,7 @@ import {
   RELEASE_CONFIRMED_CONTEXT,
   releaseConfirmedDescription,
   readCertifiedFinalDelivery,
+  readUncertifiedFinalDelivery,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   type ApprovalCandidateAnchor,
@@ -1260,6 +1261,23 @@ export function latestDecisionPerStage<T extends { stageId: string; createdAt: D
     latestByStage.set(decision.stageId, decision);
   }
   return latestByStage;
+}
+
+/**
+ * SUP-24054: the stage ids of `policyStageIds` whose LATEST durable decision
+ * ({@link latestDecisionPerStage}) is `approved`. This is the decision-table view
+ * of ladder satisfaction that survives a reopen nulling the executionState
+ * projection (SUP-14912). A later `changes_requested` supersedes an earlier
+ * approval, and a stage with no decision row is absent, so both stay undecided
+ * (fail closed). A row for a stage outside the current policy is ignored.
+ */
+export function listDurablyApprovedStageIds<
+  T extends { stageId: string; createdAt: Date; id: string; outcome: string },
+>(decisions: readonly T[], policyStageIds: Iterable<string>): string[] {
+  const policyStageIdSet = new Set(policyStageIds);
+  return Array.from(latestDecisionPerStage(decisions).values())
+    .filter((decision) => decision.outcome === "approved" && policyStageIdSet.has(decision.stageId))
+    .map((decision) => decision.stageId);
 }
 
 /**
@@ -2924,6 +2942,18 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       kind: "skipped",
       reason: "non-terminal-ladder",
       detail: `non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+    };
+  }
+
+  // SUP-24085 F1-later: the current decision was admitted over a card with
+  // no open PR and certified no head. A PR linked later must not be stamped
+  // for that decision; skip before any GitHub read or write.
+  const uncertifiedReason = readUncertifiedFinalDelivery(row.executionState);
+  if (uncertifiedReason !== undefined) {
+    return {
+      kind: "skipped",
+      reason: "head_uncertified",
+      detail: `head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason}); refusing to stamp a head it never saw`,
     };
   }
 

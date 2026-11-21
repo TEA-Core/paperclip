@@ -257,6 +257,7 @@ import {
   changeConsentGateService,
   REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
   touchesAgentProfileChangeConsentFields,
+  type ConsumedChangeConsent,
 } from "../services/change-consent-gate.js";
 import {
   PaperclipRunnerProviderProfileError,
@@ -1603,10 +1604,13 @@ export function agentRoutes(
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
 
-  async function buildAgentAccessState(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
-    const membership = await access.getMembership(agent.companyId, "agent", agent.id);
+  async function buildAgentAccessState(
+    agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    accessSvc: ReturnType<typeof accessService> = access,
+  ) {
+    const membership = await accessSvc.getMembership(agent.companyId, "agent", agent.id);
     const grants = membership
-      ? await access.listPrincipalGrants(agent.companyId, "agent", agent.id)
+      ? await accessSvc.listPrincipalGrants(agent.companyId, "agent", agent.id)
       : [];
     const hasExplicitTaskAssignGrant = grants.some((grant) => grant.permissionKey === "tasks:assign");
 
@@ -2791,11 +2795,12 @@ export function agentRoutes(
     }
   }
 
+  /** Resolves to the consumed-consent receipt when an accepted confirmation was spent; hand it to the service door. */
   async function assertCanApplyProtectedAgentChange(
     req: Request,
     targetAgent: { id: string; companyId: string },
     targetKeys: string[],
-  ) {
+  ): Promise<ConsumedChangeConsent | undefined> {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
     }
@@ -2812,8 +2817,9 @@ export function agentRoutes(
     }
 
     if (decision.reason === "deny_missing_consent" && req.actor.type === "agent" && targetKeys.length > 0) {
+      let consent: ConsumedChangeConsent | null;
       try {
-        await changeConsentGateService(db).assertConsented({
+        consent = await changeConsentGateService(db).assertConsented({
           companyId: targetAgent.companyId,
           actorAgentId: req.actor.agentId,
           actorRunId: req.actor.runId ?? null,
@@ -2836,7 +2842,7 @@ export function agentRoutes(
         scope: { ...changeScope, consentedChange: true },
       });
       if (consentedDecision.allowed) {
-        return;
+        return consent ?? undefined;
       }
       throw forbidden(consentedDecision.explanation, authorizationDeniedDetails(consentedDecision));
     }
@@ -2845,7 +2851,7 @@ export function agentRoutes(
   }
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
-    await assertCanApplyProtectedAgentChange(
+    return assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
       [agentInstructionsChangeTargetKey(targetAgent.id)],
@@ -5150,24 +5156,71 @@ export function agentRoutes(
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }
 
-    const agent = await svc.updatePermissions(id, req.body);
+    // A request changes task assignment only when canAssignTasks is present and
+    // differs from the effective value the agent would have after this update
+    // with its current grants and membership. Otherwise the tasks:assign grant,
+    // the membership, and the stored flag stay as they are, so a single-flag
+    // change cannot move a default-sourced agent onto an explicit grant or
+    // rewrite an existing grant.
+    const requestedCanAssignTasks = req.body.canAssignTasks as boolean | undefined;
+    const { canAssignTasks: _canAssignTasks, ...permissionsWithoutTaskAssign } = req.body;
+    const grantedByUserId = req.actor.type === "board" ? (req.actor.userId ?? null) : null;
+
+    // One transaction holding the agent row lock: concurrent permission updates
+    // on the same agent read the projection and write the permissions, the
+    // membership, and the grant in one serial order.
+    const agent = await db.transaction(async (tx) => {
+      await tx.select({ id: agentsTable.id }).from(agentsTable).where(eq(agentsTable.id, id)).for("update");
+      const txDb = tx as unknown as Db;
+      const txAccess = accessService(txDb);
+      const projectedAccess = await buildAgentAccessState(
+        { ...existing, permissions: { ...existing.permissions, canCreateAgents: req.body.canCreateAgents } },
+        txAccess,
+      );
+      // The projection ignores grants when the agent has no membership row, so
+      // a false request must still revoke a stored grant there.
+      const hasStoredTaskAssignGrant = (await txAccess.listPrincipalGrants(existing.companyId, "agent", existing.id))
+        .some((grant) => grant.permissionKey === "tasks:assign");
+      const changesTaskAssign =
+        requestedCanAssignTasks !== undefined &&
+        (requestedCanAssignTasks !== projectedAccess.canAssignTasks ||
+          (requestedCanAssignTasks === false && hasStoredTaskAssignGrant));
+
+      const updated = await agentService(txDb).updatePermissions(
+        id,
+        changesTaskAssign ? req.body : permissionsWithoutTaskAssign,
+      );
+      if (!updated) return updated;
+      if (!changesTaskAssign) {
+        // A false request reaches this point only when it read no stored grant
+        // and the agent has no role or creator grant. Grant writers outside this
+        // route do not take the agent row lock, so delete a tasks:assign row
+        // they committed after that read, as the unconditional write used to.
+        if (requestedCanAssignTasks === false) {
+          await txAccess.setPrincipalPermission(updated.companyId, "agent", updated.id, "tasks:assign", false, grantedByUserId);
+        }
+        return updated;
+      }
+
+      const grantTaskAssign =
+        updated.role === "ceo" || Boolean(updated.permissions?.canCreateAgents) || requestedCanAssignTasks === true;
+      await txAccess.ensureMembership(updated.companyId, "agent", updated.id, "member", "active");
+      await txAccess.setPrincipalPermission(
+        updated.companyId,
+        "agent",
+        updated.id,
+        "tasks:assign",
+        grantTaskAssign,
+        grantedByUserId,
+      );
+      return updated;
+    });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
-    const effectiveCanAssignTasks =
-      agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
-    await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
-    await access.setPrincipalPermission(
-      agent.companyId,
-      "agent",
-      agent.id,
-      "tasks:assign",
-      effectiveCanAssignTasks,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-
+    const detail = await buildAgentDetail(agent);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
@@ -5183,12 +5236,13 @@ export function agentRoutes(
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canCreateSkills: agent.permissions?.canCreateSkills ?? true,
-        canAssignTasks: effectiveCanAssignTasks,
+        canAssignTasks: detail.access.canAssignTasks,
+        requestedCanAssignTasks: requestedCanAssignTasks ?? null,
         trustPreset: agent.permissions?.trustPreset ?? "standard",
       },
     });
 
-    res.json(await buildAgentDetail(agent));
+    res.json(detail);
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
@@ -5393,10 +5447,10 @@ export function agentRoutes(
       if (req.body.baseHash !== undefined) req.body.baseRevisionId = req.body.baseHash === null ? null : agentFileTokenFromHash(req.body.baseHash);
       if (req.body.baseRevisionId === undefined) throw unprocessable("Read the entry and supply baseRevisionId (null for a new entry)", { code: "INSTRUCTION_BASE_REQUIRED" });
       // Clearing legacy prompt configuration remains a protected config change.
-      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing);
+      const consent = req.body.clearLegacyPromptTemplate ? await assertCanManageInstructionsPath(req, existing) : undefined;
       const receipt = await instructionRevisions.commit({ companyId: existing.companyId, agentId: existing.id,
         entryFile, content: req.body.content, baseRevisionId: req.body.baseRevisionId,
-        source: req.actor.type === "board" ? "board" : "api" }, req.actor);
+        source: req.actor.type === "board" ? "board" : "api" }, req.actor, consent);
       if (req.actor.type === "agent" && req.actor.runId) {
         await instructionWorkingCopies.acknowledgeExplicitSave({ companyId: existing.companyId, agentId: existing.id,
           runId: req.actor.runId, entryFile: receipt.revision.entryFile, revisionId: receipt.revision.id,
@@ -5414,13 +5468,13 @@ export function agentRoutes(
       res.json(instructionFileDetail(receipt, receipt));
       return;
     }
-    await assertCanManageInstructionsPath(req, existing);
+    const consent = await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
       if (req.body.baseHash === undefined) throw unprocessable("Read the file and supply baseHash (null for a new file)");
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: req.body.path,
-        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor);
+        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor, consent);
       res.json(await instructions.readFile(existing, req.body.path)); return;
     }
     const actor = getActorInfo(req);
@@ -5530,7 +5584,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
+    const consent = await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";
@@ -5542,7 +5596,7 @@ export function agentRoutes(
     if (agentInstructionsBundleMode(existing) === "managed") {
       const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
       if (baseHash === null) throw unprocessable("Read the file and supply baseHash before deleting it");
-      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
+      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor, consent);
       res.json(await instructions.getBundle(existing)); return;
     }
     const actor = getActorInfo(req);
