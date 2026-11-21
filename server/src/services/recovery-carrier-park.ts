@@ -118,7 +118,7 @@ export function recoveryCarrierParkService(db: Db) {
       const created = await treeControl.createHold(companyId, carrier.id, { mode: "pause", reason: input.reason,
         releasePolicy: { strategy: "manual" }, actor: { actorType: "user", actorId: actor.actorId, userId: actor.actorId } });
       await tx.update(issueTreeHolds).set({ recoveryCarrierPark: binding }).where(eq(issueTreeHolds.id, created.hold.id));
-      await logActivityInTransaction(runner, { ...actor, companyId, action: "issue.recovery_carrier_parked", entityType: "issue", entityId: carrier.id,
+      await logActivityInTransaction(runner, { ...actor, boardApiKeyId: actor.boardApiKeyId, companyId, action: "issue.recovery_carrier_parked", entityType: "issue", entityId: carrier.id,
         details: { holdId: created.hold.id, sourceIssueId: source.id, recoveryActionId: action.id, decisionInteractionId: decision.id,
           reason: input.reason, historicalBlockers: blockers.map(row => ({ id: row.id, status: row.status, statusVersion: row.statusVersion })) } }, publications);
       return { hold: { ...created.hold, recoveryCarrierPark: binding }, created: true };
@@ -140,7 +140,7 @@ export function recoveryCarrierParkService(db: Db) {
       const [released] = await tx.update(issueTreeHolds).set({ status: "released", releasedAt: new Date(), releasedByActorType: "user",
         releasedByUserId: actor.actorId, releaseReason: input.reason, updatedAt: new Date() }).where(eq(issueTreeHolds.id, hold.id)).returning();
       const runner = tx as unknown as Db; // Same query surface; transaction is retained for audit.
-      await logActivityInTransaction(runner, { ...actor, companyId, action: "issue.recovery_carrier_park_released", entityType: "issue", entityId: carrierId,
+      await logActivityInTransaction(runner, { ...actor, boardApiKeyId: actor.boardApiKeyId, companyId, action: "issue.recovery_carrier_park_released", entityType: "issue", entityId: carrierId,
         details: { holdId, recoveryActionId: input.recoveryActionId, reason: input.reason, sourceActionUnchanged: true } }, publications);
       return released;
     });

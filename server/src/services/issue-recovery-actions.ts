@@ -9,6 +9,7 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+import { isTransactionHandle } from "./db-handle.js";
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
 import { REVIEW_PARTICIPANT_LIVE_WINDOW_MS, participantRanSince } from "./recovery/participant-liveness.js";
 
@@ -1126,7 +1127,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction | null> {
-    if (!issueRowLocked && dbOrTx === db) {
+    if (!issueRowLocked && !isTransactionHandle(dbOrTx)) {
       return db.transaction(async tx => {
         const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
           eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId),
