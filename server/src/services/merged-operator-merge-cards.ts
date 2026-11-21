@@ -520,6 +520,13 @@ export function createMergedOperatorMergeCardSweepService(
           if (!updated) {
             throw new Error("merged operator merge card vanished before close");
           }
+          // SUP-23925: the deferred tier close rows commit on THIS
+          // transaction, only after the terminal write landed.
+          if (guardVerdict.allowed && guardVerdict.closeRowAudits.length > 0) {
+            for (const audit of guardVerdict.closeRowAudits) {
+              await logActivityInTransaction(txDb, audit);
+            }
+          }
           // Dependent readiness requires the card to be done, so read it after
           // the (still uncommitted) terminal write, in this same transaction.
           const dependents =

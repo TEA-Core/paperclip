@@ -77,6 +77,28 @@ describe("delivery receipt recovery", () => {
     })).toThrow();
   });
 
+  it.each([
+    ["39 hex characters", "a".repeat(39)],
+    ["41 hex characters", "a".repeat(41)],
+    ["64 hex characters", "a".repeat(64)],
+    ["65 hex characters", "a".repeat(65)],
+    ["40 uppercase hex characters", "A".repeat(40)],
+    ["a trailing newline", `${"a".repeat(40)}\n`],
+    ["an embedded newline", `${"a".repeat(20)}\n${"a".repeat(20)}`],
+    ["an empty string", ""],
+    ["null", null],
+    ["an array", ["a".repeat(40)]],
+  ])("rejects a head SHA with %s", (_label, headSha) => {
+    expect(() => normalizeDeliveryReceiptRecoveryInput({
+      owner: "TEA-Core",
+      repo: "paperclip",
+      pullRequestNumber: 579,
+      headSha,
+      reason: "restore approved publication",
+      idempotencyKey: "recover-579",
+    })).toThrow(/headSha/);
+  });
+
   it("allows exactly one ready receipt claim", async () => {
     const db = updateDb([{ id: "receipt-1", headSha: "a".repeat(40) }]);
     const input = {

@@ -54,6 +54,8 @@ import {
   isTransientReadStatus,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
+  linkHeaderLeavesPagesUnread,
+  readOpenPullRequestEntries,
   pickMostRecentMergeQueueEjection,
   narrowToDelivered,
   preflightFinalDelivery,
@@ -687,7 +689,7 @@ function prHeadBody(sha: string, headRef = "SUP-42-branch") {
 }
 
 function installRoutes(
-  routes: Array<{ url: string | RegExp; body?: unknown; ok?: boolean; status?: number }>,
+  routes: Array<{ url: string | RegExp; body?: unknown; ok?: boolean; status?: number; headers?: Record<string, string> }>,
 ) {
   mockGhFetch.mockImplementation(async (url: string) => {
     for (const route of routes) {
@@ -697,6 +699,7 @@ function installRoutes(
           ok: route.ok ?? true,
           status: route.status ?? 200,
           json: async () => route.body ?? {},
+          headers: new Headers(route.headers ?? {}),
         } as unknown as Response;
       }
     }
@@ -2179,6 +2182,806 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
         expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
       }
+    });
+
+    // SUP-24033: a cached open+draft mention is a stale-able bit. The ordinary
+    // resolver returns head_draft from it before the merged-carrier fallback can
+    // run, so a PR that merged since still blocked final delivery. The cached
+    // draft bit is trusted only after the live read confirms a live draft.
+    it("accepts a cached open draft mention when the live read proves it merged (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    it("still refuses a cached open draft mention that is a live draft as head_draft (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open", draft: true, merged: false })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses a live draft as head_draft even when another mentioned PR is a verified merged carrier (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      await insertMention(issueId, { number: 43, state: "closed", headRefName: "SUP-43-other-branch" });
+      installRoutes([
+        ...mergedCarrierRoutes(mergedMentionBody({ state: "open", draft: true, merged: false })),
+        { url: PR_43_URL, body: mergedMentionBody() },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses a stale cached open draft whose live read is unreadable (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        { url: PR_URL, body: { message: "rate limited" }, ok: false, status: 429 },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+    });
+
+    // Release-assurance NO-GO c2: the revalidation must never admit a PR the
+    // card merely cites. The cached draft row's repo+branch must be the card's
+    // own delivery before a live-merged read can carry it.
+    it("refuses a foreign merged PR held as a stale cached open draft (SUP-24033 c2)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 77, state: "open", draft: true, headRefName: "SUP-99-foreign-branch" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        // The live read says merged and (hostile) reports the card's own branch.
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/pulls/77`, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#77`);
+      }
+    });
+
+    // Release-assurance NO-GO cr1: a draft that LIVE workspace discovery finds
+    // on the delivery branch is a live draft; a merged cached mention must not
+    // mask it. Only cached-only draft bits are revalidated.
+    it("refuses a live-discovered draft even when a closed merged mention exists (SUP-24033 cr1)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455, draft: true })] },
+        { url: PR_URL, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#455`);
+      }
+    });
+
+    // The revalidated carrier takes the same live verification as every other
+    // merged carrier: unproven containment and a live head that is not the
+    // card's delivery both stay refused (kills a mutant that skips the shared
+    // verification stage on this entry path).
+    it("refuses a stale-draft merged carrier whose merge commit is not on the base branch (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody(), { status: "ahead", ahead_by: 2 }));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("head_merged_unproven");
+      }
+    });
+
+    it("refuses a stale-draft merged carrier whose live head branch is not the card's delivery (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({
+        head: { ref: "SUP-99-other-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not_delivered");
+      }
+    });
+
+    // CodeRabbit minor: the cap must bound the list the live reads actually use.
+    // Mentions added AFTER the cap check (here: right before a second mention
+    // query would start) must not widen the live-read set.
+    it("keeps live reads inside the checked mention list when mentions are added after the cap check (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
+      // PR 50 is a LIVE OPEN DRAFT. It sits in the checked list, so it is read and
+      // it blocks the merged carrier (42). The injected mentions are not in the
+      // checked list and must never be read. A mocked read of PR 50 (instead of an
+      // unmocked throw) makes the head_draft refusal below a real guard result.
+      const routes50 = [
+        ...mergedCarrierRoutes(),
+        {
+          url: `https://api.github.com/repos/${OWNER}/${REPO}/pulls/50`,
+          body: {
+            state: "open", draft: true, merged: false, title: "Fix thing (SUP-42)",
+            head: { ref: "SUP-50-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+      ];
+      installRoutes(routes50);
+      mockGhFetch.mockClear();
+      installRoutes(routes50);
+
+      let mentionQueries = 0;
+      let injected = false;
+      const injectMentions = async () => {
+        if (injected) return;
+        injected = true;
+        for (let n = 60; n < 66; n++) {
+          await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+        }
+      };
+      const wrapBuilder = (builder: any): any =>
+        new Proxy(builder, {
+          get(target, prop) {
+            if (prop === "then") {
+              return (resolve: any, reject: any) => injectMentions().then(() => target.then(resolve, reject));
+            }
+            const value = target[prop];
+            return typeof value === "function" ? (...args: unknown[]) => wrapBuilder(value.apply(target, args)) : value;
+          },
+        });
+      // Every mention query is db.select(...).from(externalObjectMentions)...; the
+      // preflight issues the first two before the cap check. Any later one is
+      // preceded by the injected rows, so a second read of the list sees 8 PRs.
+      const racingDb = new Proxy(db, {
+        get(target, prop) {
+          const value = (target as any)[prop];
+          if (prop !== "select") return typeof value === "function" ? value.bind(target) : value;
+          return (...args: unknown[]) => {
+            const builder = value.apply(target, args);
+            return new Proxy(builder, {
+              get(b, p) {
+                const member = b[p];
+                if (p !== "from" || typeof member !== "function") {
+                  return typeof member === "function" ? member.bind(b) : member;
+                }
+                return (...fromArgs: unknown[]) => {
+                  const next = member.apply(b, fromArgs);
+                  if (fromArgs[0] !== externalObjectMentions) return next;
+                  mentionQueries += 1;
+                  return mentionQueries >= 4 ? wrapBuilder(next) : next;
+                };
+              },
+            });
+          };
+        },
+      }) as typeof db;
+
+      const result = await preflightFinalDelivery(racingDb, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      const reads = (pattern: RegExp) => mockGhFetch.mock.calls.filter(([url]) => pattern.test(String(url)));
+      expect(reads(/\/pulls\/50$/).length).toBeGreaterThan(0);
+      expect(reads(/\/pulls\/6\d$/)).toHaveLength(0);
+    });
+
+    // Release-assurance NO-GO N1: drafts never contribute repo pairs to the live
+    // workspace discovery. When the only scanned repo is ANOTHER repo, the card's
+    // own repo was never listed, so an owned live draft there is unseen; the
+    // cached draft bit cannot be called stale and the base refusal must stand.
+    describe("stale-draft revalidation pins (SUP-24033)", () => {
+      const OTHER_OWNER = "other-org";
+      const OTHER_REPO = "other-repo";
+      const pr = (n: number, owner = OWNER, repo = REPO) => `https://api.github.com/repos/${owner}/${repo}/pulls/${n}`;
+      const closedUnmerged = (overrides: Record<string, unknown> = {}) => ({
+        state: "closed",
+        draft: false,
+        merged: false,
+        title: "Fix thing (SUP-42)",
+        head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+        ...overrides,
+      });
+
+      it("refuses when the card's own repo was not scanned by discovery (N1)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, {
+          number: 9, state: "closed", owner: OTHER_OWNER, repo: OTHER_REPO, headRefName: "SUP-9-branch",
+        });
+        installRoutes([
+          { url: `https://api.github.com/repos/${OTHER_OWNER}/${OTHER_REPO}/pulls?state=open&per_page=100`, body: [] },
+          { url: pr(9, OTHER_OWNER, OTHER_REPO), body: closedUnmerged({ head: { ref: "SUP-9-branch", sha: "other00000000000000000000000000000000001", repo: { full_name: `${OTHER_OWNER}/${OTHER_REPO}` } } }) },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        }
+      });
+
+      // F1: a draft that live discovery DOES list beside a cached stale draft is a
+      // live draft; the merged cached draft must not mask it.
+      it("refuses a live-discovered draft beside a merged cached draft mention (F1)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455, draft: true })] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(50), body: closedUnmerged() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#455`);
+        }
+      });
+
+      it("refuses when another mention is a live open draft beside the merged cached draft", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(44), body: closedUnmerged({ state: "open", draft: true }) },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      it("ignores a CLOSED unmerged mention that still reads draft (only live OPEN drafts block)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(44), body: closedUnmerged({ draft: true }) },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("resolved");
+      });
+
+      // Release-assurance T2: the open-PR list is ONE 100-entry page. A repo whose
+      // page came back full was not read completely, so a live draft past it is
+      // invisible; the stale-draft revalidation must keep the base refusal. Under
+      // a full page the mock returns only the first page, exactly as GitHub does
+      // for 101 and 250 open PRs.
+      const fillerPage = (count: number) =>
+        Array.from({ length: count }, (_, i) =>
+          openPrsListItem({ number: 1000 + i, head: { ref: `unrelated-${i}` }, title: `Unrelated ${i}`, body: null }));
+      type TestRoute = { url: string | RegExp; body?: unknown; ok?: boolean; status?: number; headers?: Record<string, string> };
+      const pageRoutes = (page: unknown[], headers?: Record<string, string>): TestRoute[] => [
+        { url: OPEN_PRS_LIST_URL, body: page, headers },
+        { url: PR_URL, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ];
+
+      it.each([
+        ["99 open PRs (page not full): read completely, merged carrier accepted", 99, "resolved"],
+        ["exactly 100 open PRs (page full): cannot prove nothing lies past it", 100, "unresolvable"],
+        ["101 open PRs (first page returned): live draft may sit on page 2", 100, "unresolvable"],
+        ["250 open PRs (first page returned): live draft may sit on a later page", 100, "unresolvable"],
+      ] as const)("open-PR page boundary: %s (T2)", async (_label, returned, expected) => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        installRoutes(pageRoutes(fillerPage(returned)));
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe(expected);
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        }
+      });
+
+      it("counts a full page on the raw response even when malformed entries are dropped (T2)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        installRoutes(pageRoutes([...fillerPage(99), "malformed-entry"]));
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      // Mention-read cap boundary: 5 cited PRs may be read, a 6th turns the
+      // revalidation off with zero live reads.
+      it.each([
+        ["5 cited PRs (at the cap): revalidated and accepted", 4, "resolved"],
+        ["6 cited PRs (over the cap): refused without any live read", 5, "unresolvable"],
+      ] as const)("mention cap boundary: %s", async (_label, extraClosed, expected) => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        const routes: TestRoute[] = [...pageRoutes([])];
+        for (let n = 50; n < 50 + extraClosed; n++) {
+          await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+          routes.push({ url: pr(n), body: closedUnmerged() });
+        }
+        installRoutes(routes);
+        mockGhFetch.mockClear();
+        installRoutes(routes);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe(expected);
+        if (expected === "unresolvable") {
+          expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
+        }
+      });
+
+      // R4L / round 7: the scan reads ONLY page 1 (no page parameter). A page counts
+      // as scanned only when it is short, well-formed, and its Link header is
+      // absent or carries nothing but rel=self. A real GitHub page-1 response never
+      // carries prev/first and carries next+last when more pages exist, so any
+      // other Link relation, a link-value with no rel, or an extra parameter means
+      // the list may be longer than what was read: the base head_draft stands.
+      describe("Link header and malformed entries on the open-PR page (R4L, R7)", () => {
+        // The page-1 self link of this exact request: the only Link the scan accepts.
+        const U = `<${OPEN_PRS_LIST_URL}>`;
+        const run = async (headers?: Record<string, string>, entries: unknown[] = fillerPage(50)) => {
+          const issueId = await insertIssue();
+          await insertMention(issueId, { number: 42, state: "open", draft: true });
+          installRoutes(pageRoutes(entries, headers));
+          return preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+        };
+        const expectRefused = (result: Awaited<ReturnType<typeof run>>) => {
+          expect(result.kind).toBe("unresolvable");
+          if (result.kind === "unresolvable") {
+            expect(result.reason).toMatch(/^head_draft:/);
+            expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+          }
+        };
+
+        it("refuses a short page that carries Link rel=next and rel=last", async () => {
+          expectRefused(await run({ link: `${U}; rel="next", ${U.replace("page=2", "page=9")}; rel="last"` }));
+        });
+
+        it.each([
+          ["no Link header (a short list that fit one page)", undefined],
+          ["Link rel=self alone", { link: `${U}; rel="self"` }],
+          ["Link rel=self unquoted, mixed case", { link: `${U}; REL=Self` }],
+        ] as const)("admits the verified merged carrier on a short page with %s", async (_label, headers) => {
+          expect((await run(headers as Record<string, string> | undefined)).kind).toBe("resolved");
+        });
+
+        // Round 6: spellings of a next page that an earlier parser read as none.
+        it.each([
+          ["single-quoted rel", `${U}; rel='next'`],
+          ["trailing comma after rel=next", `${U}; rel="next",`],
+          ["unterminated quote", `${U}; rel="next`],
+          ["escaped rel value", `${U}; rel="\\next"`],
+          ["rel* extended parameter", `${U}; rel*=UTF-8''next`],
+        ] as const)("refuses a short page whose Link header spells next as: %s", async (_label, link) => {
+          expectRefused(await run({ link }));
+        });
+
+        // Round 7 (R7-1): a link-value with no rel proves nothing about the list.
+        it.each([
+          ["no rel at all", U],
+          ["only title=", `${U}; title="page two"`],
+          ["only rev=", `${U}; rev="next"`],
+          ["only foo=", `${U}; foo=bar`],
+          ["no rel as the second link-value after a valid rel=self", `<https://api.github.com/x?page=1>; rel="self", ${U}`],
+          ["an extra parameter beside rel=self", `${U}; rel="self"; title="t"`],
+        ] as const)("refuses a short page whose Link has a link-value with %s", async (_label, link) => {
+          expectRefused(await run({ link }));
+        });
+
+        // Round 7 (R7-2): none of these is a page-1 response of a complete list.
+        it.each([
+          ["rel=last alone", `${U.replace("page=2", "page=5")}; rel="last"`],
+          ["rel=LAST alone", `${U.replace("page=2", "page=5")}; REL="LAST"`],
+          ["rel=last with anchor=", `${U}; rel="last"; anchor="#x"`],
+          ["rel=last with rev=next", `${U}; rel="last"; rev="next"`],
+          ["rel=prev alone", `${U}; rel="prev"`],
+          ["rel=first alone", `${U}; rel="first"`],
+          ["rel=previous alone", `${U}; rel="previous"`],
+          ["the final-page shape prev + first", `${U}; rel="prev", ${U}; rel="first"`],
+          ["a self link beside a last link", `${U}; rel="self", ${U}; rel="last"`],
+          ["two Link header lines joined (one empty)", `${U}; rel="self", `],
+          ["an unknown relation (a proxy-added canonical)", `${U}; rel="canonical"`],
+        ] as const)("refuses a short page whose Link header is %s", async (_label, link) => {
+          expectRefused(await run({ link }));
+        });
+
+        it.each([
+          ["empty Link header", ""],
+          ["garbage Link header", "this is not a link header"],
+          ["unterminated target", '<https://api.github.com/x?page=2; rel="next"'],
+          ["target missing its angle brackets", 'https://api.github.com/x?page=2; rel="next"'],
+        ] as const)("refuses on a malformed Link header: %s (fail closed)", async (_label, link) => {
+          expectRefused(await run({ link }));
+        });
+
+        // Round 9: a rel=self link must name page 1 of THIS request. A self link to
+        // another page, a relative, empty or other-host target, or any other query,
+        // describes some other list.
+        it.each([
+          ["page 1 of this request", `<${OPEN_PRS_LIST_URL}>`],
+          ["page=1 given explicitly", `<${OPEN_PRS_LIST_URL}&page=1>`],
+          ["the same query in another order, page=1", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?per_page=100&page=1&state=open>`],
+          ["an upper-case host", `<https://API.GITHUB.COM/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+        ] as const)("admits a short page whose rel=self target is %s", async (_label, target) => {
+          expect((await run({ link: `${target}; rel="self"` })).kind).toBe("resolved");
+        });
+
+        it.each([
+          ["page 2 of this request", `<${OPEN_PRS_LIST_URL}&page=2>`],
+          ["page 3", `<${OPEN_PRS_LIST_URL}&page=3>`],
+          ["page=01", `<${OPEN_PRS_LIST_URL}&page=01>`],
+          ["page given twice", `<${OPEN_PRS_LIST_URL}&page=1&page=1>`],
+          ["a relative target", `</repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["an empty target", "<>"],
+          ["another host", `<https://example.test/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["another scheme", `<http://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["another repository path", `<https://api.github.com/repos/${OWNER}/other/pulls?state=open&per_page=100>`],
+          ["another per_page", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=50>`],
+          ["another state", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=closed&per_page=100>`],
+          ["an extra query parameter", `<${OPEN_PRS_LIST_URL}&sort=updated>`],
+          ["a fragment", `<${OPEN_PRS_LIST_URL}#x>`],
+          ["a target that is not a URL", "<not a url>"],
+        ] as const)("refuses a short page whose rel=self target is %s", async (_label, target) => {
+          expectRefused(await run({ link: `${target}; rel="self"` }));
+        });
+
+        it("refuses a short page with self links for page 1 and page 2", async () => {
+          expectRefused(await run({ link: `<${OPEN_PRS_LIST_URL}>; rel="self", <${OPEN_PRS_LIST_URL}&page=2>; rel="self"` }));
+        });
+
+        // Round 7 / round 9 (owner ruling, allow-list rule): every field of a list
+        // entry that a consumer reads to decide ownership, liveness, draft state or
+        // anchoring (number, head.ref, title, draft) is validated. A violation marks the
+        // list incomplete even when the entry is otherwise unowned, so each cell below
+        // isolates ONE field check: the entry is well-formed in every other field and
+        // owned by nothing, so only the parser's validation can refuse it.
+        const UNOWNED = { number: 7, draft: false, head: { ref: "unrelated-7" }, title: "Unrelated 7", body: null };
+        const ABSENT = Symbol("absent");
+        const withField = (field: string, value: unknown): unknown => {
+          const entry: Record<string, unknown> = { ...UNOWNED, head: { ...UNOWNED.head } };
+          const set = (target: Record<string, unknown>, key: string) => {
+            if (value === ABSENT) delete target[key];
+            else target[key] = value;
+          };
+          if (field === "head.ref") set(entry.head as Record<string, unknown>, "ref");
+          else set(entry, field);
+          return entry;
+        };
+        const NOT_A_STRING = [["null", null], ["absent", ABSENT], ["a number", 7], ["a boolean", true], ["an array", ["x"]], ["an object", { a: 1 }]] as const;
+        it.each([
+          ...NOT_A_STRING.map(([label, v]) => ["title", label, v] as const),
+          ...NOT_A_STRING.map(([label, v]) => ["head.ref", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "7"], ["a boolean", true], ["an array", [7]], ["an object", { a: 1 }],
+            ["fractional", 1.5], ["negative", -1], ["zero", 0], ["unsafe", 2 ** 60]].map(([label, v]) => ["number", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "false"], ["a number", 0], ["an array", [false]], ["an object", { a: 1 }]].map(([label, v]) => ["draft", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "x"], ["a number", 7], ["an array", []]].map(([label, v]) => ["head", label, v] as const),
+        ] as const)("refuses a short page holding an otherwise unowned entry whose %s is %s", async (field, _label, value) => {
+          expectRefused(await run(undefined, [...fillerPage(10), withField(field, value)]));
+        });
+
+        it.each([
+          ["an entry that is a JSON string", "50"],
+          ["a null entry", null],
+          ["an entry that is an array", [UNOWNED]],
+          ["an entry that is a number", 50],
+          ["an entry that is a boolean", true],
+        ] as const)("refuses a short page that holds %s", async (_label, entry) => {
+          expectRefused(await run(undefined, [...fillerPage(10), entry]));
+        });
+
+        it("admits a short page whose only extra entries are well-formed and unowned, with every other field varied (control)", async () => {
+          const varied = [
+            { ...UNOWNED, body: null }, { ...UNOWNED, number: 8, body: "text", draft: true },
+            { ...UNOWNED, number: 9, title: "", head: { ref: "", sha: 3 } },
+            { ...UNOWNED, number: 10, user: null, state: 7, merged_at: ["x"] },
+          ];
+          expect((await run(undefined, varied)).kind).toBe("resolved");
+        });
+
+        it("refuses a short page that holds 99 malformed entries", async () => {
+          expectRefused(await run(undefined, Array.from({ length: 99 }, () => null)));
+        });
+
+        it("still admits a short page of well-formed entries with no Link header (control)", async () => {
+          expect((await run(undefined, fillerPage(10))).kind).toBe("resolved");
+        });
+      });
+
+      // Unit cells run against the request the scan issues; U is its page-1 self link.
+      const REQ_URL = OPEN_PRS_LIST_URL;
+      const U = `<${REQ_URL}>`;
+      const leaves = (header: string | null) => linkHeaderLeavesPagesUnread(header, REQ_URL);
+      // The only headers proven to be a complete page-1 list.
+      it.each([
+        ["rel=self", `${U}; rel="self"`],
+        ["rel=self unquoted", `${U}; rel=self`],
+        ["rel=SELF quoted upper case", `${U}; REL="SELF"`],
+        ["rel list of self tokens", `${U}; rel="self self"`],
+        ["spacing around separators", `${U} ; rel = "self" ,  ${U} ;rel=self`],
+        ["tabs as whitespace", `${U};\trel="self"`],
+        ["two self links", `${U}; rel="self", ${U}; rel="self"`],
+        ["a self link with page=1 given explicitly", `<${REQ_URL}&page=1>; rel="self"`],
+        ["the same query in another order, page=1", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?per_page=100&page=1&state=open>; rel="self"`],
+        ["a repeated rel parameter, all self", `${U}; rel="self"; rel=self`],
+      ])("linkHeaderLeavesPagesUnread proves a complete list for %s", (_label, header) => {
+        expect(leaves(header)).toBe(false);
+      });
+
+      it("linkHeaderLeavesPagesUnread: only an absent header is no header", () => {
+        expect(leaves(null)).toBe(false);
+        expect(leaves("")).toBe(true);
+        expect(leaves("   ")).toBe(true);
+      });
+
+      // Everything else leaves the page unread.
+      it.each([
+        // next-page spellings (canonical and decorated)
+        ["rel=next", `${U}; rel="next"`],
+        ["rel=next unquoted", `${U}; rel=next`],
+        ["REL=NEXT", `${U}; REL="NEXT"`],
+        ["rel token list with next", `${U}; rel="prev next"`],
+        ["rel=self next", `${U}; rel="self next"`],
+        ["next in the second link", `${U}; rel="self", ${U}; rel="next"`],
+        ["single-quoted rel", `${U}; rel='next'`],
+        ["trailing comma", `${U}; rel="next",`],
+        ["trailing comma after self", `${U}; rel="self",`],
+        ["unterminated quote", `${U}; rel="next`],
+        ["escaped value", `${U}; rel="\\next"`],
+        ["escaped quote hiding a self rel", `${U}; title="a\\"; rel="self"`],
+        ["rel* extended parameter", `${U}; rel*=UTF-8''next`],
+        ["trailing NUL after the value", `${U}; rel="self"\u0000`],
+        // round 7: no rel / non-self relations / extra parameters
+        ["no rel", U],
+        ["a title only", `${U}; title="t"`],
+        ["rev only", `${U}; rev="next"`],
+        ["foo only", `${U}; foo=bar`],
+        ["no rel in the second link-value", `${U}; rel="self", ${U}`],
+        ["no rel in the first link-value", `${U}, ${U}; rel="self"`],
+        ["a self link to page 2", `<${REQ_URL}&page=2>; rel="self"`],
+        ["a self link with a relative target", `</repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>; rel="self"`],
+        ["a self link with an empty target", "<>; rel=\"self\""],
+        ["a self link to another host", `<https://example.test/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>; rel="self"`],
+        ["a self link with a comma in a foreign target", '<https://a.test/x?q=a,b&page=1>; rel="self"'],
+        ["self links for page 1 and page 2", `${U}; rel="self", <${REQ_URL}&page=2>; rel="self"`],
+        ["rel=last", `${U}; rel="last"`],
+        ["rel=prev", `${U}; rel="prev"`],
+        ["rel=first", `${U}; rel="first"`],
+        ["rel=previous", `${U}; rel="previous"`],
+        ["rel=canonical", `${U}; rel="canonical"`],
+        ["a self rel beside a last token", `${U}; rel="self last"`],
+        ["extra non-rel parameter beside self", `${U}; rel="self"; title="t"`],
+        ["a non-rel parameter whose value is self", `${U}; rel="self"; title="self"`],
+        ["a non-rel parameter named like rel", `${U}; rel="self"; relx=self`],
+        ["extra extended parameter beside self", `${U}; rel="self"; title*=UTF-8''t`],
+        ["flag parameter", `${U}; rel="self"; flag`],
+        ["flag parameter before rel", `${U}; flag; rel="self"`],
+        ["empty parameter name with a value", `${U}; ="self"`],
+        ["trailing semicolon", `${U}; rel="self";`],
+        ["empty parameter", `${U};; rel="self"`],
+        ["empty parameter value", `${U}; rel="self"; title=`],
+        ["empty rel value", `${U}; rel=""`],
+        ["blank rel value", `${U}; rel="  "`],
+        ["single-quoted harmless rel", `${U}; rel='self'`],
+        ["garbage after the target", `${U} rel="self"`],
+        ["unterminated target", '<https://api.github.com/x?page=2; rel="self"'],
+        ["no angle brackets", 'https://api.github.com/x?page=2; rel="self"'],
+        ["nested angle bracket", '<a<b>; rel="self"'],
+        ["garbage link after a valid one", `${U}; rel="self", garbage`],
+        ["empty header", ""],
+        ["blank header", "   "],
+        ["comma only", ","],
+      ])("linkHeaderLeavesPagesUnread leaves the page unread on %s", (_label, header) => {
+        expect(leaves(header)).toBe(true);
+      });
+
+      // Exhaustive property over a small grammar: up to two link-values, each with up
+      // to two parameters from a mixed alphabet. The header proves a complete list
+      // exactly when every link-value is made only of rel parameters whose tokens are
+      // all `self`, with at least one rel in each, and no empty parameter.
+      it("linkHeaderLeavesPagesUnread: whitelist oracle over every header of the grammar", () => {
+        const alphabet = [
+          'rel="self"', "rel=self", 'rel="prev"', 'rel="last"', 'rel="next"', 'rel="first"',
+          'title="t"', "rev=next", "foo=bar", "",
+        ];
+        const isSelfRel = (param: string) => param === 'rel="self"' || param === "rel=self";
+        const paramLists: string[][] = [[]];
+        for (const a of alphabet) {
+          paramLists.push([a]);
+          for (const b of alphabet) paramLists.push([a, b]);
+        }
+        const linkOk = (params: string[]) =>
+          params.length > 0 && params.every(isSelfRel);
+        const render = (params: string[]) => `${U}${params.map((param) => `; ${param}`).join("")}`;
+        let checked = 0;
+        for (const first of paramLists) {
+          expect(leaves(render(first)), render(first)).toBe(!linkOk(first));
+          checked += 1;
+          for (const second of paramLists) {
+            const header = `${render(first)}, ${render(second)}`;
+            expect(leaves(header), header).toBe(!(linkOk(first) && linkOk(second)));
+            checked += 1;
+          }
+        }
+        expect(checked).toBeGreaterThan(8000);
+      });
+
+      // Property over (field x value) for every field a consumer reads. The oracle
+      // states the allow-list: an entry is well-formed exactly when it is an object
+      // with a safe positive integer number, a head object with a string ref, a string
+      // title and a boolean draft. Any other value in any of those fields is malformed.
+      it("readOpenPullRequestEntries: the field table, every field x every value", () => {
+        const ABSENT = Symbol("absent");
+        const universe: unknown[] = [null, ABSENT, 0, -1, 1, 7, 1.5, 2 ** 60, "", "x", "7", true, false, [], ["x"], {}, { ref: "r" }];
+        const validators: Record<string, (value: unknown) => boolean> = {
+          number: (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+          title: (v) => typeof v === "string",
+          draft: (v) => typeof v === "boolean",
+          "head.ref": (v) => typeof v === "string",
+          head: (v) => typeof v === "object" && v !== null && !Array.isArray(v) && typeof (v as { ref?: unknown }).ref === "string",
+        };
+        const base = () => ({ number: 7, draft: false, head: { ref: "unrelated-7" } as Record<string, unknown>, title: "t", body: null }) as Record<string, unknown>;
+        expect(readOpenPullRequestEntries([base()]).malformed).toBe(false);
+        let cells = 0;
+        for (const [field, valid] of Object.entries(validators)) {
+          for (const value of universe) {
+            const entry = base();
+            const target = (field === "head.ref" ? entry.head : entry) as Record<string, unknown>;
+            const key = field === "head.ref" ? "ref" : field;
+            if (value === ABSENT) delete target[key];
+            else target[key] = value;
+            const { items, malformed } = readOpenPullRequestEntries([entry]);
+            const expectValid = value !== ABSENT && valid(value);
+            expect(malformed, `${field} = ${String(value === ABSENT ? "absent" : JSON.stringify(value))}`).toBe(!expectValid);
+            expect(items.length).toBe(typeof entry.number === "number" && Number.isSafeInteger(entry.number) && (entry.number as number) > 0 ? 1 : 0);
+            cells += 1;
+          }
+        }
+        expect(cells).toBeGreaterThan(60);
+        for (const entry of [null, "x", 1, true, [], [base()], undefined]) {
+          expect(readOpenPullRequestEntries([entry]).malformed, JSON.stringify(entry)).toBe(true);
+        }
+        expect(readOpenPullRequestEntries([]).malformed).toBe(false);
+        // body, user, state, merged_at are read by no consumer and are not validated.
+        expect(readOpenPullRequestEntries([{ ...base(), body: 3, user: null, state: [], merged_at: {} }]).malformed).toBe(false);
+      });
+
+      it("linkHeaderLeavesPagesUnread stays linear-time on hostile input", () => {
+        const started = Date.now();
+        for (const hostile of [
+          ";".repeat(1_000_000),
+          `${U}${"; a=b".repeat(150_000)}`,
+          "<".repeat(500_000),
+          `${U}; rel="${"x ".repeat(300_000)}"`,
+          `${U}, `.repeat(100_000),
+        ]) {
+          leaves(hostile);
+        }
+        expect(Date.now() - started).toBeLessThan(10_000);
+      });
+
+      it("refuses when only some cached drafts are the card's own delivery", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 43, state: "open", draft: true, headRefName: "SUP-99-foreign-branch" });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(43), body: closedUnmerged() },
+          { url: pr(44), body: closedUnmerged() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      it("refuses when the merged mention is not one of the revalidated cached drafts", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 43, state: "closed", headRefName: "SUP-43-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: closedUnmerged() },
+          { url: pr(43), body: mergedMentionBody() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+    });
+
+    it("refuses without fanning out when the card cites more mentions than the live-read cap (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      for (let n = 50; n < 56; n++) {
+        await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+      }
+      installRoutes(mergedCarrierRoutes());
+      mockGhFetch.mockClear();
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+      expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
     });
 
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {

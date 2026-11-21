@@ -824,6 +824,30 @@ item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
 
+The Wiki handoff guard is also skipped for a field-less write. In a field-less
+write, every present key is `undefined` or request attribution: `actorAgentId`,
+`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
+write when the route adds no field to it and the request carries no
+`reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
+call too. A field-less write sets no assignee, so the guard does not
+judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
+a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
+card is `in_review`, or `done` with its review stage complete. Known limit:
+when the card has another status while its review stage is still pending, for
+example `blocked`, or `todo` with a pending stage, the PATCH route adds fields
+to the write before the field-less check. The comment is then still refused
+with 422 `wiki_handoff_unassigned`. When the write carries any other key, the
+attribution keys still count as present keys. Thus an attributed `status` or
+`unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key that comes with attribution keys is not field-less, even
+when its value is `undefined`, because the update normalizes that value to
+`null` and clears the stored policy. Thus an attributed
+`executionPolicy: undefined` write still runs the guard. A bare
+`executionPolicy: undefined` write, with no other present key, skips the guard
+and clears the stored policy, as the paragraph above states. That behavior
+predates the field-less skip, and the field-less skip does not change it.
+
 The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
 can close the final stage of an unassigned Wiki handoff card. That hand-back
 has no return-to, so the route drops the no-op `assigneeAgentId: null` and
@@ -1059,6 +1083,8 @@ An expired legacy run records that provider work never started. Stranded-work re
 One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. The candidate query leaves out runs the bound does not expire: a run whose retry alarm is in the future, and a run whose issue another running run holds. So older runs that must wait cannot fill the pages and hide a newer stuck run. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. The query also leaves out a run whose `issueId` is not a canonical issue id (for example a number or padded text). Such a run names no issue and holds no issue lock; this pass never expires it. A malformed recovery action id or comment id in a run's context is read as absent, so it cannot make the decision fail. If one candidate still fails, the pass logs it, skips it, and continues; cancellations already committed keep their effects. A pass that stops at either cap resumes after the last run it visited on the next pass, and a pass that reaches the end of the list starts the next one from the oldest run. So every listed run is visited within ceil(listed / 2,000) passes, and a run the bound expires is cancelled within ceil(expirable ahead of it / 100) passes. The resume position lives in server memory; a restart begins at the oldest run.
 
 Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
+
+A queued run whose `retry_of_run_id` is its own id can never be claimed: the claim's lineage walk cannot resolve it. The claim gate therefore cancels such a run at the next claim attempt with error code `retry_lineage_invalid`, which releases its issue lock without waiting for the 24-hour bound. Stranded-work recovery never writes this lineage: it binds `retry_of_run_id` only on a run that has no lineage yet and is not the predecessor itself, and it skips the issue when its last re-read finds a live newest run. When the atomic claim leaves a queued run in the queue for any other reason, it appends one `warn` run event per run and reason (except a run another claimer already took), with the reason in `payload.claimStaleReason`.
 
 The stale-lock sweep leaves native runs with their finalization coordinator while
 same-session recovery or accepted-result finalization is pending. A provider can
