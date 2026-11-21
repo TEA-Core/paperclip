@@ -145,6 +145,7 @@ async function fetchLivePullRequest(
     let response: Response;
     try {
       response = await ghFetch(url, {
+        signal: AbortSignal.timeout(8_000),
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${candidate.token}`,
@@ -204,7 +205,7 @@ async function enumerateChildCarrierCommits(input: {
     const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/pulls/${input.pullRequestNumber}/commits?per_page=100&page=${page}`;
     let response: Response;
     try {
-      response = await ghFetch(url, { headers });
+      response = await ghFetch(url, { headers, signal: AbortSignal.timeout(8_000) });
     } catch {
       return { ok: false, reason: "child carrier commit enumeration failed: network_error" };
     }
@@ -233,7 +234,7 @@ async function enumerateChildCarrierCommits(input: {
   const compareUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/compare/${encodeURIComponent(input.baseRef)}...${encodeURIComponent(input.childBranch)}`;
   let compare: Response;
   try {
-    compare = await ghFetch(compareUrl, { headers });
+    compare = await ghFetch(compareUrl, { headers, signal: AbortSignal.timeout(8_000) });
   } catch {
     return { ok: false, reason: "child branch commit enumeration failed: network_error" };
   }
@@ -729,6 +730,17 @@ export async function carrierOwnerChildAttributionBlock(
       eq(issueChildCarrierAttributions.state, "current"),
     ));
   if (descendants.length === 0) return null;
+  const sameRepo = [];
+  for (const descendant of descendants) {
+    const card = await readChildWorkspace(db, companyId, descendant.id);
+    if (!card) continue;
+    if (
+      card.repo.owner.toLowerCase() !== owner.repo.owner.toLowerCase()
+      || card.repo.repo.toLowerCase() !== owner.repo.repo.toLowerCase()
+    ) continue;
+    sameRepo.push({ descendant, card });
+  }
+  if (sameRepo.length === 0) return null;
   const live = await fetchLivePullRequest(db, companyId, owner.repo.owner, owner.repo.repo, pr.number);
   if (!live.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
   if (pr.headSha && live.live.headSha && pr.headSha.toLowerCase() !== live.live.headSha) {
@@ -737,13 +749,7 @@ export async function carrierOwnerChildAttributionBlock(
   const headSha = live.live.headSha;
   if (!headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
   const required = new Map<string, string[]>();
-  for (const descendant of descendants) {
-    const card = await readChildWorkspace(db, companyId, descendant.id);
-    if (!card) continue;
-    if (
-      card.repo.owner.toLowerCase() !== owner.repo.owner.toLowerCase()
-      || card.repo.repo.toLowerCase() !== owner.repo.repo.toLowerCase()
-    ) continue;
+  for (const { descendant, card } of sameRepo) {
     const enumerated = await enumerateWithCredentials({
       db,
       companyId,
