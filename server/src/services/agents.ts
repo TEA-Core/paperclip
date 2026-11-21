@@ -322,7 +322,7 @@ export function hasAgentShortnameCollision(
   if (!candidateShortname) return false;
 
   return existingAgents.some((agent) => {
-    if (agent.status === "terminated") return false;
+    if (agent.status === "terminated" || agent.status === "deleted") return false;
     if (options?.excludeAgentId && agent.id === options.excludeAgentId) return false;
     return normalizeAgentUrlKey(agent.name) === candidateShortname;
   });
@@ -990,6 +990,7 @@ export function agentService(db: Db) {
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot pause deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
       return updateAgent(id, {
@@ -1003,6 +1004,7 @@ export function agentService(db: Db) {
     resume: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot resume deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot be resumed");
@@ -1019,6 +1021,7 @@ export function agentService(db: Db) {
     clearError: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot clear error on deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
@@ -1302,6 +1305,9 @@ export function agentService(db: Db) {
       if (!existing) throw notFound("Agent not found");
       if (existing.status === "pending_approval") {
         throw conflict("Cannot create keys for pending approval agents");
+      }
+      if (existing.status === "deleted") {
+        throw conflict("Cannot create keys for deleted agents");
       }
       if (existing.status === "terminated") {
         throw conflict("Cannot create keys for terminated agents");
