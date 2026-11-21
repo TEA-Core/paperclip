@@ -488,6 +488,15 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("control-plane-operation-no-deliverable");
     });
 
+    it("allows transition with decision-only-no-repository-deliverable override", async () => {
+      const override: DoneTransitionOverride = {
+        disposition: "decision-only-no-repository-deliverable",
+        reason: "The recorded decision has no repository deliverable.",
+      };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+    });
+
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
@@ -7039,6 +7048,50 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  describe("Tier 0 decision-only via accompanying comment", () => {
+    it("allows a non-empty decision-only declaration only when the decision-only override is active", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier0");
+    });
+
+    it("does not allow a Tier 0 declaration without the decision-only override", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    it("rejects Tier 1 evidence when the decision-only override requires Tier 0", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): There is nothing to land. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tier 0");
+    });
+  });
+
   describe("Tier 1 via accompanying comment", () => {
     describe("no-repository landing", () => {
       const comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.";
@@ -7185,6 +7238,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).toContain('issue.deliveryRequirement === "record_only"');
       expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
       expect(route).toContain("TIER2_RECORD_ONLY_FORM");
+      expect((route.match(/tier0Alternative/g) ?? []).length).toBeGreaterThanOrEqual(3);
+      expect(route).toContain('` or "Closed at Tier 0 (decision-only): <reason>"`');
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
