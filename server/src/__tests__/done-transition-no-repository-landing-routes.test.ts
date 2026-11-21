@@ -22,10 +22,12 @@ import {
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceUserRoles,
   issueComments,
   issueDocuments,
+  issueDeliveryReceipts,
   issues,
   issueWorkProducts,
   nativeRunResults,
@@ -42,6 +44,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { agentService } from "../services/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import { projectRoutes } from "../routes/projects.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
@@ -2238,6 +2241,112 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       });
 
       await expectRefused(fixture, await close(fixture.identifier), REWRITE_WITHOUT_OLD_VALUE);
+    });
+
+    async function insertLinkedRun(fixture: NoWorkspaceIssue, values: Record<string, unknown>) {
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: fixture.companyId,
+        agentId: fixture.closerAgentId,
+        status: "succeeded",
+        nativeIssueId: fixture.issueId,
+        contextSnapshot: { issueId: fixture.issueId },
+        ...values,
+      }).returning({ id: heartbeatRuns.id });
+      return run!.id;
+    }
+
+    it.each([
+      ["a truncated stdout excerpt that names a workspace key and loses the value", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { stdoutExcerpt: "{\"executionWorkspaceId\":\"" });
+      }],
+      ["an escaped-quote stdout excerpt that names a workspace", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { stdoutExcerpt: "{\\\"executionWorkspaceId\\\":\\\"ew-1\\\",\\\"cwd\\\":\\\"/x" });
+      }],
+      ["an object-valued executionWorkspaceId in run context", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { contextSnapshot: { issueId: fixture.issueId, executionWorkspaceId: { id: randomUUID() } } });
+      }],
+      ["a prefixed paperclipExecutionWorkspaceId key", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { contextSnapshot: { issueId: fixture.issueId, paperclipExecutionWorkspaceId: randomUUID() } });
+      }],
+      ["runner_profile_json naming a workspace", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { runnerProfileJson: { executionWorkspaceId: randomUUID(), repoUrl: "https://github.com/TEA-Core/records" } });
+      }],
+      ["log_ref naming a workspace path", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { logRef: "executionWorkspaceId=/srv/worktrees/card" });
+      }],
+      ["trigger_detail citing a pull URL", async (fixture: NoWorkspaceIssue) => {
+        await insertLinkedRun(fixture, { triggerDetail: "opened https://github.com/TEA-Core/records/pull/12" });
+      }],
+      ["a run event message citing a pull URL", async (fixture: NoWorkspaceIssue) => {
+        const runId = await insertLinkedRun(fixture, {});
+        await db.insert(heartbeatRunEvents).values({
+          companyId: fixture.companyId,
+          runId,
+          agentId: fixture.closerAgentId,
+          seq: 1,
+          eventType: "log",
+          message: "pushed https://github.com/TEA-Core/records/pull/12",
+          payload: { executionWorkspaceId: randomUUID() },
+        });
+      }],
+      ["an issue delivery receipt naming a pull request", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueDeliveryReceipts).values({
+          companyId: fixture.companyId,
+          sourceIssueId: fixture.issueId,
+          provider: "github",
+          owner: "TEA-Core",
+          repo: "records",
+          pullRequestNumber: 12,
+          headSha: "3f9c1e0a25b84d7c9e1f2a3b4c5d6e7f8a9b0c1d",
+          branchName: "feature/records",
+          recoveryReason: "existing pull request",
+          authorizedByActorType: "board",
+          authorizedByActorId: BOARD_USER_ID,
+          idempotencyKey: randomUUID(),
+        });
+      }],
+      ["billingCode set to a pull URL", async (fixture: NoWorkspaceIssue) => {
+        await db.update(issues).set({ billingCode: "https://github.com/TEA-Core/records/pull/12" }).where(eq(issues.id, fixture.issueId));
+      }],
+      ["executionPolicy.baseRef set to a branch", async (fixture: NoWorkspaceIssue) => {
+        await db.update(issues).set({ executionPolicy: { baseRef: "feature/records" } }).where(eq(issues.id, fixture.issueId));
+      }],
+      ["a comment citing pull request 12", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body: "Opened pull request 12 for the records repo." });
+      }],
+      ["a comment citing merge request !4", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body: "Opened merge request !4." });
+      }],
+      ["a comment citing a Gerrit URL", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body: "Reviewed https://gerrit.example.com/c/records/+/12345" });
+      }],
+      ["a comment citing a self-hosted clone URL", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body: "Cloned https://git.company.internal/org/records.git" });
+      }],
+      ["a comment citing a sourcehut URL", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body: "Mirrored https://git.sr.ht/~tea/records" });
+      }],
+    ] as const)("refuses a never-had close after %s", async (_label, shape) => {
+      const fixture = await seedAdmissible();
+      await shape(fixture);
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    });
+
+    it("refuses a never-had close after a board agent-delete erases a pull-URL comment", async () => {
+      const fixture = await seedAdmissible();
+      const helperId = await insertAgent(fixture.companyId, "Helper");
+      await db.insert(issueComments).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: helperId,
+        body: "Landed in https://github.com/TEA-Core/records/pull/12",
+      });
+      await agentService(db).remove(helperId);
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
     });
 
     it.each([

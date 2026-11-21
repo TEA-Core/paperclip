@@ -14,6 +14,9 @@ A `record_only` card with no project, no project workspace and no execution work
 
 The same check refuses when `issue.created` does not record `projectId`, `projectWorkspaceId` and `description`, including when that row is absent. A later `issue.updated` `changes` entry for the title or description that has no `from` also refuses. A recorded null is a known empty value. A missing key is not.
 
+The same check scans every column of a linked run, its events, a delivery receipt, and the issue row. A JSON-like value that does not parse is evidence. A workspace key with an object value, or a key that only prefixes a workspace key, is evidence. A board delete of an agent that wrote on the card leaves an erasure row, and that row refuses the close.
+
+
 The PATCH also applies the pending execution-stage transition to the same issue update. If a pending review stage's stored status or assignee has drifted from its current participant, a PATCH that only sets `deliveryRequirement` can restore `status: in_review` and assign that stage's participant (clearing the previous assignee). Inspect the returned status, assignee, and execution state rather than assuming a classification-only mutation.
 
 A refusal returns HTTP 409 with `approval_final_delivery_preflight`, the underlying named reason, `deliveryOwnerIssueId`, and an actionable `remedy`. Draft delivery requires the owner to mark the PR ready and submit the final review again. Missing delivery requires that owner to provide the delivery receipt/PR. The stage stays pending: no approved decision, completion, approval stamp, or merge arm is committed.

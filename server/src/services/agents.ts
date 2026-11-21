@@ -1095,6 +1095,35 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        const commentIssues = await tx
+          .select({ issueId: issueComments.issueId })
+          .from(issueComments)
+          .where(eq(issueComments.authorAgentId, id));
+        const activityIssues = await tx
+          .select({ issueId: activityLog.entityId })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, existing.companyId),
+            eq(activityLog.entityType, "issue"),
+            or(
+              eq(activityLog.agentId, id),
+              sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
+            ),
+          ));
+        const erasedIssueIds = [...new Set(
+          [...commentIssues, ...activityIssues].map((row) => row.issueId).filter((issueId): issueId is string => Boolean(issueId)),
+        )];
+        for (const issueId of erasedIssueIds) {
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: existing.companyId,
+            actorType: "system",
+            actorId: "agent-delete",
+            action: "issue.agent_evidence_erased",
+            entityType: "issue",
+            entityId: issueId,
+            details: { deletedAgentId: id },
+          });
+        }
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(

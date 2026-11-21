@@ -10,8 +10,10 @@ import {
   executionWorkspaceRuntimeLeases,
   executionWorkspaces,
   externalObjectMentions,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueDeliveryReceipts,
   issueDocuments,
   issueExecutionDecisions,
   issueLabels,
@@ -2662,7 +2664,9 @@ const NO_WORKSPACE_REFUSAL_REASON = "requires this issue's own execution workspa
  */
 const REPOSITORY_REFERENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bPR\s*#\s*\d+/i, "a pull request number"],
+  [/\bpull\s+request\s+\d+/i, "a pull request number"],
   [/\bMR\s*!\s*\d+/i, "a merge request number"],
+  [/\bmerge\s+request\s+!\s*\d+/i, "a merge request number"],
   [/(?<![\w/.-])[\w.-]+\/[\w.-]+[#!]\d+\b/, "a repository issue or pull request reference"],
   [/\/pulls?\/\d+/i, "a pull request URL"],
   [/\/pull-requests\/\d+/i, "a pull request URL"],
@@ -2675,9 +2679,10 @@ const REPOSITORY_REFERENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = 
   [/\b[\w.-]+@[\w.-]+:[\w.~-]+\/[\w.-]+/i, "an SSH repository address"],
   [/\bssh:\/\/\S+/i, "an SSH repository address"],
   [/\brefs\/(?:heads|remotes|tags|pull)\//i, "a Git ref"],
-  // A bare commit SHA: 7-40 hex digits holding both a digit and a letter, not
-  // part of a longer word or a hyphenated id (a UUID segment); or any hex run
-  // named as a commit.
+  [/\/c\/[^\s]+\/\+\/\d+/i, "a Gerrit change"],
+  [/\bgerrit\b/i, "a Gerrit address"],
+  [/\bgit\.sr\.ht\b/i, "a sourcehut address"],
+  [/https?:\/\/[^\s]+\.git\b/i, "a repository clone URL"],
   [/(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i, "a commit SHA"],
   [/\bcommit\s+[0-9a-f]{7,40}\b/i, "a commit SHA"],
 ];
@@ -2715,38 +2720,57 @@ function jsonRepositoryReference(value: unknown): string | null {
 // `executionWorkspaceId` and `EXECUTION_WORKSPACE_ID` are one key.
 const WORKSPACE_KEY_PATTERN =
   /^(executionworkspaceid|projectid|projectworkspaceid|workspace|workspaceid|workspaceref|workspacepath|repo|reporef|repourl|repository|repositoryurl|branch|branchname|worktree|worktreepath|providerref|baseref|deliveryrequirement|storeddeliveryrequirement|pr|prnumber|prurl|pullrequest|pullrequestnumber|pullrequestid|pullrequesturl|mr|mrnumber|mergerequest|commit|commitsha|sha|headsha)$/;
+const WORKSPACE_KEY_SUFFIXES = ["executionworkspaceid", "projectworkspaceid", "workspaceid", "pullrequestnumber", "pullrequesturl", "repositoryurl", "worktreepath", "branchname", "baseref"];
 
 function normalizedWorkspaceKey(key: string): boolean {
-  return WORKSPACE_KEY_PATTERN.test(key.toLowerCase().replace(/[^a-z0-9]/g, ""));
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (WORKSPACE_KEY_PATTERN.test(normalized)) return true;
+  return WORKSPACE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix) && normalized.length > suffix.length);
 }
 
 function textNamesWorkspaceKey(text: string): boolean {
-  for (const match of text.matchAll(/([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*["']?([^\s,}\]"']*)/g)) {
+  const readable = text.replace(/\\"/g, "\"").replace(/\\/g, "");
+  for (const match of readable.matchAll(/([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*["']?([^\s,}\]"']*)/g)) {
+    if (!normalizedWorkspaceKey(match[1]!)) continue;
     const value = match[2] ?? "";
-    if (value !== "" && value !== "null" && normalizedWorkspaceKey(match[1]!)) return true;
+    if (value !== "" && value !== "null") return true;
   }
   return false;
+}
+
+function unparseableStructuredText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("{\\")) return false;
+  const candidates = [trimmed, trimmed.replace(/\\"/g, "\"").replace(/\\\\/g, "\\")];
+  return candidates.every((candidate) => {
+    try {
+      JSON.parse(candidate);
+      return false;
+    } catch {
+      return true;
+    }
+  });
 }
 
 function namesWorkspace(value: unknown): boolean {
   if (typeof value === "string") {
     const text = value.trim();
+    if (unparseableStructuredText(text)) return true;
     if (text.startsWith("{") || text.startsWith("[")) {
       try {
         if (namesWorkspace(JSON.parse(text))) return true;
       } catch {
-        // truncated or invalid JSON falls through to the text scan
+        return true;
       }
     }
     return textNamesWorkspaceKey(text);
   }
   return forEachJsonEntry(value, (key, item) => {
-    if (key !== null && normalizedWorkspaceKey(key)) {
-      if (item !== null && typeof item !== "object" && item !== "") return true;
-    }
+    if (key !== null && normalizedWorkspaceKey(key) && item !== null && item !== "") return true;
     return typeof item === "string" && namesWorkspace(item);
   });
 }
+
 
 // The audit actions a card with no project and no workspace can carry: its
 // creation, plain field edits, comments, documents, reads, and the close
@@ -2876,14 +2900,7 @@ async function noWorkspaceHistoryRefusal(
   if ((referencing as unknown as unknown[]).length > 0) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
 
   const runs = await db
-    .select({
-      context: heartbeatRuns.contextSnapshot,
-      resultJson: heartbeatRuns.resultJson,
-      usageJson: heartbeatRuns.usageJson,
-      stdoutExcerpt: heartbeatRuns.stdoutExcerpt,
-      stderrExcerpt: heartbeatRuns.stderrExcerpt,
-      error: heartbeatRuns.error,
-    })
+    .select()
     .from(heartbeatRuns)
     .where(
       and(
@@ -2895,15 +2912,22 @@ async function noWorkspaceHistoryRefusal(
         ),
       ),
     );
+  const runIds = runs.map((run) => run.id);
+  const events = runIds.length === 0
+    ? []
+    : await db.select().from(heartbeatRunEvents).where(inArray(heartbeatRunEvents.runId, runIds));
+  const receipts = await db
+    .select()
+    .from(issueDeliveryReceipts)
+    .where(and(eq(issueDeliveryReceipts.companyId, issue.companyId), eq(issueDeliveryReceipts.sourceIssueId, issue.id)));
+  const issueRow = await db.select().from(issues).where(eq(issues.id, issue.id)).then((rows) => rows[0] ?? null);
   const nativeResults = await db
-    .select({ resultJson: nativeRunResults.resultJson })
+    .select()
     .from(nativeRunResults)
     .where(and(eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.issueId, issue.id)));
-  const runSurfaces = [
-    ...runs.flatMap((run) => [run.context, run.resultJson, run.usageJson, run.stdoutExcerpt, run.stderrExcerpt, run.error]),
-    ...nativeResults.map((result) => result.resultJson),
-  ];
-  if (runSurfaces.some((surface) => namesWorkspace(surface) || jsonRepositoryReference(surface) !== null)) {
+  const surfaces: unknown[] = [...runs, ...events, ...receipts, ...nativeResults];
+  if (issueRow) surfaces.push({ billingCode: issueRow.billingCode, executionPolicy: issueRow.executionPolicy });
+  if (surfaces.some((surface) => namesWorkspace(surface) || jsonRepositoryReference(surface) !== null)) {
     return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
   }
 
