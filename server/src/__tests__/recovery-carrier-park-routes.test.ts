@@ -1007,6 +1007,39 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
+  it.each(["canonical", "legacy uppercase"].flatMap(stored =>
+    ["lowercase", "uppercase"].map(spelling => [stored, spelling]),
+  ))("releases %s binding with %s action UUID without repair or replay", async (stored, spelling) => {
+    const f = await fixture();
+    const parked = await park(f, { ...f.body, recoveryActionId: f.actionId.toUpperCase() });
+    expect(parked.status).toBe(201);
+    const storedId = uuidSpelling(f.actionId, stored === "canonical" ? "lowercase" : "uppercase");
+    if (stored === "legacy uppercase") {
+      await db.update(issueTreeHolds).set({ recoveryCarrierPark: {
+        ...parked.body.hold.recoveryCarrierPark, recoveryActionId: storedId,
+      } }).where(eq(issueTreeHolds.id, parked.body.hold.id));
+    }
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f), assertNoAdmission = await protectWakeAdmission(f);
+    const release = (recoveryActionId: string) => request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId, reason: "Release only this hold; no source repair or replay" });
+    const wrongId = "00000000-0000-4000-8000-000000000000";
+    expect((await release(wrongId)).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    const released = await release(uuidSpelling(f.actionId, spelling));
+    expect(released.status).toBe(200);
+    expect(released.body).toMatchObject({ id: parked.body.hold.id, status: "released" });
+    const retired = await parkRecords(f);
+    expect((await release(storedId)).status).toBe(200);
+    expect((await release(wrongId)).status).toBe(409);
+    expect(await parkRecords(f)).toEqual(retired);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
