@@ -9,7 +9,7 @@ const describePostgres = support.supported ? describe : describe.skip;
 const migration = await readFile(new URL("./migrations/0331_board_recovery_carrier_park.sql", import.meta.url), "utf8");
 
 describePostgres("board recovery carrier park migration", () => {
-  it("upgrades an existing ordinary hold without rewriting rows or inferring consent", async () => {
+  it("preserves ordinary hold rows and permits only one active park per company/action", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-carrier-park-migration-");
     const query = postgres(database.connectionString, { max: 1, onnotice: () => {} });
     try {
@@ -30,6 +30,26 @@ describePostgres("board recovery carrier park migration", () => {
       expect(column).toEqual({ is_nullable: "YES", column_default: null });
       const [index] = await query`select indisvalid, indisready from pg_index where indexrelid = 'issue_tree_holds_active_park_action_idx'::regclass`;
       expect(index).toEqual({ indisvalid: true, indisready: true });
+      const actionId = randomUUID(), activeHoldId = randomUUID();
+      const binding = JSON.stringify({ recoveryActionId: actionId });
+      await query`insert into issue_tree_holds (id, company_id, root_issue_id, mode, recovery_carrier_park)
+        values (${activeHoldId}, ${companyId}, ${issueId}, 'pause', ${binding}::jsonb)`;
+      await expect(query`insert into issue_tree_holds (company_id, root_issue_id, mode, recovery_carrier_park)
+        values (${companyId}, ${issueId}, 'pause', ${binding}::jsonb)`).rejects.toMatchObject({ code: "23505" });
+      // Released/unbound holds and another company's action identity do not occupy this slot.
+      await query`insert into issue_tree_holds (company_id, root_issue_id, mode, status, recovery_carrier_park)
+        values (${companyId}, ${issueId}, 'pause', 'released', ${binding}::jsonb),
+          (${companyId}, ${issueId}, 'pause', 'active', null)`;
+      const otherCompanyId = randomUUID(), otherIssueId = randomUUID();
+      await query`insert into companies (id, name, issue_prefix) values (${otherCompanyId}, 'Other company', 'MIGQ')`;
+      await query`insert into issues (id, company_id, title) values (${otherIssueId}, ${otherCompanyId}, 'Other carrier')`;
+      await query`insert into issue_tree_holds (company_id, root_issue_id, mode, recovery_carrier_park)
+        values (${otherCompanyId}, ${otherIssueId}, 'pause', ${binding}::jsonb)`;
+      await query`update issue_tree_holds set status = 'released' where id = ${activeHoldId}`;
+      const [replacement] = await query`insert into issue_tree_holds (company_id, root_issue_id, mode, recovery_carrier_park)
+        values (${companyId}, ${issueId}, 'pause', ${binding}::jsonb)
+        returning status, recovery_carrier_park`;
+      expect(replacement).toEqual({ status: "active", recovery_carrier_park: { recoveryActionId: actionId } });
     } finally {
       await query.end();
       await database.cleanup();

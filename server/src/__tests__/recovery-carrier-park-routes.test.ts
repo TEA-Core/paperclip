@@ -8,7 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns,
-  issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
+  issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
   type Db, type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -141,6 +141,75 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }, { timeout: 10_000 }).not.toBeNull();
     return blockedPid!;
   }
+
+  async function deferredInteraction(f: Fixture) {
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId, companyId: f.companyId, issueId: f.carrierId,
+      authorUserId: "park-operator", body: "Previously admitted board input",
+    });
+    const [finished] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      invocationSource: "assignment", contextSnapshot: { issueId: f.carrierId },
+      finishedAt: new Date(),
+    }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "park-operator",
+      payload: { issueId: f.carrierId, commentId,
+        _paperclipWakeContext: { issueId: f.carrierId, wakeReason: "issue_commented",
+          source: "issue.comment", wakeCommentId: commentId } },
+    }).returning();
+    return { finished: finished!, wake: wake! };
+  }
+
+  it("rejects park admission while a verified carrier interaction is deferred", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    await deferredInteraction(f);
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+
+    expect((await park(f)).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, f.companyId))).toEqual([]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual([]);
+    await assertNoProtectedWrites();
+  });
+
+  it("never promotes a previously deferred verified interaction through an active carrier park", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    const parked = await park(f);
+    expect(parked.status).toBe(201);
+    // Simulate an already-admitted legacy queue; promotion must independently fence it.
+    const { finished, wake } = await deferredInteraction(f);
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const counter = `park_run_attempts_${f.actionId.replaceAll("-", "")}`;
+    await db.execute(sql.raw(`create sequence ${counter}`));
+    await db.execute(sql`create or replace function reject_park_run_insert() returns trigger language plpgsql as $$ begin perform nextval(TG_ARGV[0]); raise exception 'parked carrier run admitted'; end $$`);
+    await db.execute(sql.raw(`create trigger protect_park_run_${f.actionId.replaceAll("-", "")} before insert on heartbeat_runs for each row when (new.company_id = '${f.companyId}') execute function reject_park_run_insert('${counter}')`));
+
+    await heartbeatService(db).releaseIssueExecutionAndPromote(finished, { suppressImmediateRecovery: true });
+
+    expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual([finished]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0]).toMatchObject({
+      status: "cancelled", runId: null,
+    });
+    expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual(before.source);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toEqual(before.actions);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, parked.body.hold.id)))[0]).toMatchObject({
+      status: "active", recoveryCarrierPark: { recoveryActionId: f.actionId },
+    });
+    await assertNoProtectedWrites();
+  });
 
   it("accepts an exact board park without a source/action write or fake liveness, and repeats idempotently", async () => {
     const f = await fixture(), before = await snapshot(f);
