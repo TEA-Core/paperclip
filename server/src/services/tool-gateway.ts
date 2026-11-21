@@ -1199,11 +1199,26 @@ export function createToolGatewayService(
     }).summary;
     await db.update(toolInvocations).set({ resultSummary: summary }).where(eq(toolInvocations.id, invocationId));
   }
-  function recoverUpstreamHandoff(invocation: typeof toolInvocations.$inferSelect): ToolUpstreamPending | undefined {
+  /** Records the dispatch boundary once; an earlier stamp is kept. */
+  async function markInvocationDispatchStarted(invocationId: string) {
+    await db.update(toolInvocations)
+      .set({ startedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(toolInvocations.id, invocationId), isNull(toolInvocations.startedAt)));
+  }
+  /**
+   * The provider handoff of a `provider_interaction_required` invocation. Its
+   * one-time links are returned only to the run that recorded the invocation
+   * (`callerRunId` equal to its run): any other caller, including a later run
+   * of the same agent, gets the stored handoff with no links.
+   */
+  function recoverUpstreamHandoff(
+    invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
+  ): ToolUpstreamPending | undefined {
     if (invocation.errorCode !== "provider_interaction_required") return undefined;
     const cached = upstreamHandoffs.get(invocation.id);
-    if (cached && cached.expires > Date.now()) return cached.pending;
-    upstreamHandoffs.delete(invocation.id);
+    if (cached && cached.expires > Date.now() && (callerRunId ?? null) === invocation.runId) return cached.pending;
+    if (cached && cached.expires <= Date.now()) upstreamHandoffs.delete(invocation.id);
     const stored = asRecord(storedInvocationResult(invocation));
     const pending = asRecord(stored?.upstreamPending);
     if (!pending || !["approval", "authorization"].includes(String(pending.kind))) return undefined;
@@ -6069,6 +6084,7 @@ export function createToolGatewayService(
     }
     const grant = await resolveConnectionGrant(session, connection);
     if (isBrowserUseConnection(connection)) {
+      await markInvocationDispatchStarted(invocationId);
       const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
@@ -6088,6 +6104,8 @@ export function createToolGatewayService(
     });
     let headers = builtHeaders.headers;
     let headerSummary = builtHeaders.summary;
+    // Credentials resolved: from here a request can reach the provider.
+    await markInvocationDispatchStarted(invocationId);
     const requestId = `paperclip-tool-${randomUUID()}`;
     const execution: RemoteHttpExecutionAudit = {
       transport: "mcp_remote",
@@ -7736,6 +7754,71 @@ export function createToolGatewayService(
     }
   }
 
+  /**
+   * Replay of a persisted invocation that did NOT succeed must never come back
+   * as a success-shaped response with a null result: the caller would mistake
+   * "replayed" for "executed fine". Surface the persisted failure explicitly
+   * (reasonCode/message recorded at failure time) and flag it as a replay.
+   */
+  function replayedInvocationFailure(
+    invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
+  ): ToolGatewayHttpError {
+    // The provider is still waiting on its authorization/approval: replay the
+    // same 409 handoff the action-request replay returns, not a bare failure.
+    if (invocation.errorCode === "provider_interaction_required") {
+      return new ToolGatewayHttpError(
+        409,
+        "The provider is waiting for authorization or approval. Continue the existing execution; do not repeat the original call.",
+        "provider_interaction_required",
+        {
+          invocationId: invocation.id,
+          replayed: true,
+          originalStatus: invocation.status,
+          upstreamPending: recoverUpstreamHandoff(invocation, callerRunId),
+        },
+      );
+    }
+    const status =
+      invocation.status === "timed_out" ? 504
+        : invocation.status === "rate_limited" ? 429
+          : invocation.status === "denied" ? 403
+            : 502;
+    const reasonCode = invocation.errorCode ?? "tool_execution_failed";
+    const message =
+      invocation.errorMessage
+      ?? `Tool invocation replayed with terminal status ${invocation.status}`;
+    return new ToolGatewayHttpError(status, message, reasonCode, {
+      invocationId: invocation.id,
+      replayed: true,
+      originalStatus: invocation.status,
+    });
+  }
+
+  function isReplayableFailure(
+    invocation: typeof toolInvocations.$inferSelect,
+  ): boolean {
+    return (
+      invocation.status === "failed"
+      || invocation.status === "timed_out"
+      || invocation.status === "cancelled"
+      || invocation.status === "denied"
+      || invocation.status === "rate_limited"
+    );
+  }
+
+  /**
+   * The stored outcome of a settled approved action: its result, or its
+   * persisted failure. A failed invocation never replays as a null result.
+   */
+  function replayStoredInvocation(
+    invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
+  ): unknown {
+    if (isReplayableFailure(invocation)) throw replayedInvocationFailure(invocation, callerRunId);
+    return storedInvocationResult(invocation);
+  }
+
   async function actionRequestResolution(
     actionRequest: typeof toolActionRequests.$inferSelect,
   ) {
@@ -7967,6 +8050,8 @@ export function createToolGatewayService(
   async function executeApprovedAgentInvocation(input: {
     actionRequest: typeof toolActionRequests.$inferSelect;
     invocation: typeof toolInvocations.$inferSelect;
+    /** The retrying agent's run; approval callers have none. */
+    callerRunId?: string | null;
   }) {
     const { actionRequest, invocation } = input;
     if (
@@ -7999,7 +8084,7 @@ export function createToolGatewayService(
         .where(eq(toolInvocations.id, invocation.id))
         .limit(1);
       if (settled?.status === "executed" && settledInvocation) {
-        return storedInvocationResult(settledInvocation);
+        return replayStoredInvocation(settledInvocation, input.callerRunId);
       }
       if (settled?.status === "failed") {
         throw new ToolGatewayHttpError(
@@ -8437,7 +8522,7 @@ export function createToolGatewayService(
         "The provider is waiting for authorization or approval. Continue the existing execution; do not repeat the original call.",
         "provider_interaction_required", {
           invocationId: invocation.id, actionRequestId: actionRequest.id,
-          upstreamPending: recoverUpstreamHandoff(invocation),
+          upstreamPending: recoverUpstreamHandoff(invocation, input.session.runId),
         });
     }
     if (actionRequest.status === "pending") {
@@ -8466,7 +8551,7 @@ export function createToolGatewayService(
     if (actionRequest.status === "executed") {
       return {
         matched: true as const,
-        result: storedInvocationResult(invocation),
+        result: replayStoredInvocation(invocation, input.session.runId),
         invocationId: invocation.id,
       };
     }
@@ -8480,7 +8565,7 @@ export function createToolGatewayService(
       if (settled?.status === "executed" && settledInvocation) {
         return {
           matched: true as const,
-          result: storedInvocationResult(settledInvocation),
+          result: replayStoredInvocation(settledInvocation, input.session.runId),
           invocationId: invocation.id,
         };
       }
@@ -8494,6 +8579,7 @@ export function createToolGatewayService(
       const result = await executeApprovedAgentInvocation({
         actionRequest,
         invocation,
+        callerRunId: input.session.runId,
       });
       return { matched: true as const, result, invocationId: invocation.id };
     }
@@ -8599,7 +8685,8 @@ export function createToolGatewayService(
       parameters,
       ...(result !== undefined ? { result } : {}),
       ...(error ? { error } : {}),
-      ...(recoverUpstreamHandoff(invocation) ? { upstreamPending: recoverUpstreamHandoff(invocation) } : {}),
+      // The board's own test call: it has no run, and neither does the row.
+      ...(recoverUpstreamHandoff(invocation, invocation.runId) ? { upstreamPending: recoverUpstreamHandoff(invocation, invocation.runId) } : {}),
       durationMs,
       requestedAt: actionRequest.createdAt.toISOString(),
       resolvedAt: actionRequest.resolvedAt
@@ -10722,6 +10809,30 @@ export function createToolGatewayService(
           ? await claimSlackRateLimitRetry(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId, endpointId: String(asRecord(tool.providerMetadata)?.endpointId ?? ""), identityContextId: session.identityContextId }, invocationId)
           : false;
         if (recorded.replayed && !retryingSlackRateLimit) {
+          // A replayed failure surfaces explicitly instead of a success-shaped
+          // result. A Slack rate-limit retry past its deadline was claimed
+          // above and re-executes instead of replaying.
+          if (isReplayableFailure(recorded.invocation)) {
+            const replayFailure = replayedInvocationFailure(recorded.invocation, session.runId);
+            await writeAudit({
+              session,
+              companyId: session.companyId,
+              agentId: session.agentId,
+              runId: session.runId,
+              issueId: session.issueId,
+              action: "tool_gateway.call_failed",
+              details: {
+                invocationId,
+                decision: "deny",
+                reasonCode: replayFailure.reasonCode,
+                tool: tool.name,
+                ...toolAuditMetadata(tool),
+                replayed: true,
+                originalStatus: recorded.invocation.status,
+              },
+            });
+            throw replayFailure;
+          }
           await writeAudit({
             session,
             companyId: session.companyId,
@@ -10796,11 +10907,15 @@ export function createToolGatewayService(
             },
           );
         }
+        // A remote call is stamped started only once its credentials resolve
+        // (see executeRemoteHttpTool): a failure before that never reached the
+        // provider, so its derived-key replay can expire and be retried.
+        const remoteDispatch = tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest";
         await db
           .update(toolInvocations)
           .set({
             status: "executing",
-            startedAt: new Date(),
+            ...(remoteDispatch ? {} : { startedAt: new Date() }),
             updatedAt: new Date(),
           })
           .where(eq(toolInvocations.id, invocationId));
@@ -11219,6 +11334,27 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
+        if (isReplayableFailure(recorded.invocation)) {
+          const replayFailure = replayedInvocationFailure(recorded.invocation, input.runContext.runId);
+          await writeAudit({
+            session: sessionLike,
+            companyId: input.runContext.companyId,
+            agentId: input.runContext.agentId,
+            runId: input.runContext.runId,
+            issueId: context.issueId,
+            action: "tool_gateway.call_failed",
+            details: {
+              invocationId,
+              decision: "deny",
+              reasonCode: replayFailure.reasonCode,
+              tool: input.tool,
+              ...toolAuditMetadata(tool),
+              replayed: true,
+              originalStatus: recorded.invocation.status,
+            },
+          });
+          throw replayFailure;
+        }
         // Same projection as the first execution ({pluginId, toolName,
         // result}): the persisted payload parsed from its summary, not the
         // summary wrapper row itself.
