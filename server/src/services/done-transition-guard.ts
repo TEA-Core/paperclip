@@ -637,17 +637,25 @@ export async function githubBranchHasMergedPr(
 
 async function writeAuditLog(
   db: Db,
-  issue: { id: string; companyId: string; identifier: string | null },
+  issue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
+  },
   action: string,
   details: Record<string, unknown>,
 ) {
+  const isLadderRefusal = action === "issue.done_transition_ladder_refused";
   try {
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: "system",
-      actorId: "done-transition-guard",
+      actorId: isLadderRefusal
+        ? "done-transition-guard"
+        : issue.doneTransitionAuditProvenance?.actorId ?? "done-transition-guard",
       agentId: null,
-      runId: null,
+      runId: isLadderRefusal ? null : issue.doneTransitionAuditProvenance?.runId ?? null,
       agentApiKeyId: null,
       action,
       entityType: "issue",
@@ -3799,6 +3807,9 @@ export async function resolveCitedCommits(
  *   stays countable in the ghost-PASS census and dies with the close on
  *   rollback.
  *
+ * Tier-close audit payloads retain the supplied caller actor/run provenance;
+ * omitted provenance defaults to the guard actor and no run.
+ *
  * Callers must invoke this BEFORE opening their close transaction on an
  * unlocked read: the delivery guard probes GitHub and the tier evaluator
  * reads the comment store, and running either under the sweep's row lock
@@ -3807,7 +3818,8 @@ export async function resolveCitedCommits(
 export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   db: Db;
   issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string };
-  actorId: string;
+  actorId?: string;
+  runId?: string | null;
   closeComment: string | null;
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
@@ -3836,8 +3848,12 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       reason: string;
     }
 > {
-  const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
-  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false);
+  const { db, issue, actorId = "done-transition-guard", runId = null, closeComment, structuredDoneTier, listComments } = input;
+  const guardIssue = {
+    ...issue,
+    doneTransitionAuditProvenance: { actorId, runId },
+  };
+  const guardResult = await evaluateDoneTransitionGuard(db, guardIssue, null, false);
   if (!guardResult.allowed) {
     return {
       allowed: false,
@@ -3870,9 +3886,9 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       closeRowAudits.push({
         companyId: issue.companyId,
         actorType: "system",
-        actorId: "done-transition-guard",
+        actorId,
         agentId: null,
-        runId: null,
+        runId,
         agentApiKeyId: null,
         action: "issue.done_transition_tier1_close",
         entityType: "issue",
@@ -3889,9 +3905,9 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       closeRowAudits.push({
         companyId: issue.companyId,
         actorType: "system",
-        actorId: "done-transition-guard",
+        actorId,
         agentId: null,
-        runId: null,
+        runId,
         agentApiKeyId: null,
         action: "issue.done_transition_tier2_close",
         entityType: "issue",
@@ -4235,6 +4251,43 @@ function evaluateReviewLadderSatisfaction(
     completedStageIds: [...completed],
     skippedStageIds: [...skipped],
   };
+}
+
+type ReviewLadderEvaluation = NonNullable<ReturnType<typeof evaluateReviewLadderSatisfaction>>;
+
+/** Race-free identity of the ladder state a refusal evaluated: no clocks. */
+export function reviewLadderStateKey(evaluation: ReviewLadderEvaluation): string {
+  const sorted = (values: string[]) => [...new Set(values)].sort();
+  return JSON.stringify({
+    stages: sorted([
+      ...evaluation.completedStageIds,
+      ...evaluation.skippedStageIds,
+      ...evaluation.unsatisfiedStageIds,
+    ]),
+    completedStageIds: sorted(evaluation.completedStageIds),
+    skippedStageIds: sorted(evaluation.skippedStageIds),
+    unsatisfiedStageIds: sorted(evaluation.unsatisfiedStageIds),
+  });
+}
+
+/** Current ladder-state key for an issue, or null when it carries no ladder. */
+export async function getReviewLadderStateKey(
+  db: Db,
+  issue: { id: string; companyId: string; executionPolicy?: unknown; executionState?: unknown },
+): Promise<string | null> {
+  let evaluation = evaluateReviewLadderSatisfaction(issue.executionPolicy, issue.executionState, false);
+  if (evaluation === null) return null;
+  if (!evaluation.satisfied) {
+    const decisionSatisfiedStageIds = await listDecisionSatisfiedStageIds(db, issue.companyId, issue.id);
+    const recovered = evaluateReviewLadderSatisfaction(
+      issue.executionPolicy,
+      issue.executionState,
+      false,
+      decisionSatisfiedStageIds,
+    );
+    if (recovered !== null) evaluation = recovered;
+  }
+  return reviewLadderStateKey(evaluation);
 }
 
 /**
@@ -4843,6 +4896,7 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
     // The status version before this close; it binds a requirement-change
     // marker to the close (SUP-24429).
     statusVersion?: number;
@@ -4970,6 +5024,12 @@ async function evaluateDoneTransitionGuardCore(
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
     await writeLadderRefusalAuditLog(db, issue, {
+      ...(issue.doneTransitionAuditProvenance
+        ? {
+            callingActor: issue.doneTransitionAuditProvenance.actorId,
+            callingRunId: issue.doneTransitionAuditProvenance.runId,
+          }
+        : {}),
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,
@@ -4977,6 +5037,7 @@ async function evaluateDoneTransitionGuardCore(
       unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
       completedStageIds: reviewLadder.completedStageIds,
       skippedStageIds: reviewLadder.skippedStageIds,
+      ladderStateKey: reviewLadderStateKey(reviewLadder),
       decisionCarried,
     });
     return {

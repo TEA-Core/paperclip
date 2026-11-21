@@ -656,6 +656,31 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("keeps refusal identity stable and records the calling reaper and run as provenance", async () => {
+      const result = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        actorId: "system:execution-control-reconciliation",
+        runId: "reaper-run-1",
+        closeComment: null,
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(logActivity).toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          actorType: "system",
+          actorId: "done-transition-guard",
+          runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:execution-control-reconciliation",
+            callingRunId: "reaper-run-1",
+          }),
+        }),
+      );
+    });
+
     it("refuses done for the literal SUP-8098 shape: parked pending on stage 1 with zero decisions (AC2)", async () => {
       // The state as it landed on SUP-8098: pending at stage index 0, no
       // completedStageIds. It does not round-trip the state schema (the
@@ -6985,6 +7010,7 @@ describe("evaluateDoneTierDeclaration", () => {
         db: mockDb,
         issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
         actorId: "execution-control-reconciliation",
+        runId: "backstop-run-1",
         closeComment: null,
         structuredDoneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
       });
@@ -6998,6 +7024,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(verdict.closeRowAudits).toHaveLength(1);
       expect(verdict.closeRowAudits[0]).toMatchObject({
         action: "issue.done_transition_tier2_close",
+        actorId: "execution-control-reconciliation",
+        runId: "backstop-run-1",
         entityType: "issue",
         entityId: "issue-1",
         details: {
@@ -7021,6 +7049,49 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(logActivity).not.toHaveBeenCalledWith(
         mockDb,
         expect.objectContaining({ action: "issue.done_transition_tier2_close" }),
+      );
+    });
+
+    it.each([
+      { tier: "tier1" as const, provenance: { actorId: "test-backstop", runId: "test-run" }, actorId: "test-backstop", runId: "test-run" },
+      { tier: "tier2" as const, provenance: { actorId: "test-backstop", runId: "test-run" }, actorId: "test-backstop", runId: "test-run" },
+      { tier: "tier1" as const, provenance: {}, actorId: "done-transition-guard", runId: null },
+      { tier: "tier2" as const, provenance: {}, actorId: "done-transition-guard", runId: null },
+    ])("returns $tier close audit provenance ($actorId, $runId) without writing before the close", async ({ tier, provenance, actorId, runId }) => {
+      if (tier === "tier1") {
+        setupTier2OriginMocks();
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+        mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+          { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        ]);
+        ghFetchMock.mockImplementation(async (url: string) =>
+          String(url).includes("/compare/")
+            ? new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 })
+            : new Response(JSON.stringify({}), { status: 404 }),
+        );
+      }
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: tier === "tier1" ? "ew-1" : null },
+        ...provenance,
+        closeComment: null,
+        structuredDoneTier: tier === "tier1"
+          ? { tier: "tier1", reason: "Recorded delivery landed", landing: { mode: "landedAtTip", mergeCommit: T2_MERGE_SHA } }
+          : { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed, JSON.stringify(verdict)).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeRowAudits).toEqual([
+        expect.objectContaining({
+          action: `issue.done_transition_${tier}_close`,
+          actorId,
+          runId,
+          details: expect.objectContaining({ systemBackstopActor: actorId }),
+        }),
+      ]);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({ action: `issue.done_transition_${tier}_close` }),
       );
     });
 

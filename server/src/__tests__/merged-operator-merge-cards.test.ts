@@ -1090,6 +1090,11 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
         expect.objectContaining({
           action: "issue.done_transition_ladder_refused",
           actorId: "done-transition-guard",
+          runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:merged-operator-merge-cards",
+            callingRunId: null,
+          }),
         }),
       ]),
     );

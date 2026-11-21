@@ -33,7 +33,10 @@ import {
 } from "./issue-continuation-path.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "./successful-run-handoff-state.js";
 import { hasSummaryGenerationToken } from "./summary-slot-finalization.js";
-import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
+import {
+  evaluateDoneTransitionGuardForBackstopClose,
+  getReviewLadderStateKey,
+} from "./done-transition-guard.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -335,6 +338,24 @@ async function reapUnboundSummaryGenerationIssues(
  * so a card that gained a live run, a pending interaction, or a terminal
  * status between scan and write is left to its own owner; a re-run over
  * already-terminal rows matches nothing and is a no-op.
+ *
+ * Blocked cards stay in this population: `blocked` is non-terminal, and the
+ * SUP-17698 contract terminalizes a blocked strand whose continuation paths
+ * have all died.
+ *
+ * A card the done-transition guard already refused for an unsatisfied review
+ * ladder is deferred only while the ladder state that refusal evaluated is
+ * still the card's current ladder state. The refusal audit row stores that
+ * state's key (`ladderStateKey`: stage, completed, skipped, and unsatisfied
+ * ids, with durable approved decisions folded in); the reaper recomputes the
+ * current key and skips the card only on an exact match. No timestamps are
+ * compared — the audit row's `created_at` is stamped by the database clock
+ * when the fire-and-forget insert lands, while `issues.updated_at` is stamped
+ * by the application clock, so ordering those two values can strand a card
+ * whose approval committed between the reaper tick and the audit insert.
+ * Any ladder-state change (an approval, a skip, a policy change) re-arms the
+ * card for the next sweep. A refusal row written before state keys existed
+ * carries no key and never defers a card.
  */
 export async function reapStrandedSummaryGenerationIssues(
   db: Db,
@@ -343,7 +364,7 @@ export async function reapStrandedSummaryGenerationIssues(
   // Unbound token-bearing tasks first, so they end `cancelled` rather than
   // `done` by the continuation-path class below.
   const unboundReaping = await reapUnboundSummaryGenerationIssues(db, now);
-  const candidates = await db
+  const scannedCandidates = await db
     .select({
       issueId: issues.id,
       companyId: issues.companyId,
@@ -371,6 +392,42 @@ export async function reapStrandedSummaryGenerationIssues(
       ),
     )
     .limit(50);
+
+  // Defer only cards whose latest ladder refusal evaluated exactly the
+  // ladder state the card is still in (see the docblock above). Any state
+  // change re-arms the card; a keyless legacy refusal never defers.
+  const candidates: typeof scannedCandidates = [];
+  for (const candidate of scannedCandidates) {
+    const [latestRefusal] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          eq(activityLog.action, "issue.done_transition_ladder_refused"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1);
+    const refusedKey =
+      latestRefusal && typeof latestRefusal.details?.ladderStateKey === "string"
+        ? latestRefusal.details.ladderStateKey
+        : null;
+    if (refusedKey === null) {
+      candidates.push(candidate);
+      continue;
+    }
+    const [currentIssue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, candidate.issueId), eq(issues.companyId, candidate.companyId)))
+      .limit(1);
+    if (!currentIssue) continue;
+    const currentKey = await getReviewLadderStateKey(db, currentIssue);
+    if (currentKey !== refusedKey) candidates.push(candidate);
+  }
 
   let terminalized = 0;
   let nextCandidate = 0;

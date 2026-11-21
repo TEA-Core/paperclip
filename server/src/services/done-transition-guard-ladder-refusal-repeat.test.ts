@@ -10,6 +10,7 @@ import {
   reapStrandedSummaryGenerationIssues,
   SUMMARIZER_AGENT_ID,
 } from "./execution-control-reconciliation.js";
+import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -19,9 +20,12 @@ const REPEATED = "issue.done_transition_ladder_refusal_repeated";
 
 // SUP-24136: the stranded-summary reaper runs the done-transition guard every
 // 15 s on a Summarizer-assigned card. An unsatisfied review ladder wrote one
-// identical refusal row per tick (SUP-24118: 54 rows in 13 minutes). These
-// tests drive the real reaper and guard against a real database, so the
-// window is measured on the database clock that stamps activity_log rows.
+// identical refusal row per tick (SUP-24118: 54 rows in 13 minutes). The guard
+// bounds identical refusal rows per window on the database clock. On top of
+// that, the reaper defers a card while its ladder state is unchanged (the
+// refusal row's `ladderStateKey`), so sweep ticks after the first do not
+// reach the guard at all; only a ladder-state change re-arms the card. These
+// tests drive the real reaper and guard against a real database.
 describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -114,20 +118,39 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
   // database, not on a timer. The current guard awaits the write.
   const drainAuditWrites = () => new Promise((resolve) => setTimeout(resolve, 250));
 
-  it("caps ten sweep ticks at three refusal rows and one escalation row, and defers the card on every tick", async () => {
+  it("defers an unchanged ladder state on later sweep ticks, while the guard still caps repeated direct evaluations", async () => {
     const { issueId, stageId } = await seedLadderCard();
 
-    for (let tick = 0; tick < 10; tick++) {
-      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    // First tick evaluates the guard and records the refusal; later ticks
+    // see the same ladder-state key and defer without scanning the card.
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    for (let tick = 0; tick < 9; tick++) {
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
     }
 
     expect(await statusOf(issueId)).toBe("in_progress");
+    expect(await rows(issueId, REFUSED)).toHaveLength(1);
+    expect(await rows(issueId, REPEATED)).toHaveLength(0);
+
+    // The SUP-24136 bound still applies to evaluations that do reach the
+    // guard (for example the PATCH door): three refusal rows per window,
+    // then one escalation row, then nothing.
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
+    for (let call = 0; call < 5; call++) {
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db,
+        issue: issue!,
+        actorId: "system:execution-control-reconciliation",
+        closeComment: null,
+      });
+      expect(verdict.allowed).toBe(false);
+    }
     expect(await rows(issueId, REFUSED)).toHaveLength(3);
     const escalations = await rows(issueId, REPEATED);
     expect(escalations).toHaveLength(1);
     expect(escalations[0]).toMatchObject({
       actorType: "system",
-      actorId: "done-transition-guard",
+      actorId: "system:execution-control-reconciliation",
       runId: null,
       details: expect.objectContaining({
         reason: `review_ladder_unsatisfied:${stageId}`,
@@ -185,34 +208,34 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
     expect(await rows(issueId, REFUSED)).toHaveLength(refusedBefore);
   });
 
-  it("measures the window on the database clock only: an application clock two hours ahead does not reopen it", async () => {
+  it("defers on ladder state, not on either clock: an application clock two hours ahead does not re-arm the card", async () => {
     const { issueId } = await seedLadderCard();
     for (let tick = 0; tick < 3; tick++) {
       await reapStrandedSummaryGenerationIssues(db);
     }
-    expect(await rows(issueId, REFUSED)).toHaveLength(3);
+    expect(await rows(issueId, REFUSED)).toHaveLength(1);
 
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 2 * 60 * 60_000 });
-    await reapStrandedSummaryGenerationIssues(db);
-    await reapStrandedSummaryGenerationIssues(db);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
 
-    expect(await rows(issueId, REFUSED)).toHaveLength(3);
-    expect(await rows(issueId, REPEATED)).toHaveLength(1);
+    expect(await rows(issueId, REFUSED)).toHaveLength(1);
+    expect(await rows(issueId, REPEATED)).toHaveLength(0);
   });
 
-  it("reopens the window when the rows age past it on the database clock, even with the application clock two hours behind", async () => {
+  it("does not re-arm when refusal rows age past the window: only a ladder-state change re-arms", async () => {
     const { issueId } = await seedLadderCard();
     for (let tick = 0; tick < 5; tick++) {
       await reapStrandedSummaryGenerationIssues(db);
     }
-    expect(await rows(issueId, REFUSED)).toHaveLength(3);
+    expect(await rows(issueId, REFUSED)).toHaveLength(1);
     await ageActivity(issueId, 61);
 
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() - 2 * 60 * 60_000 });
-    await reapStrandedSummaryGenerationIssues(db);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
 
-    expect(await rows(issueId, REFUSED)).toHaveLength(4);
-    expect(await rows(issueId, REPEATED)).toHaveLength(1);
+    expect(await rows(issueId, REFUSED)).toHaveLength(1);
+    expect(await rows(issueId, REPEATED)).toHaveLength(0);
   });
 
   it("records the first refusal row unchanged and counts each card separately", async () => {
@@ -235,6 +258,8 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
       entityType: "issue",
       details: {
         identifier: null,
+        callingActor: "system:execution-control-reconciliation",
+        callingRunId: null,
         reason: `review_ladder_unsatisfied:${second.stageId}`,
         skipReason: `review_ladder_unsatisfied:${second.stageId}`,
         stageIndex: 0,
@@ -242,6 +267,12 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
         unsatisfiedStageIds: [second.stageId],
         completedStageIds: [],
         skippedStageIds: [],
+        ladderStateKey: JSON.stringify({
+          stages: [second.stageId],
+          completedStageIds: [],
+          skippedStageIds: [],
+          unsatisfiedStageIds: [second.stageId],
+        }),
         decisionCarried: false,
       },
     });

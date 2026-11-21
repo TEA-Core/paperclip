@@ -499,7 +499,7 @@ describeEmbeddedPostgres(
       );
     });
 
-    it("SUP-21910: a guard refusal defers the card instead of closing around the ladder", async () => {
+    it("SUP-21910: an unchanged guard refusal is deferred without another attempt or audit row", async () => {
       // Mechanism C: the card carries a review ladder with no recorded
       // decision for its current stage. The reaper must NOT terminalize it —
       // the silent bypass was the defect — and the refusal surfaces as the
@@ -544,14 +544,25 @@ describeEmbeddedPostgres(
         .select()
         .from(activityLog)
         .where(eq(activityLog.entityId, issueId));
-      expect(refusalAudits).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            action: "issue.done_transition_ladder_refused",
-            actorId: "done-transition-guard",
+      const ladderRefusals = refusalAudits.filter((row) => row.action === "issue.done_transition_ladder_refused");
+      expect(ladderRefusals).toEqual([
+        expect.objectContaining({
+          actorId: "done-transition-guard",
+          runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:execution-control-reconciliation",
+            callingRunId: null,
+            ladderStateKey: expect.any(String),
           }),
-        ]),
-      );
+        }),
+      ]);
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+      const auditsAfterRerun = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      expect(auditsAfterRerun.filter((row) => row.action === "issue.done_transition_ladder_refused")).toHaveLength(1);
 
       // This describe shares one database and isolates with fresh rows, so a
       // card this test deliberately leaves non-terminal would inflate every
@@ -559,6 +570,68 @@ describeEmbeddedPostgres(
       // asserted.
       await db.delete(activityLog).where(eq(activityLog.entityId, issueId));
       await db.delete(issues).where(eq(issues.id, issueId));
+    });
+
+    it("re-arms after a later ladder approval even when the refusal audit row is timestamped after the card update", async () => {
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const stage1Id = randomUUID();
+      const stage2Id = randomUUID();
+      const ladderState = (completedStageIds: string[]) => ({
+        status: "pending",
+        currentStageId: stage2Id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: SUMMARIZER_AGENT_ID, userId: null },
+        completedStageIds,
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        pendingSince: new Date(Date.now() - 60_000).toISOString(),
+      });
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [
+              { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+              { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+            ],
+          },
+          executionState: ladderState([stage1Id]),
+        })
+        .where(eq(issues.id, issueId));
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("in_progress");
+      // The refusal audit is written fire-and-forget; wait until it has
+      // landed so the backdating below repositions that actual row.
+      await vi.waitFor(async () => {
+        const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+        expect(rows.some((row) => row.action === "issue.done_transition_ladder_refused")).toBe(true);
+      });
+
+      // Later approval satisfies the ladder. Then place both clocks in the
+      // two-clock race position: the refusal audit row (DB clock, written
+      // fire-and-forget) is timestamped AFTER the card update (app clock),
+      // while both sit outside the settle window. A timestamp comparison
+      // strands the card; a ladder-state comparison re-arms it.
+      await db
+        .update(issues)
+        .set({
+          executionState: ladderState([stage1Id, stage2Id]),
+          updatedAt: new Date(Date.now() - 7 * 60_000),
+        })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(activityLog)
+        .set({ createdAt: new Date(Date.now() - 6 * 60_000) })
+        .where(eq(activityLog.entityId, issueId));
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
     });
 
     it("terminalizes a summary task with a null execution state and no live run", async () => {
@@ -593,9 +666,6 @@ describeEmbeddedPostgres(
 
       expect(result).toEqual({ scanned: 1, terminalized: 1 });
       expect((await getIssue(issueId))?.status).toBe("done");
-      // The terminal transition runs the same slot finalizer SUP-17609 relies on:
-      // the binding is cleared. This generation wrote no surviving revision, so
-      // the slot fails closed to "failed" for the refresh sweep to regenerate.
       const [slot] = await db
         .select()
         .from(summarySlots)
@@ -603,6 +673,68 @@ describeEmbeddedPostgres(
         .limit(1);
       expect(slot?.generatingIssueId).toBeNull();
       expect(slot?.status).toBe("failed");
+    });
+
+    it("still terminalizes a summary task blocked after selection (blocked stays in the stranded population)", async () => {
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const slotId = randomUUID();
+      await db.insert(summarySlots).values({
+        id: slotId,
+        companyId,
+        scopeKind: "project",
+        scopeId: randomUUID(),
+        slotKey: "header",
+        status: "generating",
+        generatingIssueId: issueId,
+      });
+
+      let signalLocked!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        signalLocked = resolve;
+      });
+      let releaseLock!: () => void;
+      const lockReleased = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+      const competingBlock = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        signalLocked();
+        await lockReleased;
+        await tx.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      });
+      await locked;
+
+      const transaction = db.transaction.bind(db);
+      let closeTransactionStarted = false;
+      const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) =>
+        transaction(async (tx) => {
+          closeTransactionStarted = true;
+          return callback(tx);
+        }, config),
+      );
+      const reaping = reapStrandedSummaryGenerationIssues(db);
+      try {
+        await vi.waitFor(() => {
+          expect(closeTransactionStarted).toBe(true);
+        }, { timeout: 5_000, interval: 10 });
+        releaseLock();
+        await competingBlock;
+        transactionSpy.mockRestore();
+        const result = await reaping;
+
+        expect(result).toEqual({ scanned: 1, terminalized: 1 });
+        expect((await getIssue(issueId))?.status).toBe("done");
+        const [slot] = await db.select().from(summarySlots).where(eq(summarySlots.id, slotId)).limit(1);
+        expect(slot).toMatchObject({ status: "failed", generatingIssueId: null });
+      } finally {
+        releaseLock();
+        transactionSpy.mockRestore();
+        await competingBlock.catch(() => undefined);
+        await reaping.catch(() => undefined);
+        await db.delete(activityLog).where(eq(activityLog.entityId, issueId));
+        await db.delete(summarySlots).where(eq(summarySlots.id, slotId));
+        await db.delete(issues).where(eq(issues.id, issueId));
+      }
     });
 
     it("terminalizes a todo summary task with a null execution state", async () => {
