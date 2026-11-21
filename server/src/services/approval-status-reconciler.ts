@@ -2872,9 +2872,14 @@ async function attemptRearmOnHealedStamp(
       number: certifiedPr.number,
       headSha,
     });
-    outcome = armBlock
-      ? { kind: "skipped", message: armBlock }
-      : await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
+    if (armBlock) {
+      await releaseRearmSlot(db, row, headSha).catch((err) => {
+        logger.warn({ err, issueId: row.id, headSha }, "re-arm slot could not be given back after a carrier preflight refusal");
+      });
+      outcome = { kind: "skipped", message: armBlock };
+    } else {
+      outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
+    }
   } catch (err) {
     outcome = {
       kind: "failed",
