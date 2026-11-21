@@ -145,11 +145,20 @@ function wakeCoversIssueBlockersResolvedReadyState(
   if (idempotencyKey === keys.stateKey) {
     if (IN_FLIGHT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return true;
     if (!IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return false;
-    // Fork re-arm window: a wake that COMPLETED and left the dependent dead is
-    // allowed to re-arm once it ages past the cutoff, which is what feeds the
-    // re-arm cap and the blocked_without_blockers escalation. Without this a
-    // completed stable-key wake would suppress forever and the cap would never
-    // fire. No cutoff configured keeps upstream's plain idempotent behaviour.
+    // The canonical key is stable across blocked generations, so a finished
+    // wake only covers the generation it was REQUESTED in. A wake requested
+    // before the dependent's current blockedTransitionAt belongs to an earlier
+    // generation and must not suppress this one, even when it finished after
+    // the new generation began.
+    if (keys.blockedTransitionAt && wake.requestedAt.getTime() < keys.blockedTransitionAt.getTime()) {
+      return false;
+    }
+    // Fork re-arm window: a same-generation wake that finished and left the
+    // dependent dead is allowed to re-arm once it ages past the cutoff, which
+    // is what feeds the re-arm cap and the blocked_without_blockers escalation.
+    // Without this a finished stable-key wake would suppress forever and the
+    // cap would never fire. No cutoff keeps upstream's plain idempotent
+    // behaviour within the generation.
     if (!keys.completedRearmCutoff) return true;
     return wake.updatedAt.getTime() >= keys.completedRearmCutoff.getTime();
   }
@@ -170,18 +179,22 @@ function wakeCoversIssueBlockersResolvedReadyState(
 
 /**
  * Find a wake that already covers the current dependency-ready state of the
- * dependent issue. The check is level-triggered and stable across blocked cycles:
+ * dependent issue. The check is level-triggered per blocked generation:
  *
- * - The canonical state key matches a wake in any idempotent status
- *   (including `completed`). This suppresses a duplicate for the SAME dependent
- *   and blocker set, regardless of which producer emitted it or when it blocked.
+ * - The canonical state key matches an in-flight wake regardless of when it
+ *   was requested. A wake in another idempotent status (including `completed`)
+ *   matches only when it belongs to the current blocked generation
+ *   (`requestedAt` at or after the current `blockedTransitionAt`). This
+ *   suppresses a duplicate for the SAME dependent, blocker set and
+ *   generation, regardless of which producer emitted it.
  * - The old no-cycle state key matches in-flight statuses (deploy overlap),
  *   or a `completed` wake whose `requestedAt` is at or after the current
  *   `blockedTransitionAt` (same cycle). A completed old-key wake from a
  *   previous cycle does not suppress.
  * - Each legacy per-edge key matches only a wake that is still in flight.
- * - `completedRearmCutoff` (fork) lets a COMPLETED canonical-key wake stop
- *   suppressing once it ages past the cutoff, so the re-arm cap and the
+ * - `completedRearmCutoff` (fork) is the re-arm AGE cutoff, independent of the
+ *   generation: a same-generation finished canonical-key wake stops
+ *   suppressing once its `updatedAt` ages past it, so the re-arm cap and the
  *   blocked_without_blockers escalation still have something to count.
  *
  * Returns the first matching wake or `null`.

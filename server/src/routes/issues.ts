@@ -5000,7 +5000,11 @@ export function issueRoutes(
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
-    await recordChildCarrierDecision(db, issue.companyId, issue.id);
+    try {
+      await recordChildCarrierDecision(db, issue.companyId, issue.id);
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "child carrier decision was not attached; stamp and arm still follow the attribution row");
+    }
     // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
     // invoke this hook after the transaction commits, so the decision row and
     // completedStageIds are already durable — the predicate is evaluable here.
@@ -12724,6 +12728,7 @@ export function issueRoutes(
     try {
       outcome = await publishHeadBoundRelease(rdb, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
+        issueId: existing.id,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
         abandon: scope ? ctx.cancelScope : undefined,
       });
@@ -20883,12 +20888,15 @@ export function issueRoutes(
             childCarrierClaim: {
               prNumber: requestedDeliveryIdentity.prNumber,
               prUrl: requestedDeliveryIdentity.prUrl,
+              headSha: requestedDeliveryIdentity.headSha,
               claimedAt: new Date().toISOString(),
             },
           };
         } else {
+          const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+          delete withoutClaim.childCarrierClaim;
           updateFields.executionState = {
-            ...currentExecState,
+            ...withoutClaim,
             delivery: {
               ...requestedDeliveryIdentity,
               kind: "as05_bound_pr",
@@ -20939,8 +20947,10 @@ export function issueRoutes(
           });
           return;
         }
+        const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+        delete withoutClaim.childCarrierClaim;
         updateFields.executionState = {
-          ...currentExecState,
+          ...withoutClaim,
           delivery: {
             ...requestedDeliveryIdentity,
             recordedByRunId: actor.runId,

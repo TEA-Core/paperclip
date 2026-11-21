@@ -1,4 +1,5 @@
-import { and, eq, sql } from "drizzle-orm";
+import { isUniqueViolation } from "../db-errors.js";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -105,12 +106,17 @@ async function readChildWorkspace(db: Db, companyId: string, issueId: string) {
   return { issue, branch: workspace.branchName, repo };
 }
 
-function readClaim(executionState: unknown): { prNumber: number } | null {
+function readClaim(executionState: unknown): { prNumber: number; headSha: string | null } | null {
   if (!executionState || typeof executionState !== "object" || Array.isArray(executionState)) return null;
   const claim = (executionState as Record<string, unknown>).childCarrierClaim;
   if (!claim || typeof claim !== "object" || Array.isArray(claim)) return null;
-  const prNumber = (claim as Record<string, unknown>).prNumber;
-  return typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0 ? { prNumber } : null;
+  const record = claim as Record<string, unknown>;
+  const prNumber = record.prNumber;
+  if (typeof prNumber !== "number" || !Number.isInteger(prNumber) || prNumber <= 0) return null;
+  const headSha = typeof record.headSha === "string" && SHA_RE.test(record.headSha.toLowerCase())
+    ? record.headSha.toLowerCase()
+    : null;
+  return { prNumber, headSha };
 }
 
 function readBindingPr(executionState: unknown, cardBranch: string): { prNumber: number } | null {
@@ -139,6 +145,7 @@ async function fetchLivePullRequest(
     let response: Response;
     try {
       response = await ghFetch(url, {
+        signal: AbortSignal.timeout(8_000),
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${candidate.token}`,
@@ -198,7 +205,7 @@ async function enumerateChildCarrierCommits(input: {
     const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/pulls/${input.pullRequestNumber}/commits?per_page=100&page=${page}`;
     let response: Response;
     try {
-      response = await ghFetch(url, { headers });
+      response = await ghFetch(url, { headers, signal: AbortSignal.timeout(8_000) });
     } catch {
       return { ok: false, reason: "child carrier commit enumeration failed: network_error" };
     }
@@ -212,21 +219,39 @@ async function enumerateChildCarrierCommits(input: {
       }
       prShas.push(sha.toLowerCase());
     }
+    const link = response.headers?.get?.("link") ?? "";
+    const hasNext = /<[^>]+>;\s*rel="next"/i.test(link);
+    if (body.length < 100 && hasNext) {
+      return { ok: false, reason: "child carrier commit enumeration is incomplete" };
+    }
     if (body.length < 100) break;
     if (page === 20) return { ok: false, reason: "child carrier commit enumeration is incomplete" };
+  }
+  if (prShas.at(-1) !== input.headSha) {
+    return { ok: false, reason: "child carrier head is not the tip of the enumerated pull request commits" };
   }
   if (!input.baseRef) return { ok: false, reason: "child carrier commit enumeration has no base branch" };
   const compareUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/compare/${encodeURIComponent(input.baseRef)}...${encodeURIComponent(input.childBranch)}`;
   let compare: Response;
   try {
-    compare = await ghFetch(compareUrl, { headers });
+    compare = await ghFetch(compareUrl, { headers, signal: AbortSignal.timeout(8_000) });
   } catch {
     return { ok: false, reason: "child branch commit enumeration failed: network_error" };
   }
   if (!compare.ok) return { ok: false, reason: `child branch commit enumeration failed: HTTP ${compare.status}` };
-  const compared = await compare.json().catch(() => null) as { commits?: Array<{ sha?: unknown }> } | null;
-  if (!compared || !Array.isArray(compared.commits)) {
-    return { ok: false, reason: "child branch commit enumeration returned an unreadable list" };
+  const compareLink = compare.headers?.get?.("link") ?? "";
+  if (/<[^>]+>;\s*rel="next"/i.test(compareLink)) {
+    return { ok: false, reason: "child branch commit enumeration is incomplete" };
+  }
+  const compared = await compare.json().catch(() => null) as {
+    total_commits?: unknown;
+    commits?: Array<{ sha?: unknown }>;
+  } | null;
+  if (!compared || !Array.isArray(compared.commits) || typeof compared.total_commits !== "number") {
+    return { ok: false, reason: "child branch commit enumeration is incomplete" };
+  }
+  if (compared.total_commits !== compared.commits.length) {
+    return { ok: false, reason: "child branch commit enumeration is incomplete" };
   }
   const childShas = new Set<string>();
   for (const row of compared.commits) {
@@ -235,12 +260,16 @@ async function enumerateChildCarrierCommits(input: {
     }
     childShas.add(row.sha.toLowerCase());
   }
-  const intersection = normalizeShas(prShas.filter((sha) => childShas.has(sha)));
-  if (!intersection) return { ok: true, shas: [] };
-  if (!prShas.map((sha) => sha.toLowerCase()).includes(input.headSha)) {
-    return { ok: false, reason: "child carrier head is not in the enumerated pull request commits" };
+  const prShaSet = new Set(prShas);
+  for (const sha of childShas) {
+    if (!prShaSet.has(sha)) {
+      return { ok: false, reason: "child carrier commit enumeration is missing a child commit" };
+    }
   }
+  const intersection = normalizeShas([...childShas].filter((sha) => prShaSet.has(sha)));
+  if (!intersection) return { ok: true, shas: [] };
   return { ok: true, shas: intersection };
+
 }
 
 async function findCarrierAncestors(
@@ -248,9 +277,13 @@ async function findCarrierAncestors(
   companyId: string,
   childIssueId: string,
   branchName: string,
+  repo: { owner: string; repo: string },
 ): Promise<string[]> {
   const rows = await db
-    .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
+    .select({
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      repoUrl: executionWorkspaces.repoUrl,
+    })
     .from(executionWorkspaces)
     .where(and(
       eq(executionWorkspaces.companyId, companyId),
@@ -259,7 +292,14 @@ async function findCarrierAncestors(
   const ancestors: string[] = [];
   for (const row of rows) {
     const source = row.sourceIssueId?.trim() ?? "";
-    if (!source || source === childIssueId) continue;
+    const candidateRepo = parseRepoUrl(row.repoUrl);
+    if (
+      !source
+      || source === childIssueId
+      || !candidateRepo
+      || candidateRepo.owner.toLowerCase() !== repo.owner.toLowerCase()
+      || candidateRepo.repo.toLowerCase() !== repo.repo.toLowerCase()
+    ) continue;
     const [owner] = await db
       .select({ id: issues.id, status: issues.status })
       .from(issues)
@@ -267,14 +307,23 @@ async function findCarrierAncestors(
       .limit(1);
     if (!owner || owner.status === "cancelled") continue;
     const [owned] = await db
-      .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
+      .select({
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        repoUrl: executionWorkspaces.repoUrl,
+        branchName: executionWorkspaces.branchName,
+      })
       .from(executionWorkspaces)
       .innerJoin(issues, eq(issues.executionWorkspaceId, executionWorkspaces.id))
       .where(and(eq(issues.id, source), eq(issues.companyId, companyId)))
       .limit(1);
+    const ownedRepo = parseRepoUrl(owned?.repoUrl ?? null);
     const ownedSource = owned?.sourceIssueId?.trim() ?? "";
+    if (!owned || owned.sourceIssueId === undefined || !ownedRepo || owned.branchName !== branchName) continue;
+    if (
+      ownedRepo.owner.toLowerCase() !== repo.owner.toLowerCase()
+      || ownedRepo.repo.toLowerCase() !== repo.repo.toLowerCase()
+    ) continue;
     if (ownedSource && ownedSource !== source) continue;
-    if (owned?.sourceIssueId === undefined) continue;
     if (!(await isStrictAncestorIssueIdOf(db, companyId, childIssueId, source))) continue;
     if (!ancestors.includes(source)) ancestors.push(source);
   }
@@ -328,6 +377,11 @@ async function writeCurrent(
         repo: input.repo,
         branchName: input.branchName,
         commitShas: input.commitShas,
+        ...(normalizeShas(existing.commitShas)?.join() === normalizeShas(input.commitShas)?.join()
+          && existing.branchName === input.branchName
+          && existing.ancestorIssueId === input.ancestorIssueId
+          ? {}
+          : { childDecisionId: null }),
         provenance: { source: "control-plane-verification", headSha: input.headSha },
         updatedAt: now,
       })
@@ -335,7 +389,12 @@ async function writeCurrent(
     return existing.id;
   }
   const [sameHead] = await db
-    .select({ id: issueChildCarrierAttributions.id })
+    .select({
+      id: issueChildCarrierAttributions.id,
+      commitShas: issueChildCarrierAttributions.commitShas,
+      branchName: issueChildCarrierAttributions.branchName,
+      ancestorIssueId: issueChildCarrierAttributions.ancestorIssueId,
+    })
     .from(issueChildCarrierAttributions)
     .where(and(
       eq(issueChildCarrierAttributions.companyId, input.companyId),
@@ -355,6 +414,11 @@ async function writeCurrent(
         repo: input.repo,
         branchName: input.branchName,
         commitShas: input.commitShas,
+        ...(normalizeShas(sameHead.commitShas)?.join() === normalizeShas(input.commitShas)?.join()
+          && sameHead.branchName === input.branchName
+          && sameHead.ancestorIssueId === input.ancestorIssueId
+          ? {}
+          : { childDecisionId: null }),
         writtenByActorType: "system",
         writtenByActorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
         provenance: { source: "control-plane-verification", headSha: input.headSha },
@@ -364,41 +428,89 @@ async function writeCurrent(
     return sameHead.id;
   }
 
-  const [inserted] = await db
-    .insert(issueChildCarrierAttributions)
-    .values({
+  try {
+    const [inserted] = await db
+      .insert(issueChildCarrierAttributions)
+      .values({
+        companyId: input.companyId,
+        childIssueId: input.childIssueId,
+        ancestorIssueId: input.ancestorIssueId,
+        provider: "github",
+        owner: input.owner.toLowerCase(),
+        repo: input.repo.toLowerCase(),
+        pullRequestNumber: input.pullRequestNumber,
+        branchName: input.branchName,
+        headSha: input.headSha,
+        commitShas: input.commitShas,
+        state: "current",
+        writtenByActorType: "system",
+        writtenByActorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
+        provenance: { source: "control-plane-verification", headSha: input.headSha },
+      })
+      .returning({ id: issueChildCarrierAttributions.id });
+    await logActivity(db, {
       companyId: input.companyId,
-      childIssueId: input.childIssueId,
-      ancestorIssueId: input.ancestorIssueId,
-      provider: "github",
-      owner: input.owner.toLowerCase(),
-      repo: input.repo.toLowerCase(),
+      actorType: "system",
+      actorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
+      action: "issue.child_carrier_attribution_recorded",
+      entityType: "issue_child_carrier_attribution",
+      entityId: inserted!.id,
+      issueId: input.childIssueId,
+      details: {
+        ancestorIssueId: input.ancestorIssueId,
+        pullRequestNumber: input.pullRequestNumber,
+        headSha: input.headSha,
+        commitCount: input.commitShas.length,
+      },
+    });
+    return inserted!.id;
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const winner = await readCurrent(db, input.companyId, input.childIssueId);
+    if (
+      winner
+      && winner.headSha === input.headSha
+      && winner.pullRequestNumber === input.pullRequestNumber
+      && winner.owner === input.owner.toLowerCase()
+      && winner.repo === input.repo.toLowerCase()
+      && winner.branchName === input.branchName
+      && normalizeShas(winner.commitShas)?.join() === normalizeShas(input.commitShas)?.join()
+    ) {
+      return winner.id;
+    }
+    throw new Error("child_carrier_proof_conflict");
+  }
+}
+
+async function enumerateWithCredentials(input: {
+  db: Db;
+  companyId: string;
+  owner: string;
+  repo: string;
+  pullRequestNumber: number;
+  headSha: string;
+  baseRef: string | null;
+  childBranch: string;
+}): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(input.db, input.companyId, input.owner, input.repo);
+  if (candidates.length === 0) {
+    return { ok: false, reason: "child carrier commit enumeration has no GitHub token" };
+  }
+  let last = "child carrier commit enumeration failed";
+  for (const candidate of candidates) {
+    const enumerated = await childCarrierCommits.enumerate({
+      token: candidate.token,
+      owner: input.owner,
+      repo: input.repo,
       pullRequestNumber: input.pullRequestNumber,
-      branchName: input.branchName,
       headSha: input.headSha,
-      commitShas: input.commitShas,
-      state: "current",
-      writtenByActorType: "system",
-      writtenByActorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
-      provenance: { source: "control-plane-verification", headSha: input.headSha },
-    })
-    .returning({ id: issueChildCarrierAttributions.id });
-  await logActivity(db, {
-    companyId: input.companyId,
-    actorType: "system",
-    actorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
-    action: "issue.child_carrier_attribution_recorded",
-    entityType: "issue_child_carrier_attribution",
-    entityId: inserted!.id,
-    issueId: input.childIssueId,
-    details: {
-      ancestorIssueId: input.ancestorIssueId,
-      pullRequestNumber: input.pullRequestNumber,
-      headSha: input.headSha,
-      commitCount: input.commitShas.length,
-    },
-  });
-  return inserted!.id;
+      baseRef: input.baseRef,
+      childBranch: input.childBranch,
+    });
+    if (enumerated.ok || !/HTTP 401|HTTP 403/.test(enumerated.reason)) return enumerated;
+    last = enumerated.reason;
+  }
+  return { ok: false, reason: last };
 }
 
 export async function resolveChildCarrierDecisionHead(
@@ -417,7 +529,7 @@ export async function resolveChildCarrierDecisionHead(
     return { kind: "absent" };
   }
   if (!live.headRef || live.headRef === card.branch) return { kind: "absent" };
-  const ancestors = await findCarrierAncestors(db, companyId, issueId, live.headRef);
+  const ancestors = await findCarrierAncestors(db, companyId, issueId, live.headRef, card.repo);
   if (ancestors.length === 0) return { kind: "absent" };
   if (ancestors.length !== 1) {
     return { kind: "unresolvable", reason: "delivery_identity_unresolved: multiple ancestor carrier candidates; refusing child attribution" };
@@ -430,6 +542,16 @@ export async function resolveChildCarrierDecisionHead(
     return { kind: "unresolvable", reason: "head_unverifiable: recorded child carrier pull request has no readable head" };
   }
   const current = await readCurrent(db, companyId, issueId);
+  const claimedHead = "headSha" in claim ? claim.headSha : null;
+  if (claimedHead && claimedHead !== live.headSha) {
+    if (current) {
+      await db
+        .update(issueChildCarrierAttributions)
+        .set({ state: "invalidated", invalidatedAt: new Date(), updatedAt: new Date() })
+        .where(eq(issueChildCarrierAttributions.id, current.id));
+    }
+    return { kind: "unresolvable", reason: `head_moved: child carrier head moved to ${live.headSha.slice(0, 7)}; review the new head` };
+  }
   if (current && current.headSha !== live.headSha) {
     await db
       .update(issueChildCarrierAttributions)
@@ -437,10 +559,9 @@ export async function resolveChildCarrierDecisionHead(
       .where(eq(issueChildCarrierAttributions.id, current.id));
     return { kind: "unresolvable", reason: `head_moved: child carrier head moved to ${live.headSha.slice(0, 7)}; review the new head` };
   }
-  const token = (await resolveGitHubTokenCandidatesForRepo(db, companyId, card.repo.owner, card.repo.repo))[0]?.token;
-  if (!token) return { kind: "unresolvable", reason: "delivery_identity_unresolved: child carrier commit enumeration has no GitHub token" };
-  const enumerated = await childCarrierCommits.enumerate({
-    token,
+  const enumerated = await enumerateWithCredentials({
+    db,
+    companyId,
     owner: card.repo.owner,
     repo: card.repo.repo,
     pullRequestNumber: claim.prNumber,
@@ -461,17 +582,24 @@ export async function resolveChildCarrierDecisionHead(
       return { kind: "unresolvable", reason: "delivery_identity_unresolved: child carrier commit enumeration is missing or extra" };
     }
   }
-  await writeCurrent(db, {
-    companyId,
-    childIssueId: issueId,
-    ancestorIssueId: ancestors[0]!,
-    owner: card.repo.owner.toLowerCase(),
-    repo: card.repo.repo.toLowerCase(),
-    pullRequestNumber: claim.prNumber,
-    branchName: live.headRef,
-    headSha: live.headSha,
-    commitShas: shas,
-  });
+  try {
+    await writeCurrent(db, {
+      companyId,
+      childIssueId: issueId,
+      ancestorIssueId: ancestors[0]!,
+      owner: card.repo.owner.toLowerCase(),
+      repo: card.repo.repo.toLowerCase(),
+      pullRequestNumber: claim.prNumber,
+      branchName: live.headRef,
+      headSha: live.headSha,
+      commitShas: shas,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "child_carrier_proof_conflict") {
+      return { kind: "unresolvable", reason: "delivery_identity_unresolved: child carrier proof conflict" };
+    }
+    throw error;
+  }
   return {
     kind: "resolved",
     headSha: live.headSha,
@@ -506,7 +634,7 @@ export async function classifyAncestorCarrierHead(
 ): Promise<"absent" | "one" | "many"> {
   const card = await readChildWorkspace(db, companyId, issueId);
   if (!card || card.branch === headRef) return "absent";
-  const ancestors = await findCarrierAncestors(db, companyId, issueId, headRef);
+  const ancestors = await findCarrierAncestors(db, companyId, issueId, headRef, card.repo);
   if (ancestors.length === 0) return "absent";
   return ancestors.length === 1 ? "one" : "many";
 }
@@ -547,6 +675,8 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     ))
     .limit(1);
   if (!decision || decision.outcome !== "approved") return;
+  const claim = readClaim(state);
+  if (!claim || claim.prNumber !== current.pullRequestNumber || claim.headSha !== current.headSha) return;
   await db
     .update(issueChildCarrierAttributions)
     .set({ childDecisionId: decision.id, updatedAt: new Date() })
@@ -585,7 +715,7 @@ export async function carrierOwnerChildAttributionBlock(
 ): Promise<string | null> {
   const owner = await readChildWorkspace(db, companyId, ownerIssueId);
   if (!owner) return null;
-  if (pr.headRef && pr.headRef !== owner.branch) return null;
+  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) return null;
   if (pr.owner.toLowerCase() !== owner.repo.owner.toLowerCase() || pr.repo.toLowerCase() !== owner.repo.repo.toLowerCase()) {
     return null;
   }
@@ -599,21 +729,30 @@ export async function carrierOwnerChildAttributionBlock(
       eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
       eq(issueChildCarrierAttributions.state, "current"),
     ));
-  if (descendants.length === 0 && attributions.length === 0) return null;
-  const live = await fetchLivePullRequest(db, companyId, owner.repo.owner, owner.repo.repo, pr.number);
-  if (!live.ok && (descendants.length > 0 || attributions.length > 0)) return CHILD_CARRIER_OWNER_GATE_SKIP;
-  const headSha = pr.headSha ?? (live.ok ? live.live.headSha : null);
-  const required = new Set<string>();
+  if (descendants.length === 0) return null;
+  const sameRepo = [];
   for (const descendant of descendants) {
     const card = await readChildWorkspace(db, companyId, descendant.id);
     if (!card) continue;
-    const token = (await resolveGitHubTokenCandidatesForRepo(db, companyId, owner.repo.owner, owner.repo.repo))[0]?.token;
-    if (!token || !headSha || !live.ok) {
-      if (attributions.some((row) => row.childIssueId === descendant.id)) required.add(descendant.id);
-      continue;
-    }
-    const enumerated = await childCarrierCommits.enumerate({
-      token,
+    if (
+      card.repo.owner.toLowerCase() !== owner.repo.owner.toLowerCase()
+      || card.repo.repo.toLowerCase() !== owner.repo.repo.toLowerCase()
+    ) continue;
+    sameRepo.push({ descendant, card });
+  }
+  if (sameRepo.length === 0) return null;
+  const live = await fetchLivePullRequest(db, companyId, owner.repo.owner, owner.repo.repo, pr.number);
+  if (!live.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  if (pr.headSha && live.live.headSha && pr.headSha.toLowerCase() !== live.live.headSha) {
+    return CHILD_CARRIER_OWNER_GATE_SKIP;
+  }
+  const headSha = live.live.headSha;
+  if (!headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  const required = new Map<string, string[]>();
+  for (const { descendant, card } of sameRepo) {
+    const enumerated = await enumerateWithCredentials({
+      db,
+      companyId,
       owner: owner.repo.owner,
       repo: owner.repo.repo,
       pullRequestNumber: pr.number,
@@ -621,16 +760,39 @@ export async function carrierOwnerChildAttributionBlock(
       baseRef: live.live.baseRef,
       childBranch: card.branch,
     });
-    if (!enumerated.ok || enumerated.shas.length > 0) required.add(descendant.id);
+    if (!enumerated.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    const shas = normalizeShas(enumerated.shas);
+    if (!shas) continue;
+    required.set(descendant.id, shas);
   }
-  for (const row of attributions) required.add(row.childIssueId);
   if (required.size === 0) return null;
-  for (const childId of required) {
+  for (const [childId, shas] of required) {
     const row = attributions.find((item) => item.childIssueId === childId);
-    if (!row || row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (pr.headSha && row.headSha !== pr.headSha.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (pr.headRef && row.branchName !== pr.headRef) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    const stored = row ? normalizeShas(row.commitShas) : null;
+    if (!row || !stored || stored.join() !== shas.join()) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (row.headSha !== headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (pr.headRef && row.branchName.toLowerCase() !== pr.headRef.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (!row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    const [childIssue] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(and(eq(issues.id, childId), eq(issues.companyId, companyId)))
+      .limit(1);
+    const claim = readClaim(childIssue?.executionState);
+    if (!claim || claim.prNumber !== row.pullRequestNumber || (claim.headSha !== null && claim.headSha !== row.headSha)) {
+      return CHILD_CARRIER_OWNER_GATE_SKIP;
+    }
+    const [latest] = await db
+      .select({ outcome: issueExecutionDecisions.outcome })
+      .from(issueExecutionDecisions)
+      .where(and(
+        eq(issueExecutionDecisions.issueId, childId),
+        eq(issueExecutionDecisions.companyId, companyId),
+      ))
+      .orderBy(desc(issueExecutionDecisions.createdAt))
+      .limit(1);
+    if (!latest || latest.outcome !== "approved") return CHILD_CARRIER_OWNER_GATE_SKIP;
     const [decision] = await db
       .select({ outcome: issueExecutionDecisions.outcome })
       .from(issueExecutionDecisions)
@@ -642,7 +804,44 @@ export async function carrierOwnerChildAttributionBlock(
       .limit(1);
     if (!decision || decision.outcome !== "approved") return CHILD_CARRIER_OWNER_GATE_SKIP;
   }
-  if (attributions.length !== required.size) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  return null;
+}
+
+export async function childCarrierStampBlock(
+  db: Db,
+  companyId: string,
+  pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null },
+  issueId?: string,
+): Promise<string | null> {
+  if (issueId) {
+    const childSkip = await childCarrierMustNotPublish(db, companyId, issueId, pr);
+    if (childSkip) return childSkip;
+    const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, issueId, pr);
+    if (ownerSkip) return ownerSkip;
+  }
+  const rows = await db
+    .select({
+      ancestorIssueId: issueChildCarrierAttributions.ancestorIssueId,
+      childIssueId: issueChildCarrierAttributions.childIssueId,
+    })
+    .from(issueChildCarrierAttributions)
+    .where(and(
+      eq(issueChildCarrierAttributions.companyId, companyId),
+      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
+      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
+      eq(issueChildCarrierAttributions.state, "current"),
+    ));
+  for (const row of rows) {
+    if (row.ancestorIssueId !== issueId) {
+      const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, row.ancestorIssueId, pr);
+      if (ownerSkip) return ownerSkip;
+    }
+    if (row.childIssueId !== issueId) {
+      const childSkip = await childCarrierMustNotPublish(db, companyId, row.childIssueId, pr);
+      if (childSkip) return childSkip;
+    }
+  }
   return null;
 }
 
@@ -652,7 +851,7 @@ export async function carrierArmBlock(
   issueId: string,
   pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null } | null,
 ): Promise<string | null> {
+  if (pr) return childCarrierStampBlock(db, companyId, pr, issueId);
   if (await readCurrent(db, companyId, issueId)) return CHILD_CARRIER_STAMP_SKIP;
-  if (!pr) return null;
-  return carrierOwnerChildAttributionBlock(db, companyId, issueId, pr);
+  return null;
 }
