@@ -762,6 +762,47 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     expect(card?.status).toBe("done");
   });
 
+  it("wakes a dependent re-blocked after a completed wake requested in its earlier blocked generation", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+      cardDescription: mergeGateMarker([404]),
+    });
+    // Generation 2 began an hour ago; the completed canonical wake was
+    // requested in generation 1 and only finished after the re-block.
+    const generationTwoAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: generationTwoAt })
+      .where(eq(issues.id, fixture.dependentId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: fixture.dependentId,
+        blockerIssueIds: [fixture.cardId],
+      }),
+      requestedAt: new Date(generationTwoAt.getTime() - 60 * 60 * 1000),
+      updatedAt: new Date(generationTwoAt.getTime() + 30 * 60 * 1000),
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async () => ({ ...MERGED_EVIDENCE })),
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("defers a card whose pull-request evidence is unmeasurable instead of closing it", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
