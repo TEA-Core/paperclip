@@ -31,9 +31,11 @@ describePostgres("board recovery carrier park migration", () => {
       const [index] = await query`select indisvalid, indisready from pg_index where indexrelid = 'issue_tree_holds_active_park_action_idx'::regclass`;
       expect(index).toEqual({ indisvalid: true, indisready: true });
       const actionId = randomUUID(), activeHoldId = randomUUID();
-      const binding = JSON.stringify({ recoveryActionId: actionId });
-      await query`insert into issue_tree_holds (id, company_id, root_issue_id, mode, recovery_carrier_park)
-        values (${activeHoldId}, ${companyId}, ${issueId}, 'pause', ${binding}::jsonb)`;
+      const binding = query.json({ recoveryActionId: actionId });
+      const [active] = await query`insert into issue_tree_holds (id, company_id, root_issue_id, mode, recovery_carrier_park)
+        values (${activeHoldId}, ${companyId}, ${issueId}, 'pause', ${binding}::jsonb)
+        returning status, recovery_carrier_park`;
+      expect(active).toEqual({ status: "active", recovery_carrier_park: { recoveryActionId: actionId } });
       await expect(query`insert into issue_tree_holds (company_id, root_issue_id, mode, recovery_carrier_park)
         values (${companyId}, ${issueId}, 'pause', ${binding}::jsonb)`).rejects.toMatchObject({ code: "23505" });
       // Released/unbound holds and another company's action identity do not occupy this slot.
