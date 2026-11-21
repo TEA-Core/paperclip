@@ -3,6 +3,9 @@ import { generateKeyPairSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   normalizeRepoUrl,
+  parseRepoUrlRef,
+  canonicalGitHubRepoRef,
+  GITHUB_CANONICAL_HOST,
   resolveGitHubToken,
   resolveGitHubTokenForRepo,
   resolveGitHubTokenCandidatesForRepo,
@@ -1888,5 +1891,133 @@ describe("normalizeRepoUrl", () => {
     expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip-smart-router")).not.toBe(
       normalizeRepoUrl("https://github.com/TEA-Core/paperclip"),
     );
+  });
+
+  it("still erases the host — which is why an authorization comparison must not use it alone", () => {
+    // SUP-23880: this collapse is the general behavior other callers depend on, but it
+    // makes a GitLab-hosted workspace compare equal to a GitHub one. Host-aware
+    // authorization uses parseRepoUrlRef/canonicalGitHubRepoRef instead.
+    expect(normalizeRepoUrl("https://gitlab.example.com/TEA-Core/paperclip")).toBe(
+      normalizeRepoUrl("https://github.com/TEA-Core/paperclip"),
+    );
+  });
+});
+
+describe("parseRepoUrlRef / canonicalGitHubRepoRef — host-aware repo identity (SUP-23880)", () => {
+  it("parseRepoUrlRef preserves the host so a non-GitHub URL cannot compare equal to a GitHub one", () => {
+    const gitlab = parseRepoUrlRef("https://gitlab.example.com/TEA-Core/paperclip");
+    const github = parseRepoUrlRef("https://github.com/TEA-Core/paperclip");
+    expect(gitlab).toEqual({ host: "gitlab.example.com", owner: "TEA-Core", repo: "paperclip" });
+    expect(github).toEqual({ host: "github.com", owner: "TEA-Core", repo: "paperclip" });
+    expect(gitlab!.host).not.toBe(github!.host);
+  });
+
+  it("keeps registered owner/repo casing, strips .git and trailing slashes, lowercases only the host", () => {
+    expect(parseRepoUrlRef("https://GitHub.com/TEA-Core/Paperclip.git/")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "Paperclip",
+    });
+    expect(parseRepoUrlRef("git@GitHub.com:TEA-Core/paperclip.git")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+    expect(parseRepoUrlRef("TEA-Core/paperclip.git")).toEqual({ host: "", owner: "TEA-Core", repo: "paperclip" });
+    expect(parseRepoUrlRef("https://user@github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+  });
+
+  it("canonicalGitHubRepoRef admits only a github.com host — bare owner/repo and other hosts fail closed", () => {
+    expect(GITHUB_CANONICAL_HOST).toBe("github.com");
+    expect(canonicalGitHubRepoRef("https://github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+    expect(canonicalGitHubRepoRef("git@github.com:TEA-Core/paperclip.git")).not.toBeNull();
+    // A bare owner/repo carries no host to prove it is GitHub, so it cannot authorize.
+    expect(canonicalGitHubRepoRef("TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("https://www.github.com/TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("https://gitlab.example.com/TEA-Core/paperclip")).toBeNull();
+  });
+
+  it("returns null for anything that is not exactly owner/repo after the host", () => {
+    expect(parseRepoUrlRef("https://github.com/TEA-Core/paperclip/tree/main")).toBeNull();
+    expect(parseRepoUrlRef("https://github.com/TEA-Core/")).toBeNull();
+    expect(parseRepoUrlRef("https://github.com")).toBeNull();
+    expect(parseRepoUrlRef("")).toBeNull();
+    expect(parseRepoUrlRef("just-a-name")).toBeNull();
+  });
+
+  // SUP-23892: only HTTP(S) URLs and the scp-like form are supported transports
+  // for repo identity. Any other URI scheme fails closed in the parser, before
+  // host comparison, so a URL that merely places github.com after an
+  // unsupported scheme cannot lend GitHub's host identity to that transport.
+  it("parseRepoUrlRef accepts only https/http URL transports — other schemes fail closed", () => {
+    expect(parseRepoUrlRef("file://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("ftp://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("ssh://git@github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("git://github.com/TEA-Core/paperclip")).toBeNull();
+    // Supported URL transports keep parsing, HTTP included.
+    expect(parseRepoUrlRef("http://github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+  });
+
+  it("canonicalGitHubRepoRef refuses an unsupported transport that impersonates github.com (SUP-23892)", () => {
+    expect(canonicalGitHubRepoRef("file://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("git://github.com/TEA-Core/paperclip")).toBeNull();
+    // Supported transports keep authorizing: HTTPS, HTTP, and scp-like.
+    expect(canonicalGitHubRepoRef("https://github.com/TEA-Core/paperclip")).not.toBeNull();
+    expect(canonicalGitHubRepoRef("http://github.com/TEA-Core/paperclip")).not.toBeNull();
+    expect(canonicalGitHubRepoRef("git@github.com:TEA-Core/paperclip.git")).not.toBeNull();
+  });
+
+  // Release-assurance NO-GO at bf2a23ac: the URL form must read the same to the pattern as
+  // to the WHATWG parser every real client uses, or it is null — never a host the client
+  // would not contact.
+  it.each([
+    // The review thread's exact string: WHATWG reads host attacker.example (`\` is `/`).
+    "https://attacker.example\\@github.com/TEA-Core/paperclip",
+    "https://evil.example#@github.com/TEA-Core/paperclip",
+    "https://evil.example?@github.com/TEA-Core/paperclip",
+    "https://github.com\\TEA-Core\\paperclip",
+    "https://github.com/TEA-Core/pape\trclip",
+    "https://github.com/TEA-Core/..",
+  ])("parseRepoUrlRef refuses %j, which a WHATWG parser reads differently", (repoUrl) => {
+    expect(parseRepoUrlRef(repoUrl)).toBeNull();
+    expect(canonicalGitHubRepoRef(repoUrl)).toBeNull();
+  });
+
+  it.each([
+    "https://github.com.evil.example/TEA-Core/paperclip",
+    "https://github.com@evil.example/TEA-Core/paperclip",
+    "https://github.com:443/TEA-Core/paperclip",
+    "https://github.com./TEA-Core/paperclip",
+    // Hosts WHATWG maps onto github.com (IDNA fullwidth `ｇ`, a stripped tab, a decoded `%68`)
+    // while the registration does not literally say github.com: none may mint.
+    "https://\uFF47ithub.com/TEA-Core/paperclip",
+    "https://git\thub.com/TEA-Core/paperclip",
+    "https://git%68ub.com/TEA-Core/paperclip",
+    "https://github.com/TEA%2DCore/paperclip",
+    "https://github.com/TEA-Core/pap%65rclip",
+    `https://github.com/${"o".repeat(40)}/paperclip`,
+    `https://github.com/TEA-Core/${"r".repeat(101)}`,
+    "git@github.com:TEA%2DCore/paperclip.git",
+  ])("canonicalGitHubRepoRef refuses the non-canonical github.com lookalike %j", (repoUrl) => {
+    expect(canonicalGitHubRepoRef(repoUrl)).toBeNull();
+  });
+
+  it("canonicalGitHubRepoRef keeps userinfo forms that WHATWG also reads as github.com", () => {
+    const expected = { host: "github.com", owner: "TEA-Core", repo: "paperclip" };
+    expect(canonicalGitHubRepoRef("https://user@github.com/TEA-Core/paperclip")).toEqual(expected);
+    expect(canonicalGitHubRepoRef("https://user:pass@github.com/TEA-Core/paperclip")).toEqual(expected);
+    expect(canonicalGitHubRepoRef(`https://github.com/${"o".repeat(39)}/${"r".repeat(100)}`)).not.toBeNull();
   });
 });
