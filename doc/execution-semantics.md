@@ -680,11 +680,14 @@ the manual execution hold; it cannot grant a fresh run.
 Deferred promotion rechecks the typed park under the issue lock. The ordinary
 pause's verified-interaction exception cannot bypass a carrier park: a legacy
 deferred receipt is cancelled without a run and cannot replay on release.
-Action-only wake admission locks the linked source and carrier before the agent,
-then rechecks the exact-action gate. Native dependency/child-completion producers
-persist a terminal skipped intent when the carrier is parked. A native dispatch
-attempt suppressed by a park also marks its original intent skipped; release
-cannot replay it. Other native deferral policies remain unchanged.
+Action-only queue insertion and coalescing share a source-then-carrier locked
+park gate. Coalescing preserves the existing run-first lock order before that
+gate. A typed park takes priority over ordinary holds anywhere in its subtree;
+nested ordinary holds remain active and require their own explicit release.
+Native dependency/child-completion producers persist a terminal skipped intent
+when the carrier is parked. A native dispatch attempt suppressed by a park also
+marks its original intent skipped; release cannot replay it. Other native
+deferral policies remain unchanged.
 
 A typed park intentionally excludes comment delivery. Existing manual-pause
 admission rejects ordinary issue-comment writes, and the composer stays disabled.

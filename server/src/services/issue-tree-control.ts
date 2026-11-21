@@ -592,7 +592,9 @@ export function issueTreeControlService(db: Db) {
     if (activePauseHolds.length === 0) return null;
 
     const holdByRootIssueId = new Map<string, typeof activePauseHolds[number]>();
+    let hasTypedPark = false;
     for (const hold of activePauseHolds) {
+      if (hold.recoveryCarrierPark) hasTypedPark = true;
       const existing = holdByRootIssueId.get(hold.rootIssueId);
       if (!existing?.recoveryCarrierPark || hold.recoveryCarrierPark) {
         holdByRootIssueId.set(hold.rootIssueId, hold);
@@ -600,6 +602,7 @@ export function issueTreeControlService(db: Db) {
     }
     let currentIssueId: string | null = issueId;
     const visited = new Set<string>();
+    let effectiveHold: typeof activePauseHolds[number] | null = null;
 
     while (
       currentIssueId
@@ -609,16 +612,13 @@ export function issueTreeControlService(db: Db) {
       visited.add(currentIssueId);
       const hold = holdByRootIssueId.get(currentIssueId);
       if (hold) {
-        return {
-          holdId: hold.id,
-          rootIssueId: hold.rootIssueId,
-          issueId,
-          isRoot: hold.rootIssueId === issueId,
-          mode: "pause",
-          reason: hold.reason,
-          releasePolicy: (hold.releasePolicy as IssueTreeHoldReleasePolicy | null) ?? null,
-          ...(hold.recoveryCarrierPark ? { recoveryCarrierPark: hold.recoveryCarrierPark } : {}),
-        };
+        effectiveHold ??= hold;
+        // A descendant's ordinary pause cannot weaken an ancestor's typed stop.
+        // Keep the nearest-hold fast path when this company has no typed park.
+        if (hold.recoveryCarrierPark || !hasTypedPark) {
+          effectiveHold = hold;
+          break;
+        }
       }
 
       const parent: { parentId: string | null } | null = await db
@@ -629,7 +629,17 @@ export function issueTreeControlService(db: Db) {
       currentIssueId = parent?.parentId ?? null;
     }
 
-    return null;
+    if (!effectiveHold) return null;
+    return {
+      holdId: effectiveHold.id,
+      rootIssueId: effectiveHold.rootIssueId,
+      issueId,
+      isRoot: effectiveHold.rootIssueId === issueId,
+      mode: "pause",
+      reason: effectiveHold.reason,
+      releasePolicy: (effectiveHold.releasePolicy as IssueTreeHoldReleasePolicy | null) ?? null,
+      ...(effectiveHold.recoveryCarrierPark ? { recoveryCarrierPark: effectiveHold.recoveryCarrierPark } : {}),
+    };
   }
 
   async function preview(

@@ -32704,6 +32704,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ));
   }
 
+  /** Caller retains these locks through either queue insertion or run coalescing. */
+  async function lockRecoveryActionWakeGate(runner: Db, companyId: string, actionId: string) {
+    const [action] = await runner.select({
+      sourceIssueId: issueRecoveryActions.sourceIssueId, recoveryIssueId: issueRecoveryActions.recoveryIssueId,
+    }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.id, actionId), eq(issueRecoveryActions.companyId, companyId),
+    )).limit(1);
+    if (action) {
+      await runner.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, action.sourceIssueId), eq(issues.companyId, companyId),
+      )).for("update");
+      if (action.recoveryIssueId && action.recoveryIssueId !== action.sourceIssueId) {
+        await runner.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, action.recoveryIssueId), eq(issues.companyId, companyId),
+        )).for("update");
+      }
+    }
+    return await isRecoveryActionBoardParked(runner, companyId, actionId) ||
+      Boolean(action?.recoveryIssueId && (await issueTreeControlService(runner)
+        .getActivePauseHoldGate(companyId, action.recoveryIssueId))?.recoveryCarrierPark);
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -35029,30 +35051,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return mergedRun;
       };
       const nestedIssueId = readNonEmptyString(parseObject(mergedContextSnapshot.paperclipIssue).id);
-      const mergedRun = nestedIssueId && isUuidLike(nestedIssueId)
+      let parkRefused = false;
+      const mergedRun = recoveryActionId || (nestedIssueId && isUuidLike(nestedIssueId))
         ? await db.transaction(async (tx) => {
             // Match restore's run-then-issue lock order even when this queued run
             // was previously unbound and therefore absent from its first scan.
             await tx.execute(sql`select id from heartbeat_runs where company_id = ${agent.companyId} and id = ${coalescedTargetRun.id} for update`);
-            const [lockedIssue] = await tx.select({
-              assigneeAgentId: issues.assigneeAgentId,
-              executionState: issues.executionState,
-            }).from(issues).where(and(
-              eq(issues.companyId, agent.companyId),
-              eq(issues.id, nestedIssueId),
-            )).for("update");
-            const state = parseObject(lockedIssue?.executionState);
-            const participant = parseObject(state.currentParticipant);
-            if (lockedIssue &&
-              state.status === "pending" &&
-              lockedIssue.assigneeAgentId !== agentId &&
-              !(participant.type === "agent" && participant.agentId === agentId)
-            ) return null;
+            const runner = tx as unknown as Db;
+            if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+              parkRefused = true;
+              await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+              return null;
+            }
+            if (nestedIssueId && isUuidLike(nestedIssueId)) {
+              const [lockedIssue] = await tx.select({
+                assigneeAgentId: issues.assigneeAgentId,
+                executionState: issues.executionState,
+              }).from(issues).where(and(
+                eq(issues.companyId, agent.companyId),
+                eq(issues.id, nestedIssueId),
+              )).for("update");
+              const state = parseObject(lockedIssue?.executionState);
+              const participant = parseObject(state.currentParticipant);
+              if (lockedIssue &&
+                state.status === "pending" &&
+                lockedIssue.assigneeAgentId !== agentId &&
+                !(participant.type === "agent" && participant.agentId === agentId)
+              ) return null;
+            }
             return persistCoalescedWake(tx as unknown as Db);
           })
         : await persistCoalescedWake(db);
       if (!mergedRun) {
-        await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
+        if (!parkRefused) await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
         return null;
       }
       return mergedRun;
@@ -35062,30 +35093,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the context, so the task key and execution context stay unchanged.
     const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
-      if (recoveryActionId) {
-        const [action] = await tx.select({
-          sourceIssueId: issueRecoveryActions.sourceIssueId, recoveryIssueId: issueRecoveryActions.recoveryIssueId,
-        }).from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.id, recoveryActionId), eq(issueRecoveryActions.companyId, agent.companyId),
-        )).limit(1);
-        // Match park admission's source-then-carrier order before taking the agent lock.
-        if (action) {
-          await tx.select({ id: issues.id }).from(issues).where(and(
-            eq(issues.id, action.sourceIssueId), eq(issues.companyId, agent.companyId),
-          )).for("update");
-          if (action.recoveryIssueId && action.recoveryIssueId !== action.sourceIssueId) {
-            await tx.select({ id: issues.id }).from(issues).where(and(
-              eq(issues.id, action.recoveryIssueId), eq(issues.companyId, agent.companyId),
-            )).for("update");
-          }
-        }
-        const runner = tx as unknown as Db;
-        if (await isRecoveryActionBoardParked(runner, agent.companyId, recoveryActionId) ||
-            (action?.recoveryIssueId && (await issueTreeControlService(runner)
-              .getActivePauseHoldGate(agent.companyId, action.recoveryIssueId))?.recoveryCarrierPark)) {
-          await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
-          return { kind: "deferred" as const };
-        }
+      if (recoveryActionId && await lockRecoveryActionWakeGate(tx as unknown as Db, agent.companyId, recoveryActionId)) {
+        await suppressParkedNativeStatusWakeIntent(tx as unknown as Db, agent.companyId, agentId, opts);
+        return { kind: "deferred" as const };
       }
       if (nestedIssueId && isUuidLike(nestedIssueId)) {
         const [nestedIssue] = await tx.select({
