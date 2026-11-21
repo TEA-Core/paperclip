@@ -119,7 +119,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     await tempDb?.cleanup();
   });
 
-  async function seedWikiCompany(resourceId: "maintainer" | "stale") {
+  async function seedWikiCompany(resourceId: "maintainer" | "stale" | "unresolvable") {
     const nonce = randomUUID().slice(0, 8);
     const [company] = await db.insert(companies).values({
       name: `Wiki ${nonce}`,
@@ -179,7 +179,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       pluginKey: PLUGIN_KEY,
       resourceKind: "agent",
       resourceKey: AGENT_KEY,
-      resourceId: resourceId === "maintainer" ? maintainer!.id : stale!.id,
+      resourceId: resourceId === "maintainer" ? maintainer!.id : resourceId === "stale" ? stale!.id : randomUUID(),
       defaultsJson: {},
     });
     await db.insert(companyMemberships).values({
@@ -224,8 +224,8 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     return row;
   }
 
-  it("admits a field repair of an unassigned wiki handoff whose plugin-managed maintainer the resource row already names", async () => {
-    const { company, maintainer } = await seedWikiCompany("maintainer");
+  it("still refuses a no-assignee field write on an unassigned wiki handoff", async () => {
+    const { company } = await seedWikiCompany("maintainer");
     const stub = await seedUnassignedHandoff(company.id);
 
     const res = await request(createApp(db, boardActor(company.id)))
@@ -236,15 +236,14 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
         deliveryRequirement: "record_only",
       });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({ guard: "assignee_review_gate", subGuard: "wiki_handoff" });
     const stored = await readAssignee(stub.id);
     expect(stored?.assigneeAgentId).toBeNull();
-    expect(stored?.assigneeUserId).toBeNull();
-    expect(maintainer.id).not.toBe(stored?.assigneeAgentId);
   });
 
-  it("admits an assignee write of the metadata-marked Wiki Maintainer when the resource row points at a stale agent", async () => {
-    const { company, maintainer } = await seedWikiCompany("stale");
+  it("admits an assignee write of the metadata-marked Wiki Maintainer when the resource row is unresolvable", async () => {
+    const { company, maintainer } = await seedWikiCompany("unresolvable");
     const stub = await seedUnassignedHandoff(company.id);
 
     const res = await request(createApp(db, boardActor(company.id)))
@@ -259,6 +258,40 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect(res.body.details?.reason).not.toBe("wiki_handoff_unassigned");
     const stored = await readAssignee(stub.id);
     expect(stored?.assigneeAgentId).toBe(maintainer.id);
+  });
+
+  it("does not let forged metadata on a non-canonical agent outrank the resource row", async () => {
+    const { company, maintainer, intruder } = await seedWikiCompany("maintainer");
+    await db.update(agents).set({ metadata: maintainerMetadata(randomUUID()) }).where(eq(agents.id, intruder.id));
+    const stub = await seedUnassignedHandoff(company.id);
+
+    const forged = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`)
+      .send({ assigneeAgentId: intruder.id, status: "in_review", executionPolicy: userReviewPolicy() });
+    expect(forged.status, JSON.stringify(forged.body)).toBe(422);
+    expect(forged.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      canonicalMaintainerAgentId: maintainer.id,
+    });
+    const stored = await readAssignee(stub.id);
+    expect(stored?.assigneeAgentId).toBeNull();
+    expect(stored?.executionState).toBeNull();
+  });
+
+  it("refuses every assignee write when two agents are marked and the resource row is unresolvable", async () => {
+    const { company, maintainer, intruder } = await seedWikiCompany("unresolvable");
+    await db.update(agents).set({ metadata: maintainerMetadata(randomUUID()) }).where(eq(agents.id, intruder.id));
+    await db.delete(pluginEntities);
+    const stub = await seedUnassignedHandoff(company.id);
+
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`)
+      .send({ assigneeAgentId: maintainer.id, status: "todo", executionPolicy: userReviewPolicy() });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({ guard: "assignee_review_gate", subGuard: "wiki_handoff" });
+    const stored = await readAssignee(stub.id);
+    expect(stored?.assigneeAgentId).toBeNull();
   });
 
   it("keeps the Wiki Maintainer as the return assignee when a wiki handoff enters human review", async () => {

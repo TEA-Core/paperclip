@@ -153,6 +153,8 @@ export function isWikiHandoffTitle(title: unknown): boolean {
 const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
   `${WIKI_LLM_WIKI_PLUGIN_KEY}:agent:${WIKI_MAINTAINER_AGENT_KEY}` as const;
 
+export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
+
 function metadataMarksWikiMaintainer(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
   const record = metadata as Record<string, unknown>;
@@ -184,7 +186,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
   if (!isWikiHandoffTitle(issue.title)) return null;
-  const [resourceRows, liveAgents, bindings] = await Promise.all([
+  const [resourceRows, bindings] = await Promise.all([
     db
       .select({
         resourceKey: pluginManagedResources.resourceKey,
@@ -201,11 +203,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
         ]),
       )),
     db
-      .select({ id: agents.id, metadata: agents.metadata })
-      .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated"))),
-    db
-      .select({ data: pluginEntities.data, pluginId: pluginEntities.pluginId })
+      .select({ data: pluginEntities.data })
       .from(pluginEntities)
       .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
       .where(and(
@@ -215,22 +213,32 @@ export async function resolveCanonicalWikiMaintainerAgentId(
         eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
       )),
   ]);
-  const liveIds = new Set(liveAgents.map((agent) => agent.id));
-  const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
   const resourceId = resourceRows.find((row) => row.resourceKey === WIKI_MAINTAINER_AGENT_KEY)?.resourceId
     ?? resourceRows[0]?.resourceId
     ?? null;
-  const boundId = bindings.map((row) => bindingAgentId(row.data)).find((id) => id && liveIds.has(id)) ?? null;
+  const boundIds = bindings.map((row) => bindingAgentId(row.data)).filter((id): id is string => id !== null);
+  const candidateIds = [resourceId, ...boundIds].filter((id): id is string => id !== null);
+  const liveCandidates = candidateIds.length === 0
+    ? []
+    : await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(
+        eq(agents.companyId, companyId),
+        ne(agents.status, "terminated"),
+        inArray(agents.id, candidateIds),
+      ));
+  const liveIds = new Set(liveCandidates.map((agent) => agent.id));
+  const resolved = candidateIds.find((id) => liveIds.has(id));
+  if (resolved) return resolved;
+  const liveAgents = await db
+    .select({ id: agents.id, metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+  const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
   if (marked.length === 1) return marked[0]!.id;
-  if (marked.length > 1) {
-    return marked.find((agent) => agent.id === resourceId)?.id
-      ?? marked.find((agent) => agent.id === boundId)?.id
-      ?? marked.map((agent) => agent.id).sort()[0]
-      ?? null;
-  }
-  // No metadata-marked agent: keep the resource row, including for route mocks
-  // whose agent select does not return that id.
-  return resourceId;
+  if (marked.length > 1) return AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID;
+  return resourceId ?? boundIds[0] ?? null;
 }
 
 function isWorkflowControlledPendingReviewParticipant(input: {
@@ -351,26 +359,6 @@ export function isUnassignedWikiHandoffBoardStageDecision(input: {
   );
 }
 
-/**
- * An interrupted Wiki handoff create is repaired by a field write that does not
- * set an assignee and does not request a status. The stored assignees stay
- * null. That write is not an assignee substitution: the dispatch assignment is
- * a later write. A status write, including status-only todo, stays guarded.
- */
-export function isUnassignedWikiHandoffNonDispatchFieldWrite(input: {
-  requestedStatus: unknown;
-  assigneeFieldWritten: boolean;
-  currentAssigneeAgentId: string | null | undefined;
-  currentAssigneeUserId: string | null | undefined;
-}): boolean {
-  return (
-    input.requestedStatus === undefined &&
-    input.assigneeFieldWritten === false &&
-    input.currentAssigneeAgentId === null &&
-    input.currentAssigneeUserId === null
-  );
-}
-
 function wikiReviewKeepsCanonicalReturnAssignee(input: {
   canonical: string;
   executionState: unknown;
@@ -452,15 +440,6 @@ export async function assertWikiHandoffWriteIntegrity(input: {
       assigneeFieldWritten: input.boardStageDecision.assigneeFieldWritten,
       currentAssigneeAgentId: input.currentAssigneeAgentId,
       currentAssigneeUserId: input.boardStageDecision.currentAssigneeUserId,
-    })
-  ) return;
-  if (
-    input.cancellation &&
-    isUnassignedWikiHandoffNonDispatchFieldWrite({
-      requestedStatus: input.cancellation.requestedStatus,
-      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
-      currentAssigneeAgentId: input.currentAssigneeAgentId,
-      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
     })
   ) return;
   if (

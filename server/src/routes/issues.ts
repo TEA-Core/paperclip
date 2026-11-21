@@ -465,7 +465,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle, resolveCanonicalWikiMaintainerAgentId } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -20367,7 +20367,14 @@ export function issueRoutes(
       requestedMaintainerId &&
       resultingAssigneeAgentId === null &&
       guardedExecutionState &&
-      typeof guardedExecutionState === "object"
+      typeof guardedExecutionState === "object" &&
+      requestedMaintainerId === await resolveCanonicalWikiMaintainerAgentId(db, existing.companyId, {
+        title: handoffTitle,
+        description:
+          updateFields.description !== undefined
+            ? updateFields.description
+            : existing.description,
+      })
     ) {
       const returnAssignee = "returnAssignee" in guardedExecutionState
         ? guardedExecutionState.returnAssignee
