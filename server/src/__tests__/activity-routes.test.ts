@@ -322,6 +322,56 @@ describe("activity routes", () => {
     expect(mockActivityService.list).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["offset=0", "offset"],
+    ["offset=500", "offset"],
+    ["limit=500&offset=1500", "offset"],
+    ["offset=-1", "offset"],
+    ["offset=abc", "offset"],
+    ["cursor=00000000-0000-0000-0000-000000000001", "cursor"],
+    ["limit=500&cursor=abc&from=2026-04-21T10:00:00.000Z", "cursor"],
+  ])("rejects company activity ?%s with a 400 naming from/to windowing instead of returning page 0", async (query, param) => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/companies/company-1/activity?${query}`),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(`does not support ${param}`);
+    expect(res.body.error).toContain("from/to window");
+    expect(res.body.details).toEqual({ unsupportedParams: [param], supportedPaging: ["from", "to", "limit"] });
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("names every unsupported paging parameter when offset and cursor are both sent", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?offset=500&cursor=abc"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.details.unsupportedParams).toEqual(["offset", "cursor"]);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("keeps company access ahead of paging validation", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      companyIds: ["company-2"],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?offset=500"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
   it("lets an agent-scoped actor list company activity with the new filters without board access", async () => {
     mockActivityService.list.mockResolvedValue([]);
 

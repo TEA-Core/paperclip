@@ -122,6 +122,11 @@ const agentActionAuditQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
+// SUP-24633: the company feed has no offset or keyset paging. A paging
+// parameter that cannot be honoured must fail loudly instead of returning the
+// newest page for every value, so callers are pointed at from/to windowing.
+const UNSUPPORTED_COMPANY_ACTIVITY_PAGING_PARAMS = ["offset", "cursor"] as const;
+
 const companyActivityQuerySchema = z.object({
   action: z.string().optional(),
   actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
@@ -245,6 +250,17 @@ export function activityRoutes(db: Db) {
     if (!parsedQuery.success) {
       throw badRequest("Invalid activity query", parsedQuery.error.issues);
     }
+    const unsupportedPagingParams = UNSUPPORTED_COMPANY_ACTIVITY_PAGING_PARAMS.filter(
+      (name) => Object.hasOwn(req.query, name),
+    );
+    if (unsupportedPagingParams.length > 0) {
+      throw badRequest(
+        `Company activity does not support ${unsupportedPagingParams.join(" or ")} paging; `
+          + "page by narrowing the from/to window (ISO-8601 timestamps) and use limit (max 500) to bound each page",
+        { unsupportedParams: unsupportedPagingParams, supportedPaging: ["from", "to", "limit"] },
+      );
+    }
+
     const actionValues = parsedQuery.data.action
       ? parsedQuery.data.action
           .split(",")
