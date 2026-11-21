@@ -2536,7 +2536,7 @@ const NO_WORKSPACE_HISTORY_RECORDS = [
   "execution_workspaces, workspace_operations, environment_leases, workspace_runtime_services, execution_workspace_runtime_leases, tool_runtime_slots (any row tied to the issue)",
   "issue_work_products (only artifact or document, no project or workspace, no repository reference)",
   "heartbeat_runs linked by native_issue_id or whose context names the issue by id or identifier (no project, workspace, repository, branch, worktree or pull request key in context, result_json, usage_json, stdout/stderr excerpts or error), and native_run_results.result_json of the issue",
-  "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference)",
+  "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference, and issue.created records projectId, projectWorkspaceId and description)",
   "issue_comments (none deleted, no repository reference)",
   "documents of the issue (every revision, no repository reference)",
   "issue title and description (current and every recorded change)",
@@ -2811,7 +2811,13 @@ function activityRowRefusal(action: string, details: unknown): NoRepositoryLandi
     }
     for (const [field, change] of Object.entries((changes ?? {}) as Record<string, unknown>)) {
       if (!NO_WORKSPACE_ALLOWED_CHANGED_FIELDS.has(field)) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
-      const { from, to } = (change ?? {}) as { from?: unknown; to?: unknown };
+      const changeRecord = change !== null && typeof change === "object" ? (change as Record<string, unknown>) : null;
+      if ((field === "title" || field === "description") && (changeRecord === null || !Object.hasOwn(changeRecord, "from"))) {
+        return noRepositoryRefusal(
+          "cannot be declared on an issue whose title or description was rewritten without a recorded earlier value: the earlier text can no longer be checked for repository work.",
+        );
+      }
+      const { from, to } = (changeRecord ?? {}) as { from?: unknown; to?: unknown };
       if ([from, to].some((value) => typeof value === "string" && Array.from(value).length >= RECORDED_CHANGE_TEXT_LIMIT)) {
         return noRepositoryRefusal(
           "cannot be declared on an issue whose recorded title or description history is truncated: the earlier text can no longer be checked for repository work.",
@@ -2901,6 +2907,17 @@ async function noWorkspaceHistoryRefusal(
   for (const row of activity) {
     const refusal = activityRowRefusal(row.action, row.details);
     if (refusal) return refusal;
+  }
+  const created = activity.filter((row) => row.action === "issue.created");
+  const snapshotComplete = (details: unknown) => {
+    if (details === null || typeof details !== "object" || Array.isArray(details)) return false;
+    const record = details as Record<string, unknown>;
+    return Object.hasOwn(record, "projectId") && Object.hasOwn(record, "projectWorkspaceId") && Object.hasOwn(record, "description");
+  };
+  if (created.length === 0 || created.some((row) => !snapshotComplete(row.details))) {
+    return noRepositoryRefusal(
+      "cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.",
+    );
   }
 
   const mention = await db

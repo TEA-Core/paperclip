@@ -2029,6 +2029,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         deliveryRequirement?: "record_only" | "repository_delivery";
         withProject?: boolean;
         withProjectWorkspace?: boolean;
+        omitCreationSnapshot?: boolean;
       } = {},
     ): Promise<NoWorkspaceIssue> {
       seedSequence += 1;
@@ -2076,6 +2077,23 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         status: "running",
         contextSnapshot: { issueId },
       });
+      if (!options.omitCreationSnapshot) {
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "user",
+          actorId: "cloud-user-1",
+          action: "issue.created",
+          entityType: "issue",
+          entityId: issueId,
+          details: {
+            title: "Record the ruling",
+            identifier,
+            projectId: null,
+            projectWorkspaceId: null,
+            description: null,
+          },
+        });
+      }
       currentActor = { type: "agent", agentId: closerAgentId, companyId, source: "agent_key", runId };
       return { companyId, closerAgentId, rulerAgentId, issueId, identifier, actor: currentActor };
     }
@@ -2126,6 +2144,67 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(bodies.some((body) => body.includes("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing"))).toBe(true);
       expect(mockGhFetch).not.toHaveBeenCalled();
       expect(mockRecheckRecordedWorktree).not.toHaveBeenCalled();
+    });
+
+    const UNKNOWN_CREATION_SNAPSHOT =
+      `Tier 1 "no-repository-landing" cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.`;
+    const REWRITE_WITHOUT_OLD_VALUE =
+      `Tier 1 "no-repository-landing" cannot be declared on an issue whose title or description was rewritten without a recorded earlier value: the earlier text can no longer be checked for repository work.`;
+
+    async function insertCreationSnapshot(fixture: NoWorkspaceIssue, description: string | null = null) {
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId,
+        actorType: "user",
+        actorId: BOARD_USER_ID,
+        action: "issue.created",
+        entityType: "issue",
+        entityId: fixture.issueId,
+        details: {
+          title: "Record the ruling",
+          identifier: fixture.identifier,
+          projectId: null,
+          projectWorkspaceId: null,
+          description,
+        },
+      });
+    }
+
+    it("refuses a never-had close when issue.created lacks the creation snapshot", async () => {
+      const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+
+      await expectRefused(fixture, await close(fixture.identifier), UNKNOWN_CREATION_SNAPSHOT);
+    });
+
+    it("refuses a never-had close when a later update rewrites the description without a recorded old value", async () => {
+      const fixture = await seedAdmissible();
+      await insertCreationSnapshot(fixture, "Decide the retention policy.");
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId,
+        actorType: "agent",
+        actorId: fixture.closerAgentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fixture.issueId,
+        details: { changes: { description: { to: "Decide the retention policy." } } },
+      });
+
+      await expectRefused(fixture, await close(fixture.identifier), REWRITE_WITHOUT_OLD_VALUE);
+    });
+
+    it("refuses a never-had close when a plugin-host patch rewrites the description without a recorded old value", async () => {
+      const fixture = await seedAdmissible();
+      await insertCreationSnapshot(fixture, "Decide the retention policy.");
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId,
+        actorType: "agent",
+        actorId: fixture.closerAgentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fixture.issueId,
+        details: { patch: { description: "Decide the retention policy." } },
+      });
+
+      await expectRefused(fixture, await close(fixture.identifier), REWRITE_WITHOUT_OLD_VALUE);
     });
 
     it.each([

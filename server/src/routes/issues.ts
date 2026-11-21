@@ -17795,6 +17795,9 @@ export function issueRoutes(
         details: {
           title: issue.title,
           identifier: issue.identifier,
+          projectId: issue.projectId ?? null,
+          projectWorkspaceId: issue.projectWorkspaceId ?? null,
+          description: issue.description ?? null,
           ...(watchdogProductBugFollowUp
             ? {
                 watchdogDiscovery: {
