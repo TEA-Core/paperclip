@@ -666,6 +666,8 @@ cancellation, attempt/evidence refresh, supersession, replacement action, monito
 or wake is authorized. Repeated identical acceptance returns the same hold.
 An active exact-action binding gates automatic action upserts and source recovery
 re-arm, including exhaustion drain. It is not a general source-task pause.
+The active company/action binding is unique; unbound or released holds do not
+occupy that slot.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
 the source's unresolved escalation and from actual dependency counts/tree
