@@ -795,7 +795,7 @@ export class PaperclipRunnerToolAuthority {
       !row
       || row.run.runtimeMode !== "native"
       || row.run.status !== "running"
-      || ["paused", "terminated", "pending_approval", "error"].includes(row.actor.status)
+      || ["paused", "terminated", "deleted", "pending_approval", "error"].includes(row.actor.status)
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
     }
@@ -1841,7 +1841,7 @@ export class PaperclipRunnerToolAuthority {
       || context.issue.assigneeAgentId !== this.binding.agentId
       || context.issue.executionRunId !== this.binding.runId
       || context.actor.companyId !== this.binding.companyId
-      || ["paused", "terminated", "pending_approval", "error"].includes(context.actor.status)
+      || ["paused", "terminated", "deleted", "pending_approval", "error"].includes(context.actor.status)
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
     }

@@ -178,7 +178,7 @@ export function getAgentOrgChainHealth(input: {
     }
 
     fullChain.push(chainEntry(parent, depth, "ancestor"));
-    if (parent.status === "terminated") {
+    if ((parent.status === "terminated" || parent.status === "deleted")) {
       invalidAncestors.push(invalidAncestor(parent));
     }
     if (parent.status === "paused") {
@@ -226,7 +226,7 @@ export function getAgentWorkEligibility(input: {
 }): AgentWorkEligibility {
   const orgChainHealth = getAgentOrgChainHealth(input);
   const assignabilityReason: AgentEligibilityLifecycleReason = !isAgentStatusAssignableToWork(input.agent.status)
-    ? input.agent.status === "terminated"
+    ? (input.agent.status === "terminated" || input.agent.status === "deleted")
       ? "terminated"
       : input.agent.status === "pending_approval"
         ? "pending_approval"

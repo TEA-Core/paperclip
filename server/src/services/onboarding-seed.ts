@@ -1,4 +1,4 @@
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, eq, ne, sql, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyOnboardingSeeds, goals, issues, projects } from "@paperclipai/db";
 import type { ApplyOnboardingSeed } from "@paperclipai/shared";
@@ -141,7 +141,7 @@ export function onboardingSeedService(db: Db) {
       .where(and(
         eq(agents.companyId, companyId),
         eq(agents.role, SEEDED_AGENT_ROLE),
-        ne(agents.status, "terminated"),
+        notInArray(agents.status, ["terminated", "deleted"]),
       ));
     return candidates.find((row) => !readBuiltInAgentMarker(row.metadata))?.id ?? null;
   }

@@ -6189,7 +6189,7 @@ export function issueRoutes(
       agent &&
         agent.companyId === input.companyId &&
         agent.status !== "paused" &&
-        agent.status !== "terminated" &&
+        agent.status !== "terminated" && agent.status !== "deleted" &&
         agent.status !== "pending_approval",
     );
   };
@@ -10659,7 +10659,7 @@ export function issueRoutes(
     if (resolved.agent.status === "pending_approval") {
       throw conflict("Cannot assign work to pending approval agents");
     }
-    if (resolved.agent.status === "terminated") {
+    if ((resolved.agent.status === "terminated" || resolved.agent.status === "deleted")) {
       throw conflict("Cannot assign work to terminated agents");
     }
     // Agents must not route work to a paused peer/manager: the assignment is
@@ -14606,7 +14606,7 @@ export function issueRoutes(
             !sourceOwner ||
             sourceOwner.companyId !== lockedIssue.companyId ||
             sourceOwner.status === "paused" ||
-            sourceOwner.status === "terminated"
+            (sourceOwner.status === "terminated" || sourceOwner.status === "deleted")
           ) {
             throw conflict(
               "The assigned agent is unavailable. Resume or review the agent before retrying.",

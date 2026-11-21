@@ -170,7 +170,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       }
       if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) return;
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, row.handoff.agentId), eq(agents.companyId, claimed.companyId)));
-      if (!agent || ["paused", "terminated"].includes(agent.status)) return;
+      if (!agent || ["paused", "terminated", "deleted"].includes(agent.status)) return;
       const key = `chat-completion:${id}:${claimed.attempts}`;
       const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
       const runId = claimed.targetRunId ?? wakes.find(w => w.runId)?.runId;

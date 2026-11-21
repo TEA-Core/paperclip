@@ -1027,7 +1027,7 @@ export function browserUseService(
       issue.assigneeAgentId !== s.agentId ||
       issue.status === "cancelled" ||
       agent?.status === "paused" ||
-      agent?.status === "terminated"
+      (agent?.status === "terminated" || agent?.status === "deleted")
     )
       end = true;
     if (
