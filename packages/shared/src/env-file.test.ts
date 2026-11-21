@@ -416,6 +416,21 @@ describe("env file editor", () => {
       shadow: "BETTER_AUTH_SECRET=good-auth-secret",
     },
     {
+      name: "D8 colon newline quote",
+      file: [
+        "FOO:",
+        ' "alpha',
+        "DATABASE_URL=postgresql://canary.invalid/db",
+        "PAPERCLIP_CONTEXT=/hidden",
+        'omega"',
+        "FOO=final",
+        "DATABASE_URL=postgresql://good.invalid/db",
+        "",
+      ].join("\n"),
+      key: "DATABASE_URL",
+      shadow: "DATABASE_URL=postgresql://good.invalid/db",
+    },
+    {
       name: "split equals",
       file: [
         "FOO",

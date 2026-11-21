@@ -240,13 +240,41 @@ function contextFromWorktreeLayout(env: NodeJS.ProcessEnv): WorktreeRuntimeConte
   }, env, {});
 }
 
+function findWorktreeStateDir(startDir: string): string | null {
+  let currentDir = path.resolve(startDir);
+  while (true) {
+    const candidate = path.join(currentDir, ".paperclip");
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
+    } catch {
+      // An unreadable ancestor is not this worktree. Keep walking.
+    }
+    const nextDir = path.resolve(currentDir, "..");
+    if (nextDir === currentDir) return null;
+    currentDir = nextDir;
+  }
+}
+
+function resolveWorktreeConfigPath(env: NodeJS.ProcessEnv, overrideConfigPath?: string): string {
+  if (overrideConfigPath) return path.resolve(overrideConfigPath);
+  if (env.PAPERCLIP_CONFIG) return path.resolve(env.PAPERCLIP_CONFIG);
+  // A worktree may not have written config.json yet. The ancestor file
+  // lookup then falls back to the default instance. Prefer the nearest
+  // `.paperclip` directory so the repair does not silently disengage.
+  if (env.PAPERCLIP_IN_WORKTREE === "true") {
+    const stateDir = findWorktreeStateDir(process.cwd());
+    if (stateDir) return path.join(stateDir, "config.json");
+  }
+  return resolvePaperclipConfigPath();
+}
+
 function resolveWorktreeRuntimeContext(
   env: NodeJS.ProcessEnv,
   overrideConfigPath?: string,
 ): WorktreeRuntimeContext | null {
   if (env.PAPERCLIP_IN_WORKTREE !== "true") return null;
 
-  const configPath = resolvePaperclipConfigPath(overrideConfigPath);
+  const configPath = resolveWorktreeConfigPath(env, overrideConfigPath);
   const envPath = resolvePaperclipEnvPath(configPath);
   const persistedEnv = readEnvEntries(envPath);
 
@@ -263,7 +291,9 @@ function resolveWorktreeRuntimeContext(
     /^uid-\d+$/.test(path.basename(worktreeStateDir))
     && path.basename(path.dirname(worktreeStateDir)) === ".paperclip";
   if (!isCanonicalWorktreeState && !isUidScopedWorktreeState) return null;
-  if (persistedEnv.PAPERCLIP_IN_WORKTREE !== "true") return null;
+  const configMissing = !fs.existsSync(configPath);
+  const envMissing = !fs.existsSync(envPath);
+  if (persistedEnv.PAPERCLIP_IN_WORKTREE !== "true" && !(configMissing && envMissing)) return null;
 
   const persistedConfigPath = nonEmpty(persistedEnv.PAPERCLIP_CONFIG);
   const persistedConfigLooksStale =
