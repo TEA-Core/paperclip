@@ -465,7 +465,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle, resolveCanonicalWikiMaintainerAgentId } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle, resolveCanonicalWikiMaintainerAgentId, resolveLiveCanonicalWikiMaintainerAgentId } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -20341,6 +20341,48 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+    // An interrupted wiki-handoff create is repaired by a field write that
+    // sets no assignee and no status. Adopt the live canonical Maintainer in
+    // this same write so the guard sees that assignee. A stale or ambiguous
+    // resolver result does not adopt, and the unassigned refusal stands.
+    const fieldRepairTitle = updateFields.title !== undefined ? updateFields.title : existing.title;
+    const requestOmitsAssignee =
+      normalizedAssigneeAgentId === undefined && req.body.assigneeUserId === undefined;
+    const requestOmitsStatus = req.body.status === undefined;
+    const storedUnassigned = existing.assigneeAgentId == null && existing.assigneeUserId == null;
+    const transitionLeftAssigneeUnset =
+      (updateFields.assigneeAgentId === undefined || updateFields.assigneeAgentId === null) &&
+      (updateFields.assigneeUserId === undefined || updateFields.assigneeUserId === null);
+    const fieldRepairActorMayAdopt =
+      req.actor.type === "board" ||
+      (req.actor.type === "agent" &&
+        typeof existing.createdByAgentId === "string" &&
+        existing.createdByAgentId.length > 0 &&
+        req.actor.agentId === existing.createdByAgentId);
+    if (
+      requestOmitsAssignee &&
+      requestOmitsStatus &&
+      storedUnassigned &&
+      transitionLeftAssigneeUnset &&
+      fieldRepairActorMayAdopt &&
+      isWikiHandoffTitle(fieldRepairTitle)
+    ) {
+      const adoptedMaintainerId = await resolveLiveCanonicalWikiMaintainerAgentId(
+        db,
+        existing.companyId,
+        {
+          title: fieldRepairTitle,
+          description:
+            updateFields.description !== undefined
+              ? updateFields.description
+              : existing.description,
+        },
+      );
+      if (adoptedMaintainerId) {
+        updateFields.assigneeAgentId = adoptedMaintainerId;
+        updateFields.assigneeUserId = null;
+      }
+    }
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
     // will persist. The gate is keyed on the request explicitly supplying an
     // assignee; a workflow-owned assignment is exempt for an implicit handoff

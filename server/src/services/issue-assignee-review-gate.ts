@@ -241,6 +241,29 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   return resourceId ?? boundIds[0] ?? null;
 }
 
+/**
+ * Live id only. The resolver's last fallback can be a stale resource id; a
+ * field repair must not adopt that id, or the guard would treat the dead row
+ * as canonical and admit it.
+ */
+export async function resolveLiveCanonicalWikiMaintainerAgentId(
+  db: Db,
+  companyId: string,
+  issue: { title?: string | null; description?: string | null } | null | undefined,
+): Promise<string | null> {
+  const resolved = await resolveCanonicalWikiMaintainerAgentId(db, companyId, issue);
+  if (!resolved || resolved === AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID) return null;
+  const [live] = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(
+      eq(agents.id, resolved),
+      eq(agents.companyId, companyId),
+      ne(agents.status, "terminated"),
+    ));
+  return live?.id ?? null;
+}
+
 function isWorkflowControlledPendingReviewParticipant(input: {
   executionPolicy: unknown;
   executionState: unknown;

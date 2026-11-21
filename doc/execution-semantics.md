@@ -859,6 +859,15 @@ marks both `pluginKey` `paperclipai.plugin-llm-wiki` and agent key
 every assignee write until it is resolved. A terminated agent is not a live
 match.
 
+A field repair of an unassigned Wiki handoff adopts that live Maintainer as
+`assigneeAgentId` in the same `PATCH /api/issues/:id` when the request omits
+assignee and status, the stored assignees are both null, and the actor is the
+board or the agent that created the card. The route writes the adopted id
+before the guard runs, and it does not change status. A missing, stale, or
+ambiguous resolver result does not adopt, so the unassigned write is still
+refused. An explicit non-canonical assignee is not this repair and stays
+refused. A status-only write is not this repair either.
+
 When a Wiki handoff enters human review in the same write that names the
 canonical Wiki Maintainer, and the workflow seats the user reviewer, that
 Maintainer stays the execution state's `returnAssignee`. The resulting agent

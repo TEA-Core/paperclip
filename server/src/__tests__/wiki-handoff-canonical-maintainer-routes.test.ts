@@ -13,6 +13,7 @@ import {
   pluginEntities,
   pluginManagedResources,
   plugins,
+  projects,
 } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
@@ -221,22 +222,28 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     return row;
   }
 
-  it("still refuses a no-assignee field write on an unassigned wiki handoff", async () => {
-    const { company } = await seedWikiCompany("maintainer");
+  it("adopts the canonical Wiki Maintainer on the emitter field-repair PATCH", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    const [project] = await db.insert(projects).values({
+      companyId: company.id,
+      name: "Weekly reports",
+    }).returning();
     const stub = await seedUnassignedHandoff(company.id);
 
     const res = await request(createApp(db, boardActor(company.id)))
       .patch(`/api/issues/${stub.id}`)
       .send({
         description: "Weekly report handoff pointer",
+        projectId: project!.id,
         executionPolicy: userReviewPolicy(),
         deliveryRequirement: "record_only",
       });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(res.body.details).toMatchObject({ guard: "assignee_review_gate", subGuard: "wiki_handoff" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     const stored = await readAssignee(stub.id);
-    expect(stored?.assigneeAgentId).toBeNull();
+    expect(stored?.assigneeAgentId).toBe(maintainer.id);
+    expect(stored?.assigneeUserId).toBeNull();
+    expect(stored?.status).toBe("backlog");
   });
 
   it("admits an assignee write of the metadata-marked Wiki Maintainer when the resource row is unresolvable", async () => {
