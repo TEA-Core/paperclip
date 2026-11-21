@@ -22,7 +22,9 @@ const mockWakeup = vi.hoisted(() =>
 const mockLogActivity = vi.hoisted(() =>
   vi.fn(async (_db: unknown, _activity: { action?: string }) => undefined),
 );
-const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
+const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _input: Record<string, unknown>): Promise<{ id: string } | null> => null),
+);
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -577,6 +579,95 @@ describe("issue dependency wakeups in issue routes", () => {
             mutation: "blocker_done",
           }),
         }),
+      );
+    });
+  });
+
+  describe("blocked generation of a completed canonical wake", () => {
+    const reviewIssueId = "11111111-1111-4111-8111-111111111111";
+    const releaseIssueId = "22222222-2222-4222-8222-222222222222";
+    const releaseBlockedAt = new Date("2026-08-01T15:00:00.000Z");
+
+    // Seeds one completed canonical-key wake for the Release dependent and
+    // routes the dedupe lookup through the REAL ready-state predicate over the
+    // route test db, so the generation the route passes decides the outcome.
+    const patchReviewDoneWithCompletedWake = async (wake: { requestedAt: Date; updatedAt: Date }) => {
+      const actual = await vi.importActual<typeof import("../services/issue-dependency-wakeups.js")>(
+        "../services/issue-dependency-wakeups.js",
+      );
+      mockFindExistingIssueBlockersResolvedWakeForReadyState.mockImplementation((db, input) =>
+        actual.findExistingIssueBlockersResolvedWakeForReadyState(
+          db as Parameters<typeof actual.findExistingIssueBlockersResolvedWakeForReadyState>[0],
+          input as Parameters<typeof actual.findExistingIssueBlockersResolvedWakeForReadyState>[1],
+        ),
+      );
+      mockIssueService.getById.mockResolvedValue(issueRecord({
+        id: reviewIssueId,
+        identifier: "PAP-REVIEW",
+        title: "Review",
+        status: "in_progress",
+      }));
+      mockIssueService.update.mockResolvedValue(issueRecord({
+        id: reviewIssueId,
+        identifier: "PAP-REVIEW",
+        title: "Review",
+        status: "done",
+      }));
+      mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+        {
+          id: releaseIssueId,
+          assigneeAgentId: "agent-release",
+          blockerIssueIds: [reviewIssueId],
+          blockedTransitionAt: releaseBlockedAt,
+        },
+      ]);
+      const app = await createApp({
+        tableRows: {
+          agent_wakeup_requests: [
+            {
+              id: "wake-completed",
+              runId: null,
+              status: "completed",
+              idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+                dependentIssueId: releaseIssueId,
+                blockerIssueIds: [reviewIssueId],
+              }),
+              ...wake,
+            },
+          ],
+        },
+      });
+      const res = await request(app).patch(`/api/issues/${reviewIssueId}`).send({ status: "done" });
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => {
+        expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledTimes(1);
+      });
+      // The route continues only after this lookup settles; return its
+      // decision so each test asserts it directly instead of guessing a delay.
+      return mockFindExistingIssueBlockersResolvedWakeForReadyState.mock.results[0]?.value;
+    };
+
+    it("suppresses a completed wake requested in the current blocked generation", async () => {
+      const covering = await patchReviewDoneWithCompletedWake({
+        requestedAt: new Date("2026-08-01T15:05:00.000Z"),
+        updatedAt: new Date("2026-08-01T15:10:00.000Z"),
+      });
+      expect(covering).toMatchObject({ id: "wake-completed" });
+      expect(mockWakeup).not.toHaveBeenCalled();
+    });
+
+    it("wakes the current generation when the completed wake was requested in an earlier one, even if it finished after the re-block", async () => {
+      const covering = await patchReviewDoneWithCompletedWake({
+        requestedAt: new Date("2026-08-01T14:00:00.000Z"),
+        updatedAt: new Date("2026-08-01T15:30:00.000Z"),
+      });
+      expect(covering).toBeNull();
+      await vi.waitFor(() => {
+        expect(mockWakeup).toHaveBeenCalledTimes(1);
+      });
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-release",
+        expect.objectContaining({ reason: "issue_blockers_resolved" }),
       );
     });
   });

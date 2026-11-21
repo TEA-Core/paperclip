@@ -977,6 +977,47 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
   });
 
+  it.each([
+    ["39 hex characters", "a".repeat(39)],
+    ["41 hex characters", "a".repeat(41)],
+    ["64 hex characters", "a".repeat(64)],
+    ["65 hex characters", "a".repeat(65)],
+    ["40 uppercase hex characters", "A".repeat(40)],
+    ["a trailing newline", `${"a".repeat(40)}\n`],
+    ["an empty string", ""],
+    ["null", null],
+    ["an array", ["a".repeat(40)]],
+  ])("rejects a recovery head SHA with %s as 400 before any GitHub read or persistence", async (_label, headSha) => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    // The live PR head equals the requested head, so only validation can refuse it.
+    mockGhFetch.mockResolvedValue(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: headSha,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha,
+      reason: "restore approved publication",
+      idempotencyKey: "recover-invalid-head",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toMatch(/headSha/);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
   it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: 579, headRefName: DELIVERY_BRANCH },
@@ -1038,6 +1079,81 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).toHaveBeenCalledTimes(4);
     const [replayedReceipt] = await db.select().from(issueDeliveryReceipts);
     expect(replayedReceipt?.state).toBe("consumed");
+  });
+
+  // SUP-24085 F1-later: the current decision was admitted over a card with no
+  // open PR and certified no head (finalDeliveryUncertified tag). A PR linked
+  // later, even with a ready receipt, must not be stamped by this route.
+  async function seedUncertifiedDecision(opts: { staleTag?: boolean; malformedReason?: boolean } = {}) {
+    const seeded = await seedIssue({
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+      deliveryReceipt: true,
+    });
+    const [decision] = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const tagDecisionId = opts.staleTag ? randomUUID() : decision!.id;
+    await db.update(issues).set({
+      executionState: {
+        ...(issue!.executionState as Record<string, unknown>),
+        lastDecisionId: decision!.id,
+        approvalStatus: {
+          finalDeliveryUncertified: {
+            decisionId: tagDecisionId,
+            reason: opts.malformedReason ? 42 : "no-pr: no open linked PR resolvable at decision time",
+          },
+        },
+      },
+    }).where(eq(issues.id, seeded.issueId));
+    return seeded;
+  }
+
+  it("refuses to stamp a later-linked PR for an uncertified no-pr decision (SUP-24085 F1-later)", async () => {
+    const { companyId, issueId } = await seedUncertifiedDecision();
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (String(url).includes("/statuses/")) return createMockResponse({ id: 579 });
+      return createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}` });
+    });
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({ outcome: "rejected", reason: "head_uncertified" });
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    const [receipt] = await db.select().from(issueDeliveryReceipts);
+    expect(receipt?.state).toBe("ready");
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect((after!.executionState as { approvalStatus?: Record<string, unknown> }).approvalStatus?.publishedHeadSha).toBeUndefined();
+  });
+
+  it("refuses an uncertified decision whose tag reason is malformed (SUP-24085 F1-later)", async () => {
+    const { companyId, issueId } = await seedUncertifiedDecision({ malformedReason: true });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({ outcome: "rejected", reason: "head_uncertified" });
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("still republishes when the uncertified tag belongs to an earlier decision (SUP-24085)", async () => {
+    const { companyId, issueId } = await seedUncertifiedDecision({ staleTag: true });
+    currentActor = boardActor(companyId);
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}` }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockImplementationOnce(async () => createMockResponse({ id: 579 }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).toBe("armed");
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
   });
 
   it("invalidates a recovered receipt when the exact-head status write fails", async () => {
