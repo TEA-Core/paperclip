@@ -754,14 +754,19 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoAdmission();
   });
 
-  it("serializes action-only wake admission with a park that wins the carrier lock", async () => {
-    const f = await fixture(), before = await snapshot(f);
+  it.each([false, true])("serializes action-only wake admission with a winning park (coalescing=%s)", async coalescing => {
+    const f = await fixture();
+    const queued = coalescing ? await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, status: "queued", invocationSource: "on_demand", contextSnapshot: {},
+    }).returning() : [];
+    const before = await snapshot(f);
     const assertNoProtectedWrites = await protectSourceRows(f);
     const assertNoAdmission = await protectWakeAdmission(f);
     const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
     let settled = false;
     const wake = heartbeatService(db).wakeup(f.agentId, {
       source: "automation", reason: "recovery", payload: { recoveryActionId: f.actionId },
+      contextSnapshot: { recoveryActionId: f.actionId },
     }).then(run => { settled = true; return { run, error: null }; },
       error => { settled = true; return { run: null, error }; });
     try {
@@ -777,9 +782,25 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect((await acceptance).status).toBe(201);
     expect(await wake).toEqual({ run: null, error: null });
     expect(await snapshot(f)).toEqual(before);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual(queued);
     await assertNoAdmission();
     await assertNoProtectedWrites();
   }, 30_000);
+
+  it("preserves action-only coalescing into an unscoped run when no park exists", async () => {
+    const f = await fixture();
+    const [queued] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, status: "queued", invocationSource: "on_demand", contextSnapshot: {},
+    }).returning();
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const wake = await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { recoveryActionId: f.actionId } });
+    expect(wake?.id).toBe(queued!.id);
+    expect(await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+      .toEqual([{ status: "coalesced", runId: queued!.id }]);
+    await assertNoProtectedWrites();
+  });
 
   it.each(["issue_blockers_resolved", "issue_children_completed"])("does not replay a native %s intent suppressed during a park after release", async reason => {
     const f = await fixture();
@@ -819,15 +840,21 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it.each(["dependency", "child"] as const)("persists native %s suppression before dispatch so release cannot revive it", async shape => {
+  it.each(["dependency", "child", "nested child"] as const)("persists native %s suppression before dispatch so release cannot revive it", async shape => {
     const f = await fixture(), completedIssueId = randomUUID(), runId = randomUUID(), contractId = randomUUID();
     const resultId = randomUUID(), assessmentId = randomUUID();
+    let nativeParentId = f.carrierId, nestedHoldId: string | null = null;
     await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
     f.body.expectedAssigneeAgentId = f.agentId;
     f.body.expectedAssigneeUserId = null;
+    if (shape === "nested child") {
+      nativeParentId = randomUUID();
+      await db.insert(issues).values({ id: nativeParentId, companyId: f.companyId, title: "Independently paused descendant",
+        status: "blocked", assigneeAgentId: f.agentId, parentId: f.carrierId });
+    }
     await db.insert(issues).values({ id: completedIssueId, companyId: f.companyId, title: "Late native finalization",
       status: "in_progress", assigneeAgentId: f.agentId, deliveryRequirement: "record_only",
-      parentId: shape === "child" ? f.carrierId : null });
+      parentId: shape === "dependency" ? null : nativeParentId });
     await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: completedIssueId,
       revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v1", risk: "standard",
       completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
@@ -846,6 +873,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       assessmentJson: {}, inputDigest: assessmentId });
     await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: completedIssueId,
       phase: "assessing", resultId, assessmentId });
+    if (shape === "nested child") {
+      const pause = await request(app(f.companyId)).post(`/api/issues/${nativeParentId}/tree-holds`)
+        .send({ mode: "pause", reason: "Independent descendant pause" });
+      expect(pause.status).toBe(201);
+      const [hold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.rootIssueId, nativeParentId));
+      nestedHoldId = hold!.id;
+    }
     const parked = await park(f);
     expect(parked.status).toBe(201);
     if (shape === "dependency") await db.insert(issueRelations).values({
@@ -857,13 +891,18 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "done", toStatus: "done",
         reasonCode: "completion_contract_satisfied", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] } });
     const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-    expect(intent).toMatchObject({ reason: shape === "child" ? "issue_children_completed" : "issue_blockers_resolved",
+    expect(intent).toMatchObject({ reason: shape === "dependency" ? "issue_blockers_resolved" : "issue_children_completed",
       status: "skipped", runId: null });
     expect(intent.finishedAt).not.toBeNull();
     const assertNoAdmission = await protectWakeAdmission(f);
     expect((await request(app(f.companyId))
       .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
       .send({ recoveryActionId: f.actionId, reason: "Do not dispatch work suppressed before release" })).status).toBe(200);
+    if (nestedHoldId) {
+      expect((await request(app(f.companyId))
+        .post(`/api/issues/${nativeParentId}/tree-holds/${nestedHoldId}/release`)
+        .send({ reason: "Release the independent descendant hold", metadata: { wakeAgents: false } })).status).toBe(200);
+    }
     await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const after = await snapshot(f);
     expect(after.source).toEqual(before.source);
