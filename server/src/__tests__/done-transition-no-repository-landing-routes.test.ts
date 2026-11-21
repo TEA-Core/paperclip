@@ -2175,6 +2175,39 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await expectRefused(fixture, await close(fixture.identifier), UNKNOWN_CREATION_SNAPSHOT);
     });
 
+    it("closes a parentless card whose issue.created_without_parent row sits beside a complete creation snapshot", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId,
+        actorType: "agent",
+        actorId: fixture.closerAgentId,
+        action: "issue.created_without_parent",
+        entityType: "issue",
+        entityId: fixture.issueId,
+        details: { issueId: fixture.issueId, identifier: fixture.identifier, projectId: null, actorAgentId: fixture.closerAgentId, hasParent: false },
+      });
+
+      const res = await close(fixture.identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("done");
+    });
+
+    it("still refuses a parentless card with an issue.created_without_parent row and no creation snapshot", async () => {
+      const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId,
+        actorType: "agent",
+        actorId: fixture.closerAgentId,
+        action: "issue.created_without_parent",
+        entityType: "issue",
+        entityId: fixture.issueId,
+        details: { issueId: fixture.issueId, identifier: fixture.identifier, projectId: null },
+      });
+
+      await expectRefused(fixture, await close(fixture.identifier), UNKNOWN_CREATION_SNAPSHOT);
+    });
+
     it("refuses a never-had close when a later update rewrites the description without a recorded old value", async () => {
       const fixture = await seedAdmissible();
       await insertCreationSnapshot(fixture, "Decide the retention policy.");

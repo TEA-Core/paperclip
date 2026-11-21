@@ -2741,6 +2741,7 @@ function namesWorkspace(value: unknown): boolean {
 // guard's own rows. Any other action refuses.
 const NO_WORKSPACE_ALLOWED_ACTIVITY_ACTIONS: ReadonlySet<string> = new Set([
   "issue.created",
+  "issue.created_without_parent",
   "issue.updated",
   "issue.comment_added",
   // A tombstoned comment keeps its row with `deletedAt`, and that row refuses
