@@ -506,7 +506,15 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import {
+  CLOSE_ON_ACCEPT_DECISION_BODY,
+  closeIssueOnAcceptIneligibleReason,
+  closeOnAcceptCardBindingIneligibleReason,
+  closeOnAcceptStageIneligibleReason,
+  isCloseOnAcceptReconciliationAllowlisted,
+  resolveSelectedSuggestedTasks,
+  type CloseOnAcceptResult,
+} from "../services/issue-thread-interactions.js";
 import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
 import { isAgentInstructionsChangeTargetKey } from "../services/change-consent-gate.js";
 import {
@@ -5595,6 +5603,11 @@ export function issueRoutes(
     // whose request can change it. The guard's record-only skip then applies
     // only when this is record_only too.
     storedDeliveryRequirement?: IssueDeliveryRequirement | null;
+    // SUP-24788: a door that can still refuse after the guard allowed (the
+    // close-on-accept lock re-check) defers the board path's "transition
+    // allowed" rows; the guard returns them as recordGuardSkipDisposition for
+    // the caller to write once the close commits.
+    deferAllowedDisposition?: boolean;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5606,6 +5619,7 @@ export function issueRoutes(
       caller,
       persistRefusalComment = true,
       storedDeliveryRequirement,
+      deferAllowedDisposition = false,
     } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(
@@ -5746,12 +5760,18 @@ export function issueRoutes(
       // SUP-13939: board closes are exempt from the tier-evidence requirement, but the
       // bypass itself is recorded so board closes stay countable in the ghost-PASS
       // census (an unexplained "skip" would look exactly like the old silent gap).
-      recordGuardSkipDisposition();
-      void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
-        reason: "Board actor bypassed the done-tier close-evidence requirement",
-        skipReason: "board_actor_bypass",
-        decisionCarried,
-      });
+      const recordBoardBypass = () => {
+        recordGuardSkipDisposition();
+        void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
+          reason: "Board actor bypassed the done-tier close-evidence requirement",
+          skipReason: "board_actor_bypass",
+          decisionCarried,
+        });
+      };
+      if (deferAllowedDisposition) {
+        return { ok: true, overrideAccepted, recordGuardSkipDisposition: recordBoardBypass, closeRowAudits: [] };
+      }
+      recordBoardBypass();
       return { ok: true, overrideAccepted, closeRowAudits: [] };
     }
 
@@ -5957,6 +5977,122 @@ export function issueRoutes(
     }
     recordGuardSkipDisposition();
     return { ok: true, overrideAccepted, noRepositoryLanding: false, closeRowAudits };
+  }
+
+  // SUP-24788: the done-transition preflight for a close-on-accept confirmation
+  // and its allowlisted reconciliation. It runs the normal guard before any
+  // write, as the accepting human, with the refusal returned to the caller
+  // instead of posted to the thread so a refusal leaves the issue and the
+  // interaction unchanged. The guard's "transition allowed" rows come back as
+  // recordGuardSkipDisposition: the caller writes them only after the close
+  // commits, so a later refusal under the lock leaves no allowed-row behind.
+  async function preflightCloseOnAcceptDoneTransition(
+    issue: Parameters<typeof evaluateDoneTransitionGuards>[0]["issue"] & {
+      executionPolicy?: Record<string, unknown> | null;
+      executionState?: Record<string, unknown> | null;
+      deliveryRequirement: IssueDeliveryRequirement;
+      status: string;
+    },
+    userId: string,
+    boardActor: boolean,
+  ): Promise<DoneTransitionGuardOutcome> {
+    const projected = applyIssueExecutionPolicyTransition({
+      issue,
+      policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId },
+      commentBody: CLOSE_ON_ACCEPT_DECISION_BODY,
+    });
+    return evaluateDoneTransitionGuards({
+      issue,
+      override: null,
+      commentBody: CLOSE_ON_ACCEPT_DECISION_BODY,
+      runId: null,
+      decisionCarried: !!projected.decision,
+      boardActor,
+      caller: { agentId: null, userId },
+      persistRefusalComment: false,
+      closingAgentId: null,
+      storedDeliveryRequirement: issue.deliveryRequirement,
+      deferAllowedDisposition: true,
+    });
+  }
+
+  // SUP-24788: a close-on-accept is a close, so dependents blocked on the issue
+  // and a parent waiting on its children get the same wakes PATCH done emits.
+  // It never runs the merge-arming hook: a publication accept is not a head
+  // approval, even when it records the final review stage decision.
+  // Post-commit and non-fatal, like the recovery-action close path.
+  async function runCloseOnAcceptCompletionWakes(
+    closeOnAccept: CloseOnAcceptResult | undefined,
+    actor: ReturnType<typeof getActorInfo>,
+  ) {
+    if (!closeOnAccept || closeOnAccept.issue.status !== "done") return;
+    const issue = closeOnAccept.issue;
+    try {
+      const dependents = await svc.listWakeableBlockedDependents(issue.id);
+      for (const dependent of dependents) {
+        const wakeup = await prepareIssueBlockersResolvedWakeup({
+          companyId: issue.companyId,
+          dependentIssueId: dependent.id,
+          resolvedBlockerIssueId: issue.id,
+          blockerIssueIds: dependent.blockerIssueIds,
+          blockedTransitionAt: dependent.blockedTransitionAt,
+          source: "issue.blockers_resolved",
+          mutation: "blocker_done",
+          actor,
+          dedupeContext: "close-on-accept wake",
+        });
+        if (!wakeup) continue;
+        const wakeRun = await heartbeat.wakeup(dependent.assigneeAgentId, wakeup);
+        await logIssueBlockersResolvedWakeEmitted({
+          companyId: issue.companyId,
+          emittedBy: "issue_close_on_accept",
+          agentId: dependent.assigneeAgentId,
+          actor,
+          wakeup,
+          wakeupRunId: wakeRun?.id ?? null,
+          fallbackDependentIssueId: dependent.id,
+          defaultSource: "issue.close_on_accept",
+        }).catch((err) =>
+          logger.warn({ err, issueId: dependent.id }, "failed to audit dependency wake after close-on-accept"),
+        );
+      }
+      if (issue.parentId) {
+        const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
+        if (parent) {
+          await heartbeat.wakeup(parent.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_children_completed",
+            payload: {
+              issueId: parent.id,
+              completedChildIssueId: issue.id,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: parent.id,
+              taskId: parent.id,
+              wakeReason: "issue_children_completed",
+              source: "issue.children_completed",
+              completedChildIssueId: issue.id,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to wake dependents after close-on-accept");
+    }
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -25241,6 +25377,46 @@ export function issueRoutes(
           };
         }
       }
+      // SUP-24788: an explicitly flagged weekly-report publication confirmation
+      // closes its record_only issue when the addressed human accepts it. Every
+      // condition is read from the stored issue and interaction, never from the
+      // request; the service re-checks them under the row locks. The normal
+      // done-transition guard runs before the accept, so a refusal leaves the
+      // issue and the interaction pending. Ineligible shapes keep the ordinary
+      // accept.
+      let closeIssueOnAccept =
+        !reviewEscalationAccept &&
+        current.kind === "request_confirmation" &&
+        req.actor.type === "board" &&
+        closeIssueOnAcceptIneligibleReason({
+          issue,
+          interaction: current,
+          acceptingUserId: req.actor.userId ?? null,
+        }) === null &&
+        (await closeOnAcceptCardBindingIneligibleReason(db, issue, current)) === null;
+      let closeOnAcceptGuardSnapshot: string | undefined;
+      let recordCloseOnAcceptGuardDisposition: (() => void) | undefined;
+      if (closeIssueOnAccept) {
+        // Snapshot first, then let the guard read a fresh row: any change after
+        // the snapshot refuses under the lock instead of being baked into it.
+        closeOnAcceptGuardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
+        const [guardIssue = null] = await db.select().from(issueRows)
+          .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+        if (!guardIssue) throw notFound("Issue not found");
+        const acceptingUserId = req.actor.type === "board" ? (req.actor.userId ?? "") : "";
+        // A stage that close-on-accept may not decide (or a done that would start
+        // one) keeps the confirmation an ordinary accept instead of refusing it.
+        if ((await closeOnAcceptStageIneligibleReason(db, guardIssue, current, acceptingUserId)) !== null) {
+          closeIssueOnAccept = false;
+        } else {
+          const closeOutcome = await preflightCloseOnAcceptDoneTransition(guardIssue, acceptingUserId, true);
+          if (!closeOutcome.ok) {
+            res.status(closeOutcome.status).json(closeOutcome.body);
+            return;
+          }
+          recordCloseOnAcceptGuardDisposition = closeOutcome.recordGuardSkipDisposition;
+        }
+      }
       const acceptActor = {
         agentId: actor.agentId,
         runId: actor.runId,
@@ -25268,7 +25444,7 @@ export function issueRoutes(
         deferredPostCommit,
       });
       const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
-      const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept
+      const { interaction, createdIssues, continuationIssue, closeOnAccept } = reviewEscalationAccept
         ? await interactionSvc.acceptInteraction(...acceptArgs, {
             // The decision commits in the interaction's transaction, under the issue
             // lock taken by the revalidation, so a stale verdict leaves both pending.
@@ -25316,9 +25492,13 @@ export function issueRoutes(
               },
             } : {}),
           })
-        : await interactionSvc.acceptInteraction(...acceptArgs);
+        : closeIssueOnAccept
+          ? await interactionSvc.acceptInteraction(...acceptArgs, { closeIssueOnAccept: true, closeOnAcceptGuardSnapshot })
+          : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
+      if (closeOnAccept) recordCloseOnAcceptGuardDisposition?.();
+      await runCloseOnAcceptCompletionWakes(closeOnAccept, actor);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
       // a decision instead of vanishing. The interaction's own resolution leaves
@@ -25626,6 +25806,66 @@ export function issueRoutes(
       });
 
       res.json(continuationInteraction);
+    },
+  );
+
+  // SUP-24788: operator-invoked reconciliation for the one allowlisted
+  // acceptance that predates close-on-accept. It is never run automatically.
+  // Only the human who accepted the confirmation may invoke it; it re-runs the
+  // normal done-transition preflight and the shared close transition, and a
+  // repeat call is a verified no-op. Every other issue/interaction pair is 404.
+  router.post(
+    "/issues/:id/interactions/:interactionId/reconcile-close-on-accept",
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      if (!isCloseOnAcceptReconciliationAllowlisted(issue.id, interactionId)) {
+        throw notFound("Interaction not found");
+      }
+      const userId = req.actor.type === "board" ? (req.actor.userId ?? null) : null;
+      if (!userId) {
+        throw forbidden("Close-on-accept reconciliation requires an authenticated human user");
+      }
+      const interactionSvc = issueThreadInteractionService(db);
+      if (await interactionSvc.hasAppliedCloseOnAcceptReconciliation(issue, interactionId)) {
+        res.json({ outcome: "already_applied", issueId: issue.id, interactionId });
+        return;
+      }
+      const guardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
+      const [guardIssue = null] = await db.select().from(issueRows)
+        .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+      if (!guardIssue) throw notFound("Issue not found");
+      const closeOutcome = await preflightCloseOnAcceptDoneTransition(guardIssue, userId, true);
+      if (!closeOutcome.ok) {
+        res.status(closeOutcome.status).json(closeOutcome.body);
+        return;
+      }
+      const reconciled = await interactionSvc.reconcileAcceptedConfirmationClose(
+        issue,
+        interactionId,
+        { userId, boardApiKeyId: getActorInfo(req).boardApiKeyId },
+        guardSnapshot,
+      );
+      if (reconciled.outcome === "applied") {
+        closeOutcome.recordGuardSkipDisposition?.();
+        await runCloseOnAcceptCompletionWakes(reconciled.closeOnAccept, getActorInfo(req));
+      }
+      res.json({
+        outcome: reconciled.outcome,
+        issueId: issue.id,
+        interactionId,
+        ...(reconciled.outcome === "applied"
+          ? { status: reconciled.closeOnAccept.issue.status }
+          : {}),
+      });
     },
   );
 
