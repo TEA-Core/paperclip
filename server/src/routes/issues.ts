@@ -438,6 +438,8 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionStateWithSameRequestSkips,
+  skippedStageIdsFromExecutionState,
   applyBoardStageDecision,
   approvingCurrentStageCompletesLadder,
   assertNoStageInsertedBehindPointer,
@@ -21193,6 +21195,32 @@ export function issueRoutes(
       await recordRecordOnlyCloseFlipRefusal(existing.deliveryRequirement, "request");
       throw recordOnlyCloseFlipRefusal(existing.deliveryRequirement, "request");
     }
+    // Skips this close actually merged into the guard. The write-transaction
+    // lock revalidates them against the locked row.
+    let trustedSameRequestSkippedIds: string[] = [];
+    const recomputedSkippedStageIds = (
+      issue: typeof existing,
+      policy: NormalizedExecutionPolicy | null,
+    ) => {
+      try {
+        const recomputed = applyIssueExecutionPolicyTransition({
+          issue,
+          policy,
+          previousPolicy: policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          allowBoardOverride: false,
+          commentBody: transitionCommentBody,
+        });
+        return skippedStageIdsFromExecutionState(recomputed.patch.executionState);
+      } catch {
+        return [];
+      }
+    };
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -21207,33 +21235,30 @@ export function issueRoutes(
       };
       // SUP-22800/SUP-23202: a same-request auto-skip records skippedStageIds on
       // the transition patch and persists them only after this guard returns.
-      // Mechanism C must treat those stages as skipped. An omitted executionState
-      // (durable-approval close, already-completed ladder) keeps the pre-patch row.
-      const sameRequestExecutionState = transition.patch.executionState;
-      const sameRequestSkippedIds =
-        sameRequestExecutionState != null &&
-        typeof sameRequestExecutionState === "object" &&
-        !Array.isArray(sameRequestExecutionState) &&
-        Array.isArray((sameRequestExecutionState as { skippedStageIds?: unknown }).skippedStageIds)
-          ? ((sameRequestExecutionState as { skippedStageIds: unknown[] }).skippedStageIds.filter(
-              (id): id is string => typeof id === "string",
-            ))
-          : [];
-      // Only the skipped ids are merged: the pre-patch state (live stage, currentParticipant)
-      // stays intact so mechanism-D seat resolution is unchanged.
-      const preState = finalDeliveryIssue.executionState as { skippedStageIds?: string[] } | null;
-      const guardDeliveryIssue =
-        sameRequestSkippedIds.length > 0
-          ? {
-              ...finalDeliveryIssue,
-              executionState: preState
-                ? {
-                    ...preState,
-                    skippedStageIds: [...new Set([...(preState.skippedStageIds ?? []), ...sameRequestSkippedIds])],
-                  }
-                : sameRequestExecutionState,
-            }
-          : finalDeliveryIssue;
+      // Mechanism C must treat those stages as skipped. Only ids the stored
+      // policy and stored assignee would skip are trusted, so a same-request
+      // participant or stage-type rewrite cannot manufacture a skip. An omitted
+      // executionState keeps the pre-patch row.
+      const transitionSkips = skippedStageIdsFromExecutionState(transition.patch.executionState);
+      const requestRewritesPolicy = req.body.executionPolicy !== undefined;
+      const storedPolicySkips = requestRewritesPolicy
+        ? recomputedSkippedStageIds(existing, previousExecutionPolicy)
+        : transitionSkips;
+      trustedSameRequestSkippedIds = transitionSkips.filter((id) => storedPolicySkips.includes(id));
+      const patchState = transition.patch.executionState;
+      const guardedPatch = requestRewritesPolicy
+        && patchState != null
+        && typeof patchState === "object"
+        && !Array.isArray(patchState)
+        ? { ...patchState, skippedStageIds: trustedSameRequestSkippedIds }
+        : patchState;
+      const guardDeliveryIssue = {
+        ...finalDeliveryIssue,
+        executionState: executionStateWithSameRequestSkips(
+          finalDeliveryIssue.executionState,
+          guardedPatch,
+        ),
+      };
       const outcome = await evaluateDoneTransitionGuards({
         issue: guardDeliveryIssue,
         override,
@@ -21310,8 +21335,28 @@ export function issueRoutes(
             nextExecutionPolicy?.stallEscalation ||
             readState?.stallHandoff,
           ));
-      if (!stallLockRequired && !recordsDecision && !durableApprovalClose) return;
+      const computedSkipClose = trustedSameRequestSkippedIds.length > 0;
+      if (!stallLockRequired && !recordsDecision && !durableApprovalClose && !computedSkipClose) return;
       const locked = await svc.getByIdForUpdate(id, tx);
+      if (computedSkipClose && locked) {
+        const rowMoved =
+          !isDeepStrictEqual(locked.executionPolicy ?? null, existing.executionPolicy ?? null) ||
+          locked.assigneeAgentId !== existing.assigneeAgentId ||
+          locked.assigneeUserId !== existing.assigneeUserId ||
+          !isDeepStrictEqual(locked.executionState ?? null, existing.executionState ?? null);
+        if (rowMoved) {
+          const recomputedSkipped = recomputedSkippedStageIds(
+            locked,
+            normalizeIssueExecutionPolicy(locked.executionPolicy ?? null),
+          );
+          if (trustedSameRequestSkippedIds.some((id) => !recomputedSkipped.includes(id))) {
+            throw conflict(
+              "The execution policy or execution state changed while this close was in flight; a review stage this request auto-skipped is no longer skipped. Re-read the issue before closing it.",
+              { code: "execution_skip_close_conflict", issueId: existing.id },
+            );
+          }
+        }
+      }
       // SUP-24054 (release-assurance B3): the durable approvals were read
       // without the row lock. Re-read the policy, the execution state and the
       // decision rows under it, so a board re-arm, a reviewer's changes_requested

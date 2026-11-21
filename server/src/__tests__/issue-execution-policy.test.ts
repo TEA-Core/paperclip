@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, listCurrentPolicyApprovedStageIds, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stallHoldControlsDiffer, stripMonitorFromExecutionPolicy, type DurableApprovalDecisionRow } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, executionStateWithSameRequestSkips, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, listCurrentPolicyApprovedStageIds, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, skippedStageIdsFromExecutionState, stallHoldControlsDiffer, stripMonitorFromExecutionPolicy, type DurableApprovalDecisionRow } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -6096,5 +6096,40 @@ describe("actor-versus-seat and stage membership compare principal ids exactly",
         commentBody: "Approved.",
       }),
     ).toThrow("Only the active reviewer or approver can advance");
+  });
+});
+
+describe("same-request skip merge", () => {
+  const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const reviewer = { type: "agent" as const, agentId: qaAgentId };
+
+  it("merges only skipped ids and keeps the stored live seat (M2)", () => {
+    const stored = {
+      status: "pending",
+      currentParticipant: reviewer,
+      skippedStageIds: [] as string[],
+    };
+    const patch = {
+      status: "completed",
+      currentParticipant: null,
+      skippedStageIds: [stageId],
+    };
+    const merged = executionStateWithSameRequestSkips(stored, patch);
+    expect(merged).toMatchObject({
+      status: "pending",
+      currentParticipant: reviewer,
+      skippedStageIds: [stageId],
+    });
+  });
+
+  it("does not borrow skipped ids from the stored row when the patch has none (M3)", () => {
+    const stored = {
+      status: "pending",
+      currentParticipant: reviewer,
+      skippedStageIds: [stageId],
+    };
+    expect(executionStateWithSameRequestSkips(stored, { skippedStageIds: [] })).toBe(stored);
+    expect(executionStateWithSameRequestSkips(stored, undefined)).toBe(stored);
+    expect(skippedStageIdsFromExecutionState({ skippedStageIds: [stageId, 1, null] })).toEqual([stageId]);
   });
 });

@@ -36,6 +36,7 @@ const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
 const mockAddComment = vi.hoisted(() => vi.fn());
 const realAddCommentRef = vi.hoisted(() => ({ current: null as ((...args: any[]) => any) | null }));
+const pauseNextIssueLock = vi.hoisted(() => ({ current: null as null | (() => Promise<void>) }));
 const mockEvaluateDoneTransitionGuard = vi.hoisted(() => vi.fn());
 const realEvaluateGuardRef = vi.hoisted(() => ({ current: null as ((...args: any[]) => any) | null }));
 
@@ -71,6 +72,14 @@ vi.mock("../services/issues.js", async (importOriginal) => {
       return {
         ...real,
         addComment: mockAddComment,
+        getByIdForUpdate: async (...args: Parameters<typeof real.getByIdForUpdate>) => {
+          const pause = pauseNextIssueLock.current;
+          if (pause) {
+            pauseNextIssueLock.current = null;
+            await pause();
+          }
+          return real.getByIdForUpdate(...args);
+        },
       };
     },
   };
@@ -123,6 +132,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
   });
 
   beforeEach(() => {
+    pauseNextIssueLock.current = null;
     mockGhFetch.mockReset();
     mockGetByName.mockReset();
     mockResolveSecretValue.mockReset();
@@ -2034,6 +2044,219 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         skippedStageIds: [],
       });
       expect(JSON.stringify(rows[0]?.executionState)).not.toContain(stageId);
+    });
+
+    async function insertAgent(companyId: string, name: string) {
+      const id = randomUUID();
+      await db.insert(agents).values({
+        id,
+        companyId,
+        name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      return id;
+    }
+
+    function localBoard(): Express.Request["actor"] {
+      return {
+        type: "board",
+        userId: "local-board",
+        userName: "Local Board",
+        userEmail: null,
+        isInstanceAdmin: true,
+        source: "local_implicit",
+      };
+    }
+
+    it("refuses an approval stage whose only participant is the assignee (M4)", async () => {
+      const seeded = await seedReopenedSelfReviewCard("APPR");
+      const [row] = await db
+        .select({ executionPolicy: issues.executionPolicy })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      const policy = row?.executionPolicy as { stages: Array<{ type: string }> };
+      policy.stages[0]!.type = "approval";
+      await db.update(issues).set({
+        executionPolicy: policy as unknown as Record<string, unknown>,
+      }).where(eq(issues.id, seeded.issueId));
+      currentActor = agentActor(seeded.companyId, seeded.agentId, seeded.runId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({
+          status: "done",
+          comment: "Approval cannot auto-skip.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      const [stored] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      expect(stored?.status).toBe("in_progress");
+    });
+
+    it("refuses a stale done close after a board return-assignee re-arm", async () => {
+      const seeded = await seedReopenedSelfReviewCard("RACE");
+      const otherId = await insertAgent(seeded.companyId, "ReturnAssignee");
+      const [row] = await db
+        .select({ executionPolicy: issues.executionPolicy })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      const policy = {
+        ...(row?.executionPolicy as Record<string, unknown>),
+        returnAssigneeAgentId: otherId,
+      };
+      let releaseLock: () => void = () => {};
+      const enteredLock = new Promise<void>((resolve) => {
+        pauseNextIssueLock.current = () => new Promise<void>((resume) => {
+          releaseLock = resume;
+          resolve();
+        });
+      });
+      currentActor = agentActor(seeded.companyId, seeded.agentId, seeded.runId);
+      const pendingClose = request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({
+          status: "done",
+          comment: "Stale close.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+      const first = await Promise.race([
+        enteredLock.then(() => "entered" as const),
+        pendingClose.then((response) => response),
+      ]);
+      if (typeof first !== "string") {
+        throw new Error(`close returned before lock: ${first.status} ${JSON.stringify(first.body)}`);
+      }
+      currentActor = localBoard();
+      const armed = await request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({ status: "in_review", executionPolicy: policy });
+      expect(armed.status, JSON.stringify(armed.body)).toBe(200);
+      releaseLock();
+      const res = await pendingClose;
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      const [stored] = await db
+        .select({ status: issues.status, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      expect(stored?.status).not.toBe("done");
+      expect(stored?.executionState).toMatchObject({ status: "pending" });
+      const decisions = await db
+        .select({ id: issueExecutionDecisions.id })
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+      expect(decisions).toHaveLength(0);
+    });
+
+    it("refuses a done close that rewrites the stored reviewer to the assignee and reassigns", async () => {
+      const seeded = await seedIssue("REWR");
+      const reviewerId = await insertAgent(seeded.companyId, "IndependentReviewer");
+      const strangerId = await insertAgent(seeded.companyId, "Stranger");
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerId }],
+        }],
+      })!;
+      await db.update(issues).set({
+        status: "in_progress",
+        deliveryRequirement: "record_only",
+        assigneeAgentId: seeded.agentId,
+        executionPolicy: policy as unknown as Record<string, unknown>,
+        executionState: null,
+      }).where(eq(issues.id, seeded.issueId));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        status: "running",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId: seeded.issueId },
+      });
+      currentActor = agentActor(seeded.companyId, seeded.agentId, runId);
+      const res = await request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({
+          status: "done",
+          assigneeAgentId: strangerId,
+          executionPolicy: {
+            stages: [{
+              id: policy.stages[0]!.id,
+              type: "review",
+              participants: [{ type: "agent", agentId: seeded.agentId }],
+            }],
+          },
+          comment: "Manufactured skip.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      const [stored] = await db
+        .select({ status: issues.status, executionPolicy: issues.executionPolicy })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      expect(stored?.status).toBe("in_progress");
+      expect(JSON.stringify(stored?.executionPolicy)).toContain(reviewerId);
+    });
+
+    it("refuses a done close that rewrites an approval stage to a self-review", async () => {
+      const seeded = await seedIssue("RTYP");
+      const approverId = await insertAgent(seeded.companyId, "Approver");
+      const strangerId = await insertAgent(seeded.companyId, "StrangerTwo");
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "approval",
+          participants: [{ type: "agent", agentId: approverId }],
+        }],
+      })!;
+      await db.update(issues).set({
+        status: "in_progress",
+        deliveryRequirement: "record_only",
+        assigneeAgentId: seeded.agentId,
+        executionPolicy: policy as unknown as Record<string, unknown>,
+        executionState: null,
+      }).where(eq(issues.id, seeded.issueId));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        status: "running",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId: seeded.issueId },
+      });
+      currentActor = agentActor(seeded.companyId, seeded.agentId, runId);
+      const res = await request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({
+          status: "done",
+          assigneeAgentId: strangerId,
+          executionPolicy: {
+            stages: [{
+              id: policy.stages[0]!.id,
+              type: "review",
+              participants: [{ type: "agent", agentId: seeded.agentId }],
+            }],
+          },
+          comment: "Approval rewritten to review.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      const [stored] = await db
+        .select({ status: issues.status, executionPolicy: issues.executionPolicy })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      expect(stored?.status).toBe("in_progress");
+      expect(JSON.stringify(stored?.executionPolicy)).toContain('"type":"approval"');
     });
   });
 });
