@@ -64,8 +64,8 @@ export interface AgentWorkEligibility {
   orgChainHealth: AgentOrgChainHealth;
 }
 
-const NON_ASSIGNABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval"]);
-const NON_INVOKABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval", "paused"]);
+const NON_ASSIGNABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval", "deleted"]);
+const NON_INVOKABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval", "paused", "deleted"]);
 const ASSIGNABLE_AGENT_STATUSES = new Set<string>(["active", "paused", "idle", "running", "error"]);
 const INVOKABLE_AGENT_STATUSES = new Set<string>(["active", "idle", "running", "error"]);
 

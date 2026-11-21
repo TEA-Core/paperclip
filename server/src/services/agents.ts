@@ -9,19 +9,14 @@ import {
   agentApiKeys,
   agentRuntimeState,
   agentTaskSessions,
-  agentWakeupRequests,
-  activityLog,
   costEvents,
   decisionQueueItems,
   decisionQueues,
   decisionRetention,
   decisionTriage,
   decisionTriageEvents,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueExecutionDecisions,
   issues,
-  issueComments,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -716,7 +711,7 @@ export function agentService(db: Db) {
     const existing = await getById(id);
     if (!existing) return null;
 
-    if (existing.status === "terminated" && data.status && data.status !== "terminated") {
+    if ((existing.status === "terminated" || existing.status === "deleted") && data.status && data.status !== existing.status) {
       throw conflict("Terminated agents cannot be resumed");
     }
     if (
@@ -1095,54 +1090,7 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
-        const commentIssues = await tx
-          .select({ issueId: issueComments.issueId })
-          .from(issueComments)
-          .where(eq(issueComments.authorAgentId, id));
-        const activityIssues = await tx
-          .select({ issueId: activityLog.entityId })
-          .from(activityLog)
-          .where(and(
-            eq(activityLog.companyId, existing.companyId),
-            eq(activityLog.entityType, "issue"),
-            or(
-              eq(activityLog.agentId, id),
-              sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-            ),
-          ));
-        const agentRuns = await tx
-          .select({ nativeIssueId: heartbeatRuns.nativeIssueId, contextSnapshot: heartbeatRuns.contextSnapshot })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.agentId, id));
-        const runIssues = agentRuns.map((run) => {
-          const context = run.contextSnapshot as Record<string, unknown> | null;
-          const contextIssueId = context && typeof context.issueId === "string" ? context.issueId : null;
-          return { issueId: run.nativeIssueId ?? contextIssueId };
-        });
-        const erasedIssueIds = [...new Set(
-          [...commentIssues, ...activityIssues, ...runIssues].map((row) => row.issueId).filter((issueId): issueId is string => Boolean(issueId)),
-        )];
-        for (const issueId of erasedIssueIds) {
-          await logActivityInTransaction(tx as unknown as Db, {
-            companyId: existing.companyId,
-            actorType: "system",
-            actorId: "agent-delete",
-            action: "issue.agent_evidence_erased",
-            entityType: "issue",
-            entityId: issueId,
-            details: { deletedAgentId: id },
-          });
-        }
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
-        await tx.delete(activityLog).where(
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        );
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
-        await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
+        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         // Decision-table actor rows carry check constraints tying the 'agent'
         // actor type to a non-null agent FK. Re-label this agent's rows as
         // system-owned before the FKs detach (migration 0222) so the rows
@@ -1166,21 +1114,32 @@ export function agentService(db: Db) {
           .update(decisionRetention)
           .set({ archivedByType: "system", archivedByAgentId: null })
           .where(eq(decisionRetention.archivedByAgentId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
         await tx.delete(principalPermissionGrants).where(and(
           eq(principalPermissionGrants.companyId, existing.companyId),
           eq(principalPermissionGrants.principalType, "agent"),
           eq(principalPermissionGrants.principalId, id),
         ));
-        const deleted = await tx
-          .delete(agents)
+        const tombstone = await tx
+          .update(agents)
+          .set({
+            status: "deleted",
+            name: "Deleted agent",
+            title: null,
+            capabilities: null,
+            adapterConfig: {},
+            runtimeConfig: {},
+            permissions: {},
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            metadata: { tombstone: true, deletedAt: new Date().toISOString() },
+            updatedAt: new Date(),
+          })
           .where(eq(agents.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
-        return deleted ? normalizeAgentRow(deleted) : null;
+        return tombstone ? normalizeAgentRow(tombstone) : null;
       });
     },
 
@@ -1429,7 +1388,7 @@ export function agentService(db: Db) {
 
     orgForCompany: async (companyId: string) => {
       const allCompanyRows = await listCompanyAgentRows(companyId);
-      const rows = allCompanyRows.filter((row) => row.status !== "terminated");
+      const rows = allCompanyRows.filter((row) => row.status !== "terminated" && row.status !== "deleted");
       const normalizedRows = normalizeAgentRows(rows, allCompanyRows);
       const byManager = new Map<string | null, typeof normalizedRows>();
       for (const row of normalizedRows) {
@@ -1492,7 +1451,7 @@ export function agentService(db: Db) {
 
       const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
       const matches = normalizeAgentRows(rows, rows)
-        .filter((agent) => agent.urlKey === urlKey && agent.status !== "terminated");
+        .filter((agent) => agent.urlKey === urlKey && agent.status !== "terminated" && agent.status !== "deleted");
       if (matches.length === 1) {
         return { agent: matches[0] ?? null, ambiguous: false } as const;
       }

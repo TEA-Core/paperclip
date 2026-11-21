@@ -21,6 +21,9 @@ import {
   executionWorkspaceRuntimeLeases,
   executionWorkspaces,
   externalObjectMentions,
+  costEvents,
+  agentTaskSessions,
+  agentWakeupRequests,
   externalObjects,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -2172,10 +2175,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       });
     }
 
-    it("refuses a never-had close when issue.created lacks the creation snapshot", async () => {
+    it("closes a never-had card whose missing creation snapshot is derived from a still-null project", async () => {
       const fixture = await seedAdmissible({ omitCreationSnapshot: true });
-
-      await expectRefused(fixture, await close(fixture.identifier), UNKNOWN_CREATION_SNAPSHOT);
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
     });
 
     it("closes a parentless card whose issue.created_without_parent row sits beside a complete creation snapshot", async () => {
@@ -2196,7 +2199,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await statusOf(fixture.issueId)).toBe("done");
     });
 
-    it("still refuses a parentless card with an issue.created_without_parent row and no creation snapshot", async () => {
+    it("closes a parentless card with no creation snapshot when the project is still null", async () => {
       const fixture = await seedAdmissible({ omitCreationSnapshot: true });
       await db.insert(activityLog).values({
         companyId: fixture.companyId,
@@ -2207,9 +2210,120 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         entityId: fixture.issueId,
         details: { issueId: fixture.issueId, identifier: fixture.identifier, projectId: null },
       });
-
-      await expectRefused(fixture, await close(fixture.identifier), UNKNOWN_CREATION_SNAPSHOT);
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
     });
+    it("refuses a citation planted in a cost event, a task session, or a wakeup payload", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(costEvents).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        agentId: fixture.closerAgentId,
+        provider: "anthropic",
+        model: "test",
+        costCents: 1,
+        occurredAt: new Date(),
+        billingCode: "https://github.com/TEA-Core/records/pull/12",
+      });
+      expect((await close(fixture.identifier)).status).toBe(422);
+    });
+
+    it("refuses a task session whose params cite a repository", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(agentTaskSessions).values({
+        companyId: fixture.companyId,
+        agentId: fixture.closerAgentId,
+        adapterType: "codex_local",
+        taskKey: fixture.issueId,
+        sessionParamsJson: { repoUrl: "https://github.com/TEA-Core/records" },
+      });
+      expect((await close(fixture.identifier)).status).toBe(422);
+    });
+
+    it("refuses a wakeup payload that names the card and a repository", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(agentWakeupRequests).values({
+        companyId: fixture.companyId,
+        agentId: fixture.closerAgentId,
+        source: "assignment",
+        payload: { issueId: fixture.issueId, repoUrl: "https://github.com/TEA-Core/records" },
+      });
+      expect((await close(fixture.identifier)).status).toBe(422);
+    });
+
+    it("closes a comment that only uses the word gerrit", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(issueComments).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.closerAgentId,
+        body: "This card does not use gerrit.",
+      });
+      expect((await close(fixture.identifier)).status).toBe(200);
+    });
+
+    it("closes a comment that links an unknown host with an ordinary path", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(issueComments).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.closerAgentId,
+        body: "Policy: https://example.org/policies/retention",
+      });
+      expect((await close(fixture.identifier)).status).toBe(200);
+    });
+
+    it("refuses pull request #12, merge request 4, and a sourcehut URL", async () => {
+      for (const body of ["Opened pull request #12.", "Opened merge request 4.", "Mirrored https://sr.ht/~team/records"]) {
+        const fixture = await seedAdmissible();
+        await db.insert(issueComments).values({
+          companyId: fixture.companyId,
+          issueId: fixture.issueId,
+          authorAgentId: fixture.closerAgentId,
+          body,
+        });
+        expect((await close(fixture.identifier)).status, body).toBe(422);
+      }
+    });
+
+    it("refuses a ruling author whose membership is not active, and one whose membership is in another company", async () => {
+      const suspended = await seedAdmissible();
+      await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, suspended.companyId));
+      expect((await close(suspended.identifier)).status).toBe(422);
+
+      const other = await seedAdmissible();
+      const elsewhere = randomUUID();
+      await db.insert(companies).values({ id: elsewhere, name: "Other", issuePrefix: `OTH${elsewhere.slice(0, 4)}`, issueCounter: 1, requireBoardApprovalForNewAgents: false });
+      await db.update(companyMemberships).set({ companyId: elsewhere }).where(eq(companyMemberships.companyId, other.companyId));
+      expect((await close(other.identifier)).status).toBe(422);
+    });
+
+    it("closes after checkout and after a preflight-blocked audit row", async () => {
+      const checkedOut = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: checkedOut.companyId,
+        actorType: "agent",
+        actorId: checkedOut.closerAgentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: checkedOut.issueId,
+        details: { agentId: checkedOut.closerAgentId },
+      });
+      expect((await close(checkedOut.identifier)).status).toBe(200);
+
+      const blocked = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: blocked.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        action: "issue.workspace_preflight_blocked",
+        entityType: "issue",
+        entityId: blocked.issueId,
+        details: { hasResolvablePriorSessionWorkspace: false },
+      });
+      expect((await close(blocked.identifier)).status).toBe(200);
+    });
+
 
     it("refuses a never-had close when a later update rewrites the description without a recorded old value", async () => {
       const fixture = await seedAdmissible();

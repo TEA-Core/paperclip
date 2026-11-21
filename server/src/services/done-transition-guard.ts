@@ -38,6 +38,8 @@ import {
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { detectEvidence } from "./card-evidence.js";
+import { scanCardEvidence } from "./card-evidence-census.js";
 import {
   resolveGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
@@ -2595,20 +2597,8 @@ export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLanding
 // Repository evidence a no-repository declaration must not carry: a close that
 // claims no repository landing while citing a PR, a commit, a ref or a GitHub
 // URL is citing somebody's repository work as its own record.
-const REPOSITORY_EVIDENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bPR\s*#\s*\d+/i, "a pull request number"],
-  [/\/pull\/\d+/i, "a pull request URL"],
-  [/github\.com\//i, "a GitHub URL"],
-  [/\brefs\/(?:heads|remotes|tags)\//i, "a Git ref"],
-];
-
 function citedRepositoryEvidence(text: string): string | null {
-  for (const [pattern, label] of REPOSITORY_EVIDENCE_PATTERNS) {
-    if (pattern.test(text)) return label;
-  }
-  const hexTokens = text.match(/\b[0-9a-f]{7,64}\b/gi) ?? [];
-  if (hexTokens.some((token) => /[0-9]/.test(token) && /[a-f]/i.test(token))) return "a commit SHA";
-  return extractCitedCommitShas(text).length > 0 ? "a commit SHA" : null;
+  return detectEvidence(text, "prose")?.label ?? null;
 }
 
 // A ruling that opens with one of these words, or says nothing else, is a
@@ -2662,37 +2652,9 @@ const NO_WORKSPACE_REFUSAL_REASON = "requires this issue's own execution workspa
  * GitHub, GitLab, Bitbucket or Azure DevOps, a bare `owner/repo#N`), any URL
  * or SSH address of a code host, and Git refs.
  */
-const REPOSITORY_REFERENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bPR\s*#\s*\d+/i, "a pull request number"],
-  [/\bpull\s+request\s+\d+/i, "a pull request number"],
-  [/\bMR\s*!\s*\d+/i, "a merge request number"],
-  [/\bmerge\s+request\s+!\s*\d+/i, "a merge request number"],
-  [/(?<![\w/.-])[\w.-]+\/[\w.-]+[#!]\d+\b/, "a repository issue or pull request reference"],
-  [/\/pulls?\/\d+/i, "a pull request URL"],
-  [/\/pull-requests\/\d+/i, "a pull request URL"],
-  [/\/pullrequests?\/\d+/i, "a pull request URL"],
-  [/\/merge_requests\/\d+/i, "a merge request URL"],
-  [/\bgithub\.com\b/i, "a GitHub address"],
-  [/\bgitlab\.[a-z0-9.-]+/i, "a GitLab address"],
-  [/\bbitbucket\.org\b/i, "a Bitbucket address"],
-  [/\bdev\.azure\.com\b|\.visualstudio\.com\b/i, "an Azure DevOps address"],
-  [/\b[\w.-]+@[\w.-]+:[\w.~-]+\/[\w.-]+/i, "an SSH repository address"],
-  [/\bssh:\/\/\S+/i, "an SSH repository address"],
-  [/\brefs\/(?:heads|remotes|tags|pull)\//i, "a Git ref"],
-  [/\/c\/[^\s]+\/\+\/\d+/i, "a Gerrit change"],
-  [/\bgerrit\b/i, "a Gerrit address"],
-  [/\bgit\.sr\.ht\b/i, "a sourcehut address"],
-  [/https?:\/\/[^\s]+\.git\b/i, "a repository clone URL"],
-  [/(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i, "a commit SHA"],
-  [/\bcommit\s+[0-9a-f]{7,40}\b/i, "a commit SHA"],
-];
-
 function repositoryReference(text: string | null | undefined): string | null {
   if (!text) return null;
-  for (const [pattern, label] of REPOSITORY_REFERENCE_PATTERNS) {
-    if (pattern.test(text)) return label;
-  }
-  return null;
+  return detectEvidence(text, "prose")?.label ?? null;
 }
 
 function forEachJsonEntry(value: unknown, visit: (key: string | null, value: unknown) => boolean): boolean {
@@ -2713,62 +2675,9 @@ function jsonRepositoryReference(value: unknown): string | null {
   return found;
 }
 
-// Keys that, with a non-null scalar value at any depth, show a project, a
-// workspace, a repository, a branch, a worktree, a pull request, a commit or a
-// delivery classification. Keys are compared after lowercasing and removing
-// every non-alphanumeric character, so `execution-workspace-id`,
-// `executionWorkspaceId` and `EXECUTION_WORKSPACE_ID` are one key.
-const WORKSPACE_KEY_PATTERN =
-  /^(executionworkspaceid|projectid|projectworkspaceid|workspace|workspaceid|workspaceref|workspacepath|repo|reporef|repourl|repository|repositoryurl|branch|branchname|worktree|worktreepath|providerref|baseref|deliveryrequirement|storeddeliveryrequirement|pr|prnumber|prurl|pullrequest|pullrequestnumber|pullrequestid|pullrequesturl|mr|mrnumber|mergerequest|commit|commitsha|sha|headsha)$/;
-const WORKSPACE_KEY_SUFFIXES = ["executionworkspaceid", "projectworkspaceid", "workspaceid", "pullrequestnumber", "pullrequesturl", "repositoryurl", "worktreepath", "branchname", "baseref"];
 
-function normalizedWorkspaceKey(key: string): boolean {
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (WORKSPACE_KEY_PATTERN.test(normalized)) return true;
-  return WORKSPACE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix) && normalized.length > suffix.length);
-}
-
-function textNamesWorkspaceKey(text: string): boolean {
-  const readable = text.replace(/\\"/g, "\"").replace(/\\/g, "");
-  for (const match of readable.matchAll(/([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*["']?([^\s,}\]"']*)/g)) {
-    if (!normalizedWorkspaceKey(match[1]!)) continue;
-    const value = match[2] ?? "";
-    if (value !== "" && value !== "null") return true;
-  }
-  return false;
-}
-
-function unparseableStructuredText(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("{\\")) return false;
-  const candidates = [trimmed, trimmed.replace(/\\"/g, "\"").replace(/\\\\/g, "\\")];
-  return candidates.every((candidate) => {
-    try {
-      JSON.parse(candidate);
-      return false;
-    } catch {
-      return true;
-    }
-  });
-}
-
-function namesWorkspace(value: unknown, evidenceColumn = false): boolean {
-  if (typeof value === "string") {
-    const text = value.trim();
-    if (evidenceColumn && unparseableStructuredText(text)) return true;
-    if (text.startsWith("{") || text.startsWith("[")) {
-      try {
-        if (namesWorkspace(JSON.parse(text), evidenceColumn)) return true;
-      } catch {
-        if (evidenceColumn) return true;
-      }
-    }
-    return textNamesWorkspaceKey(text);
-  }
-  return forEachJsonEntry(value, (key, item) => {
-    if (key !== null && normalizedWorkspaceKey(key) && item !== null && item !== "") return true;
-    return typeof item === "string" && namesWorkspace(item, evidenceColumn);
-  });
+function namesWorkspace(value: unknown, _evidenceColumn = false): boolean {
+  return detectEvidence(value, "machine")?.arm === "key";
 }
 
 
@@ -2791,6 +2700,14 @@ const NO_WORKSPACE_ALLOWED_ACTIVITY_ACTIONS: ReadonlySet<string> = new Set([
   "issue.done_transition_guard_skipped",
   "issue.done_tier_declaration_skipped",
   "issue.done_transition_tier1_close",
+  "issue.document_locked",
+  "issue.document_unlocked",
+  "issue.checked_out",
+  "issue.released",
+  "issue.checkout_lock_adopted",
+  "issue.successful_run_handoff_required",
+  "issue.workspace_preflight_blocked",
+  "issue.done_transition_no_repository_landing_verified",
 ]);
 
 // The fields an `issue.updated` row may record as changed. Any other changed
@@ -2951,7 +2868,8 @@ async function noWorkspaceHistoryRefusal(
     const record = details as Record<string, unknown>;
     return Object.hasOwn(record, "projectId") && Object.hasOwn(record, "projectWorkspaceId") && Object.hasOwn(record, "description");
   };
-  if (created.length === 0 || created.some((row) => !snapshotComplete(row.details))) {
+  const projectAbsentNow = issueRow?.projectId == null && issueRow?.projectWorkspaceId == null;
+  if (!projectAbsentNow && (created.length === 0 || created.some((row) => !snapshotComplete(row.details)))) {
     return noRepositoryRefusal(
       "cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.",
     );
@@ -3024,6 +2942,19 @@ async function noWorkspaceHistoryRefusal(
     const reference = repositoryReference(text);
     if (reference) {
       return noRepositoryRefusal(`cannot be declared on an issue whose thread cites repository work (${reference}).`);
+    }
+  }
+  if (issueRow) {
+    const census = await scanCardEvidence(db, {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdAt: issueRow.createdAt,
+    });
+    if (census) {
+      return noRepositoryRefusal(
+        `cannot be declared on an issue whose ${census.table} row carries unread workspace or repository evidence (${census.label}).`,
+      );
     }
   }
   return null;
