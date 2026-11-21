@@ -12738,6 +12738,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(
         input.claimed,
       );
+      const reusedRecoveryIssue = recoveryIssue !== null;
       if (!recoveryIssue) {
         recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
           title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
@@ -12760,28 +12761,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // The recovery issue is the effect; waking its assignee is best effort. A paused or
+      // budget-blocked assignee must not undo or repeat the issue creation.
+      let recoveryWakeQueued = false;
       if (recoveryIssue.assigneeAgentId) {
-        await enqueueWakeup(recoveryIssue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_monitor_recovery_issue",
-          idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-          payload: withRecoveryContext(
-            { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
-            "status_only",
-          ),
-          requestedByActorType: input.actorType,
-          requestedByActorId: input.actorId,
-          contextSnapshot: withRecoveryContext(
-            {
-              issueId: recoveryIssue.id,
-              sourceIssueId: input.claimed.id,
-              source: "issue.monitor.recovery_issue",
-              wakeReason: "issue_monitor_recovery_issue",
-            },
-            "status_only",
-          ),
-        });
+        try {
+          recoveryWakeQueued = Boolean(
+            await enqueueWakeup(recoveryIssue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_monitor_recovery_issue",
+              idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+              payload: withRecoveryContext(
+                { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
+                "status_only",
+              ),
+              requestedByActorType: input.actorType,
+              requestedByActorId: input.actorId,
+              contextSnapshot: withRecoveryContext(
+                {
+                  issueId: recoveryIssue.id,
+                  sourceIssueId: input.claimed.id,
+                  source: "issue.monitor.recovery_issue",
+                  wakeReason: "issue_monitor_recovery_issue",
+                },
+                "status_only",
+              ),
+            }),
+          );
+        } catch (err) {
+          if (!(err instanceof HttpError && err.status >= 400 && err.status < 500)) throw err;
+        }
       }
 
       await logActivity(db, {
@@ -12798,9 +12808,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...details,
           recoveryIssueId: recoveryIssue.id,
           recoveryIdentifier: recoveryIssue.identifier,
+          recoveryIssueReused: reusedRecoveryIssue,
+          recoveryWakeQueued,
         },
       });
-      return;
+      return {
+        recoveryOutcome: reusedRecoveryIssue ? ("recovery_issue_reused" as const) : ("recovery_issue_created" as const),
+      };
     }
 
     if (input.recoveryPolicy === "escalate_to_board") {
@@ -12827,10 +12841,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         entityId: input.claimed.id,
         details,
       });
-      return;
+      return { recoveryOutcome: "escalated_to_board" as const };
     }
 
-    await enqueueWakeup(input.claimed.assigneeAgentId!, {
+    const wakeResult = await enqueueWakeup(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_monitor_recovery",
@@ -12867,6 +12881,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ),
     });
 
+    // enqueueWakeup returns null when it skipped the wake (e.g. the owner does not accept
+    // on-demand wakes). Never record or report a queued wake that was not queued.
+    if (!wakeResult) return { recoveryOutcome: "owner_wake_not_queued" as const };
+
     await logActivity(db, {
       companyId: input.claimed.companyId,
       actorType: input.actorType,
@@ -12879,6 +12897,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       entityId: input.claimed.id,
       details,
     });
+    return { recoveryOutcome: "owner_wake_queued" as const };
   }
 
   async function clearIssueMonitorAndRecover(input: {
@@ -12897,56 +12916,100 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
-    await db
-      .update(issues)
-      .set({
-        ...buildIssueMonitorClearedPatch({
-          issue: input.claimed,
-          policy: input.policy,
+    // SUP-23786: the recovery effect runs first and the clear + the single
+    // `issue.monitor_exhausted` row commit afterwards, in one transaction, with an
+    // outcome derived from what the effect actually did. A failing effect rolls
+    // back, releases the claim and leaves the monitor armed so the next tick
+    // retries; it is never cleared with the recovery lost. A per-issue advisory
+    // lock serialises overlapping claims of the same due monitor, and the
+    // claimed-schedule check inside it means the loser writes and runs nothing.
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`issue-monitor-exhaustion:${input.claimed.id}`}, 0))`,
+        );
+        const [current] = await tx
+          .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+          .from(issues)
+          .where(eq(issues.id, input.claimed.id))
+          .limit(1);
+        if (
+          !current ||
+          (current.monitorNextCheckAt?.getTime() ?? null) !==
+            (input.claimed.monitorNextCheckAt?.getTime() ?? null)
+        ) {
+          return { outcome: "skipped" as const, reason: "monitor_rearmed" };
+        }
+
+        const recovery = await performIssueMonitorRecovery({
+          claimed: input.claimed,
+          scheduledAtIso: input.scheduledAtIso,
+          nextAttemptCount: input.nextAttemptCount,
           clearReason: input.clearReason,
-          clearedAt: input.now,
-        }),
-        updatedAt: input.now,
-      })
-      .where(eq(issues.id, input.claimed.id));
+          recoveryPolicy: input.recoveryPolicy,
+          monitor: input.monitor,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          boardApiKeyId: input.boardApiKeyId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
 
-    await logActivity(db, {
-      companyId: input.claimed.companyId,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      boardApiKeyId: input.boardApiKeyId ?? null,
-      agentId: input.agentId,
-      runId: input.runId,
-      action: "issue.monitor_exhausted",
-      entityType: "issue",
-      entityId: input.claimed.id,
-      details: monitorRecoveryDetails({
-        claimed: input.claimed,
-        scheduledAtIso: input.scheduledAtIso,
-        nextAttemptCount: input.nextAttemptCount,
-        clearReason: input.clearReason,
-        recoveryPolicy: input.recoveryPolicy,
-        monitor: input.monitor,
-        source: input.activitySource,
-      }),
-    });
+        await tx
+          .update(issues)
+          .set({
+            ...buildIssueMonitorClearedPatch({
+              issue: input.claimed,
+              policy: input.policy,
+              clearReason: input.clearReason,
+              clearedAt: input.now,
+              // Only an agent-armed monitor records the sticky "recovery ran" fact that
+              // stops the owner agent from re-arming; board-armed state is unchanged.
+              exhaustionRecovered: input.monitor?.scheduledBy === "assignee",
+            }),
+            updatedAt: input.now,
+          })
+          .where(eq(issues.id, input.claimed.id));
 
-    await performIssueMonitorRecovery({
-      claimed: input.claimed,
-      scheduledAtIso: input.scheduledAtIso,
-      nextAttemptCount: input.nextAttemptCount,
-      clearReason: input.clearReason,
-      recoveryPolicy: input.recoveryPolicy,
-      monitor: input.monitor,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      boardApiKeyId: input.boardApiKeyId,
-      agentId: input.agentId,
-      runId: input.runId,
-      activitySource: input.activitySource,
-    });
-
-    return { outcome: "skipped" as const, reason: input.clearReason };
+        await logActivityInTransaction(tx as unknown as Db, {
+          companyId: input.claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          boardApiKeyId: input.boardApiKeyId ?? null,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_exhausted",
+          entityType: "issue",
+          entityId: input.claimed.id,
+          details: {
+            ...monitorRecoveryDetails({
+              claimed: input.claimed,
+              scheduledAtIso: input.scheduledAtIso,
+              nextAttemptCount: input.nextAttemptCount,
+              clearReason: input.clearReason,
+              recoveryPolicy: input.recoveryPolicy,
+              monitor: input.monitor,
+              source: input.activitySource,
+            }),
+            attemptCount: input.claimed.monitorAttemptCount ?? 0,
+            recoveryOutcome: recovery.recoveryOutcome,
+          },
+        });
+        return { outcome: "skipped" as const, reason: input.clearReason };
+      });
+    } catch (err) {
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
+        .where(eq(issues.id, input.claimed.id));
+      // A paused or budget-blocked owner refuses the recovery wake with a 4xx: the same
+      // deferral a normal fire gets. The monitor stays armed and a later tick retries.
+      if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+        return { outcome: "skipped" as const, reason: "recovery_deferred" };
+      }
+      throw err;
+    }
   }
 
   async function dispatchClaimedIssueMonitor(

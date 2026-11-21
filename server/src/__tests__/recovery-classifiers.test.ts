@@ -168,6 +168,45 @@ describe("recovery classifier boundary", () => {
     expect(exhausted[0]?.state).toBe("in_review_without_action_path");
   });
 
+  // SUP-23786: an exhausted, agent-armed monitor with a recoveryPolicy is persisted
+  // armed so the due dispatch can recover. Until then it is a real action path.
+  it("treats a persisted exhausted agent re-arm with a pending recovery as an action path", () => {
+    const classify = (monitor: Record<string, unknown>, stateMonitor: Record<string, unknown> | null = null) =>
+      classifyIssueGraphLiveness({
+        now: "2026-04-30T18:00:00.000Z",
+        issues: [
+          {
+            id: issueId,
+            companyId,
+            identifier: "PAP-2945",
+            title: "Wait for external review",
+            status: "in_review",
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            createdByAgentId: null,
+            createdByUserId: null,
+            executionPolicy: { monitor: { nextCheckAt: "2026-04-30T19:00:00.000Z", maxAttempts: 1, ...monitor } },
+            executionState: stateMonitor ? { monitor: stateMonitor } : null,
+            monitorNextCheckAt: "2026-04-30T19:00:00.000Z",
+            monitorAttemptCount: 1,
+          },
+        ],
+        relations: [],
+        agents: [{ id: agentId, companyId, name: "Coder", role: "engineer", status: "idle", reportsTo: managerId }],
+      });
+
+    expect(classify({ scheduledBy: "assignee", recoveryPolicy: "wake_owner" })).toEqual([]);
+    // Controls: board-armed, no recoveryPolicy, or a recovery that already ran stay without a path.
+    expect(classify({ scheduledBy: "board", recoveryPolicy: "wake_owner" })[0]?.state).toBe("in_review_without_action_path");
+    expect(classify({ scheduledBy: "assignee" })[0]?.state).toBe("in_review_without_action_path");
+    expect(
+      classify(
+        { scheduledBy: "assignee", recoveryPolicy: "wake_owner" },
+        { exhaustionRecoveredAt: "2026-04-30T17:00:00.000Z" },
+      )[0]?.state,
+    ).toBe("in_review_without_action_path");
+  });
+
   it("keeps run liveness continuation decision parity with the compatibility export", () => {
     const input = {
       run: {
