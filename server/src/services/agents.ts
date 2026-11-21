@@ -883,7 +883,7 @@ export function agentService(db: Db) {
     list: async (companyId: string, options?: { includeTerminated?: boolean }) => {
       const conditions = [eq(agents.companyId, companyId)];
       if (!options?.includeTerminated) {
-        conditions.push(ne(agents.status, "terminated"));
+        conditions.push(ne(agents.status, "terminated"), ne(agents.status, "deleted"));
       }
       const [rows, allCompanyRows] = await Promise.all([
         db.select().from(agents).where(and(...conditions)),

@@ -36,6 +36,7 @@ export const DIRECT_NON_INVOKABLE_STATUSES = new Set<AgentStatus>([
   "paused",
   "terminated",
   "pending_approval",
+  "deleted",
 ]);
 
 function blocked(
@@ -49,7 +50,7 @@ function blocked(
 
 function statusBlockReason(status: AgentStatus): AgentInvokabilityBlockReason | null {
   if (status === "paused") return "paused";
-  if (status === "terminated") return "terminated";
+  if (status === "terminated" || status === "deleted") return "terminated";
   if (status === "pending_approval") return "pending_approval";
   return null;
 }
@@ -151,7 +152,7 @@ export function listInvalidOrgChainDescendantIds(
     const current = stack.pop();
     if (!current || seen.has(current.id)) continue;
     seen.add(current.id);
-    if (current.status !== "terminated") {
+    if (current.status !== "terminated" && current.status !== "deleted") {
       invalidDescendantIds.push(current.id);
     }
     stack.push(...(byManager.get(current.id) ?? []));

@@ -21759,7 +21759,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const existing = await getAgent(agentId);
     if (!existing) return;
 
-    if (existing.status === "paused" || existing.status === "terminated") {
+    if (existing.status === "paused" || existing.status === "terminated" || existing.status === "deleted") {
       return;
     }
 
@@ -31021,6 +31021,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
+      recoveryAgent.status !== "deleted" &&
       recoveryAgent.status !== "pending_approval";
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))

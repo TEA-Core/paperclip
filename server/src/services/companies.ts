@@ -86,7 +86,7 @@ export function companyService(db: Db) {
       })
       .where(and(
         eq(agents.companyId, id),
-        notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+        notInArray(agents.status, ["paused", "terminated", "pending_approval", "deleted"]),
       ))
       .returning({ id: agents.id });
 

@@ -98,7 +98,13 @@ async function loadCatalog(db: Db) {
 }
 
 function catalog(db: Db) {
-  catalogPromise ??= loadCatalog(db);
+  if (!catalogPromise) {
+    const loading = loadCatalog(db);
+    catalogPromise = loading;
+    loading.catch(() => {
+      if (catalogPromise === loading) catalogPromise = null;
+    });
+  }
   return catalogPromise;
 }
 
