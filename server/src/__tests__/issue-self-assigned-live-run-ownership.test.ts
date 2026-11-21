@@ -1276,10 +1276,13 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const board = appFor(boardActor(companyId));
     const away = await request(board).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: peerAgentId });
     expect(away.status, JSON.stringify(away.body)).toBe(200);
+    await heartbeat.drainActiveRunExecutions();
     const back = await request(board).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: writerAgentId });
     expect(back.status, JSON.stringify(back.body)).toBe(200);
+    await heartbeat.drainActiveRunExecutions();
+    expect((await cardRow(issueId)).originRunId).toBeNull();
 
-    await heartbeat.wakeup(writerAgentId, {
+    const woken = await heartbeat.wakeup(writerAgentId, {
       source: "on_demand",
       triggerDetail: "manual",
       reason: "board_wake",
@@ -1288,9 +1291,9 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       requestedByActorType: "user",
       requestedByActorId: "board-user",
     });
-    await sleep(WAKE_SETTLE_MS);
-    const wakes = await wakesForCard(issueId, writerAgentId);
-    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    expect(woken?.status).toBe("queued");
+    expect(woken?.id).not.toBe(writerRunId);
+    expect(woken?.contextSnapshot?.issueId).toBe(issueId);
     expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
   });
 
