@@ -152,7 +152,9 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
-    await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+    const remainingActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(remainingActivity.map((row) => row.action)).toEqual(["issue.agent_evidence_erased"]);
+    expect(remainingActivity[0]?.entityId).toBe(issueId);
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {
