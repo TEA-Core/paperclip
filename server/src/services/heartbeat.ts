@@ -33596,10 +33596,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             // Producers do not always stamp blockedTransitionAt into the
             // context snapshot (the liveness backstop is one). Without the
-            // cycle timestamp an old-key COMPLETED wake from any earlier
-            // blocked cycle would suppress the enqueue, so fall back to the
-            // dependent issue's live cycle timestamp — the same information
-            // the producer's own pre-check used.
+            // generation timestamp a COMPLETED canonical or old-key wake from
+            // any earlier blocked generation would suppress the enqueue, so
+            // fall back to the dependent issue's live generation timestamp —
+            // the same information the producer's own pre-check used.
             const dependencyBlockedTransitionAt = snapshotBlockedTransitionAt ??
               (await tx
                 .select({ blockedTransitionAt: issues.blockedTransitionAt })

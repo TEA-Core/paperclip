@@ -645,6 +645,13 @@ export async function reapStrandedSummaryGenerationIssues(
               postCommitActivityPublications,
               postCommitIssueActions,
             );
+            // SUP-23925: the deferred tier close rows commit on THIS
+            // transaction, only after the terminal write landed.
+            if (updated?.status === "done" && guardVerdict.closeRowAudits.length > 0) {
+              for (const audit of guardVerdict.closeRowAudits) {
+                await logActivityInTransaction(tx as unknown as Parameters<typeof logActivityInTransaction>[0], audit);
+              }
+            }
             return updated?.status === "done";
           });
           if (settled) {

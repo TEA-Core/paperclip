@@ -8494,6 +8494,11 @@ export function recoveryService(
               dependentIssueId: candidate.id,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
               blockedTransitionAt: candidate.blockedTransitionAt,
+              // Two independent cutoffs: blockedTransitionAt scopes a finished
+              // canonical wake to the generation it was requested in, and the
+              // re-arm-age `cutoff` lets a same-generation wake that aged out
+              // re-arm so the cap and the blocked_without_blockers escalation
+              // still fire.
               completedRearmCutoff: cutoff,
             });
         if (existingWake) {
@@ -8763,6 +8768,9 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
+            // Heartbeat's own canonical ready-state lookup derives the
+            // generation (blockedTransitionAt) itself; hand it the same
+            // re-arm-age cutoff the producer lookup used.
             completedRearmCutoff: cutoff,
             requestedByActorType: "system",
             requestedByActorId,
