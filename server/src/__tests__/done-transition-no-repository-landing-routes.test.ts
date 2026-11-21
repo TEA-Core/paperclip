@@ -21,6 +21,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
   issues,
   issueWorkProducts,
   projectWorkspaces,
@@ -2019,6 +2020,111 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
     expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
+  });
+
+  async function seedFinalZeroDeltaApproval() {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        returnAssigneeAgentId: fixture.rulerAgentId,
+        stages: [{
+          id: stageId,
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: fixture.closerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: fixture.closerAgentId },
+        returnAssignee: { type: "agent", agentId: fixture.rulerAgentId },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    answerZeroDeltaGitHub();
+    return { ...fixture, stageId };
+  }
+
+  it("closes a final-stage zero-delta approval without certifying or publishing a head", async () => {
+    const fixture = await seedFinalZeroDeltaApproval();
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "done",
+      comment: "Independent final approval.",
+      doneTier: zeroDeltaDoneTier(fixture.worktree),
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(stored?.status).toBe("done");
+    expect(stored?.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId],
+      lastDecisionOutcome: "approved",
+      approvalStatus: {
+        finalDeliveryUncertified: {
+          decisionId: stored?.executionState?.lastDecisionId,
+          reason: expect.stringContaining("zero-delta:"),
+        },
+        publishSkipped: { reason: expect.stringContaining("head_uncertified"), headSha: null },
+      },
+    });
+    const approval = stored?.executionState?.approvalStatus as Record<string, unknown>;
+    expect(approval.finalDelivery).toBeUndefined();
+    expect(approval.approvedHeadSha).toBeUndefined();
+    expect(approval.publishedHeadSha).toBeUndefined();
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId));
+    expect(decisions.map(({ stageId, outcome }) => ({ stageId, outcome }))).toEqual([{ stageId: fixture.stageId, outcome: "approved" }]);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === "POST")).toEqual([]);
+  });
+
+  it("refuses a final-stage approval with no PR and no zero-delta declaration", async () => {
+    const fixture = await seedFinalZeroDeltaApproval();
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "done",
+      comment: "Independent final approval.",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(await statusOf(fixture.issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId))).toEqual([]);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+  });
+
+  it("rolls back a final-stage approval when the zero-delta proof changes before the close write", async () => {
+    const fixture = await seedFinalZeroDeltaApproval();
+    mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+      const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.zeroDeltaMeasurement).toBeDefined();
+      writeFileSync(path.join(fixture.worktree, "late-work.txt"), "undelivered\n");
+      return result;
+    });
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "done",
+      comment: "Independent final approval.",
+      doneTier: zeroDeltaDoneTier(fixture.worktree),
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("merge_commit_unrecorded");
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(stored?.status).toBe("in_review");
+    expect(stored?.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(stored?.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId))).toEqual([]);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+    expect(mockGhFetch.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === "POST")).toEqual([]);
   });
 
   it("refuses a zero-delta close that rebinds the execution workspace in the same request", async () => {

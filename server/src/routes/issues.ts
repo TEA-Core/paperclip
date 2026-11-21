@@ -21578,7 +21578,7 @@ export function issueRoutes(
           updateFields,
           transition.decision,
           nextExecutionPolicy,
-          { overrideAccepted: doneOverrideAccepted, prefetched: finalDeliveryPrefetch },
+          { overrideAccepted: doneOverrideAccepted, zeroDeltaProven: zeroDeltaCloseMeasurement !== null, prefetched: finalDeliveryPrefetch },
         );
       } catch (err) {
         await rewakeSuppressedReassignmentRun();

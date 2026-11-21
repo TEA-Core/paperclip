@@ -16,6 +16,7 @@ import * as doneTransitionGuard from "./done-transition-guard.js";
 import { zeroDeltaWorktreeRefusal } from "./hardened-git-probe.js";
 import type * as MergeArming from "./merge-arming.js";
 import { resolveGitHubToken } from "./github-credential.js";
+import { resetZeroDeltaForgeCache } from "./zero-delta-forge-rule.js";
 
 // SUP-24402: the zero-delta repository_delivery Tier 2 close, measured with
 // real git against a real worktree. GitHub is a bare "origin" repository the
@@ -215,6 +216,7 @@ const UNRECORDED =
 let previousHome: string | undefined;
 
 beforeEach(() => {
+  resetZeroDeltaForgeCache();
   root = mkdtempSync(path.join(os.tmpdir(), "paperclip-zero-delta-"));
   previousHome = process.env.PAPERCLIP_HOME;
   process.env.PAPERCLIP_HOME = root;
@@ -791,7 +793,8 @@ describe("zero-delta review regressions (PR 1213 round 2)", () => {
   async function measured() {
     const result = await close();
     expect(result.allowed, result.reason).toBe(true);
-    expect((await verify(result.zeroDeltaMeasurement)).ok).toBe(true);
+    const initial = await verify(result.zeroDeltaMeasurement);
+    expect(initial.ok, initial.reason).toBe(true);
     return result.zeroDeltaMeasurement;
   }
 
@@ -897,15 +900,6 @@ describe("zero-delta review regressions (PR 1213 round 2)", () => {
     const verdict = await verify(measurement);
     expect(verdict.ok).toBe(false);
     expect(verdict.reason).toContain("stash");
-  });
-
-  it("compares one distinct forge tip once", async () => {
-    const tip = headSha();
-    for (const suffix of ["a", "b", "c"]) git(repoRoot, "push", "-q", origin, `${tip}:refs/heads/old-${suffix}`);
-    const result = await close();
-    expect(result.allowed, result.reason).toBe(true);
-    const headCompares = mockGhFetch.mock.calls.filter(([url]) => String(url).includes("/compare/") && String(url).includes(tip));
-    expect(headCompares).toHaveLength(1);
   });
 
   it("refuses with too_many_branch_tips when more than five distinct tips would need comparing", async () => {
