@@ -112,6 +112,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
         expectedBlockers: [{ id: blockerId, status: "done", statusVersion: 0 }],
         reason: "Intentionally unresolved; manual board release only" } };
   }
+  function uuidSpelling(id: string, spelling: string) {
+    if (spelling === "uppercase") return id.toUpperCase();
+    if (spelling === "compact") return id.replaceAll("-", "");
+    if (spelling === "braced") return `{${id.toUpperCase()}}`;
+    return id;
+  }
   const park = (f: Fixture, body = f.body, client = app(f.companyId)) => request(client).post(`/api/issues/${f.carrierId}/recovery-carrier-park`).send(body);
   async function snapshot(f: Fixture) {
     return {
@@ -788,14 +794,14 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
-  it.each(["lowercase", "uppercase"])("preserves %s action-only coalescing into an unscoped run when no park exists", async casing => {
+  it.each(["lowercase", "uppercase", "compact", "braced"])("preserves %s action-only coalescing into an unscoped run when no park exists", async casing => {
     const f = await fixture();
     const [queued] = await db.insert(heartbeatRuns).values({
       companyId: f.companyId, agentId: f.agentId, status: "queued", invocationSource: "on_demand", contextSnapshot: {},
     }).returning();
     const assertNoProtectedWrites = await protectSourceRows(f);
     const wake = await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
-      payload: { recoveryActionId: casing === "uppercase" ? f.actionId.toUpperCase() : f.actionId } });
+      payload: { recoveryActionId: uuidSpelling(f.actionId, casing) } });
     expect(wake?.id).toBe(queued!.id);
     expect(await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
@@ -920,10 +926,11 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
-  it("treats uppercase action UUID admission as the same board acceptance", async () => {
+  it("treats uppercase bound UUIDs as the same board acceptance", async () => {
     const f = await fixture();
     const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
-    const parked = await park(f, { ...f.body, recoveryActionId: f.actionId.toUpperCase() });
+    const parked = await park(f, { ...f.body, recoveryActionId: f.actionId.toUpperCase(),
+      sourceIssueId: f.sourceId.toUpperCase(), decisionInteractionId: f.decisionId.toUpperCase() });
     expect(parked.status).toBe(201);
     expect(await attention(f)).toMatchObject({ state: "none", carrierPark: { state: "accepted" } });
     const repeated = await park(f);
@@ -950,12 +957,53 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       companyId: f.companyId, sourceIssueId: f.sourceId, cause: "different-identity", fingerprint: "different-identity",
       kind: "blocked_without_blockers", nextAction: "Automatic retry", supersedeOnIdentityChange: true,
     })).id).toBe(f.actionId);
-    for (const actionId of [f.actionId, f.actionId.toUpperCase()]) {
+    for (const spelling of ["lowercase", "uppercase", "compact", "braced"]) {
+      const actionId = uuidSpelling(f.actionId, spelling);
       expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
         payload: { recoveryActionId: actionId } })).toBeNull();
     }
     expect(await snapshot(f)).toEqual(before);
     await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
+
+  it("retains the active SQL resolution guard for an older uppercase binding", async () => {
+    const f = await fixture(), parked = await park(f);
+    expect(parked.status).toBe(201);
+    await db.update(issueTreeHolds).set({ recoveryCarrierPark: {
+      ...parked.body.hold.recoveryCarrierPark, recoveryActionId: f.actionId.toUpperCase(),
+    } }).where(eq(issueTreeHolds.id, parked.body.hold.id));
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect(await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId: f.companyId, sourceIssueId: f.sourceId, actionId: f.actionId,
+      status: "resolved", outcome: "restored", boardResolution: true,
+    })).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["run", "wake payload", "wake context"].flatMap(shape =>
+    ["lowercase", "uppercase", "compact", "braced"].map(spelling => [shape, spelling]),
+  ))("rejects pre-existing action-scoped %s with %s UUID identity", async (shape, spelling) => {
+    const f = await fixture();
+    const actionId = uuidSpelling(f.actionId, spelling);
+    if (shape === "run") {
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        status: "running", contextSnapshot: { recoveryActionId: actionId } });
+    } else {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "automation", reason: "recovery", status: "queued", payload: shape === "wake payload"
+          ? { recoveryActionId: actionId } : { _paperclipWakeContext: { recoveryActionId: actionId } } });
+    }
+    const before = await snapshot(f), records = await parkRecords(f);
+    const beforeRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual(beforeRuns);
     await assertNoProtectedWrites();
   });
 
