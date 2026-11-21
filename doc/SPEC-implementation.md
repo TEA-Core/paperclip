@@ -155,7 +155,7 @@ Invariant: every business record belongs to exactly one company.
 - `role` text not null
 - `title` text null
 - `icon` text null
-- `status` enum: `active | paused | idle | running | error | pending_approval | terminated`
+- `status` enum: `active | paused | idle | running | error | pending_approval | terminated | deleted`
 - `reports_to` uuid fk `agents.id` null
 - `capabilities` text null
 - `adapter_type` text; built-ins include `process`, `http`, `claude_local`, `codex_local`, `gemini_local`, `opencode_local`, `pi_local`, `cursor`, `hermes_local`, `hermes_gateway`, and `openclaw_gateway`
@@ -174,7 +174,7 @@ Invariants:
 
 - agent and manager must be in same company
 - no cycles in reporting tree
-- `terminated` agents cannot be resumed
+- `terminated` and `deleted` agents cannot be resumed (`deleted` is the tombstone left by agent delete: comments, activity, runs and sessions are kept, the row is anonymized)
 
 ## 7.3 `agent_api_keys`
 
@@ -611,6 +611,7 @@ Allowed transitions:
 - `running -> paused` (requires cancel flow)
 - `paused -> idle`
 - `* -> terminated` (board only, irreversible)
+- `* -> deleted` (board only, irreversible; tombstone, evidence rows kept)
 
 ## 8.2 Issue Status
 
