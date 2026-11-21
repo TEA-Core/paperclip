@@ -1000,6 +1000,8 @@ The server/UI use those values for worktree-specific branding such as the top ba
 Authenticated worktree servers also use the `PAPERCLIP_INSTANCE_ID` value to scope Better Auth cookie names.
 Browser cookies are shared by host rather than port, so this prevents logging into one `127.0.0.1:<port>` worktree from replacing another worktree server's session cookie.
 
+When the server repairs a worktree's `.paperclip/.env` at boot, it keeps the worktree's own `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` when that file sets one. If the file does not set it, an inherited value from the parent shell is used for that boot only and is never written into the worktree `.env`; with neither, the repair generates a new worktree-local secret. The repair reads the `.env` with the same dotenv parser the server loads it with, so quoted values, inline comments and `export` prefixes read back unchanged.
+
 When Paperclip closes a server-managed git worktree, it also reclaims the isolated instance referenced by that worktree's repo-local `.paperclip/.env`. New server-managed worktrees use a collision-resistant instance id derived from the resolved absolute worktree path, and Paperclip persists the resulting instance root as execution-workspace ownership metadata. Cleanup requires the env pointer to match that persisted root, stops a running embedded PostgreSQL process, and then removes the instance directory. The deletion guard only accepts canonical instance paths below `PAPERCLIP_WORKTREES_DIR/instances/`; legacy or mismatched ownership, pointers to the default/live Paperclip home, and all other locations are logged and left untouched.
 
 Print shell exports explicitly when needed:
