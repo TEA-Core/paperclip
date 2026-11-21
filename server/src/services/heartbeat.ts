@@ -300,7 +300,7 @@ import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-ru
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   findLiveIssueExecutionHolder,
-  ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
+  releasedSilentAuthorDoesNotOccupyDispatchSlot,
   listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
@@ -19195,11 +19195,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
-  // A running issue-less author past the silence bound no longer holds any
-  // card. Counting it keeps maxConcurrentRuns=1 from starting the wake the
-  // sweep just promoted, for as long as that run stays running. The run is
-  // left running: it may still have a live handle, and the no-output hard-stop
-  // is what terminalizes it.
+  // A lapsed issue-less author whose hold the sweep already released must not
+  // keep maxConcurrentRuns=1 from starting the successor. The run stays
+  // running until the no-output hard-stop. A silent issue-less run that did
+  // not author a card, or that still holds one, still occupies its slot.
   async function countSlotOccupyingRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -19207,11 +19206,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(
         eq(heartbeatRuns.agentId, agentId),
         eq(heartbeatRuns.status, "running"),
-        sql`not (
-          nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null
-          and coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})
-            <= clock_timestamp() - (${ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS} * interval '1 millisecond')
-        )`,
+        sql`not ${releasedSilentAuthorDoesNotOccupyDispatchSlot()}`,
       ));
     return Number(count ?? 0);
   }

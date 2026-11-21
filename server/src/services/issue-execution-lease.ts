@@ -138,6 +138,33 @@ export async function runIsIssueAuthor(
 }
 
 /**
+ * A still-running issue-less author no longer occupies a dispatch slot only
+ * after the silence lapse has released its hold. Any other silent issue-less
+ * run, including a busy-slot fixture that authored nothing, still counts
+ * toward maxConcurrentRuns.
+ */
+export function releasedSilentAuthorDoesNotOccupyDispatchSlot(): SQL {
+  return sql`(
+    nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null
+    and coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})
+      <= clock_timestamp() - (${ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS} * interval '1 millisecond')
+    and not exists (
+      select 1 from ${issues}
+      where ${issues.companyId} = ${heartbeatRuns.companyId}
+        and (
+          ${issues.executionRunId} = ${heartbeatRuns.id}
+          or ${issues.checkoutRunId} = ${heartbeatRuns.id}
+        )
+    )
+    and exists (
+      select 1 from ${issues}
+      where ${issues.companyId} = ${heartbeatRuns.companyId}
+        and ${runAuthoredIssueAssignment(heartbeatRuns.id)}
+    )
+  )`;
+}
+
+/**
  * Finds the owner before acquiring an issue execution lock. The caller must
  * hold the issue row lock until its stamp commits. Include legacy
  * context-only owners and queued reservations, not just running direct leases.

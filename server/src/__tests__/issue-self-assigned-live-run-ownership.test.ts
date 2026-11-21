@@ -289,6 +289,43 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId)))[0]?.status).toBe("running");
   });
 
+  it("an old issue-less running run that did not author a card still occupies the only slot", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Board-assigned card behind a busy slot",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+
+    const woken = await heartbeat.wakeup(writerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, source: "issue.update" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    // A silent issue-less run occupies a dispatch slot unless the sweep has
+    // already released that run's own authored hold. A busy-slot fixture is
+    // not an author, so the wake must stay queued.
+    expect(woken?.status).toBe("queued");
+    const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, writerAgentId), eq(heartbeatRuns.status, "running")));
+    expect(running.map((row) => row.id)).toEqual([writerRunId]);
+  });
+
   it("self-assign of a parked card from a run that holds no card: the assignment and monitor wakes wait behind it", async () => {
     const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
     const issueId = randomUUID();
