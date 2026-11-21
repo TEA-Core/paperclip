@@ -584,6 +584,15 @@ export interface WorkspaceDiscoveryFailure {
 export interface WorkspaceDiscoveryResult {
   matched: WorkspacePullRequestMatch[];
   terminalFailure: WorkspaceDiscoveryFailure | null;
+  /**
+   * SUP-24033: lower-cased `owner/repo` of every repo whose open PRs were read
+   * COMPLETELY: the response was a short page with an absent (or `self`-only)
+   * `Link` header and no malformed entry (see `OpenPullRequestsSuccess.incomplete`).
+   * A cached draft mention whose repo is absent here was never fully live-checked
+   * by this discovery (drafts do not contribute repo pairs; an incomplete page may
+   * hide a live draft), so its draft bit cannot be called stale.
+   */
+  scannedRepos: string[];
 }
 
 /**
@@ -706,6 +715,7 @@ async function discoverCardPullRequestByWorkspace(
       : null;
   const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const matched: WorkspacePullRequestMatch[] = [];
+  const scannedRepos: string[] = [];
   let terminalFailure: WorkspaceDiscoveryFailure | null = null;
 
   for (const pair of pairs) {
@@ -770,6 +780,11 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
+      // SUP-24033: an incomplete list (full page, a Link header that is not absent or a
+      // page-1 self link, or a malformed entry) means open PRs may be unread or
+      // unreadable, so the repo is NOT fully scanned and an owned live draft can stay
+      // invisible.
+      if (!listResult.incomplete) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -800,7 +815,7 @@ async function discoverCardPullRequestByWorkspace(
     if (terminalFailure) break;
   }
 
-  return { matched, terminalFailure };
+  return { matched, terminalFailure, scannedRepos };
 }
 
 /**
@@ -3466,6 +3481,22 @@ export type DecisionHeadResolution =
        * reasons, which have no branch to certify.
        */
       pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
+      /**
+       * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
+       * from cached mentions, live workspace discovery found no draft, AND that
+       * discovery read every cached draft's repo completely (not a full
+       * 100-entry page). Those
+       * cached draft bits can be stale, so the final-delivery preflight alone
+       * revalidates them live. Never set when a live-discovered draft exists:
+       * a merged mention must not mask a draft the forge just reported.
+       */
+      cachedDraftMentions?: Array<{
+        owner: string;
+        repo: string;
+        number: number;
+        displayName: string;
+        headRefName: string | null;
+      }>;
     };
 
 /**
@@ -3684,6 +3715,18 @@ export async function resolveApprovalDecisionHead(
     return {
       kind: "unresolvable",
       reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
+      ...(draftMatched.length === 0 &&
+        draftLinkedPRs.every((pr) => discovery.scannedRepos.includes(`${pr.owner}/${pr.repo}`.toLowerCase()))
+        ? {
+            cachedDraftMentions: draftLinkedPRs.map((pr) => ({
+              owner: pr.owner,
+              repo: pr.repo,
+              number: pr.number,
+              displayName: pr.displayName,
+              headRefName: pr.headRefName,
+            })),
+          }
+        : {}),
     };
   }
 
@@ -3732,8 +3775,12 @@ const finalDeliveryLiveSchema = z.object({
  * open-PR resolver (cached mentions, live workspace discovery) legitimately
  * returns nothing. Exactly one LIVE-merged mentioned carrier is accepted, and
  * only after the same live merged-state, base-branch merge-commit containment,
- * and branch/repo ownership checks as the ordinary path. Every other
- * resolution path (approval publication, merge arming, reconciliation) stays
+ * and branch/repo ownership checks as the ordinary path.
+ *
+ * SUP-24033: a head_draft refusal that came from cached open+draft mentions
+ * alone is revalidated live (resolveStaleDraftMergedCarrier); the base refusal
+ * stands unless exactly one card-owned draft mention is live-merged and passes
+ * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
  */
 export async function preflightFinalDelivery(
@@ -3742,6 +3789,15 @@ export async function preflightFinalDelivery(
   const resolved = await resolveApprovalDecisionHead(db, companyId, issueId, identifier, true);
   if (resolved.kind === "resolved") {
     return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
+  }
+  if (resolved.reason.startsWith("head_draft:")) {
+    // SUP-24033: a cached open+draft mention is a stale-able bit — the resolver
+    // returns head_draft from it before the no-pr fallback could run, so a PR
+    // merged since still blocked final delivery. Revalidate it live. Every
+    // outcome except one live-merged, card-owned carrier keeps the base
+    // head_draft refusal unchanged.
+    const carrier = await resolveStaleDraftMergedCarrier(db, companyId, issueId, resolved);
+    return carrier ? verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier) : resolved;
   }
   if (resolved.reason.startsWith("no-pr:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
@@ -3819,6 +3875,39 @@ async function verifyLiveFinalDeliveryHead(
   return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
 }
 
+/** SUP-24033: the stale-draft revalidation reads each mention live; above this many it refuses instead of fanning out. */
+const MAX_STALE_DRAFT_MENTION_READS = 5;
+
+/**
+ * SUP-24033: revalidate the cached open+draft mentions behind a `head_draft`
+ * refusal against live state. Returns a carrier ONLY when all of these hold;
+ * otherwise null and the caller keeps the base refusal:
+ *  - the refusal came from cached drafts alone (no live-discovered draft);
+ *  - every cached draft is the card's own delivery (cached repo+branch pass
+ *    narrowToDelivered), so a foreign PR the card merely cites cannot carry it;
+ *  - the card cites at most MAX_STALE_DRAFT_MENTION_READS PRs (bounded reads);
+ *  - every mention reads live (no unreadable), none is a live open draft, and
+ *    exactly one is live-merged;
+ *  - that merged PR is one of the revalidated cached drafts.
+ * The caller then runs the full verifyLiveFinalDeliveryHead on it.
+ */
+async function resolveStaleDraftMergedCarrier(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+): Promise<{ kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } } | null> {
+  const drafts = refusal.cachedDraftMentions;
+  if (!drafts || drafts.length === 0) return null;
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
+  const owned = await narrowToDelivered(db, companyId, issueId, drafts);
+  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
+  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason, mentioned);
+  if (carrier.kind !== "resolved") return null;
+  return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
+}
+
 /**
  * SUP-22346: among the issue's explicitly mentioned PRs (cached state is
  * irrelevant — a PR merged out-of-band is cached closed), resolve the single
@@ -3839,18 +3928,24 @@ async function resolveSingleMergedMentionCarrier(
   db: Db,
   companyId: string,
   issueId: string,
+  liveDraftRefusal: string | null = null,
+  // SUP-24033: the stale-draft path passes the list it already cap-checked so the
+  // live reads cannot run over a second, uncapped read of the mentions.
+  checkedMentions?: LinkedPullRequest[],
 ): Promise<
   | { kind: "none" }
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | { kind: "unresolvable"; reason: string }
 > {
-  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  const mentioned =
+    checkedMentions ?? (await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true }));
   const mergedCarriers: Array<{
     kind: "resolved";
     headSha: string;
     displayName: string;
     pr: { owner: string; repo: string; number: number };
   }> = [];
+  let liveDraft = false;
   for (const pr of mentioned) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
     // SUP-22355: a mention no credential can even attempt is unreadable —
@@ -3860,6 +3955,9 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
+        if (liveDraftRefusal !== null && live.merged !== true && live.open === true && live.draft === true) {
+          liveDraft = true;
+        }
         if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
@@ -3881,6 +3979,9 @@ async function resolveSingleMergedMentionCarrier(
       };
     }
   }
+  // SUP-24033: a genuine live draft keeps its head_draft refusal even beside a
+  // merged mention; the merged carrier must not mask an open draft.
+  if (liveDraft && liveDraftRefusal !== null) return { kind: "unresolvable", reason: liveDraftRefusal };
   if (mergedCarriers.length === 0) return { kind: "none" };
   if (mergedCarriers.length > 1) {
     const names = mergedCarriers.map((carrier) => carrier.displayName).join(", ");
@@ -4616,6 +4717,168 @@ async function fetchPullRequestHeadSha(
   return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number, signal), { signal });
 }
 
+/**
+ * SUP-24033: read the entries of one open-PR list page. ALLOW-LIST RULE: every field
+ * that a consumer reads to decide ownership, liveness, draft state or anchoring is
+ * validated here, and an entry that violates any of them is dropped from `items`
+ * AND marks the whole list `malformed` (the caller then treats the list as
+ * incomplete: unscanned, the base behaviour). The consumers are
+ * `discoverCardPullRequestByWorkspace` (this file) and the open-PR probe in
+ * done-transition-guard.ts; both read exactly `number`, `head.ref`, `title` and
+ * `draft`. Validated per field:
+ *   entry     a non-null object (an array has no `number`, so the number check covers it)
+ *   number    a safe positive integer          (identity of the PR)
+ *   head.ref  a string, `head` a non-null object (ownership anchor: branch)
+ *   title     a string                         (ownership anchor: title-led identifier)
+ *   draft     a boolean                        (draft state; `draft === true` is what
+ *                                               consumers test, so a non-boolean would
+ *                                               silently read as "ready")
+ * `body` is stored on the item but read by no consumer, so it is not validated.
+ */
+export function readOpenPullRequestEntries(
+  body: unknown[],
+): { items: OpenPullRequestListItem[]; malformed: boolean } {
+  const items: OpenPullRequestListItem[] = [];
+  let malformed = false;
+  for (const raw of body) {
+    if (typeof raw !== "object" || raw === null) {
+      malformed = true;
+      continue;
+    }
+    const pr = raw as Record<string, unknown>;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || pr.number <= 0) {
+      malformed = true;
+      continue;
+    }
+    const head = pr.head as Record<string, unknown> | undefined | null;
+    if (
+      typeof head !== "object" ||
+      head === null ||
+      typeof head.ref !== "string" ||
+      typeof pr.title !== "string" ||
+      typeof pr.draft !== "boolean"
+    ) {
+      malformed = true;
+    }
+    items.push({
+      number: pr.number,
+      draft: typeof pr.draft === "boolean" ? pr.draft : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+      title: typeof pr.title === "string" ? pr.title : null,
+      body: typeof pr.body === "string" ? pr.body : null,
+    });
+  }
+  return { items, malformed };
+}
+
+/** The open-PR list is read as one page of this size; there is no pagination. */
+const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
+
+const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
+
+/**
+ * SUP-24033: true when a `rel=self` link target is page 1 of THIS EXACT request: an
+ * absolute URL with the same origin and path, no fragment, the same query
+ * parameters, and a `page` parameter that is absent or exactly `1`. A relative,
+ * empty, other-host or other-page target describes some other list.
+ */
+function selfTargetIsPageOneOfRequest(target: string, requestUrl: string): boolean {
+  try {
+    const self = new URL(target);
+    const request = new URL(requestUrl);
+    if (self.origin !== request.origin || self.pathname !== request.pathname || self.hash !== "") return false;
+    const pageOfSelf = self.searchParams.getAll("page");
+    if (pageOfSelf.length > 1 || (pageOfSelf.length === 1 && pageOfSelf[0] !== "1")) return false;
+    const rest = (params: URLSearchParams) =>
+      [...params.entries()].filter(([key]) => key !== "page").map(([key, value]) => `${key}=${value}`).sort().join("&");
+    return rest(self.searchParams) === rest(request.searchParams);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * SUP-24033: true unless the `Link` header of the open-PR list response PROVES the
+ * page is a complete list. A WHITELIST, not a blacklist: false (complete) only for
+ *  (a) an absent header (null), or
+ *  (b) a header in which EVERY link-value parses fully as `<uri>` plus `;`-separated
+ *      `token=token|"quoted"` parameters, carries a `rel` parameter, has no other
+ *      parameter, has only the relation `self` among its rel tokens, and whose
+ *      target is page 1 of THIS request (`selfTargetIsPageOneOfRequest`).
+ * Everything else is true: an empty header, a link-value with no `rel`, any
+ * parameter other than `rel` (title, rev, anchor, name*, a flag), a trailing comma
+ * or semicolon, a stray character, a single-quoted, unterminated or escaped value,
+ * and every other relation (`next`, `last`, `prev`, `previous`, `first`, `canonical`, ...).
+ *
+ * Why `prev`, `first` and `last` are NOT harmless: this scan reads only page 1 (no
+ * `page` parameter). A real GitHub page-1 response never carries `prev` or `first`
+ * (they appear only on later pages) and carries `next` plus `last` when more pages
+ * exist, so those relations on a page-1 response mean more pages or an altered
+ * response, never a final page. `self` is the one relation consistent with a
+ * complete list. One left-to-right scan, no backtracking: linear in the header.
+ */
+export function linkHeaderLeavesPagesUnread(header: string | null, requestUrl: string): boolean {
+  if (header === null) return false;
+  const n = header.length;
+  let i = 0;
+  const skipOws = () => {
+    while (i < n && (header[i] === " " || header[i] === "\t")) i += 1;
+  };
+  const readToken = () => {
+    const start = i;
+    while (i < n && LINK_TOKEN_CHAR.test(header[i]!)) i += 1;
+    return header.slice(start, i);
+  };
+  skipOws();
+  if (i >= n) return true;
+  for (;;) {
+    if (header[i] !== "<") return true;
+    const end = header.indexOf(">", i + 1);
+    if (end === -1 || header.slice(i + 1, end).includes("<")) return true;
+    const target = header.slice(i + 1, end);
+    i = end + 1;
+    let sawRel = false;
+    for (;;) {
+      skipOws();
+      if (i >= n) return !sawRel;
+      if (header[i] === ",") {
+        if (!sawRel) return true;
+        i += 1;
+        skipOws();
+        if (i >= n) return true;
+        break;
+      }
+      if (header[i] !== ";") return true;
+      i += 1;
+      skipOws();
+      if (readToken().toLowerCase() !== "rel") return true;
+      skipOws();
+      if (header[i] !== "=") return true;
+      i += 1;
+      skipOws();
+      let value: string;
+      if (header[i] === '"') {
+        i += 1;
+        const start = i;
+        while (i < n && header[i] !== '"') {
+          if (header[i] === "\\") return true;
+          i += 1;
+        }
+        if (i >= n) return true;
+        value = header.slice(start, i);
+        i += 1;
+      } else {
+        value = readToken();
+        if (value === "") return true;
+      }
+      const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
+      if (tokens.length === 0 || tokens.some((token) => token !== "self")) return true;
+      if (!selfTargetIsPageOneOfRequest(target, requestUrl)) return true;
+      sawRel = true;
+    }
+  }
+}
+
 export interface OpenPullRequestListItem {
   number: number;
   draft: boolean | null;
@@ -4627,6 +4890,17 @@ export interface OpenPullRequestListItem {
 export interface OpenPullRequestsSuccess extends GitHubFetchResult {
   ok: true;
   items: OpenPullRequestListItem[];
+  /**
+   * SUP-24033: true unless this response is PROVEN to be the complete, well-formed
+   * open-PR list. Incomplete when ANY of: the raw page filled
+   * `OPEN_PULL_REQUESTS_PAGE_SIZE` entries (counted before malformed entries are
+   * dropped); the `Link` header is anything other than absent or `self`-only (see
+   * `linkHeaderLeavesPagesUnread`); or an entry is not a well-formed open-PR record
+   * (see `readOpenPullRequestEntries`: an object with a positive-integer `number`, a
+   * string `head.ref` and `title`, and a boolean `draft`), because it may have been
+   * an owned live draft.
+   */
+  incomplete: boolean;
 }
 
 export interface OpenPullRequestsFailure extends GitHubFetchResult {
@@ -4660,7 +4934,7 @@ async function fetchOpenPullRequestsOnce(
 ): Promise<OpenPullRequestsResult> {
   const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
-  )}/pulls?state=open&per_page=100`;
+  )}/pulls?state=open&per_page=${OPEN_PULL_REQUESTS_PAGE_SIZE}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-merge-arming",
@@ -4686,21 +4960,17 @@ async function fetchOpenPullRequestsOnce(
     return { ok: false, status: response.status, message: "empty_response", items: [] };
   }
 
-  const items: OpenPullRequestListItem[] = [];
-  for (const raw of body) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const pr = raw as Record<string, unknown>;
-    if (typeof pr.number !== "number") continue;
-    const head = pr.head as Record<string, unknown> | undefined | null;
-    items.push({
-      number: pr.number,
-      draft: typeof pr.draft === "boolean" ? pr.draft : null,
-      headRef: typeof head?.ref === "string" ? head.ref : null,
-      title: typeof pr.title === "string" ? pr.title : null,
-      body: typeof pr.body === "string" ? pr.body : null,
-    });
-  }
-  return { ok: true, status: response.status, message: null, items };
+  const { items, malformed } = readOpenPullRequestEntries(body);
+  return {
+    ok: true,
+    status: response.status,
+    message: null,
+    items,
+    incomplete:
+      malformed ||
+      body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE ||
+      linkHeaderLeavesPagesUnread(response.headers?.get("link") ?? null, url),
+  };
 }
 
 async function writeCommitStatus(
