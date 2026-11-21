@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
-  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -22,6 +21,8 @@ import {
   type EmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { StorageService } from "../storage/types.js";
 
@@ -104,15 +105,11 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(agentWakeupRequests);
-    await db.delete(activityLog);
-    await db.delete(issues);
-    await db.delete(pluginEntities);
-    await db.delete(pluginManagedResources);
+    // An admitted assignee write dispatches a fire-and-forget wakeup; drain it
+    // before tearing rows down so it cannot race the deletes.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
     await db.delete(plugins);
-    await db.delete(companyMemberships);
-    await db.delete(agents);
-    await db.delete(companies);
   });
 
   afterAll(async () => {
