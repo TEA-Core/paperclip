@@ -137,7 +137,9 @@ export function recoveryCarrierParkService(db: Db) {
       if (!carrier) throw notFound("Recovery carrier not found");
       const [hold] = await tx.select().from(issueTreeHolds).where(and(eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.id, holdId))).for("update");
       if (!hold || hold.rootIssueId !== carrierId || !hold.recoveryCarrierPark) throw notFound("Recovery carrier park not found");
-      if (hold.recoveryCarrierPark.recoveryActionId !== input.recoveryActionId) throw conflict("Recovery carrier park identity changed");
+      const boundActionId = hold.recoveryCarrierPark.recoveryActionId;
+      if (boundActionId !== input.recoveryActionId &&
+          boundActionId.toLowerCase() !== input.recoveryActionId.toLowerCase()) throw conflict("Recovery carrier park identity changed");
       if (hold.status === "released") return hold;
       const [released] = await tx.update(issueTreeHolds).set({ status: "released", releasedAt: new Date(), releasedByActorType: "user",
         releasedByUserId: actor.actorId, releaseReason: input.reason, updatedAt: new Date() }).where(eq(issueTreeHolds.id, hold.id)).returning();

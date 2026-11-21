@@ -703,9 +703,10 @@ Internal wake attempts do not create a deferred delivery queue. Board release
 does not replay those attempts or start work.
 
 Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/release`
-retires the acceptance and releases this hold. It checks the bound action ID,
-audits atomically and repeats idempotently. It changes no source/action row,
-starts no work, and does not approve a review stage or authorize repair.
+retires the acceptance and releases this hold. It checks the bound action's UUID
+identity regardless of letter case, audits atomically and repeats idempotently.
+It changes no source/action row, starts no work, and does not approve a review
+stage or authorize repair.
 Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
 sentinel blocker or consent backfill exists. Rollback retains the pause and audit
 evidence; it must not release holds or revive source recovery as cleanup.
