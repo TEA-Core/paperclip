@@ -298,7 +298,13 @@ import {
 import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { findLiveIssueExecutionHolder, resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
+import {
+  findLiveIssueExecutionHolder,
+  releasedSilentAuthorDoesNotOccupyDispatchSlot,
+  listUnlockedIssuesWithDeferredWakesForRun,
+  resolveLiveExecutionLeases,
+  type LiveExecutionLease,
+} from "./issue-execution-lease.js";
 import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
@@ -10850,6 +10856,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // instance-level dispatch suppression that skipped the wake has cleared.
     resolveSchedulingSuppression: getSchedulingSuppression,
     settleExplicitContinuationRetry: releaseIssueExecutionAndPromote,
+    promoteDeferredWakesAfterLockClear: (run, issueId) =>
+      releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId),
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()
@@ -19199,6 +19207,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // A lapsed issue-less author whose hold the sweep already released must not
+  // keep maxConcurrentRuns=1 from starting the successor. The run stays
+  // running until the no-output hard-stop. A silent issue-less run that did
+  // not author a card, or that still holds one, still occupies its slot.
+  async function countSlotOccupyingRunsForAgent(agentId: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "running"),
+        sql`not ${releasedSilentAuthorDoesNotOccupyDispatchSlot()}`,
+      ));
+    return Number(count ?? 0);
+  }
+
   async function withChatControlRecoveryGate(
     run: typeof heartbeatRuns.$inferSelect,
     stage: "claim" | "dispatch",
@@ -23823,8 +23847,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileUndispatchableAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+  async function sweepStaleIssueLocks(opts?: { now?: Date }) {
+    return recovery.sweepStaleIssueLocks(opts);
   }
 
   // The queued-run age bound (MAX_QUEUED_ISSUE_RUN_AGE_MS). Every claim-skip
@@ -24116,7 +24140,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
+      const runningCount = await countSlotOccupyingRunsForAgent(agentId);
       const availableSlots = Math.max(
         0,
         policy.maxConcurrentRuns - runningCount,
@@ -31202,6 +31226,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      // SUP-20121: a promotion-only visit (author-finish linked cards, a
+      // lock-clear hook, the stale-lock sweep) must not promote a held wake
+      // onto a board-closed card. That promotion reopens the card to todo.
+      // The base never visits a card the finishing run did not hold by pointer
+      // or context, so the card stays closed and the wake stays deferred.
+      // A release that visits the card because the run's own context or lock
+      // names it is not promotion-only, and keeps the existing comment-reopen
+      // path.
+      if (promotionOnly && (issue.status === "done" || issue.status === "cancelled")) {
+        return null;
+      }
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
@@ -32579,6 +32614,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await releaseIssueExecutionAndPromote(run, siblingOptions, issueId);
         } catch (err) {
           logger.error({ err, runId: run.id, issueId }, "failed to promote released sibling issue execution");
+        }
+      }
+    }
+    // SUP-20121: an issue-less run also owns cards it created or self-assigned.
+    // A status write by that run clears their lock, so the release above never
+    // visits them; promote the wakes that were held behind the run here.
+    if (!promotionOnly && !contextIssueId) {
+      const linkedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+      }).catch((err) => {
+        logger.error({ err, runId: run.id }, "failed to list cards held behind a finished run");
+        return [] as string[];
+      });
+      for (const issueId of linkedIssueIds) {
+        try {
+          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId);
+        } catch (err) {
+          logger.error({ err, runId: run.id, issueId }, "failed to promote wakes held behind a finished run");
         }
       }
     }
@@ -34232,6 +34287,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                       legacyAgent?.name,
                     ),
                     executionLockedAt: new Date(),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issue.id));
+              }
+            }
+          }
+
+          // SUP-20121: the woken agent's live run may own the card without
+          // either pointer or a context naming it: it created the card, holds
+          // only its checkout, or assigned the card to its own agent. Starting
+          // a run here made a second run of the same agent that took the
+          // checkout and locked the author out of its own card. Hold this wake
+          // behind that run instead, through the same owner lookup the claim,
+          // checkout and release gates use.
+          if (!activeExecutionRun) {
+            const holder = await findLiveIssueExecutionHolder(
+              tx as unknown as Db,
+              issue.companyId,
+              issue.id,
+            );
+            if (holder?.status === "running" && holder.agentId === agentId) {
+              const holderRun = await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, holder.runId))
+                .then((rows) => rows[0] ?? null);
+              if (holderRun) {
+                activeExecutionRun = holderRun;
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: holderRun.id,
+                    executionAgentNameKey: agentNameKey,
+                    executionLockedAt: holderRun.startedAt ?? new Date(),
                     updatedAt: new Date(),
                   })
                   .where(eq(issues.id, issue.id));
@@ -36623,8 +36712,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     ) => setRunStatusIfRunning(runId, status, patch),
 
-    releaseIssueExecutionAndPromote: (run: typeof heartbeatRuns.$inferSelect, options: { suppressImmediateRecovery?: boolean } = {}) =>
-      releaseIssueExecutionAndPromote(run, options),
+    releaseIssueExecutionAndPromote: (run: typeof heartbeatRuns.$inferSelect, options: { suppressImmediateRecovery?: boolean } = {}, promotionIssueId?: string) =>
+      releaseIssueExecutionAndPromote(run, options, promotionIssueId),
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 

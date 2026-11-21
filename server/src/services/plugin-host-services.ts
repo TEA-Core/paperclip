@@ -1950,11 +1950,20 @@ export function buildHostServices(
             ? pluginOperationIssueOriginKind(pluginKey)
             : originKind,
         );
+        // originRunId is ownership proof, and a plugin cannot mint it. The
+        // host holds no authenticated agent run for a plugin call: every
+        // actor field here is plugin-supplied, so a plugin can name any
+        // agent together with that agent's live run and pass a
+        // belongs-to-the-actor check on both supplied values. A
+        // plugin-supplied origin/actor run is therefore never stored as
+        // proof; only host-authenticated doors (agent/board run actors) may
+        // record an origin run.
+        const verifiedOriginRunId: string | null = null;
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
-          originRunId: params.originRunId ?? actorRunId ?? null,
+          originRunId: verifiedOriginRunId,
           createdByAgentId: actorAgentId ?? null,
           createdByUserId: actorUserId ?? null,
           actorResponsibleUserId: actorUserId ?? null,
@@ -1989,6 +1998,9 @@ export function buildHostServices(
         for (const key of Object.keys(PLUGIN_ISSUE_UPDATE_PATCH_FIELDS)) {
           if (Object.hasOwn(rawPatch, key)) patch[key] = rawPatch[key];
         }
+        // originRunId is ownership proof. A plugin update can name any run,
+        // so the supplied value is never stored. Create refuses it the same way.
+        delete patch.originRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }

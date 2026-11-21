@@ -204,6 +204,44 @@ from the claiming run. A board or user claim, a claim for a different agent, an
 assignment that does not set `in_progress`, and a claim from a run scoped to a
 different issue still wake the assignee.
 
+A `running` run whose context names no issue also owns a card it created
+(`originRunId`) or reassigned to its own agent (its `issue.updated` activity
+records an `assigneeAgentId` change to that agent; a write that only names the
+current assignee is not proof), as long as that agent is still the assignee and
+the run has not been silent for 90 minutes. Every
+execution gate treats that run as the card's live holder: a wake for the same
+agent on the card (assignment, monitor, comment, stage, recovery) is held behind
+it instead of starting a second run, the run is stamped as the card's execution
+holder, a queued run for the card is not claimed, and checkout by another run is
+refused. A held wake is never merged into that run, because merging would scope
+the run to the card. Held wakes are promoted when the run finishes, including
+wakes on cards whose lock a status write cleared while the run was live, and
+when the silent-run hard-stop, the stale-lock sweep, a checkout self-heal, an
+issue release, or an admin force-release clears the lock. A lock cleared by
+any other write (a hook-less service update, checkout, release, or a plugin
+host write) is caught by the stale-lock sweep, which promotes the held wake
+on the already-unlocked card once no live holder remains. The stale-lock sweep
+also lapses a stamped hold whose issue-less author has produced no output for
+90 minutes while a wake is held behind it or a successor run for the card is
+already queued; a run with recent output never lapses there, and the lapse
+never touches a run whose context names a card.
+Only an authenticated run claim is recorded on an `issue.updated` activity
+row or as a card's `originRunId`: an agent JWT is minted for one run, while a
+board request or an agent API key can only claim a run through an
+unauthenticated header, which is never copied into either proof. A plugin
+claim is stored only when the recorded run belongs to the acting agent in
+that company. Other
+actions keep their attribution. A reassignment drops `originRunId`; a later
+self-assign proves itself through its assignee-change row. An adopted stamp
+never makes the issue-less author the card's interruptible run, including
+when its recorded context is null or names no issue; a checked-out run that
+did not author the card remains interruptible. A reassignment also drops an
+adopted author's stamped hold, so the new assignee's wakes are not held
+behind the previous author. Wakes
+for a different agent, and wakes after the run has finished, start normally. A
+run whose context names a different issue does not own the cards it creates or
+assigns.
+
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
@@ -218,7 +256,10 @@ returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
 Under the issue row lock, a non-terminal assignee change retains a running
 holder identified by the issue's existing execution or checkout binding. It
 clears checkout permission but preserves execution admission across the saved
-update, a delayed cancellation and a failed cancellation. A request header alone
+update, a delayed cancellation and a failed cancellation. The one exception
+is an adopted issue-less author: its stamped hold ends at the reassignment,
+because the stamp proves authorship for the previous assignee, not work on
+this card. A request header alone
 grants neither cancellation nor a hold. If only a legacy issue-context binding
 remains, admission recovers it by company and issue, not by the new assignee.
 

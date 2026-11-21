@@ -524,6 +524,24 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     expect(issue.executionRunId).not.toBe(holderRunId);
   });
 
+  it("saves the handoff without cancelling an issuing run that authored the card", async () => {
+    const { reviewerAgentId, issueId, holderRunId, policy, client } =
+      await seedStageHandoff(() => ({ wakeReason: "timer" }));
+    await db.update(issues).set({ originRunId: holderRunId }).where(eq(issues.id, issueId));
+    const response = await request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed; handing off my own card.",
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      executionState: { currentStageId: policy.stages[1]!.id },
+    });
+    // The issuer created this card: it is the adopted issue-less author, and
+    // its own stage handoff must not cancel the whole author run.
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+  });
+
   it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
     const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, policy, busyRun, client } =
       await seedStageHandoff();

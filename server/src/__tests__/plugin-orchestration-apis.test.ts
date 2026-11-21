@@ -31,6 +31,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -211,6 +212,90 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
   });
 
+  it("does not store a plugin-claimed run of another agent as the origin run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin forged origin",
+      status: "todo",
+      assigneeAgentId: victimAgentId,
+      actorAgentId: agentId,
+      actorRunId: victimRunId,
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    // A plugin can only claim a run; it does not authenticate it. A claimed
+    // run of another agent is never stored as the ownership proof.
+    expect(stored?.originRunId).toBeNull();
+  });
+
+  it("does not store a plugin-claimed victim agent+run pair as the origin run (J1)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin forged origin via matching pair",
+      status: "todo",
+      assigneeAgentId: victimAgentId,
+      // The plugin supplies BOTH sides of the earlier check: the victim
+      // agent as actor and the victim's live run as actor run.
+      actorAgentId: victimAgentId,
+      actorRunId: victimRunId,
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    // A plugin does not authenticate an agent run; a plugin-supplied
+    // actorRunId is never stored as the card's ownership proof, even when
+    // the named run really belongs to the named agent.
+    expect(stored?.originRunId).toBeNull();
+    expect(await findLiveIssueExecutionHolder(db, companyId, issue.id)).toBeNull();
+  });
+
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();
@@ -251,7 +336,10 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(stored?.billingCode).toBe("mission:alpha");
     expect(stored?.assigneeAgentId).toBe(agentId);
     expect(stored?.createdByAgentId).toBe(agentId);
-    expect(stored?.originRunId).toBe(originRunId);
+    // A plugin-supplied actor run is audit attribution only, never the
+    // stored ownership proof (J1): the host holds no authenticated run
+    // for a plugin call, so plugin creates record no origin run.
+    expect(stored?.originRunId).toBeNull();
 
     const [relation] = await db
       .select()

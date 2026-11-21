@@ -184,14 +184,23 @@ export function publishActivity(publication: ActivityPublication) {
 export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const run = await lookupActivityRun(db, input);
+  // An issue.updated run id is ownership proof, so only an authenticated run
+  // claim is stamped there: an agent JWT is minted for one run, and
+  // system/internal callers name runs directly. A board/user actor or an
+  // agent API key can only claim a run through the unauthenticated
+  // x-paperclip-run-id header, so that header is never copied into an
+  // issue.updated activity row. Other actions keep their attribution.
+  const authenticatedRun = run?.row
+    ? (input.action === "issue.updated" && (input.actorType === "user" || input.agentApiKeyId) ? null : run)
+    : null;
   const responsibleUserId = input.responsibleUserIdOverride !== undefined
     ? readNonEmptyString(input.responsibleUserIdOverride)
     : input.actorType === "user"
       ? readNonEmptyString(input.actorId)
-      : await resolveResponsibleUserIdWithRun(db, input, run);
+      : await resolveResponsibleUserIdWithRun(db, input, authenticatedRun);
   // Only stamp run_id when the run actually exists here; a dangling reference would trip the
   // `activity_log_run_id_heartbeat_runs_id_fk` foreign key and cost us the whole audit row.
-  const runId = run?.row ? run.runId : null;
+  const runId = authenticatedRun ? authenticatedRun.runId : null;
   if (run && !run.row) {
     logger.warn(
       {
