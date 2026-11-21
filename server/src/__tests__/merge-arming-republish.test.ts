@@ -5215,6 +5215,52 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
   });
 
+  it("still writes as05_bound_pr for a shared-workspace child binding its ancestor carrier's PR, with no carrier claim (SUP-24619)", async () => {
+    const runId = randomUUID();
+    const carrierBranch = "SUP-14823-carrier-branch";
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      sharedWorkspaceOwnerBranch: carrierBranch,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockImplementation(async () =>
+      createMockResponse({
+        state: "open",
+        draft: false,
+        merged: false,
+        head: { ref: carrierBranch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } },
+        base: { ref: "main" },
+      }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: carrierBranch,
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = (row!.executionState ?? {}) as Record<string, unknown>;
+    expect(state.childCarrierClaim).toBeUndefined();
+    const delivery = state.delivery as Record<string, unknown> | undefined;
+    expect(delivery?.kind).toBe("as05_bound_pr");
+    expect(delivery?.prNumber).toBe(PR_NUMBER);
+    expect(delivery?.cardBranch).toBe(carrierBranch);
+  });
+
   it("rejects deliveryIdentity when the recorded branch is not the card's execution-workspace branch (SUP-15909)", async () => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });

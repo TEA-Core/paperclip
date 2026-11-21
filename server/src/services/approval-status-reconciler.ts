@@ -18,6 +18,7 @@ import {
 } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
+import { carrierArmBlock } from "./child-carrier-attribution.js";
 import {
   armMergeOnApproval,
   createAuthorityGuard,
@@ -2865,8 +2866,15 @@ async function attemptRearmOnHealedStamp(
 
   let outcome: ArmingOutcome;
   try {
-    // Bound to the head just verified: GitHub refuses to enable auto-merge on a PR that has moved on.
-    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
+    const armBlock = await carrierArmBlock(db, row.companyId, row.id, {
+      owner: certifiedPr.owner,
+      repo: certifiedPr.repo,
+      number: certifiedPr.number,
+      headSha,
+    });
+    outcome = armBlock
+      ? { kind: "skipped", message: armBlock }
+      : await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
   } catch (err) {
     outcome = {
       kind: "failed",
