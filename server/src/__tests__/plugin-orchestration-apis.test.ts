@@ -32,6 +32,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -349,6 +350,68 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(stored?.originRunId).toBeNull();
     expect(stored?.executionRunId).toBeNull();
     expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+  });
+
+  it("does not store a plugin interaction sourceRunId as the child's origin proof", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    const parentId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix(companyId)}-1`,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const created = await services.issues.createInteraction({
+      companyId,
+      issueId: parentId,
+      authorAgentId: victimAgentId,
+      interaction: {
+        kind: "suggest_tasks",
+        continuationPolicy: "wake_assignee",
+        sourceRunId: victimRunId,
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "child", title: "Forged child", assigneeAgentId: victimAgentId }],
+        },
+      },
+    });
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id: parentId, companyId, projectId: null, goalId: null, status: "in_progress" },
+      created.id,
+      {},
+      { userId: "local-board" },
+    );
+    const childId = accepted.createdIssues[0]?.id;
+    expect(childId).toBeTruthy();
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId!));
+    expect(child?.originRunId).toBeNull();
+    expect(await findLiveIssueExecutionHolder(db, companyId, childId!)).toBeNull();
   });
 
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {

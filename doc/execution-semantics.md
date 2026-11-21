@@ -229,9 +229,10 @@ Only an authenticated run claim is recorded on an `issue.updated` activity
 row or as a card's `originRunId`: an agent JWT is minted for one run, while a
 board request or an agent API key can only claim a run through an
 unauthenticated header, which is never copied into either proof. A plugin
-call never stores a supplied run as `originRunId`: the host holds no
-authenticated run for that call, so a claimed agent and run pair is not
-proof. Other
+call never stores a supplied run as `originRunId`. A plugin interaction
+drops a supplied `sourceRunId`, so accepting it does not copy that run onto
+the child. The host holds no authenticated run for that call, so a claimed
+agent and run pair is not proof. Other
 actions keep their attribution. A reassignment drops `originRunId`. A later
 self-assign proves itself only through the latest assignee-change row, not
 an older row that names the same assignee. An adopted stamp

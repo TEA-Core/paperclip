@@ -2510,7 +2510,15 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
+        // A plugin supplies both authorAgentId and sourceRunId. That pair is
+        // not host-authenticated provenance, so it must not become the child's
+        // originRunId on accept. The interaction itself still creates.
+        const supplied = params.interaction as CreateIssueThreadInteraction;
+        const interactionInput: CreateIssueThreadInteraction = {
+          ...supplied,
+          sourceRunId: null,
+        };
+        const interaction = await issueThreadInteractionService(db).create(issue, interactionInput, {
           agentId: params.authorAgentId ?? null,
         });
         await logPluginActivity({

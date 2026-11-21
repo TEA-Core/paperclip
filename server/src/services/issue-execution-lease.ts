@@ -177,6 +177,23 @@ export function releasedSilentAuthorDoesNotOccupyDispatchSlot(): SQL {
   )`;
 }
 
+/** A running issue-less author whose open-card hold the sweep already released. */
+export async function findReleasedSilentAuthorRunId(
+  db: Pick<Db, "select">,
+  agentId: string,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.status, "running"),
+      releasedSilentAuthorDoesNotOccupyDispatchSlot(),
+    ))
+    .limit(1);
+  return row?.id ?? null;
+}
+
 /**
  * Finds the owner before acquiring an issue execution lock. The caller must
  * hold the issue row lock until its stamp commits. Include legacy

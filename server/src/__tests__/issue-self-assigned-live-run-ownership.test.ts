@@ -31,7 +31,7 @@ import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { findLiveIssueExecutionHolder, listUnlockedIssuesWithDeferredWakesForRun } from "../services/issue-execution-lease.ts";
+import { findLiveIssueExecutionHolder, findReleasedSilentAuthorRunId, listUnlockedIssuesWithDeferredWakesForRun } from "../services/issue-execution-lease.ts";
 import { persistActivity } from "../services/activity-log.js";
 import { issueService } from "../services/issues.js";
 
@@ -731,6 +731,53 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     expect(wake?.status).not.toBe("deferred_issue_execution");
     expect(wake?.runId).toBe(successors[0]!.id);
+  });
+
+  it("a promoted successor uses the card's responsible user, not the departing run's", async () => {
+    const { writerRunId, issueId } = await seedHeldCard({ authorStatus: "failed" });
+    await db.update(heartbeatRuns).set({ responsibleUserId: "author-user" }).where(eq(heartbeatRuns.id, writerRunId));
+    await db.update(issues).set({ responsibleUserId: "card-user" }).where(eq(issues.id, issueId));
+    runningProcesses.delete(writerRunId);
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.cleared).toBe(1);
+    const successors = await otherRunsForCard(issueId, (await cardRow(issueId)).assigneeAgentId!, writerRunId);
+    expect(successors).toHaveLength(1);
+    expect(successors[0]?.responsibleUserId).toBe("card-user");
+  });
+
+  it("fresh output after the sweep read keeps the silent author's lock", async () => {
+    const { writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns).set({
+      startedAt: staleAt,
+      createdAt: staleAt,
+      lastOutputAt: null,
+    }).where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    const swept = await heartbeat.sweepStaleIssueLocks({
+      now: new Date(),
+      beforeSilentLockClear: async () => {
+        await db.update(heartbeatRuns).set({ lastOutputAt: new Date() }).where(eq(heartbeatRuns.id, writerRunId));
+      },
+    });
+    expect(swept.issueIds).not.toContain(issueId);
+    expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+  });
+
+  it("a released silent author is the workspace fence key, and a holder is not", async () => {
+    const { writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns).set({
+      startedAt: staleAt,
+      createdAt: staleAt,
+      lastOutputAt: null,
+    }).where(eq(heartbeatRuns.id, writerRunId));
+    expect(await findReleasedSilentAuthorRunId(db, writerAgentId)).toBeNull();
+    runningProcesses.delete(writerRunId);
+    await heartbeat.sweepStaleIssueLocks({ now: new Date() });
+    expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+    expect(await findReleasedSilentAuthorRunId(db, writerAgentId)).toBe(writerRunId);
   });
 
   it("the silent-run hard-stop promotes the held wake when it clears the lock", async () => {

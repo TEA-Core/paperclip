@@ -301,6 +301,7 @@ import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   findLiveIssueExecutionHolder,
   releasedSilentAuthorDoesNotOccupyDispatchSlot,
+  findReleasedSilentAuthorRunId,
   listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
@@ -14065,9 +14066,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
-    await fs.mkdir(cwd, { recursive: true });
-    await ensureSharedGroupOwnership(cwd);
+    const sharedHome = resolveDefaultAgentWorkspaceDir(agent.id);
+    const releasedAuthorId = await findReleasedSilentAuthorRunId(db, agent.id);
+    const cwd = releasedAuthorId
+      ? path.join(sharedHome, "while-released", releasedAuthorId)
+      : sharedHome;
+    await fs.mkdir(sharedHome, { recursive: true });
+    await ensureSharedGroupOwnership(sharedHome);
+    if (cwd !== sharedHome) {
+      await fs.mkdir(cwd, { recursive: true });
+      await ensureSharedGroupOwnership(cwd);
+    }
     const warnings: string[] = [];
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
@@ -23847,7 +23856,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileUndispatchableAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  async function sweepStaleIssueLocks(opts?: { now?: Date }) {
+  async function sweepStaleIssueLocks(opts?: {
+    now?: Date;
+    beforeSilentLockClear?: (input: { runId: string; issueId: string }) => Promise<void>;
+  }) {
     return recovery.sweepStaleIssueLocks(opts);
   }
 
@@ -32003,7 +32015,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: deferred.requestedByActorId,
             source: promotedSource,
             triggerDetail: promotedTriggerDetail,
-            existingRunResponsibleUserId: run.responsibleUserId,
+            // Ordinary admission omits the departing run's user. Passing it
+            // here made every promoted successor execute as that user instead
+            // of the card's responsible user.
             executor: txDb,
           });
         if (!promotedResponsibleUserId) {

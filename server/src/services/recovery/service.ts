@@ -9523,7 +9523,10 @@ export function recoveryService(
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks(opts?: { now?: Date }) {
+  async function sweepStaleIssueLocks(opts?: {
+    now?: Date;
+    beforeSilentLockClear?: (input: { runId: string; issueId: string }) => Promise<void>;
+  }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
@@ -9703,6 +9706,31 @@ export function recoveryService(
         !isCleanable(issue.executionRunId, issue.id)
       ) {
         return;
+      }
+
+      const silenceClearRunId = [issue.executionRunId, issue.checkoutRunId].find((runId) => {
+        if (!runId || !silentRunIds.has(runId)) return false;
+        const status = runStatusById.get(runId);
+        return !status || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      });
+      if (silenceClearRunId) {
+        await opts?.beforeSilentLockClear?.({ runId: silenceClearRunId, issueId: issue.id });
+        const [fresh] = await db
+          .select({
+            status: heartbeatRuns.status,
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+            startedAt: heartbeatRuns.startedAt,
+            createdAt: heartbeatRuns.createdAt,
+            contextSnapshot: heartbeatRuns.contextSnapshot,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, silenceClearRunId));
+        const freshActivityAt = fresh?.lastOutputAt ?? fresh?.startedAt ?? fresh?.createdAt ?? null;
+        const resumed = fresh?.status === "running"
+          && !issueIdFromRunContext(fresh.contextSnapshot)
+          && freshActivityAt != null
+          && sweepNow.getTime() - new Date(freshActivityAt).getTime() <= ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS;
+        if (resumed) return;
       }
 
       const updated = await db
