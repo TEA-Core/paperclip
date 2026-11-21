@@ -12730,6 +12730,7 @@ export function issueRoutes(
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
         issueId: existing.id,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
+        abandon: scope ? ctx.cancelScope : undefined,
       });
     } catch (error) {
       // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome

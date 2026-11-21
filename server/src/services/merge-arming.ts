@@ -5591,7 +5591,7 @@ export async function publishHeadBoundRelease(
   // The PR's liveness and the card's eligibility, both as they are now.
   // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
   const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => {
-    const childBlock = await childCarrierStampBlock(db, companyId, {
+    const childBlock = await childCarrierStampBlock(conn, companyId, {
       owner,
       repo,
       number,
