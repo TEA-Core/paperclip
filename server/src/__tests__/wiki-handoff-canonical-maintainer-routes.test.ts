@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
   issues,
   pluginEntities,
   pluginManagedResources,
@@ -221,6 +224,159 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       .where(eq(issues.id, issueId));
     return row;
   }
+
+  it.each([{}, { comment: "Observation only" }])("keeps a field-less PATCH unassigned: %j", async (body) => {
+    const { company } = await seedWikiCompany("maintainer");
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await readAssignee(stub.id)).toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      status: "backlog",
+    });
+  });
+
+  it("does not treat an unmarked resource target as the Wiki Maintainer", async () => {
+    const { company, maintainer, intruder } = await seedWikiCompany("maintainer");
+    await db.update(pluginManagedResources).set({ resourceId: intruder.id });
+    const app = createApp(db, boardActor(company.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const refused = await request(app).patch(`/api/issues/${stub.id}`).send({ assigneeAgentId: intruder.id });
+    expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+
+    const repaired = await request(app).patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+    expect(repaired.status, JSON.stringify(repaired.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+  });
+
+  it("refuses adoption of a paused maintainer", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, maintainer.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+  });
+
+  it("preserves the no-reference, no-marked-agent field write without adoption", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    await db.update(agents).set({ metadata: {} }).where(eq(agents.id, maintainer.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+  });
+
+  it("refuses adoption when two agents are marked without a resource reference", async () => {
+    const { company, intruder } = await seedWikiCompany("maintainer");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    await db.update(agents).set({ metadata: maintainerMetadata(randomUUID()) }).where(eq(agents.id, intruder.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+  });
+
+  it.each(["backlog", "todo", "in_progress", "blocked", "in_review", "done", "cancelled"] as const)(
+    "preserves assignment wake semantics for a statusless %s repair",
+    async (status) => {
+      const { company, maintainer } = await seedWikiCompany("maintainer");
+      const stub = await seedUnassignedHandoff(company.id);
+      await db.update(issues).set({ status }).where(eq(issues.id, stub.id));
+      const res = await request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe(status);
+      expect(res.body.assigneeAgentId).toBe(maintainer.id);
+      await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, maintainer.id));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, maintainer.id));
+      if (status === "backlog" || status === "done" || status === "cancelled") {
+        expect(wakes).toEqual([]);
+        expect(runs).toEqual([]);
+      } else {
+        expect(wakes).not.toEqual([]);
+        expect(runs).not.toEqual([]);
+      }
+    },
+  );
+
+  it.each(["resource", "binding"] as const)(
+    "serializes a late canonical %s repoint with the issue write",
+    async (source) => {
+      const { company, maintainer, intruder } = await seedWikiCompany("maintainer");
+      await db.update(agents).set({ metadata: maintainerMetadata(randomUUID()) }).where(eq(agents.id, intruder.id));
+      if (source === "binding") await db.delete(pluginManagedResources);
+      const stub = await seedUnassignedHandoff(company.id);
+      const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+      const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+        unsafe: (query: string) => Promise<unknown>;
+        end: (options?: { timeout?: number }) => Promise<unknown>;
+      };
+      const locker = postgres(tempDb!.connectionString, { max: 1 });
+      const barrier = 2493601;
+      let pending: Promise<request.Response> | undefined;
+      try {
+        await locker.unsafe(`
+          CREATE FUNCTION wiki_handoff_update_barrier() RETURNS trigger AS $$
+          BEGIN
+            PERFORM pg_advisory_xact_lock(${barrier});
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+          CREATE TRIGGER wiki_handoff_update_barrier BEFORE UPDATE ON issues
+          FOR EACH ROW WHEN (NEW.id = '${stub.id}'::uuid)
+          EXECUTE FUNCTION wiki_handoff_update_barrier();
+          SELECT pg_advisory_lock(${barrier});
+        `);
+        pending = request(createApp(db, boardActor(company.id)))
+          .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" })
+          .then((res) => res);
+        await expect.poll(async () => {
+          const rows = await db.execute(sql`SELECT 1 FROM pg_locks
+            WHERE locktype = 'advisory' AND objid = ${barrier} AND NOT granted`);
+          return rows.length;
+        }, { timeout: 10_000 }).toBe(1);
+        // The request has passed its service guard and reached UPDATE. A
+        // second connection must not be able to repoint the canonical row.
+        const repoint = db.transaction(async (tx) => {
+          if (source === "resource") {
+            await tx.execute(sql`SELECT id FROM plugin_managed_resources
+              WHERE company_id = ${company.id} FOR UPDATE NOWAIT`);
+            await tx.update(pluginManagedResources).set({ resourceId: intruder.id });
+          } else {
+            await tx.execute(sql`SELECT id FROM plugin_entities
+              WHERE company_id = ${company.id} FOR UPDATE NOWAIT`);
+            await tx.update(pluginEntities).set({ data: {
+              pluginKey: PLUGIN_KEY, resourceKey: AGENT_KEY, agentId: intruder.id,
+            } });
+          }
+        });
+        await expect(repoint).rejects.toMatchObject({ cause: { code: "55P03" } });
+        await locker.unsafe(`SELECT pg_advisory_unlock(${barrier})`);
+        const res = await pending;
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+      } finally {
+        await locker.end({ timeout: 1 });
+        await pending;
+        await db.execute(sql`DROP TRIGGER IF EXISTS wiki_handoff_update_barrier ON issues`);
+        await db.execute(sql`DROP FUNCTION IF EXISTS wiki_handoff_update_barrier()`);
+      }
+    },
+    20_000,
+  );
 
   it("adopts the canonical Wiki Maintainer on the emitter field-repair PATCH", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");
