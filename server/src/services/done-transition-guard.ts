@@ -2716,20 +2716,32 @@ function jsonRepositoryReference(value: unknown): string | null {
 const WORKSPACE_KEY_PATTERN =
   /^(executionworkspaceid|projectid|projectworkspaceid|workspace|workspaceid|workspaceref|workspacepath|repo|reporef|repourl|repository|repositoryurl|branch|branchname|worktree|worktreepath|providerref|baseref|deliveryrequirement|storeddeliveryrequirement|pr|prnumber|prurl|pullrequest|pullrequestnumber|pullrequestid|pullrequesturl|mr|mrnumber|mergerequest|commit|commitsha|sha|headsha)$/;
 
+function normalizedWorkspaceKey(key: string): boolean {
+  return WORKSPACE_KEY_PATTERN.test(key.toLowerCase().replace(/[^a-z0-9]/g, ""));
+}
+
+function textNamesWorkspaceKey(text: string): boolean {
+  for (const match of text.matchAll(/([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*["']?([^\s,}\]"']*)/g)) {
+    const value = match[2] ?? "";
+    if (value !== "" && value !== "null" && normalizedWorkspaceKey(match[1]!)) return true;
+  }
+  return false;
+}
+
 function namesWorkspace(value: unknown): boolean {
   if (typeof value === "string") {
     const text = value.trim();
     if (text.startsWith("{") || text.startsWith("[")) {
       try {
-        return namesWorkspace(JSON.parse(text));
+        if (namesWorkspace(JSON.parse(text))) return true;
       } catch {
-        return false;
+        // truncated or invalid JSON falls through to the text scan
       }
     }
-    return false;
+    return textNamesWorkspaceKey(text);
   }
   return forEachJsonEntry(value, (key, item) => {
-    if (key !== null && WORKSPACE_KEY_PATTERN.test(key.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
+    if (key !== null && normalizedWorkspaceKey(key)) {
       if (item !== null && typeof item !== "object" && item !== "") return true;
     }
     return typeof item === "string" && namesWorkspace(item);

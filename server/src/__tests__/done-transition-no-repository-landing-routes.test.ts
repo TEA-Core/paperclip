@@ -2996,6 +2996,9 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       ["a run whose stdout excerpt cites a pull request", async (fixture: NoWorkspaceIssue) => {
         await insertNativeRun(fixture, { stdoutExcerpt: "opened PR #41" });
       }],
+      ["a run whose truncated stdout excerpt names an execution workspace", async (fixture: NoWorkspaceIssue) => {
+        await insertNativeRun(fixture, { stdoutExcerpt: '{"executionWorkspaceId":"ew-1","cwd":"/work/spa' });
+      }],
       ["a run whose stderr excerpt cites a Git ref", async (fixture: NoWorkspaceIssue) => {
         await insertNativeRun(fixture, { stderrExcerpt: "pushed refs/heads/feature" });
       }],
