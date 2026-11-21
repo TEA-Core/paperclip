@@ -1,7 +1,7 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginManagedResources } from "@paperclipai/db";
+import { agents, pluginEntities, pluginManagedResources, plugins } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -150,6 +150,35 @@ export function isWikiHandoffTitle(title: unknown): boolean {
   );
 }
 
+const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
+  `${WIKI_LLM_WIKI_PLUGIN_KEY}:agent:${WIKI_MAINTAINER_AGENT_KEY}` as const;
+
+export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
+
+function metadataMarksWikiMaintainer(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const record = metadata as Record<string, unknown>;
+  return [record.paperclipManagedResource, record.pluginManagedAgent].some((marker) => {
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
+    const row = marker as Record<string, unknown>;
+    const agentKey = row.agentKey ?? row.resourceKey;
+    const resourceKind = row.resourceKind;
+    return (
+      row.pluginKey === WIKI_LLM_WIKI_PLUGIN_KEY &&
+      agentKey === WIKI_MAINTAINER_AGENT_KEY &&
+      (resourceKind === undefined || resourceKind === "agent")
+    );
+  });
+}
+
+function bindingAgentId(data: unknown): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const record = data as Record<string, unknown>;
+  if (record.pluginKey !== undefined && record.pluginKey !== WIKI_LLM_WIKI_PLUGIN_KEY) return null;
+  if (record.resourceKey !== undefined && record.resourceKey !== WIKI_MAINTAINER_AGENT_KEY) return null;
+  return typeof record.agentId === "string" && record.agentId.length > 0 ? record.agentId : null;
+}
+
 export async function resolveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
@@ -157,19 +186,59 @@ export async function resolveCanonicalWikiMaintainerAgentId(
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
   if (!isWikiHandoffTitle(issue.title)) return null;
-  const rows = await db
-    .select({ resourceId: pluginManagedResources.resourceId })
-    .from(pluginManagedResources)
-    .where(
-      and(
+  const [resourceRows, bindings] = await Promise.all([
+    db
+      .select({
+        resourceKey: pluginManagedResources.resourceKey,
+        resourceId: pluginManagedResources.resourceId,
+      })
+      .from(pluginManagedResources)
+      .where(and(
         eq(pluginManagedResources.companyId, companyId),
         eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
         eq(pluginManagedResources.resourceKind, "agent"),
-        eq(pluginManagedResources.resourceKey, WIKI_MAINTAINER_AGENT_KEY),
-      ),
-    )
-    .then((found) => found);
-  return rows[0]?.resourceId ?? null;
+        inArray(pluginManagedResources.resourceKey, [
+          WIKI_MAINTAINER_AGENT_KEY,
+          WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY,
+        ]),
+      )),
+    db
+      .select({ data: pluginEntities.data })
+      .from(pluginEntities)
+      .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
+      .where(and(
+        eq(pluginEntities.companyId, companyId),
+        eq(pluginEntities.entityType, "managed_agent"),
+        eq(pluginEntities.externalId, `managed:agent:${companyId}:${WIKI_MAINTAINER_AGENT_KEY}`),
+        eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+      )),
+  ]);
+  const resourceId = resourceRows.find((row) => row.resourceKey === WIKI_MAINTAINER_AGENT_KEY)?.resourceId
+    ?? resourceRows[0]?.resourceId
+    ?? null;
+  const boundIds = bindings.map((row) => bindingAgentId(row.data)).filter((id): id is string => id !== null);
+  const candidateIds = [resourceId, ...boundIds].filter((id): id is string => id !== null);
+  const liveCandidates = candidateIds.length === 0
+    ? []
+    : await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(
+        eq(agents.companyId, companyId),
+        ne(agents.status, "terminated"),
+        inArray(agents.id, candidateIds),
+      ));
+  const liveIds = new Set(liveCandidates.map((agent) => agent.id));
+  const resolved = candidateIds.find((id) => liveIds.has(id));
+  if (resolved) return resolved;
+  const liveAgents = await db
+    .select({ id: agents.id, metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+  const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
+  if (marked.length === 1) return marked[0]!.id;
+  if (marked.length > 1) return AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID;
+  return resourceId ?? boundIds[0] ?? null;
 }
 
 function isWorkflowControlledPendingReviewParticipant(input: {
@@ -288,6 +357,17 @@ export function isUnassignedWikiHandoffBoardStageDecision(input: {
     input.currentAssigneeAgentId === null &&
     input.currentAssigneeUserId === null
   );
+}
+
+function wikiReviewKeepsCanonicalReturnAssignee(input: {
+  canonical: string;
+  executionState: unknown;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (state?.currentParticipant?.type !== "user") return false;
+  return state.returnAssignee?.type === "agent" && state.returnAssignee.agentId === input.canonical;
 }
 
 export async function assertWikiHandoffWriteIntegrity(input: {
@@ -409,6 +489,14 @@ export function wikiHandoffWriteWouldViolate(input: {
     ? input.incomingAssigneeAgentId
     : null;
   if (incoming !== canonical) {
+    if (
+      incoming === null &&
+      wikiReviewKeepsCanonicalReturnAssignee({
+        canonical,
+        executionState: input.executionState,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
     if (
       (incoming !== null || (
         input.actorAgentId === canonical &&

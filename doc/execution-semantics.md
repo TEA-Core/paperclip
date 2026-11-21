@@ -848,6 +848,23 @@ when its value is `undefined`, because the update normalizes that value to
 and clears the stored policy, as the paragraph above states. That behavior
 predates the field-less skip, and the field-less skip does not change it.
 
+The canonical Wiki Maintainer is the live company agent that the plugin
+`paperclipai.plugin-llm-wiki` manages under `wiki-maintainer`: the
+`plugin_managed_resources` row's `resourceId`, else the
+`managed:agent:<companyId>:wiki-maintainer` plugin entity binding. Agent
+metadata never outranks that row or binding. Only when neither resolves to a
+live agent does the guard fall back to the single live agent whose metadata
+marks both `pluginKey` `paperclipai.plugin-llm-wiki` and agent key
+`wiki-maintainer`. More than one such agent is ambiguous, and the guard refuses
+every assignee write until it is resolved. A terminated agent is not a live
+match.
+
+When a Wiki handoff enters human review in the same write that names the
+canonical Wiki Maintainer, and the workflow seats the user reviewer, that
+Maintainer stays the execution state's `returnAssignee`. The resulting agent
+assignee may be null. A write that names a different agent does not receive
+that return assignee.
+
 The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
 can close the final stage of an unassigned Wiki handoff card. That hand-back
 has no return-to, so the route drops the no-op `assigneeAgentId: null` and
