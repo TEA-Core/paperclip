@@ -22,7 +22,6 @@ import { readBuildCommit } from "../build-commit.js";
 import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
-  branchNamesIssue,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
   probeZeroDeltaWorktree,
@@ -31,6 +30,13 @@ import {
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import {
+  decideZeroDeltaFromForge,
+  githubForgeReader,
+  recheckZeroDeltaForgeAtWrite,
+  ZERO_DELTA_MEASUREMENT_BUDGET,
+  ZERO_DELTA_WRITE_BUDGET,
+} from "./zero-delta-forge-rule.js";
 import {
   resolveGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
@@ -487,47 +493,6 @@ async function resolveGitHubRefHeadSha(
     throw new Error("GitHub commits API returned no commit sha");
   }
   return sha.toLowerCase();
-}
-
-/** Every forge branch tip. A full page is followed; a page of 100 is not a refusal. */
-async function listGitHubBranchTips(
-  hostname: string,
-  owner: string,
-  repo: string,
-  token: string,
-  signal?: AbortSignal,
-): Promise<Array<{ name: string; sha: string }>> {
-  const apiBase = gitHubApiBase(hostname);
-  const headers: Record<string, string> = {
-    accept: "application/vnd.github+json",
-    "user-agent": "paperclip-done-transition-guard",
-    "x-github-api-version": "2022-11-28",
-    authorization: `Bearer ${token}`,
-  };
-  const tips: Array<{ name: string; sha: string }> = [];
-  for (let page = 1; page <= 20; page += 1) {
-    const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100&page=${page}`;
-    const response = await ghFetch(url, { headers, signal });
-    if (!response.ok) throw new Error(`GitHub branches API returned ${response.status}`);
-    const body = await response.json().catch(() => null);
-    if (!Array.isArray(body)) throw new Error("GitHub branches API returned no branch list");
-    for (const entry of body) {
-      const row = entry as Record<string, unknown>;
-      const commit = row.commit as Record<string, unknown> | undefined;
-      const name = row.name;
-      const sha = commit?.sha;
-      if (typeof name !== "string" || typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
-        throw new Error("GitHub branches API returned a branch without a commit sha");
-      }
-      tips.push({ name, sha: sha.toLowerCase() });
-    }
-    if (body.length < 100) return tips;
-  }
-  throw new Error("GitHub branches API returned more branches than the close can read");
-}
-
-function remoteBranchDigest(tips: readonly { name: string; sha: string }[]): string {
-  return [...tips].map((tip) => `${tip.name} ${tip.sha}`).sort().join("\n");
 }
 
 // SUP-22880: the local-worktree probes below read an agent-writable workspace.
@@ -2370,15 +2335,10 @@ async function attributeTier2EvidenceToClosingRun(
 
 const ZERO_DELTA_CLOSE_CONDITIONS =
   "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only through " +
-  "PATCH /api/issues/{id}, and only when the server proves its own recorded worktree, on its recorded branch, has " +
-  "zero commits ahead of the base ref, a HEAD that is an ancestor of the base ref (in the worktree and on the " +
-  "remote), a local base ref whose commit is the remote base commit, no tracked changes, no untracked files, no " +
-  "ignored entries outside the regenerated-artefact directories and no stash; that every local ref is an ancestor " +
-  "of that remote base commit, including a packed ref hidden by a loose file and a reflog tip (an unrelated " +
-  "remote-tracking ref is not this card's parked work); that no remote branch naming this card is ahead of the " +
-  "base, and that the remote branch list is unchanged at the close write; that no other worktree on a " +
-  "branch naming this card (or with a detached HEAD) holds uncommitted work; and the declaration's probe head names " +
-  "that HEAD.";
+  "PATCH /api/issues/{id}, and only when the server proves from the board-recorded forge repository that every " +
+  "branch and tag tip is on the base line or is a pull-request head, that a ref naming this card is on the base " +
+  "line, and that the declared head is on the base line. A name is never a reason to skip a tip. The close write " +
+  "re-reads that snapshot and refuses if it changed. Local checks can only refuse.";
 
 /** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
 export interface ZeroDeltaCloseMeasurement {
@@ -2396,8 +2356,8 @@ export interface ZeroDeltaCloseMeasurement {
   baseRef: string;
   baseSha: string;
   headSha: string;
-  /** Commits the card's branch carries beyond the base on the remote; null when the branch is not on the remote. */
-  remoteBranchAheadBy: number | null;
+  /** sha256 of the forge base and every branch and tag. The close write requires the same snapshot. */
+  forgeSnapshotDigest: string;
   /** The project workspace's `defaultRef` and `repoRef` as read; the close write requires both unchanged. */
   projectDefaultRef: string | null;
   projectRepoRef: string | null;
@@ -2405,8 +2365,6 @@ export interface ZeroDeltaCloseMeasurement {
   issueIdentifier: string;
   /** Digest of the branches the sibling scan read; the close write requires them unchanged. */
   refsDigest: string;
-  /** Sorted forge branch name and tip. A branch that appears after measurement changes it. */
-  remoteBranchDigest: string;
 }
 
 type ZeroDeltaCloseProof =
@@ -2573,83 +2531,23 @@ async function proveZeroDeltaRepositoryClose(
     },
   });
   if (!probe.ok) return refuse(probe.reason);
-  let remoteBaseSha: string | null;
-  try {
-    remoteBaseSha = await resolveGitHubRefHeadSha(hostname, owner, repo, baseBranch, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS));
-  } catch {
-    remoteBaseSha = null;
-  }
-  if (!remoteBaseSha) return refuse(`the remote base ${baseBranch} could not be read`);
-  if (remoteBaseSha !== probe.baseSha.toLowerCase()) {
+  const forge = githubForgeReader(token);
+  const forgeCard = { repo: { hostname, owner, repo }, baseBranch, declaredHead: probe.headSha, cardBranch: workspace.branchName, cardIdentifier: issue.identifier };
+  const decided = await decideZeroDeltaFromForge(forgeCard, forge, ZERO_DELTA_MEASUREMENT_BUDGET);
+  if (!decided.ok) return refuse(decided.reason);
+  if (decided.proof.baseSha !== probe.baseSha.toLowerCase()) {
     return refuse(`the local base ref ${probe.baseRef} is not the remote base ${baseBranch}`);
   }
   try {
     const outside = await localRefOutsideRemoteBaseRefusal(
       path.dirname(probe.commonDir),
-      remoteBaseSha,
+      decided.proof.baseSha,
       issue.identifier,
-      Date.now() + GITHUB_BASE_COMPARE_TIMEOUT_MS,
+      Date.now() + ZERO_DELTA_MEASUREMENT_BUDGET.totalMs,
     );
     if (outside) return refuse(outside);
   } catch (err) {
     return refuse(`the local refs could not be compared with the remote base (${err instanceof Error ? err.message : "unknown"})`);
-  }
-  let remoteBranchDigestValue: string;
-  try {
-    const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
-    const tips = await listGitHubBranchTips(hostname, owner, repo, token, signal);
-    remoteBranchDigestValue = remoteBranchDigest(tips);
-    for (const tip of tips) {
-      if (tip.sha === remoteBaseSha || !branchNamesIssue(tip.name, issue.identifier)) continue;
-      const ahead = await githubCompareAheadBy(hostname, owner, repo, baseBranch, tip.sha, token, signal);
-      if (ahead === null) return refuse(`the remote branch ${tip.name} could not be compared with ${baseBranch}`);
-      if (ahead !== 0) {
-        return refuse(`the remote branch ${tip.name} carries ${ahead} commit(s) that ${baseBranch} lacks`);
-      }
-    }
-  } catch (err) {
-    return refuse(`the remote branches could not be listed (${err instanceof Error ? err.message : "unknown"})`);
-  }
-
-
-  let headAheadBy: number | null;
-  try {
-    headAheadBy = await githubCompareAheadBy(
-      hostname, owner, repo, baseBranch, probe.headSha, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
-    );
-  } catch {
-    headAheadBy = null;
-  }
-  if (headAheadBy === null) {
-    return refuse(`HEAD ${probe.headSha} could not be compared with ${baseBranch} on the remote`);
-  }
-  if (headAheadBy !== 0) {
-    return refuse(`HEAD ${probe.headSha} carries ${headAheadBy} commit(s) that ${baseBranch} on the remote lacks`);
-  }
-
-  let remoteBranchAheadBy: number | null;
-  try {
-    const ahead = await githubCompareAheadBy(
-      hostname, owner, repo, baseBranch, workspace.branchName, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
-    );
-    if (ahead === null) {
-      return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
-    }
-    remoteBranchAheadBy = ahead;
-  } catch (err) {
-    if (!(err instanceof GitHubBranchNotFoundError)) {
-      return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
-    }
-    const presence = await githubBranchExists(hostname, owner, repo, workspace.branchName, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS));
-    if (presence.outcome !== "absent") {
-      return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
-    }
-    remoteBranchAheadBy = null;
-  }
-  if (remoteBranchAheadBy !== null && remoteBranchAheadBy !== 0) {
-    return refuse(
-      `the card's branch ${workspace.branchName} on the remote carries ${remoteBranchAheadBy} commit(s) that ${baseBranch} lacks`,
-    );
   }
   return {
     ok: true,
@@ -2665,14 +2563,13 @@ async function proveZeroDeltaRepositoryClose(
       branch: probe.branch,
       baseBranch,
       baseRef: probe.baseRef,
-      baseSha: probe.baseSha,
+      baseSha: decided.proof.baseSha,
       headSha: probe.headSha,
-      remoteBranchAheadBy,
+      forgeSnapshotDigest: decided.proof.snapshotDigest,
       projectDefaultRef: projectWorkspace?.defaultRef ?? null,
       projectRepoRef: projectWorkspace?.repoRef ?? null,
       issueIdentifier: issue.identifier,
       refsDigest: probe.refsDigest,
-      remoteBranchDigest: remoteBranchDigestValue,
     },
   };
 }
@@ -2871,29 +2768,13 @@ export async function verifyZeroDeltaCloseAtTransition(
     if (!token) return refuse("the remote could not be re-read at the close write");
     const [hostname, owner, repo] = measurement.repository.split("/");
     if (!hostname || !owner || !repo) return refuse("the measured repository could not be re-read at the close write");
-    const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
-    const remoteBase = await resolveGitHubRefHeadSha(hostname, owner, repo, measurement.baseBranch, token, signal);
-    if (remoteBase !== measurement.baseSha.toLowerCase()) {
-      return refuse("the remote base commit changed after the close was measured");
-    }
-    const tips = await listGitHubBranchTips(hostname, owner, repo, token, signal);
-    if (remoteBranchDigest(tips) !== measurement.remoteBranchDigest) {
-      return refuse("the remote branches changed after the close was measured");
-    }
-    if (measurement.remoteBranchAheadBy === null) {
-      const presence = await githubBranchExists(hostname, owner, repo, measurement.branch, token, signal);
-      if (presence.outcome !== "absent") {
-        return refuse(`the card's branch ${measurement.branch} could not be confirmed absent on the remote at the close write`);
-      }
-    } else {
-      const ahead = await githubCompareAheadBy(
-        hostname, owner, repo, measurement.baseBranch, measurement.branch, token,
-        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
-      );
-      if (ahead !== 0) {
-        return refuse(`the card's branch ${measurement.branch} on the remote carries commits that ${measurement.baseBranch} lacks at the close write`);
-      }
-    }
+    const again = await recheckZeroDeltaForgeAtWrite(
+      { repo: { hostname, owner, repo }, baseBranch: measurement.baseBranch },
+      { snapshotDigest: measurement.forgeSnapshotDigest, baseSha: measurement.baseSha },
+      githubForgeReader(token),
+      ZERO_DELTA_WRITE_BUDGET,
+    );
+    if (!again.ok) return refuse(again.reason);
   } catch (err) {
     return refuse(`the remote could not be re-read at the close write (${err instanceof Error ? err.message : "unknown"})`);
   }

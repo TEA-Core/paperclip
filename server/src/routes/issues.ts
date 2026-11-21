@@ -4931,7 +4931,16 @@ export function issueRoutes(
     const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
     const decisionId = state?.lastDecisionId;
     if (verdict.kind !== "resolved") {
-      if (options.overrideAccepted || (options.zeroDeltaProven && verdict.reason.startsWith("no-pr:"))) return;
+      if (options.overrideAccepted) return;
+      if (options.zeroDeltaProven && verdict.reason.startsWith("no-pr:")) {
+        if (decisionId) {
+          patch.executionState = {
+            ...rawState,
+            approvalStatus: { ...prior, finalDeliveryUncertified: { decisionId, reason: `zero-delta: ${verdict.reason}` } },
+          };
+        }
+        return;
+      }
       // SUP-24085: a stage approval that leaves the ladder pending on a later stage
       // does not complete the card, so a card that owns no open PR is not refused.
       // The decision certifies no head: the tag stops the post-commit hook from
@@ -22199,10 +22208,10 @@ export function issueRoutes(
           }
 
           // SUP-22570: compare-and-set against the measurement taken before
-          // this transaction. It re-reads the database half of the proof,
+          // this transaction. It re-reads the database half of the proof and
           // re-checks the measured worktree with a Git status under one
-          // shared 15 s budget (no GitHub call), and refuses if anything moved,
-          // got dirty or ran out of budget since the measurement.
+          // shared 15 s budget. The record_only path makes no GitHub call.
+          // It refuses if anything moved, got dirty, or ran out of budget.
           if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
             const lockedForLanding = await svc.getByIdForUpdate(id, tx);
             if (!lockedForLanding) return null;
@@ -22232,10 +22241,9 @@ export function issueRoutes(
           }
 
           // SUP-24402: compare-and-set against the zero-delta measurement
-          // taken before this transaction. It re-reads the database half of
-          // the proof and re-checks the measured worktree with a Git status
-          // under one shared 15 s budget (no GitHub call), and refuses if
-          // anything moved or got dirty since the measurement.
+          // taken before this transaction. It re-reads the database half,
+          // re-checks the worktree, and re-reads the forge snapshot under a
+          // 20 s budget while the issue row is held. A changed digest refuses.
           if (zeroDeltaCloseMeasurement !== null) {
             const lockedForZeroDelta = await svc.getByIdForUpdate(id, tx);
             if (!lockedForZeroDelta) return null;

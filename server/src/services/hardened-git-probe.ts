@@ -1395,13 +1395,7 @@ export async function localRefOutsideRemoteBaseRefusal(
   const seen = new Set<string>();
   for (const ref of refs) {
     if (Date.now() > deadlineAt) return "the local refs could not be compared with the remote base within the deadline";
-    const storedName = ref.refname.startsWith("logs/") ? ref.refname.slice("logs/".length) : ref.refname;
-    if (storedName.startsWith("refs/remotes/")) {
-      const remoteRef = storedName.slice("refs/remotes/".length);
-      const slash = remoteRef.indexOf("/");
-      const name = slash < 0 ? remoteRef : remoteRef.slice(slash + 1);
-      if (!branchNamesIssue(name, issueIdentifier)) continue;
-    }
+    void issueIdentifier;
     if (!SHA_RE.test(ref.sha) || ref.sha === remoteBaseSha || seen.has(ref.sha)) continue;
     seen.add(ref.sha);
     const ancestor = await runHardenedGit(

@@ -44,6 +44,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => ({
 // returning "fail" replaces that process with one that exits 1.
 const gitFault = vi.hoisted(() => ({ onGit: null as null | ((args: readonly string[]) => "fail" | void) }));
 let plantDuringCommitsRead = false;
+const pullRequestHeads: string[] = [];
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcess>();
   return {
@@ -169,6 +170,17 @@ function answerGitHub(url: string): Response {
     });
     return json(branches);
   }
+  if (u.pathname === `${repoPath}/tags`) {
+    const listed = originGit("for-each-ref", "--format=%(refname:short) %(objectname)", "refs/tags");
+    const tags = listed.length === 0 ? [] : listed.split("\n").map((line) => {
+      const space = line.indexOf(" ");
+      return { name: line.slice(0, space), commit: { sha: line.slice(space + 1) } };
+    });
+    return json(tags);
+  }
+  if (u.pathname === `${repoPath}/pulls`) {
+    return json(pullRequestHeads.map((sha, index) => ({ number: index + 1, state: "open", head: { sha } })));
+  }
   return json({ message: "Not Found" }, 404);
 }
 
@@ -249,6 +261,7 @@ beforeEach(() => {
   mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
   gitFault.onGit = null;
   plantDuringCommitsRead = false;
+  pullRequestHeads.length = 0;
 });
 
 afterEach(() => {
@@ -285,7 +298,6 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
         baseRef: "refs/remotes/origin/main",
         baseSha: git(worktree, "rev-parse", "origin/main"),
         headSha: head,
-        remoteBranchAheadBy: null,
       },
     });
   });
@@ -443,10 +455,10 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     expectZeroDeltaRefusal(await close(), "the proof could not be completed (db down)");
   });
 
-  it("refuses when GitHub cannot compare the HEAD with the base", async () => {
+  it("refuses when GitHub cannot compare a forge tip with the base", async () => {
     mockGhFetch.mockImplementation(async (url: string) =>
       String(url).includes("/compare/") ? json({ message: "boom" }, 502) : answerGitHub(String(url)));
-    expectZeroDeltaRefusal(await close(), `HEAD ${headSha()} could not be compared with main on the remote`);
+    expectZeroDeltaRefusal(await close(), "the forge read failed (502)");
   });
 
   it("refuses a worktree whose local origin ref was moved onto its own commit (the remote is the authority)", async () => {
@@ -455,7 +467,7 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     git(worktree, "commit", "-qm", "SUP-24395 work");
     git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
     git(repoRoot, "update-ref", "refs/remotes/origin/main", headSha());
-    expectZeroDeltaRefusal(await close(), "the local base ref refs/remotes/origin/main is not the remote base main");
+    expectZeroDeltaRefusal(await close(), `branch ${BRANCH} is not on the base line and is not a pull-request head`);
   });
 
   it("refuses when the card's branch on the remote carries commits the base lacks", async () => {
@@ -464,7 +476,7 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     git(worktree, "commit", "-qm", "SUP-24395 work");
     git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
     git(worktree, "reset", "-q", "--hard", "HEAD~1");
-    expectZeroDeltaRefusal(await close(), `refs/remotes/origin/${BRANCH} holds a commit the remote base lacks`);
+    expectZeroDeltaRefusal(await close(), `branch ${BRANCH} is not on the base line and is not a pull-request head`);
   });
 
   it("refuses a workspace the card does not own", async () => {
@@ -485,19 +497,24 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     expectZeroDeltaRefusal(await close(), "the card's delivery repository is not its project workspace's repository");
   });
 
-  it("refuses when the card's branch compare fails on the remote", async () => {
+  it("refuses when a forge tip compare fails", async () => {
+    writeFileSync(path.join(seed, "ahead.txt"), "ahead\n");
+    git(seed, "add", "ahead.txt");
+    git(seed, "commit", "-qm", "ahead of base");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
     mockGhFetch.mockImplementation(async (url: string) =>
-      String(url).includes(`...${BRANCH}`) ? json({ message: "boom" }, 502) : answerGitHub(String(url)));
-    expectZeroDeltaRefusal(await close(), `the card's branch ${BRANCH} could not be compared with main on the remote`);
+      String(url).includes("/compare/") ? json({ message: "boom" }, 502) : answerGitHub(String(url)));
+    expectZeroDeltaRefusal(await close(), "the forge read failed (502)");
   });
 
-  it("refuses when the branch compare 404s but the branch exists on the remote", async () => {
-    mockGhFetch.mockImplementation(async (url: string) => {
-      if (String(url).includes(`...${BRANCH}`)) return json({ message: "Not Found" }, 404);
-      if (String(url).includes("/git/ref/heads/")) return json({ ref: `refs/heads/${BRANCH}` });
-      return answerGitHub(String(url));
-    });
-    expectZeroDeltaRefusal(await close(), `the card's branch ${BRANCH} could not be compared with main on the remote`);
+  it("refuses when a forge tip compare is not a compare result", async () => {
+    writeFileSync(path.join(seed, "ahead.txt"), "ahead\n");
+    git(seed, "add", "ahead.txt");
+    git(seed, "commit", "-qm", "ahead of base");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    mockGhFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/compare/") ? json({ status: "identical" }) : answerGitHub(String(url)));
+    expectZeroDeltaRefusal(await close(), "the forge could not compare");
   });
 
   it("refuses a worktree with a git operation in progress", async () => {
@@ -785,12 +802,14 @@ describe("zero-delta review regressions (PR 1213 round 2)", () => {
     expect(result.reason).toContain("PATCH /api/issues/{id}");
   });
 
-  it("refuses when the remote branch compare answers without an ahead count", async () => {
-    git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
+  it("refuses when a forge tip compare omits the ahead count", async () => {
+    writeFileSync(path.join(seed, "ahead.txt"), "ahead\n");
+    git(seed, "add", "ahead.txt");
+    git(seed, "commit", "-qm", "ahead of base");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
     mockGhFetch.mockImplementation(async (url: string) =>
-      String(url).endsWith(`...${encodeURIComponent(BRANCH)}`) ? json({ status: "identical" }) : answerGitHub(String(url)),
-    );
-    expectZeroDeltaRefusal(await close(), `the card's branch ${BRANCH} could not be compared with main on the remote`);
+      String(url).includes("/compare/") ? json({ status: "identical" }) : answerGitHub(String(url)));
+    expectZeroDeltaRefusal(await close(), "the forge could not compare");
   });
 
   it("refuses a base whose branch name itself starts with origin/ (the remote compare would strip it again)", async () => {
@@ -880,11 +899,12 @@ describe("zero-delta review regressions (PR 1213 round 2)", () => {
     expect(verdict.reason).toContain("stash");
   });
 
-  it("compares each distinct branch tip with GitHub once", async () => {
-    for (const suffix of ["a", "b", "c"]) git(repoRoot, "branch", `SUP-24395-${suffix}`, headSha());
+  it("compares one distinct forge tip once", async () => {
+    const tip = headSha();
+    for (const suffix of ["a", "b", "c"]) git(repoRoot, "push", "-q", origin, `${tip}:refs/heads/old-${suffix}`);
     const result = await close();
     expect(result.allowed, result.reason).toBe(true);
-    const headCompares = mockGhFetch.mock.calls.filter(([url]) => String(url).endsWith(`...${headSha()}`));
+    const headCompares = mockGhFetch.mock.calls.filter(([url]) => String(url).includes("/compare/") && String(url).includes(tip));
     expect(headCompares).toHaveLength(1);
   });
 
@@ -997,11 +1017,20 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     expectZeroDeltaRefusal(await close(), `refs/remotes/fork/${BRANCH} holds a commit the remote base lacks`);
   });
 
-  it("does not refuse a pre-existing forge branch that does not name this card", async () => {
+  it("refuses a pre-existing forge branch that is not a pull-request head", async () => {
     writeFileSync(path.join(seed, "other.txt"), "undelivered\n");
     git(seed, "add", "other.txt");
     git(seed, "commit", "-qm", "other work");
     git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    expectZeroDeltaRefusal(await close(), "branch other-work is not on the base line and is not a pull-request head");
+  });
+
+  it("admits a pre-existing forge branch whose tip is a pull-request head", async () => {
+    writeFileSync(path.join(seed, "other.txt"), "undelivered\n");
+    git(seed, "add", "other.txt");
+    git(seed, "commit", "-qm", "other work");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    pullRequestHeads.push(git(seed, "rev-parse", "HEAD"));
     const result = await close();
     expect(result.allowed, result.reason).toBe(true);
   });
@@ -1014,7 +1043,7 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
     const verdict = await verify(measurement);
     expect(verdict.ok).toBe(false);
-    expect(verdict.reason).toContain("remote branches changed");
+    expect(verdict.reason).toContain("remote refs changed");
   });
 
   it("refuses at the close write when the remote base moves", async () => {
@@ -1092,7 +1121,7 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     git(seed, "push", "-q", origin, `HEAD:refs/heads/${BRANCH}`);
     const verdict = await verify(measurement);
     expect(verdict.ok).toBe(false);
-    expect(verdict.reason).toContain("remote branches changed");
+    expect(verdict.reason).toContain("remote refs changed");
   });
 
   it("refuses at the close write when the issue's project workspace changed", async () => {

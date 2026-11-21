@@ -1985,6 +1985,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         });
         return new Response(JSON.stringify(body), { status: 200 });
       }
+      if (/\/tags(?:\?|$)/.test(text)) return new Response(JSON.stringify([]), { status: 200 });
+      if (/\/pulls(?:\?|$)/.test(text)) return new Response(JSON.stringify([]), { status: 200 });
       const commit = /\/commits\/([^/?]+)$/.exec(text);
       if (commit) {
         try {
