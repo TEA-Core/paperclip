@@ -977,6 +977,47 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
   });
 
+  it.each([
+    ["39 hex characters", "a".repeat(39)],
+    ["41 hex characters", "a".repeat(41)],
+    ["64 hex characters", "a".repeat(64)],
+    ["65 hex characters", "a".repeat(65)],
+    ["40 uppercase hex characters", "A".repeat(40)],
+    ["a trailing newline", `${"a".repeat(40)}\n`],
+    ["an empty string", ""],
+    ["null", null],
+    ["an array", ["a".repeat(40)]],
+  ])("rejects a recovery head SHA with %s as 400 before any GitHub read or persistence", async (_label, headSha) => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    // The live PR head equals the requested head, so only validation can refuse it.
+    mockGhFetch.mockResolvedValue(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: headSha,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha,
+      reason: "restore approved publication",
+      idempotencyKey: "recover-invalid-head",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toMatch(/headSha/);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
+  });
+
   it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
     const { companyId, issueId } = await seedIssue({
       pr: { owner: OWNER, repo: REPO, number: 579, headRefName: DELIVERY_BRANCH },
