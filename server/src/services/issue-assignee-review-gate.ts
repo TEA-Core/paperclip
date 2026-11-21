@@ -1,7 +1,7 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginManagedResources } from "@paperclipai/db";
+import { agents, pluginEntities, pluginManagedResources, plugins } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -150,6 +150,33 @@ export function isWikiHandoffTitle(title: unknown): boolean {
   );
 }
 
+const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
+  `${WIKI_LLM_WIKI_PLUGIN_KEY}:agent:${WIKI_MAINTAINER_AGENT_KEY}` as const;
+
+function metadataMarksWikiMaintainer(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const record = metadata as Record<string, unknown>;
+  return [record.paperclipManagedResource, record.pluginManagedAgent].some((marker) => {
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
+    const row = marker as Record<string, unknown>;
+    const agentKey = row.agentKey ?? row.resourceKey;
+    const resourceKind = row.resourceKind;
+    return (
+      row.pluginKey === WIKI_LLM_WIKI_PLUGIN_KEY &&
+      agentKey === WIKI_MAINTAINER_AGENT_KEY &&
+      (resourceKind === undefined || resourceKind === "agent")
+    );
+  });
+}
+
+function bindingAgentId(data: unknown): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const record = data as Record<string, unknown>;
+  if (record.pluginKey !== undefined && record.pluginKey !== WIKI_LLM_WIKI_PLUGIN_KEY) return null;
+  if (record.resourceKey !== undefined && record.resourceKey !== WIKI_MAINTAINER_AGENT_KEY) return null;
+  return typeof record.agentId === "string" && record.agentId.length > 0 ? record.agentId : null;
+}
+
 export async function resolveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
@@ -157,19 +184,53 @@ export async function resolveCanonicalWikiMaintainerAgentId(
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
   if (!isWikiHandoffTitle(issue.title)) return null;
-  const rows = await db
-    .select({ resourceId: pluginManagedResources.resourceId })
-    .from(pluginManagedResources)
-    .where(
-      and(
+  const [resourceRows, liveAgents, bindings] = await Promise.all([
+    db
+      .select({
+        resourceKey: pluginManagedResources.resourceKey,
+        resourceId: pluginManagedResources.resourceId,
+      })
+      .from(pluginManagedResources)
+      .where(and(
         eq(pluginManagedResources.companyId, companyId),
         eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
         eq(pluginManagedResources.resourceKind, "agent"),
-        eq(pluginManagedResources.resourceKey, WIKI_MAINTAINER_AGENT_KEY),
-      ),
-    )
-    .then((found) => found);
-  return rows[0]?.resourceId ?? null;
+        inArray(pluginManagedResources.resourceKey, [
+          WIKI_MAINTAINER_AGENT_KEY,
+          WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY,
+        ]),
+      )),
+    db
+      .select({ id: agents.id, metadata: agents.metadata })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated"))),
+    db
+      .select({ data: pluginEntities.data, pluginId: pluginEntities.pluginId })
+      .from(pluginEntities)
+      .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
+      .where(and(
+        eq(pluginEntities.companyId, companyId),
+        eq(pluginEntities.entityType, "managed_agent"),
+        eq(pluginEntities.externalId, `managed:agent:${companyId}:${WIKI_MAINTAINER_AGENT_KEY}`),
+        eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+      )),
+  ]);
+  const liveIds = new Set(liveAgents.map((agent) => agent.id));
+  const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
+  const resourceId = resourceRows.find((row) => row.resourceKey === WIKI_MAINTAINER_AGENT_KEY)?.resourceId
+    ?? resourceRows[0]?.resourceId
+    ?? null;
+  const boundId = bindings.map((row) => bindingAgentId(row.data)).find((id) => id && liveIds.has(id)) ?? null;
+  if (marked.length === 1) return marked[0]!.id;
+  if (marked.length > 1) {
+    return marked.find((agent) => agent.id === resourceId)?.id
+      ?? marked.find((agent) => agent.id === boundId)?.id
+      ?? marked.map((agent) => agent.id).sort()[0]
+      ?? null;
+  }
+  // No metadata-marked agent: keep the resource row, including for route mocks
+  // whose agent select does not return that id.
+  return resourceId;
 }
 
 function isWorkflowControlledPendingReviewParticipant(input: {
@@ -290,6 +351,37 @@ export function isUnassignedWikiHandoffBoardStageDecision(input: {
   );
 }
 
+/**
+ * An interrupted Wiki handoff create is repaired by a field write that does not
+ * set an assignee and does not request a status. The stored assignees stay
+ * null. That write is not an assignee substitution: the dispatch assignment is
+ * a later write. A status write, including status-only todo, stays guarded.
+ */
+export function isUnassignedWikiHandoffNonDispatchFieldWrite(input: {
+  requestedStatus: unknown;
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.requestedStatus === undefined &&
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
+function wikiReviewKeepsCanonicalReturnAssignee(input: {
+  canonical: string;
+  executionState: unknown;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (state?.currentParticipant?.type !== "user") return false;
+  return state.returnAssignee?.type === "agent" && state.returnAssignee.agentId === input.canonical;
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -363,6 +455,15 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     })
   ) return;
   if (
+    input.cancellation &&
+    isUnassignedWikiHandoffNonDispatchFieldWrite({
+      requestedStatus: input.cancellation.requestedStatus,
+      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
+  if (
     violation.reason === "wiki_handoff_self_satisfy" &&
     input.workflowControlledAssignment !== true &&
     input.checkReviewStage !== false
@@ -409,6 +510,14 @@ export function wikiHandoffWriteWouldViolate(input: {
     ? input.incomingAssigneeAgentId
     : null;
   if (incoming !== canonical) {
+    if (
+      incoming === null &&
+      wikiReviewKeepsCanonicalReturnAssignee({
+        canonical,
+        executionState: input.executionState,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
     if (
       (incoming !== null || (
         input.actorAgentId === canonical &&

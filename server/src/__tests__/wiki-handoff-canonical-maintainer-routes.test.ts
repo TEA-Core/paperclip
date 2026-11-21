@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -103,6 +104,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentWakeupRequests);
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(pluginEntities);
@@ -179,6 +181,13 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       resourceKey: AGENT_KEY,
       resourceId: resourceId === "maintainer" ? maintainer!.id : stale!.id,
       defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId: company!.id,
+      principalType: "user",
+      principalId: REVIEWER_USER_ID,
+      status: "active",
+      membershipRole: "operator",
     });
     return { company: company!, maintainer: maintainer!, intruder: intruder!, stale: stale! };
   }
