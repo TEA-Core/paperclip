@@ -4365,6 +4365,31 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/publication-close-eligibility",
+  tags: ["issues"],
+  summary: "Read publication close eligibility for an issue",
+  description:
+    "Read-only. Requires issue:read on the issue, the same actor that can read the issue and its runs. " +
+    "Does not require company_scope:read and is not board-only. Each boolean is always present and is never null. " +
+    "deliveryIdentity is true when the parsed execution-state delivery block is present. " +
+    "deliveryReceipt is true when any delivery receipt exists for this company and issue, in any state. " +
+    "linkedPullRequest is true when a linked pull request exists, including drafts. " +
+    "true means the accept path would refuse the card for that binding. This route never writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      deliveryIdentity: z.boolean(),
+      deliveryReceipt: z.boolean(),
+      linkedPullRequest: z.boolean(),
+    }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
