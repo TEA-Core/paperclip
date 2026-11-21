@@ -246,6 +246,60 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect(stored?.status).toBe("backlog");
   });
 
+  it("does not adopt the maintainer on a status-carrying field write", async () => {
+    const { company } = await seedWikiCompany("maintainer");
+    const [project] = await db.insert(projects).values({ companyId: company.id, name: "Weekly reports" }).returning();
+    const stub = await seedUnassignedHandoff(company.id);
+
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`)
+      .send({
+        description: "Weekly report handoff pointer",
+        projectId: project!.id,
+        executionPolicy: userReviewPolicy(),
+        deliveryRequirement: "record_only",
+        status: "todo",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: "wiki_handoff_unassigned",
+    });
+    const stored = await readAssignee(stub.id);
+    expect(stored?.assigneeAgentId).toBeNull();
+    expect(stored?.status).toBe("backlog");
+  });
+
+  it("does not adopt when the resolver finds no live canonical maintainer", async () => {
+    const { company, maintainer } = await seedWikiCompany("unresolvable");
+    await db.update(agents).set({ metadata: {} }).where(eq(agents.id, maintainer.id));
+    await db.delete(pluginEntities);
+    const [project] = await db.insert(projects).values({ companyId: company.id, name: "Weekly reports" }).returning();
+    const stub = await seedUnassignedHandoff(company.id);
+
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`)
+      .send({
+        description: "Weekly report handoff pointer",
+        projectId: project!.id,
+        executionPolicy: userReviewPolicy(),
+        deliveryRequirement: "record_only",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: "wiki_handoff_unassigned",
+    });
+    const stored = await readAssignee(stub.id);
+    expect(stored?.assigneeAgentId).toBeNull();
+    expect(stored?.assigneeUserId).toBeNull();
+    expect(stored?.status).toBe("backlog");
+  });
+
   it("admits an assignee write of the metadata-marked Wiki Maintainer when the resource row is unresolvable", async () => {
     const { company, maintainer } = await seedWikiCompany("unresolvable");
     const stub = await seedUnassignedHandoff(company.id);
