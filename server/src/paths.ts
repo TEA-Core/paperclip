@@ -26,10 +26,13 @@ function findConfigFileFromAncestors(startDir: string): string | null {
 
 export function resolvePaperclipConfigPath(overridePath?: string): string {
   if (overridePath) return path.resolve(overridePath);
-  const plan = currentBootEnvPlan();
-  if (plan) return plan.configPath;
   if (process.env.PAPERCLIP_CONFIG) return path.resolve(process.env.PAPERCLIP_CONFIG);
-  return findConfigFileFromAncestors(process.cwd()) ?? resolveDefaultConfigPath();
+  const plan = currentBootEnvPlan();
+  const cwd = path.resolve(process.cwd());
+  if (plan && (cwd === path.resolve(plan.stateDir, "..") || cwd === path.resolve(plan.stateDir))) {
+    return plan.configPath;
+  }
+  return findConfigFileFromAncestors(cwd) ?? resolveDefaultConfigPath();
 }
 
 export function resolvePaperclipEnvPath(overrideConfigPath?: string): string {

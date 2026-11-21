@@ -306,7 +306,7 @@ export function stageEnvSource(source: { kind: EnvSourceKind; path: string }): {
     realPath = resolved;
   }
   const cached = current.staged.get(realPath) ?? current.staged.get(resolved);
-  if (cached) {
+  if (cached && cached.status !== "absent") {
     return { status: cached.status, refusal: cached.refusal, keys: Object.keys(cached.entries) };
   }
 
@@ -401,7 +401,7 @@ function snapshotHas(key: string): boolean {
 
 export function commitBootEnv(): { applied: string[]; shadowed: string[] } {
   const current = state();
-  if (current.refused || current.committed) return { applied: [], shadowed: [] };
+  if (current.refused) return { applied: [], shadowed: [] };
   const applied: string[] = [];
   const shadowed: string[] = [];
   const ordered = [...current.staged.values()].filter((staged) => staged.status === "staged");
@@ -412,7 +412,11 @@ export function commitBootEnv(): { applied: string[]; shadowed: string[] } {
         shadowed.push(key);
         continue;
       }
-      if (snapshotHas(key) || current.origins[key] === "operator" || current.origins[key] === "own" || current.origins[key] === "boot") {
+      if (snapshotHas(key) || current.origins[key] === "operator" || current.origins[key] === "boot") {
+        shadowed.push(key);
+        continue;
+      }
+      if (current.origins[key] === "own" && staged.kind === "cwd") {
         shadowed.push(key);
         continue;
       }
