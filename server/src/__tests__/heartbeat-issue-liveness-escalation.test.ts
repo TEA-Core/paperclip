@@ -113,7 +113,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     };
   }
 
-  function recoveryServiceWithMocks(deps: { enqueueWakeup?: (agentId: string) => Promise<{ id: string } | null> } = {}) {
+  function recoveryServiceWithMocks(deps: {
+    enqueueWakeup?: (agentId: string, wake: Record<string, unknown>) => Promise<{ id: string } | null>;
+  } = {}) {
     loadConfigMock.mockReturnValue(buildTestConfig());
     const enqueueWakeup = deps.enqueueWakeup ?? vi.fn(async () => ({ id: randomUUID() }));
     return recoveryService(db as never, { enqueueWakeup: enqueueWakeup as never });
@@ -1681,6 +1683,282 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     expect(wakes).toHaveLength(1);
     expect(wakes[0]?.status).toBe("completed");
+  });
+
+  it("admits a fresh backstop wake for a later blocked generation even when an earlier completed canonical wake sits inside the re-arm window", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    // Fixed clock: cutoff (now - windowMs) is 06:00. The dependent blocked at
+    // 09:00 (generation 1), its canonical state-key wake completed at 09:30,
+    // and the dependent re-blocked at 11:00 (generation 2) with the SAME
+    // blocker set. The completed row is INSIDE the re-arm window (09:30 >=
+    // 06:00) but predates the current generation (09:30 < 11:00), so it must
+    // not cover the generation-2 ready state: a fresh wake is admitted.
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const earlierBlockedTransitionAt = new Date("2026-11-12T09:00:00.000Z");
+    const earlierGenerationCompletedAt = new Date("2026-11-12T09:30:00.000Z");
+    const laterBlockedTransitionAt = new Date("2026-11-12T11:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: laterBlockedTransitionAt, updatedAt: laterBlockedTransitionAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+        blockedTransitionAt: earlierBlockedTransitionAt,
+      }),
+      createdAt: earlierBlockedTransitionAt,
+      requestedAt: earlierBlockedTransitionAt,
+      updatedAt: earlierGenerationCompletedAt,
+      finishedAt: earlierGenerationCompletedAt,
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.healed).toBe(1);
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+    // The enqueue consumer gets the re-arm-AGE cutoff (now - window); heartbeat
+    // derives the generation from the dependent's blockedTransitionAt itself.
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({ completedRearmCutoff: new Date(now.getTime() - windowMs) }),
+    );
+  });
+
+  it("does not let a wake requested in the previous generation and completed after the current one began suppress the backstop", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    // Generation 1's wake was requested at 10:00, generation 2 began at 11:00,
+    // and the generation-1 wake only completed at 11:30. Its updatedAt is
+    // after both cutoffs, but it was requested before the current generation.
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const generationTwoAt = new Date("2026-11-12T11:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: generationTwoAt, updatedAt: generationTwoAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+      createdAt: new Date("2026-11-12T10:00:00.000Z"),
+      requestedAt: new Date("2026-11-12T10:00:00.000Z"),
+      updatedAt: new Date("2026-11-12T11:30:00.000Z"),
+      finishedAt: new Date("2026-11-12T11:30:00.000Z"),
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+  });
+
+  it("re-arms a same-generation completed canonical wake once it ages past the re-arm window", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const blockedAt = new Date("2026-11-12T03:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: blockedAt, updatedAt: blockedAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+      createdAt: new Date("2026-11-12T04:00:00.000Z"),
+      requestedAt: new Date("2026-11-12T04:00:00.000Z"),
+      updatedAt: new Date("2026-11-12T05:00:00.000Z"),
+      finishedAt: new Date("2026-11-12T05:00:00.000Z"),
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+  });
+
+  it("keeps re-arming a dependent whose same-generation wakes complete without unblocking it until the cap escalates it", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const windowMs = 6 * 60 * 60 * 1000;
+    const maxCount = 4;
+    const sweepCount = 10;
+    const blockedAt = new Date("2026-11-12T00:00:00.000Z");
+    const stateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerIssueId],
+    });
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: blockedAt, updatedAt: blockedAt })
+      .where(eq(issues.id, blockedIssueId));
+    const recordCompletedWake = async (at: Date) => {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: blockerIssueId,
+          blockerIssueIds: [blockerIssueId],
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: at,
+        requestedAt: at,
+        updatedAt: at,
+        finishedAt: at,
+      });
+    };
+    // The current generation's first wake already completed and left the
+    // dependent blocked.
+    await recordCompletedWake(new Date(blockedAt.getTime() + 60_000));
+
+    // Every enqueued wake runs and completes at the sweep's clock without
+    // unblocking the dependent; the next sweep runs past the re-arm window.
+    let clock = new Date(blockedAt.getTime() + 60_000);
+    const enqueueWakeup = vi.fn(async () => {
+      await recordCompletedWake(clock);
+      return { id: randomUUID() };
+    });
+    const svc = recoveryServiceWithMocks({ enqueueWakeup });
+    const totals = { healed: 0, existingWakeSkipped: 0, reArmCapEscalated: 0, reArmCapSkipped: 0 };
+    for (let sweep = 0; sweep < sweepCount; sweep++) {
+      clock = new Date(clock.getTime() + windowMs + 60_000);
+      const result = await svc.reconcileResolvedDependencyWakeBackstop({
+        companyId,
+        now: clock,
+        rearmWindowMs: windowMs,
+        rearmMaxCount: maxCount,
+      });
+      totals.healed += result.healed;
+      totals.existingWakeSkipped += result.existingWakeSkipped;
+      totals.reArmCapEscalated += result.reArmCapEscalated;
+      totals.reArmCapSkipped += result.reArmCapSkipped;
+    }
+
+    // One seeded consumed wake plus three re-arms reach the cap of four; the
+    // fourth sweep escalates and the remaining six see the open escalation.
+    expect(totals).toEqual({
+      healed: maxCount - 1,
+      existingWakeSkipped: 0,
+      reArmCapEscalated: 1,
+      reArmCapSkipped: sweepCount - maxCount,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(maxCount - 1);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      kind: "blocked_without_blockers",
+      cause: "dependency_wake_rearm_cap_exhausted",
+      evidence: expect.objectContaining({ reArmCount: maxCount, reArmMax: maxCount }),
+    });
+  });
+
+  it("still suppresses a same-generation backstop repeat when a completed canonical wake covers the current blocked generation", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const currentBlockedTransitionAt = new Date("2026-11-12T11:00:00.000Z");
+    const sameGenerationCompletedAt = new Date("2026-11-12T11:00:01.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: currentBlockedTransitionAt, updatedAt: currentBlockedTransitionAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+        blockedTransitionAt: currentBlockedTransitionAt,
+      }),
+      createdAt: currentBlockedTransitionAt,
+      requestedAt: currentBlockedTransitionAt,
+      updatedAt: sameGenerationCompletedAt,
+      finishedAt: sameGenerationCompletedAt,
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.existingWakeSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each(["queued", "claimed", "deferred_issue_execution"] as const)(
