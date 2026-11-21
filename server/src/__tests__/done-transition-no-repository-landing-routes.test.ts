@@ -2251,6 +2251,173 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect((await close(fixture.identifier)).status).toBe(422);
     });
 
+    it.each(["run-reference", "soft-reference", "opaque-value", "comment-metadata"] as const)(
+      "refuses the schema-census admission: %s",
+      async (shape) => {
+        const fixture = await seedAdmissible();
+        const census = await import("../services/card-evidence-census.js");
+        try {
+          if (shape === "run-reference") {
+            const runId = await insertNativeRun(fixture, {});
+            await db.execute(sql`create table task_census_probe (
+              company_id uuid, heartbeat_run_id uuid references heartbeat_runs(id), payload jsonb
+            )`);
+            await db.execute(sql`insert into task_census_probe values (
+              ${fixture.companyId}, ${runId}, ${JSON.stringify({ evidence: "https://github.com/TEA-Core/records/pull/12" })}::jsonb
+            )`);
+          } else if (shape === "soft-reference") {
+            await db.execute(sql`create table task_census_probe (company_id uuid, scope_key text, payload jsonb)`);
+            await db.execute(sql`insert into task_census_probe values (
+              ${fixture.companyId}, ${fixture.issueId}, ${JSON.stringify({ evidence: "https://github.com/TEA-Core/records/pull/12" })}::jsonb
+            )`);
+          } else if (shape === "opaque-value") {
+            await db.execute(sql`create table task_census_probe (
+              company_id uuid, issue_id uuid references issues(id), payload bytea
+            )`);
+            await db.execute(sql`insert into task_census_probe values (
+              ${fixture.companyId}, ${fixture.issueId}, decode('deadbeef', 'hex')
+            )`);
+          } else {
+            await db.insert(issueComments).values({
+              companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId,
+              body: "Decision only.",
+              metadata: { version: 1, sections: [], authorizationReason: "https://github.com/TEA-Core/records/pull/12" },
+            });
+          }
+          census.resetEvidenceCatalogForTests();
+          const result = await close(fixture.identifier);
+          expect(result.status, `${shape}: ${JSON.stringify(result.body)}`).toBe(422);
+          expect(await statusOf(fixture.issueId)).toBe("in_progress");
+        } finally {
+          await db.execute(sql`drop table if exists task_census_probe`);
+          census.resetEvidenceCatalogForTests();
+        }
+      },
+    );
+
+    it.each([
+      "clean", "other-card", "other-company", "indexed-json", "nested-indexed-json", "actor", "old-actor",
+      "run-array", "propagated-run", "numeric-column", "identity-value", "other-card-on-run", "null-opaque",
+    ] as const)("applies catalog attribution and drift controls: %s", async (shape) => {
+      const fixture = await seedAdmissible();
+      const census = await import("../services/card-evidence-census.js");
+      const citation = "https://github.com/TEA-Core/records/pull/12";
+      try {
+        if (shape === "indexed-json" || shape === "nested-indexed-json") {
+          await db.execute(sql`create table task_census_probe (company_id uuid, payload jsonb, later_text text)`);
+          if (shape === "nested-indexed-json") {
+            await db.execute(sql`create index task_census_probe_json on task_census_probe (((payload -> 'nested') ->> 'cardToken'))`);
+          } else {
+            await db.execute(sql`create index task_census_probe_json on task_census_probe ((payload ->> 'cardToken'))`);
+          }
+          const payload = shape === "nested-indexed-json"
+            ? { nested: { cardToken: fixture.identifier } }
+            : { cardToken: fixture.issueId };
+          await db.execute(sql`insert into task_census_probe values (
+            ${fixture.companyId}, ${JSON.stringify(payload)}::jsonb, ${citation}
+          )`);
+        } else if (shape === "actor" || shape === "old-actor") {
+          await db.execute(sql`create table task_census_probe (
+            company_id uuid, holder uuid references agents(id), created_at timestamptz, payload jsonb
+          )`);
+          const when = shape === "old-actor" ? new Date("2000-01-01T00:00:00Z") : new Date();
+          await db.execute(sql`insert into task_census_probe values (
+            ${fixture.companyId}, ${fixture.closerAgentId}, ${when.toISOString()}::timestamptz,
+            ${JSON.stringify({ card: fixture.issueId, evidence: citation })}::jsonb
+          )`);
+        } else if (shape === "run-array") {
+          const runId = await insertNativeRun(fixture, {});
+          await db.execute(sql`create table task_census_probe (company_id uuid, source_run_ids uuid[], payload jsonb)`);
+          await db.execute(sql`insert into task_census_probe values (
+            ${fixture.companyId}, array[${runId}::uuid], ${JSON.stringify({ evidence: citation })}::jsonb
+          )`);
+        } else if (shape === "propagated-run") {
+          const runId = await insertNativeRun(fixture, { nativeIssueId: null, contextSnapshot: {} });
+          await db.execute(sql`create table task_census_links (
+            company_id uuid, issue_id uuid references issues(id), run_ref uuid references heartbeat_runs(id)
+          )`);
+          await db.execute(sql`create table task_census_probe (
+            company_id uuid, owner uuid references heartbeat_runs(id), payload jsonb
+          )`);
+          await db.execute(sql`insert into task_census_links values (${fixture.companyId}, ${fixture.issueId}, ${runId})`);
+          await db.execute(sql`insert into task_census_probe values (
+            ${fixture.companyId}, ${runId}, ${JSON.stringify({ evidence: citation })}::jsonb
+          )`);
+        } else if (shape === "numeric-column") {
+          await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, pull_request_number integer)`);
+          await db.execute(sql`insert into task_census_probe values (${fixture.companyId}, ${fixture.issueId}, 12)`);
+        } else if (shape === "identity-value") {
+          const projectId = await insertProject(fixture.companyId);
+          await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, note uuid)`);
+          await db.execute(sql`insert into task_census_probe values (${fixture.companyId}, ${fixture.issueId}, ${projectId})`);
+        } else if (shape === "other-card-on-run") {
+          const runId = await insertNativeRun(fixture, {});
+          const [peer] = await db.insert(issues).values({
+            companyId: fixture.companyId, title: "Another card", status: "in_progress",
+          }).returning({ id: issues.id });
+          await db.execute(sql`create table task_census_probe (
+            company_id uuid, issue_id uuid references issues(id),
+            run_ref uuid references heartbeat_runs(id), payload jsonb
+          )`);
+          await db.execute(sql`insert into task_census_probe values (
+            ${fixture.companyId}, ${peer!.id}, ${runId}, ${JSON.stringify({ evidence: citation })}::jsonb
+          )`);
+        } else if (shape === "null-opaque") {
+          await db.execute(sql`create table task_census_probe (
+            company_id uuid, issue_id uuid references issues(id), payload bytea
+          )`);
+          await db.execute(sql`insert into task_census_probe values (${fixture.companyId}, ${fixture.issueId}, null)`);
+        } else {
+          const other = shape === "other-card" || shape === "other-company" ? await seedAdmissible() : fixture;
+          await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, later_text text)`);
+          await db.execute(sql`insert into task_census_probe values (
+            ${shape === "other-company" ? other.companyId : fixture.companyId},
+            ${shape === "other-card" ? other.issueId : fixture.issueId},
+            ${shape === "clean" ? "Decision only." : citation}
+          )`);
+        }
+        census.resetEvidenceCatalogForTests();
+        currentActor = fixture.actor;
+        const result = await close(fixture.identifier);
+        const allowed = ["clean", "other-card", "other-company", "old-actor", "other-card-on-run", "null-opaque"].includes(shape);
+        expect(result.status, `${shape}: ${JSON.stringify(result.body)}`).toBe(allowed ? 200 : 422);
+        expect(await statusOf(fixture.issueId)).toBe(allowed ? "done" : "in_progress");
+      } finally {
+        await db.execute(sql`drop table if exists task_census_probe`);
+        await db.execute(sql`drop table if exists task_census_links`);
+        census.resetEvidenceCatalogForTests();
+      }
+    });
+
+    it("scans a newly added document column instead of exempting dedicated document reads", async () => {
+      const fixture = await seedAdmissible();
+      const census = await import("../services/card-evidence-census.js");
+      try {
+        await db.execute(sql`alter table documents add column census_extra text`);
+        await db.execute(sql`update documents set census_extra = 'https://github.com/TEA-Core/records/pull/12'
+          where id = ${fixture.rulingId}`);
+        census.resetEvidenceCatalogForTests();
+        const result = await close(fixture.identifier);
+        expect(result.status, JSON.stringify(result.body)).toBe(422);
+        expect(await statusOf(fixture.issueId)).toBe("in_progress");
+      } finally {
+        await db.execute(sql`alter table documents drop column census_extra`);
+        census.resetEvidenceCatalogForTests();
+      }
+    });
+
+    it("scans a soft-linked activity row even when its entity type is not issue", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId, actorType: "system", actorId: "evidence-test",
+        action: "test.evidence", entityType: "agent", entityId: fixture.issueId,
+        details: { evidence: "https://github.com/TEA-Core/records/pull/12" },
+      });
+      const result = await close(fixture.identifier);
+      expect(result.status, JSON.stringify(result.body)).toBe(422);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    });
+
     it("closes a comment that only uses the word gerrit", async () => {
       const fixture = await seedAdmissible();
       await db.insert(issueComments).values({
