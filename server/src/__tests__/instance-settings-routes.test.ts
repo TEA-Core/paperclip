@@ -19,6 +19,8 @@ const mockHeartbeatService = vi.hoisted(() => ({
   applyTaskDrain: vi.fn(),
   stopTaskDrain: vi.fn(),
   getTaskDrainStatus: vi.fn(),
+  applyLiveRunCapSettingChange: vi.fn(),
+  getLiveRunCapStatus: vi.fn(),
 }));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -682,6 +684,79 @@ describe("instance settings routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  describe("SUP-24563 live-run cap setting and status", () => {
+    const instanceAdmin = { type: "board", userId: "local-board", source: "local_implicit", isInstanceAdmin: true };
+    const boardMember = { type: "board", userId: "user-1", source: "session", isInstanceAdmin: false, companyIds: ["company-1"] };
+    const agentCaller = { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key" };
+
+    it.each([10, null])("lets an instance admin set the cap to %s and applies it at once", async (liveRunCap) => {
+      const res = await request(createApp(instanceAdmin))
+        .patch("/api/instance/settings/general")
+        .send({ liveRunCap });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ liveRunCap });
+      expect(mockHeartbeatService.applyLiveRunCapSettingChange).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not re-drive the queue for a write that leaves the cap alone", async () => {
+      await request(createApp(instanceAdmin))
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: true })
+        .expect(200);
+
+      expect(mockHeartbeatService.applyLiveRunCapSettingChange).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -1, 16, 1.5, "15"])("rejects cap %j instead of clamping it", async (liveRunCap) => {
+      const res = await request(createApp(instanceAdmin))
+        .patch("/api/instance/settings/general")
+        .send({ liveRunCap });
+
+      expect(res.status).toBe(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.applyLiveRunCapSettingChange).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a board member without instance admin", boardMember],
+      ["an agent", agentCaller],
+    ])("refuses the cap write to %s", async (_label, actor) => {
+      const res = await request(createApp(actor))
+        .patch("/api/instance/settings/general")
+        .send({ liveRunCap: 15 });
+
+      expect(res.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.applyLiveRunCapSettingChange).not.toHaveBeenCalled();
+    });
+
+    it("serves the instance-wide status to instance admins only: board members of one company and agents are refused", async () => {
+      const status = {
+        enabled: true,
+        setting: 15,
+        effectiveCap: 8,
+        generalCap: 6,
+        liveRuns: 7,
+        queuedRuns: 3,
+        waitingOnCap: 2,
+      };
+      mockHeartbeatService.getLiveRunCapStatus.mockResolvedValue(status);
+
+      const read = await request(createApp(instanceAdmin)).get("/api/instance/live-run-cap");
+      expect(read.status).toBe(200);
+      expect(read.body).toEqual(status);
+
+      // The counts span every company, so a board member of one company must
+      // not read them (the same rule as GET /instance/lifecycle).
+      for (const actor of [boardMember, agentCaller]) {
+        const refused = await request(createApp(actor)).get("/api/instance/live-run-cap");
+        expect(refused.status).toBe(403);
+      }
+      expect(mockHeartbeatService.getLiveRunCapStatus).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("executionMode floor on cloud-managed instances", () => {

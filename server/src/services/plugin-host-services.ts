@@ -76,6 +76,7 @@ import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
@@ -897,6 +898,39 @@ export function buildHostServices(
   };
 
   /**
+   * SUP-24563: the execution state (which review stage is pending, who is
+   * seated in it and who seated them) is written only by the execution-policy
+   * engine. A plugin issue create may not carry it, not even `null`: it could
+   * seat any agent in a review stage. (An issue update never writes it: only
+   * the declared `PLUGIN_ISSUE_UPDATE_PATCH_FIELDS` pass.)
+   */
+  const refusePluginExecutionStateWrite = (fields: Record<string, unknown>) => {
+    if (Object.prototype.hasOwnProperty.call(fields, "executionState")) {
+      throw unprocessable("executionState is written only by the execution policy; a plugin issue write cannot set it");
+    }
+  };
+
+  /**
+   * SUP-24563 N1: a monitor's `scheduledBy: "board"` stamp is reserved for
+   * monitors a board user scheduled through the HTTP routes (which restamp it
+   * from the authenticated actor). A plugin principal is never a board user,
+   * so a plugin issue create can never carry that stamp: any monitor it
+   * schedules is assignee-scheduled. This keeps a plugin-created monitor's
+   * recovery card out of the reserved live-run lane.
+   */
+  const restampPluginMonitorScheduledBy = (fields: Record<string, unknown>): Record<string, unknown> => {
+    let next = fields;
+    const policy = fields.executionPolicy;
+    if (isRecord(policy) && isRecord(policy.monitor) && policy.monitor.scheduledBy !== "assignee") {
+      next = { ...next, executionPolicy: { ...policy, monitor: { ...policy.monitor, scheduledBy: "assignee" } } };
+    }
+    if (next.monitorScheduledBy !== undefined && next.monitorScheduledBy !== "assignee") {
+      next = { ...next, monitorScheduledBy: "assignee" };
+    }
+    return next;
+  };
+
+  /**
    * Verify `userId` is an active human member of `companyId` before letting a
    * plugin attribute a mutation to them. Mirrors the authorization bar the
    * web app's own board routes apply — a plugin can only ever attribute an
@@ -1009,6 +1043,10 @@ export function buildHostServices(
         sourceRunId: interaction.sourceRunId ?? null,
         ...(planReviewInteraction ? { planReviewInteraction } : {}),
         mutation: "interaction",
+        // SUP-24563: a human action a plugin relays is attributed to that
+        // human, but the live-run cap keeps it out of the human/board slots.
+        pluginId,
+        pluginKey,
       },
       requestedByActorType: "user",
       requestedByActorId: args.actorUserId,
@@ -1944,6 +1982,7 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        refusePluginExecutionStateWrite(params as Record<string, unknown>);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -1951,7 +1990,7 @@ export function buildHostServices(
             : originKind,
         );
         const issue = (await issues.create(companyId, {
-          ...(issueInput as any),
+          ...(restampPluginMonitorScheduledBy(issueInput as Record<string, unknown>) as any),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -2473,6 +2512,9 @@ export function buildHostServices(
                 issueId: issue.id,
                 commentId: comment.id,
                 mutation: "comment",
+                // SUP-24563: relayed, so not a human/board wake for the live-run cap.
+                pluginId,
+                pluginKey,
               },
               requestedByActorType: "user",
               requestedByActorId: params.actorUserId,
@@ -2727,6 +2769,9 @@ export function buildHostServices(
             payload: {
               approvalId: approval.id,
               approvalStatus: approval.status,
+              // SUP-24563: relayed, so not a human/board wake for the live-run cap.
+              pluginId,
+              pluginKey,
             },
             requestedByActorType: "user",
             requestedByActorId: params.actorUserId,

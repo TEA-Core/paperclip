@@ -47,6 +47,13 @@ export interface InstanceGeneralSettings {
    * the detection-only path when unset.
    */
   enableBlockedWithoutBlockersAutoHeal: boolean;
+  /**
+   * SUP-24563. Global live-run cap: the most counted heartbeat runs that may be
+   * `running` instance-wide (1..`LIVE_RUN_CAP_CEILING`). `null` = off, and
+   * admission is unchanged. Admission only: lowering it never touches a
+   * running run; new work waits queued until the live count drops.
+   */
+  liveRunCap: number | null;
 }
 
 export interface InstanceExperimentalSettings {

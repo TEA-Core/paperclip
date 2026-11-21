@@ -503,11 +503,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).not.toContain("issue.monitor_triggered");
   });
 
-  it("clears timed-out monitors and creates a visible recovery issue when requested", async () => {
+  it("clears timed-out monitors and creates a visible recovery issue when a board user requested it", async () => {
     const { issueId, companyId } = await seedFixture({
       monitor: {
         timeoutAt: "2026-04-11T12:00:00.000Z",
         recoveryPolicy: "create_recovery_issue",
+        scheduledBy: "board",
       },
     });
     const heartbeat = heartbeatService(db);
@@ -536,6 +537,67 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       assigneeAdapterOverrides: null,
     });
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
+  });
+
+  // SUP-24563 round 4 (F1): a recovery-origin card takes a reserved live-run
+  // slot, so an agent's own writes must not mint one. An agent-scheduled
+  // monitor, or one an agent triggers, falls back to waking its owner on the
+  // source card instead.
+  it("does not mint a recovery issue for an agent-scheduled monitor and wakes the owner on the source card instead", async () => {
+    const { issueId, agentId } = await seedFixture({
+      monitor: {
+        timeoutAt: "2026-04-11T12:00:00.000Z",
+        recoveryPolicy: "create_recovery_issue",
+        scheduledBy: "assignee",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(await db.select().from(issues).where(eq(issues.originId, issueId))).toEqual([]);
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_recovery");
+    expect(wakeup?.payload).toMatchObject({ issueId, clearReason: "timeout_exceeded" });
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_recovery_wake_queued");
+    expect(activity.find((row) => row.action === "issue.monitor_recovery_wake_queued")?.details).toMatchObject({
+      recoveryIssueRefused: "agent_scheduled_monitor",
+    });
+  });
+
+  it("does not mint a recovery issue when an agent triggers a board-scheduled monitor's check", async () => {
+    const { issueId, agentId } = await seedFixture({
+      monitor: {
+        timeoutAt: "2026-04-11T12:00:00.000Z",
+        recoveryPolicy: "create_recovery_issue",
+        scheduledBy: "board",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+    });
+
+    expect(await db.select().from(issues).where(eq(issues.originId, issueId))).toEqual([]);
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.find((row) => row.action === "issue.monitor_recovery_wake_queued")?.details).toMatchObject({
+      recoveryIssueRefused: "agent_triggered_check",
+    });
   });
 
   it("omits external monitor refs from wake payloads and activity details", async () => {
