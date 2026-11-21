@@ -5047,7 +5047,12 @@ async function listIssueBlockerAttentionMap(
 
   for (const [id, carrierPark] of carrierParks) {
     const attention = attentionMap.get(id);
-    if (attention) attention.carrierPark = carrierPark;
+    if (!attention) continue;
+    attention.carrierPark = carrierPark;
+    if (carrierPark.state === "stale" && attention.state === "covered") {
+      attention.state = "needs_attention";
+      attention.reason = "attention_required";
+    }
   }
   return attentionMap;
 }

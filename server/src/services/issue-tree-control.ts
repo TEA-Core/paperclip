@@ -591,7 +591,13 @@ export function issueTreeControlService(db: Db) {
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
     if (activePauseHolds.length === 0) return null;
 
-    const holdByRootIssueId = new Map(activePauseHolds.map((hold) => [hold.rootIssueId, hold]));
+    const holdByRootIssueId = new Map<string, typeof activePauseHolds[number]>();
+    for (const hold of activePauseHolds) {
+      const existing = holdByRootIssueId.get(hold.rootIssueId);
+      if (!existing?.recoveryCarrierPark || hold.recoveryCarrierPark) {
+        holdByRootIssueId.set(hold.rootIssueId, hold);
+      }
+    }
     let currentIssueId: string | null = issueId;
     const visited = new Set<string>();
 

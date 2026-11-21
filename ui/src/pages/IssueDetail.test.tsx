@@ -4606,7 +4606,6 @@ describe("IssueDetail", () => {
     mockIssuesApi.get.mockResolvedValue(createIssue({
       status: "blocked", assigneeAgentId: null, assigneeUserId: "user-1",
       originKind: "stranded_issue_recovery", originId: binding.sourceIssueId,
-      statusVersion: binding.expectedStatusVersion,
       blockerAttention: {
         state: "none", reason: null, unresolvedBlockerCount: 0, explicitBlockerCount: 1, childBlockerCount: 0,
         computed: true, coveredBlockerCount: 0, stalledBlockerCount: 0, attentionBlockerCount: 0,

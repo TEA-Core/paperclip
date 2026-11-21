@@ -4304,11 +4304,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       scope,
       runId,
       wakeAgents = false,
+      carrierParkRelease = false,
     }: {
       mode: IssueTreeControlMode;
       scope: "leaf" | "subtree";
       runId?: string;
       wakeAgents?: boolean;
+      carrierParkRelease?: boolean;
       feedback?: "composer";
     }) => {
       if (mode === "resume") {
@@ -4319,7 +4321,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           );
         }
         const binding = treeControlState?.activePauseHold?.recoveryCarrierPark;
-        if (binding) {
+        if (binding && carrierParkRelease) {
           const released: ReleaseIssueTreeHoldResponse = await issuesApi.releaseRecoveryCarrierPark(issueId!, pauseHoldId, {
             recoveryActionId: binding.recoveryActionId,
             reason: "Board explicitly released the carrier park. Source repair is not authorized by this release.",
@@ -8088,7 +8090,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     error: activePauseHold.recoveryCarrierPark ? executeTreeControl.error?.message : null,
                     onResume: activePauseHold.isRoot && canManageTreeControl ? () => {
                       if (activePauseHold.recoveryCarrierPark) {
-                        executeTreeControl.mutate({ mode: "resume", scope: "leaf", wakeAgents: false });
+                        executeTreeControl.mutate({ mode: "resume", scope: "leaf", wakeAgents: false, carrierParkRelease: true });
                         return;
                       }
                       executeTreeControl.reset();

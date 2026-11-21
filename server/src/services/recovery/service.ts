@@ -3184,6 +3184,7 @@ export function recoveryService(
           .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
           .for("update").limit(1);
         if (!current) return null;
+        if (await hasBoardParkedRecoveryAction(txDb, current.companyId, current.id)) return null;
         if (current.assigneeAgentId || current.assigneeUserId) return null;
         if (
           current.executionWorkspaceId

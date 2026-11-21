@@ -47,5 +47,7 @@ export const TouchDecisionControl: Story = {
     const decision = canvas.getByRole("combobox", { name: "Historical board decision" });
     // Keep editable controls at the touch-safe base size to avoid focus zoom.
     await expect(Number.parseFloat(getComputedStyle(decision).fontSize)).toBeGreaterThanOrEqual(16);
+    const accept = canvas.getByRole("button", { name: "Accept unresolved recovery and park" });
+    await expect(accept.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
   },
 };

@@ -672,6 +672,11 @@ PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
 rejection never create acceptance. A stale binding surfaces attention and keeps
 the manual execution hold; it cannot grant a fresh run.
 
+A typed park intentionally excludes comment delivery. Existing manual-pause
+admission rejects ordinary issue-comment writes, and the composer stays disabled.
+Internal wake attempts do not create a deferred delivery queue. Board release
+does not replay those attempts or start work.
+
 Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/release`
 retires the acceptance and releases this hold. It checks the bound action ID,
 audits atomically and repeats idempotently. It changes no source/action row,

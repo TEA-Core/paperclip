@@ -26,7 +26,7 @@ export function RecoveryCarrierParkForm({ candidate, onPark, pending = false, er
           <p className="text-sm text-muted-foreground">Keep the source recovery escalated and intentionally unresolved. Automatic recovery stops until the board explicitly releases this park. This does not approve delivery or repair.</p>
           <p className="text-xs font-mono text-muted-foreground">Source: {candidate.sourceIssueId} · Recovery action: {candidate.recoveryActionId}</p>
           <Label htmlFor={`${id}-decision`}>Historical board decision</Label>
-          <select id={`${id}-decision`} className="rounded-md border border-input bg-background p-2 text-sm" value={decisionId} onChange={event => setDecisionId(event.target.value)} disabled={pending}>
+          <select id={`${id}-decision`} className="rounded-md border border-input bg-background p-2 text-base" value={decisionId} onChange={event => setDecisionId(event.target.value)} disabled={pending}>
             <option value="">Choose the rejected confirmation</option>
             {candidate.decisions.map(row => <option key={row.id} value={row.id}>{row.summary || row.id}</option>)}
           </select>
@@ -35,7 +35,7 @@ export function RecoveryCarrierParkForm({ candidate, onPark, pending = false, er
           {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
           <div className="flex items-center justify-between gap-3">
             <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={pending}>Cancel</Button>
-            <Button type="submit" disabled={pending || !parsed.success}>{pending ? "Parking…" : "Accept unresolved recovery and park"}</Button>
+            <Button type="submit" className="h-auto min-h-9 min-w-0 flex-1 whitespace-normal" disabled={pending || !parsed.success}>{pending ? "Parking…" : "Accept unresolved recovery and park"}</Button>
           </div>
         </form>
       ) : null}

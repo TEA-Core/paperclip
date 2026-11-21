@@ -184,7 +184,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await db.update(agents).set({ capabilities: "Implements repository changes" }).where(eq(agents.id, f.agentId));
     await db.update(issues).set({ createdByAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
     const dependentId = randomUUID();
-    await db.insert(issues).values({ id: dependentId, companyId: f.companyId, title: "Other dependent work", status: "todo" });
+    await db.insert(issues).values({ id: dependentId, companyId: f.companyId, title: "Other dependent work", status: "blocked", assigneeUserId: "park-operator" });
     await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.sourceId, relatedIssueId: dependentId, type: "blocks" });
     const before = await snapshot(f);
     const assertNoProtectedWrites = await protectSourceRows(f);
