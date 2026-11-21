@@ -15,6 +15,7 @@ import {
   createDb,
   documentRevisions,
   documents,
+  environmentLeases,
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
@@ -23,8 +24,11 @@ import {
   issueDocuments,
   issues,
   issueWorkProducts,
+  instanceUserRoles,
   projectWorkspaces,
   projects,
+  toolRuntimeSlots,
+  workspaceOperations,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -38,11 +42,13 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
+  NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY,
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
 import type { recheckRecordedWorktree } from "../services/hardened-git-probe.js";
 import type { StorageService } from "../storage/types.js";
+import { issueService } from "../services/issues.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
 // PATCH /api/issues/{id}, against a real Postgres and a real git checkout laid
@@ -1964,5 +1970,326 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
 
     expect(verdict).toMatchObject({ allowed: false, code: "done_transition_missing_tier_declaration" });
+  });
+
+  // SUP-24547: a record_only card with no project and no execution workspace
+  // keeps the refusal of an agent's no-repository close; only its remedy says
+  // that a board user closes the card. Every shape the earlier review rounds
+  // built keeps that refusal, whatever the card's history holds.
+  describe("a record_only card with no project and no execution workspace (SUP-24547)", () => {
+    const NO_WORKSPACE_REFUSAL = `Tier 1 "no-repository-landing" requires this issue's own execution workspace.`;
+    const PINNED_REMEDY =
+      "This record_only card has no project and no execution workspace, so an agent's close cannot carry a no-repository proof: " +
+      "there is no worktree to measure. An authorized board user closes this card: PATCH /api/issues/{id} " +
+      '{ "status": "done" } as a board user, with a comment that records the ruling.';
+    const BOARD_USER_ID = "cloud-user-1";
+
+    interface Card {
+      companyId: string;
+      closerAgentId: string;
+      rulerAgentId: string;
+      issueId: string;
+      identifier: string;
+      actor: Express.Request["actor"];
+    }
+
+    async function insertProject(companyId: string) {
+      const projectId = randomUUID();
+      await db.insert(projects).values({ id: projectId, companyId, name: "Elsewhere", status: "active" });
+      return projectId;
+    }
+
+    async function insertWorkspace(companyId: string, sourceIssueId: string | null = null, status = "active") {
+      const projectId = await insertProject(companyId);
+      const workspaceId = randomUUID();
+      await db.insert(executionWorkspaces).values({
+        id: workspaceId,
+        companyId,
+        projectId,
+        sourceIssueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        providerType: "git_worktree",
+        name: "prior-workspace",
+        status,
+      });
+      return { projectId, workspaceId };
+    }
+
+    /** A record_only card with no project and no workspace, held by the closer in a running run, with a ruling another agent wrote. */
+    async function seedCard(deliveryRequirement: "record_only" | "repository_delivery" = "record_only"): Promise<Card> {
+      seedSequence += 1;
+      const prefix = `NWS${seedSequence}`;
+      const companyId = await insertCompany(prefix);
+      const closerAgentId = await insertAgent(companyId, "Closer");
+      const rulerAgentId = await insertAgent(companyId, "Ruler");
+      const issueId = randomUUID();
+      const identifier = `${prefix}-1`;
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        identifier,
+        title: "Record the ruling",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: closerAgentId,
+        createdByUserId: BOARD_USER_ID,
+        deliveryRequirement,
+      });
+      await insertRuling({ companyId, issueId, authorAgentId: rulerAgentId });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: closerAgentId, status: "running", contextSnapshot: { issueId } });
+      currentActor = { type: "agent", agentId: closerAgentId, companyId, source: "agent_key", runId };
+      return { companyId, closerAgentId, rulerAgentId, issueId, identifier, actor: currentActor };
+    }
+
+    async function expectAgentCloseRefused(card: Card) {
+      currentActor = card.actor;
+      const verifiedBefore = await activityCount(card.issueId, "issue.done_transition_no_repository_landing_verified");
+      const res = await close(card.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.error).toBe(NO_WORKSPACE_REFUSAL);
+      expect(await statusOf(card.issueId)).toBe("in_progress");
+      expect(await activityCount(card.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(verifiedBefore);
+      return res;
+    }
+
+    it("refuses the holder's close as before and names the board close in the remedy", async () => {
+      const card = await seedCard();
+
+      const res = await expectAgentCloseRefused(card);
+
+      expect(NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY).toBe(PINNED_REMEDY);
+      expect(res.body.details.remedy).toBe(PINNED_REMEDY);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      const remedyComments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, card.issueId))
+        .then((rows) => rows.filter((row) => row.body.includes(PINNED_REMEDY)));
+      expect(remedyComments).toHaveLength(1);
+    });
+
+    it("keeps the existing remedy, byte for byte, on a card with a project or a project workspace", async () => {
+      const reference = await seed();
+      const referenceRes = await close(reference.identifier);
+      expect(referenceRes.status, JSON.stringify(referenceRes.body)).toBe(422);
+      const existingRemedy = referenceRes.body.details.remedy as string;
+      expect(existingRemedy).not.toBe(PINNED_REMEDY);
+
+      const withProject = await seedCard();
+      await db.update(issues).set({ projectId: await insertProject(withProject.companyId) }).where(eq(issues.id, withProject.issueId));
+      expect((await expectAgentCloseRefused(withProject)).body.details.remedy).toBe(existingRemedy);
+
+      const withProjectWorkspace = await seedCard();
+      const projectId = await insertProject(withProjectWorkspace.companyId);
+      const projectWorkspaceId = randomUUID();
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId: withProjectWorkspace.companyId,
+        projectId,
+        name: "Primary",
+        isPrimary: true,
+      });
+      await db.update(issues).set({ projectWorkspaceId }).where(eq(issues.id, withProjectWorkspace.issueId));
+      expect((await expectAgentCloseRefused(withProjectWorkspace)).body.details.remedy).toBe(existingRemedy);
+    });
+
+    it("keeps the repository_delivery refusal and its reclassify remedy", async () => {
+      const card = await seedCard("repository_delivery");
+      currentActor = card.actor;
+
+      const res = await close(card.identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(`Tier 1 "no-repository-landing" is accepted only on a record_only issue.`);
+      expect(res.body.details.remedy).toContain("authorized board user to reclassify it");
+    });
+
+    it("still lets a board user close the card", async () => {
+      const card = await seedCard();
+      currentActor = { type: "board", userId: BOARD_USER_ID, source: "local_implicit" } as Express.Request["actor"];
+
+      const res = await request(app)
+        .patch(`/api/issues/${card.identifier}`)
+        .send({ status: "done", comment: "Board ruling recorded; closing." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(card.issueId)).toBe("done");
+    });
+
+    async function insertRun(card: Card, values: Partial<typeof heartbeatRuns.$inferInsert>) {
+      await db.insert(heartbeatRuns).values({ companyId: card.companyId, agentId: card.closerAgentId, status: "succeeded", ...values });
+    }
+
+    async function insertMention(card: Card, providerKey: string, objectType: string, externalId: string) {
+      const [object] = await db
+        .insert(externalObjects)
+        .values({ companyId: card.companyId, providerKey, objectType, externalId, data: { state: "merged" } })
+        .returning({ id: externalObjects.id });
+      await db.insert(externalObjectMentions).values({
+        companyId: card.companyId,
+        sourceIssueId: card.issueId,
+        sourceKind: "comment",
+        objectId: object!.id,
+        providerKey,
+        objectType,
+      });
+    }
+
+    async function insertComment(card: Card, body: string) {
+      const [comment] = await db
+        .insert(issueComments)
+        .values({ companyId: card.companyId, issueId: card.issueId, authorAgentId: card.closerAgentId, body })
+        .returning({ id: issueComments.id });
+      return comment!.id;
+    }
+
+    async function insertActivity(card: Card, action: string, details: Record<string, unknown>) {
+      await db.insert(activityLog).values({
+        companyId: card.companyId,
+        actorType: "agent",
+        actorId: card.closerAgentId,
+        action,
+        entityType: "issue",
+        entityId: card.issueId,
+        details,
+      });
+    }
+
+    const asBoard = () => {
+      currentActor = { type: "board", userId: BOARD_USER_ID, source: "local_implicit" } as Express.Request["actor"];
+    };
+
+    // Every shape the review rounds built against this card shape. Each one
+    // closed at some intermediate head; at the base and now, all refuse.
+    it.each([
+      ["round 1: the holder strips its project in one request and closes in the next", async (card: Card) => {
+        await db.update(issues).set({ projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        currentActor = card.actor;
+        const strip = await request(app).patch(`/api/issues/${card.identifier}`).send({ projectId: null });
+        expect(strip.status, JSON.stringify(strip.body)).toBe(200);
+      }],
+      ["round 1: a board reclassification from repository_delivery, then a strip", async (card: Card) => {
+        await db.update(issues).set({ deliveryRequirement: "repository_delivery", projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        asBoard();
+        const flip = await request(app).patch(`/api/issues/${card.identifier}`).send({ deliveryRequirement: "record_only" });
+        expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+        currentActor = card.actor;
+        const strip = await request(app).patch(`/api/issues/${card.identifier}`).send({ projectId: null });
+        expect(strip.status, JSON.stringify(strip.body)).toBe(200);
+      }],
+      ["round 1: an owned workspace that was archived", async (card: Card) => {
+        await insertWorkspace(card.companyId, card.issueId, "archived");
+      }],
+      ["round 1: an environment lease naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(environmentLeases).values({ companyId: card.companyId, executionWorkspaceId: workspaceId, issueId: card.issueId, status: "released" });
+      }],
+      ["round 1: a workspace operation naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(workspaceOperations).values({ companyId: card.companyId, executionWorkspaceId: workspaceId, issueId: card.issueId, phase: "worktree_prepare", status: "succeeded" });
+      }],
+      ["round 1: an audit row whose executionWorkspaceId is null but names a workspace elsewhere", async (card: Card) => {
+        await insertActivity(card, "issue.updated", { executionWorkspaceId: null, workspaceChange: { to: { projectWorkspaceId: randomUUID() } } });
+      }],
+      ["round 1: a run with a nested executionWorkspaceId", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { issueId: card.issueId, paperclipWorkspace: { executionWorkspaceId: randomUUID() } } });
+      }],
+      ["round 1: a comment with a pull request URL and no mention", async (card: Card) => {
+        await insertComment(card, "Landed in https://github.com/TEA-Core/records/pull/12.");
+      }],
+      ["round 1: a pull request mention with a non-canonical external id", async (card: Card) => {
+        await insertMention(card, "github", "pull_request", "records-pr-twelve");
+      }],
+      ["round 1: a GitLab merge request mention", async (card: Card) => {
+        await insertMention(card, "gitlab", "merge_request", "team/records!4");
+      }],
+      ["round 1: a branch work product", async (card: Card) => {
+        await db.insert(issueWorkProducts).values({ companyId: card.companyId, issueId: card.issueId, type: "branch", provider: "github", title: "records-ruling", status: "active" });
+      }],
+      ["round 1: a ruling by a second agent of the company (the seeded ruler)", async (card: Card) => {
+        const rulings = await db.select({ id: issueDocuments.id }).from(issueDocuments).where(eq(issueDocuments.issueId, card.issueId));
+        expect(rulings).toHaveLength(1);
+      }],
+      ["round 2: a comment citing a pull request, then deleted", async (card: Card) => {
+        const commentId = await insertComment(card, "Landed in https://github.com/TEA-Core/records/pull/12.");
+        currentActor = card.actor;
+        const removed = await request(app).delete(`/api/issues/${card.identifier}/comments/${commentId}`);
+        expect(removed.status, JSON.stringify(removed.body)).toBeLessThan(500);
+      }],
+      ["round 2: a title citing a pull request, then restored", async (card: Card) => {
+        currentActor = card.actor;
+        expect((await request(app).patch(`/api/issues/${card.identifier}`).send({ title: "Follow-up of PR #77" })).status).toBe(200);
+        expect((await request(app).patch(`/api/issues/${card.identifier}`).send({ title: "Record the ruling" })).status).toBe(200);
+      }],
+      ["round 2: a tool runtime slot naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(toolRuntimeSlots).values({ companyId: card.companyId, issueId: card.issueId, executionWorkspaceId: workspaceId, slotKey: `slot-${card.issueId}` });
+      }],
+      ["round 2: SSH and Azure DevOps references in a comment", async (card: Card) => {
+        await insertComment(card, "Mirror git@github.com:TEA-Core/records.git; reviewed in https://dev.azure.com/tea/records/_git/records/pullrequest/12.");
+      }],
+      ["round 2: a run naming the card only by nativeIssueId in its context", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { nativeIssueId: card.issueId, executionWorkspaceId: randomUUID() } });
+      }],
+      ["round 2: a ruling by an instance admin who is not a member", async (card: Card) => {
+        const adminUserId = `admin-${card.companyId}`;
+        await db.insert(instanceUserRoles).values({ userId: adminUserId, role: "instance_admin" });
+        const [link] = await db.select({ documentId: issueDocuments.documentId }).from(issueDocuments).where(eq(issueDocuments.issueId, card.issueId));
+        await db
+          .update(documents)
+          .set({ createdByAgentId: null, updatedByAgentId: null, createdByUserId: adminUserId, updatedByUserId: adminUserId })
+          .where(eq(documents.id, link!.documentId));
+        await db
+          .update(documentRevisions)
+          .set({ createdByAgentId: null, createdByUserId: adminUserId })
+          .where(eq(documentRevisions.documentId, link!.documentId));
+      }],
+      ["round 3 B1: a run linked only by the native_issue_id column", async (card: Card) => {
+        await insertRun(card, { nativeIssueId: card.issueId, contextSnapshot: { executionWorkspaceId: randomUUID() } });
+      }],
+      ["round 3 B2: workspace and pull request evidence in a run's result and output", async (card: Card) => {
+        await insertRun(card, {
+          contextSnapshot: { issueId: card.issueId },
+          resultJson: { executionWorkspaceId: randomUUID() },
+          stdoutExcerpt: "opened https://github.com/TEA-Core/records/pull/12",
+        });
+      }],
+      ["round 3 B3: workspace keys spelled outside any pattern", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { issueId: card.issueId, "execution-workspace-id": randomUUID(), workspace: "records", pullRequestNumber: 12, payload: JSON.stringify({ executionWorkspaceId: randomUUID() }) } });
+      }],
+      ["round 3 B4: a comment citing only a commit SHA", async (card: Card) => {
+        await insertComment(card, "Done in 3f9c1e0a25b84d7c9e1f2a3b4c5d6e7f8a9b0c1d.");
+      }],
+      ["round 3 P-01: a description citing a pull request, cleaned through the issue service as the plugin host does", async (card: Card) => {
+        await db.update(issues).set({ description: "See https://github.com/TEA-Core/records/pull/12" }).where(eq(issues.id, card.issueId));
+        await issueService(db).update(card.issueId, { description: "Decide the retention policy." });
+        await insertActivity(card, "issue.updated", { patch: { description: "Decide the retention policy." } });
+      }],
+      ["round 3 P-02: a project stripped through the issue service as the plugin host does", async (card: Card) => {
+        await db.update(issues).set({ projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        await issueService(db).update(card.issueId, { projectId: null });
+        await insertActivity(card, "issue.updated", { patch: { projectId: null } });
+      }],
+      ["round 3: a reopened card that was closed before", async (card: Card) => {
+        await insertActivity(card, "issue.done_transition_no_repository_landing_verified", { proof: "never_had_execution_workspace" });
+        await insertActivity(card, "issue.checked_out", {});
+      }],
+    ] as const)("refuses the holder's close after %s", async (_label, shape) => {
+      const card = await seedCard();
+      await shape(card);
+      const stored = await db
+        .select({ projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId, executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(eq(issues.id, card.issueId))
+        .then((rows) => rows[0]!);
+      expect(stored).toEqual({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
+
+      const res = await expectAgentCloseRefused(card);
+
+      expect(res.body.details.remedy).toBe(PINNED_REMEDY);
+    });
   });
 });

@@ -2441,6 +2441,13 @@ const REPOSITORY_DELIVERY_RECLASSIFY_REMEDY =
   "If the card genuinely has no repository deliverable, ask an authorized board user to reclassify it with " +
   'PATCH /api/issues/{id} { "deliveryRequirement": "record_only" } (an agent cannot reclassify a card it is assigned), ' +
   "then close it with the no-repository-landing form; otherwise land the card's pull request and close it with a delivery declaration.";
+// SUP-24547: the remedy on a record_only card with no project and no execution
+// workspace. Such a card has no worktree, so an agent's no-repository close has
+// nothing to measure and stays refused; the close belongs to a board user.
+export const NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY =
+  "This record_only card has no project and no execution workspace, so an agent's close cannot carry a no-repository proof: " +
+  "there is no worktree to measure. An authorized board user closes this card: PATCH /api/issues/{id} " +
+  '{ "status": "done" } as a board user, with a comment that records the ruling.';
 const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
 const GITHUB_BASE_COMPARE_TIMEOUT_MS = 15_000;
 const ENTRY_RULING_DOCUMENT_KEY = "entry-ruling";
@@ -2456,6 +2463,7 @@ export interface NoRepositoryLandingSubject {
   companyId: string;
   identifier: string | null;
   status?: string | null;
+  projectId?: string | null;
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
@@ -2588,7 +2596,11 @@ async function readNoRepositoryLandingRecord(
     return noRepositoryRefusal("requires an issue identifier to tie the worktree's branch to this issue.");
   }
   if (!issue.executionWorkspaceId) {
-    return noRepositoryRefusal("requires this issue's own execution workspace.");
+    const noProject = (issue.projectId ?? null) === null && (issue.projectWorkspaceId ?? null) === null;
+    return noRepositoryRefusal(
+      "requires this issue's own execution workspace.",
+      noProject ? NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY : undefined,
+    );
   }
 
   const workspace = await db
