@@ -22,6 +22,7 @@ import { readBuildCommit } from "../build-commit.js";
 import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
+  branchNamesIssue,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
   probeZeroDeltaWorktree,
@@ -412,6 +413,7 @@ async function githubBranchExists(
   repo: string,
   branch: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<BranchProbeOutcome> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
@@ -424,7 +426,7 @@ async function githubBranchExists(
     authorization: `Bearer ${token}`,
   };
   try {
-    const response = await ghFetch(url, { headers });
+    const response = await ghFetch(url, { headers, signal });
     if (response.status === 401 || response.status === 403) {
       return { outcome: "auth_failed", status: response.status };
     }
@@ -461,6 +463,7 @@ async function resolveGitHubRefHeadSha(
   repo: string,
   ref: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`;
@@ -470,7 +473,7 @@ async function resolveGitHubRefHeadSha(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
-  const response = await ghFetch(url, { headers });
+  const response = await ghFetch(url, { headers, signal });
   if (response.status === 404 || (await isNoCommitFoundResponse(response))) return null;
   if (response.status === 401 || response.status === 403) {
     throw new GitHubAuthError(response.status, `GitHub commits API returned ${response.status}`);
@@ -486,7 +489,7 @@ async function resolveGitHubRefHeadSha(
   return sha.toLowerCase();
 }
 
-/** Branch tips on the forge. A second page refuses: an unlisted tip could hide work. */
+/** Every forge branch tip. A full page is followed; a page of 100 is not a refusal. */
 async function listGitHubBranchTips(
   hostname: string,
   owner: string,
@@ -495,30 +498,36 @@ async function listGitHubBranchTips(
   signal?: AbortSignal,
 ): Promise<Array<{ name: string; sha: string }>> {
   const apiBase = gitHubApiBase(hostname);
-  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-done-transition-guard",
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
-  const response = await ghFetch(url, { headers, signal });
-  if (!response.ok) throw new Error(`GitHub branches API returned ${response.status}`);
-  if (response.headers.get("link")?.includes('rel="next"')) {
-    throw new Error("GitHub branches API returned more than one page");
-  }
-  const body = await response.json().catch(() => null);
-  if (!Array.isArray(body)) throw new Error("GitHub branches API returned no branch list");
-  return body.flatMap((entry) => {
-    const row = entry as Record<string, unknown>;
-    const commit = row.commit as Record<string, unknown> | undefined;
-    const name = row.name;
-    const sha = commit?.sha;
-    if (typeof name !== "string" || typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
-      throw new Error("GitHub branches API returned a branch without a commit sha");
+  const tips: Array<{ name: string; sha: string }> = [];
+  for (let page = 1; page <= 20; page += 1) {
+    const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100&page=${page}`;
+    const response = await ghFetch(url, { headers, signal });
+    if (!response.ok) throw new Error(`GitHub branches API returned ${response.status}`);
+    const body = await response.json().catch(() => null);
+    if (!Array.isArray(body)) throw new Error("GitHub branches API returned no branch list");
+    for (const entry of body) {
+      const row = entry as Record<string, unknown>;
+      const commit = row.commit as Record<string, unknown> | undefined;
+      const name = row.name;
+      const sha = commit?.sha;
+      if (typeof name !== "string" || typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
+        throw new Error("GitHub branches API returned a branch without a commit sha");
+      }
+      tips.push({ name, sha: sha.toLowerCase() });
     }
-    return [{ name, sha: sha.toLowerCase() }];
-  });
+    if (body.length < 100) return tips;
+  }
+  throw new Error("GitHub branches API returned more branches than the close can read");
+}
+
+function remoteBranchDigest(tips: readonly { name: string; sha: string }[]): string {
+  return [...tips].map((tip) => `${tip.name} ${tip.sha}`).sort().join("\n");
 }
 
 // SUP-22880: the local-worktree probes below read an agent-writable workspace.
@@ -2365,7 +2374,9 @@ const ZERO_DELTA_CLOSE_CONDITIONS =
   "zero commits ahead of the base ref, a HEAD that is an ancestor of the base ref (in the worktree and on the " +
   "remote), a local base ref whose commit is the remote base commit, no tracked changes, no untracked files, no " +
   "ignored entries outside the regenerated-artefact directories and no stash; that every local ref is an ancestor " +
-  "of that remote base commit; that no remote branch carries commits the base lacks; that no other worktree on a " +
+  "of that remote base commit, including a packed ref hidden by a loose file and a reflog tip (an unrelated " +
+  "remote-tracking ref is not this card's parked work); that no remote branch naming this card is ahead of the " +
+  "base, and that the remote branch list is unchanged at the close write; that no other worktree on a " +
   "branch naming this card (or with a detached HEAD) holds uncommitted work; and the declaration's probe head names " +
   "that HEAD.";
 
@@ -2394,6 +2405,8 @@ export interface ZeroDeltaCloseMeasurement {
   issueIdentifier: string;
   /** Digest of the branches the sibling scan read; the close write requires them unchanged. */
   refsDigest: string;
+  /** Sorted forge branch name and tip. A branch that appears after measurement changes it. */
+  remoteBranchDigest: string;
 }
 
 type ZeroDeltaCloseProof =
@@ -2562,7 +2575,7 @@ async function proveZeroDeltaRepositoryClose(
   if (!probe.ok) return refuse(probe.reason);
   let remoteBaseSha: string | null;
   try {
-    remoteBaseSha = await resolveGitHubRefHeadSha(hostname, owner, repo, baseBranch, token);
+    remoteBaseSha = await resolveGitHubRefHeadSha(hostname, owner, repo, baseBranch, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS));
   } catch {
     remoteBaseSha = null;
   }
@@ -2571,25 +2584,24 @@ async function proveZeroDeltaRepositoryClose(
     return refuse(`the local base ref ${probe.baseRef} is not the remote base ${baseBranch}`);
   }
   try {
-    const outside = await localRefOutsideRemoteBaseRefusal(path.dirname(probe.commonDir), remoteBaseSha);
+    const outside = await localRefOutsideRemoteBaseRefusal(
+      path.dirname(probe.commonDir),
+      remoteBaseSha,
+      issue.identifier,
+      Date.now() + GITHUB_BASE_COMPARE_TIMEOUT_MS,
+    );
     if (outside) return refuse(outside);
   } catch (err) {
     return refuse(`the local refs could not be compared with the remote base (${err instanceof Error ? err.message : "unknown"})`);
   }
+  let remoteBranchDigestValue: string;
   try {
-    const tips = await listGitHubBranchTips(
-      hostname, owner, repo, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
-    );
-    const seen = new Set<string>([remoteBaseSha]);
+    const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
+    const tips = await listGitHubBranchTips(hostname, owner, repo, token, signal);
+    remoteBranchDigestValue = remoteBranchDigest(tips);
     for (const tip of tips) {
-      if (seen.has(tip.sha)) continue;
-      if (seen.size >= 5) {
-        return refuse("too_many_branch_tips: the remote has more than 5 distinct branch tips to compare with the base branch");
-      }
-      seen.add(tip.sha);
-      const ahead = await githubCompareAheadBy(
-        hostname, owner, repo, baseBranch, tip.sha, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
-      );
+      if (tip.sha === remoteBaseSha || !branchNamesIssue(tip.name, issue.identifier)) continue;
+      const ahead = await githubCompareAheadBy(hostname, owner, repo, baseBranch, tip.sha, token, signal);
       if (ahead === null) return refuse(`the remote branch ${tip.name} could not be compared with ${baseBranch}`);
       if (ahead !== 0) {
         return refuse(`the remote branch ${tip.name} carries ${ahead} commit(s) that ${baseBranch} lacks`);
@@ -2628,7 +2640,7 @@ async function proveZeroDeltaRepositoryClose(
     if (!(err instanceof GitHubBranchNotFoundError)) {
       return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
     }
-    const presence = await githubBranchExists(hostname, owner, repo, workspace.branchName, token);
+    const presence = await githubBranchExists(hostname, owner, repo, workspace.branchName, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS));
     if (presence.outcome !== "absent") {
       return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
     }
@@ -2660,6 +2672,7 @@ async function proveZeroDeltaRepositoryClose(
       projectRepoRef: projectWorkspace?.repoRef ?? null,
       issueIdentifier: issue.identifier,
       refsDigest: probe.refsDigest,
+      remoteBranchDigest: remoteBranchDigestValue,
     },
   };
 }
@@ -2697,6 +2710,7 @@ async function proveZeroDeltaTier2Live(
       deliveryRepository.repo,
       probeHead,
       proof.token,
+      AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
     );
   } catch (err) {
     return refuseTier2(unverifiedTier2(err, tier2Forms));
@@ -2857,12 +2871,17 @@ export async function verifyZeroDeltaCloseAtTransition(
     if (!token) return refuse("the remote could not be re-read at the close write");
     const [hostname, owner, repo] = measurement.repository.split("/");
     if (!hostname || !owner || !repo) return refuse("the measured repository could not be re-read at the close write");
-    const remoteBase = await resolveGitHubRefHeadSha(hostname, owner, repo, measurement.baseBranch, token);
+    const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
+    const remoteBase = await resolveGitHubRefHeadSha(hostname, owner, repo, measurement.baseBranch, token, signal);
     if (remoteBase !== measurement.baseSha.toLowerCase()) {
       return refuse("the remote base commit changed after the close was measured");
     }
+    const tips = await listGitHubBranchTips(hostname, owner, repo, token, signal);
+    if (remoteBranchDigest(tips) !== measurement.remoteBranchDigest) {
+      return refuse("the remote branches changed after the close was measured");
+    }
     if (measurement.remoteBranchAheadBy === null) {
-      const presence = await githubBranchExists(hostname, owner, repo, measurement.branch, token);
+      const presence = await githubBranchExists(hostname, owner, repo, measurement.branch, token, signal);
       if (presence.outcome !== "absent") {
         return refuse(`the card's branch ${measurement.branch} could not be confirmed absent on the remote at the close write`);
       }
@@ -2878,6 +2897,15 @@ export async function verifyZeroDeltaCloseAtTransition(
   } catch (err) {
     return refuse(`the remote could not be re-read at the close write (${err instanceof Error ? err.message : "unknown"})`);
   }
+  const afterRemote = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
+  });
+  if (!afterRemote.ok) return refuse(`refused at the close write: ${afterRemote.reason}`);
   return { ok: true };
 }
 

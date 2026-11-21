@@ -4869,7 +4869,7 @@ export function issueRoutes(
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    options: { overrideAccepted?: boolean; prefetched?: FinalDeliveryPrefetch | null; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
+    options: { overrideAccepted?: boolean; zeroDeltaProven?: boolean; prefetched?: FinalDeliveryPrefetch | null; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
   ): Promise<void> {
     const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
     const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
@@ -4931,7 +4931,7 @@ export function issueRoutes(
     const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
     const decisionId = state?.lastDecisionId;
     if (verdict.kind !== "resolved") {
-      if (options.overrideAccepted) return;
+      if (options.overrideAccepted || (options.zeroDeltaProven && verdict.reason.startsWith("no-pr:"))) return;
       // SUP-24085: a stage approval that leaves the ladder pending on a later stage
       // does not complete the card, so a card that owns no open PR is not refused.
       // The decision certifies no head: the tag stops the post-commit hook from
@@ -21329,6 +21329,7 @@ export function issueRoutes(
       if (!deferFinalDeliveryPrefetch) {
         await preflightTerminalApproval(finalDeliveryIssue, updateFields, transition.decision, nextExecutionPolicy, {
           overrideAccepted: outcome.overrideAccepted === true,
+          zeroDeltaProven: outcome.zeroDeltaMeasurement != null,
           prefetched: finalDeliveryPrefetch,
         });
       }
@@ -22190,6 +22191,7 @@ export function issueRoutes(
               const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
               await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
                 overrideAccepted: doneOverrideAccepted,
+                zeroDeltaProven: zeroDeltaCloseMeasurement !== null,
                 locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
               });
             }

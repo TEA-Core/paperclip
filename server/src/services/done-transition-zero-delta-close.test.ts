@@ -43,6 +43,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => ({
 // moves while it is measured. `onGit` sees each probe git invocation's argv;
 // returning "fail" replaces that process with one that exits 1.
 const gitFault = vi.hoisted(() => ({ onGit: null as null | ((args: readonly string[]) => "fail" | void) }));
+let plantDuringCommitsRead = false;
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcess>();
   return {
@@ -150,6 +151,7 @@ function answerGitHub(url: string): Response {
   }
   const commit = new RegExp(`^${repoPath}/commits/([^/]+)$`).exec(u.pathname);
   if (commit) {
+    if (plantDuringCommitsRead) writeFileSync(path.join(worktree, "during-network.txt"), "dirt\n");
     const sha = originResolves(decodeURIComponent(commit[1]!));
     return sha ? json({ sha }) : json({ message: "Not Found" }, 404);
   }
@@ -246,6 +248,7 @@ beforeEach(() => {
   mockResolveLinkedPullRequestsWithState.mockReset();
   mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
   gitFault.onGit = null;
+  plantDuringCommitsRead = false;
 });
 
 afterEach(() => {
@@ -994,12 +997,72 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     expectZeroDeltaRefusal(await close(), `refs/remotes/fork/${BRANCH} holds a commit the remote base lacks`);
   });
 
-  it("refuses a forge branch that has no local tracking ref", async () => {
+  it("does not refuse a pre-existing forge branch that does not name this card", async () => {
     writeFileSync(path.join(seed, "other.txt"), "undelivered\n");
     git(seed, "add", "other.txt");
     git(seed, "commit", "-qm", "other work");
     git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
-    expectZeroDeltaRefusal(await close(), "the remote branch other-work carries");
+    const result = await close();
+    expect(result.allowed, result.reason).toBe(true);
+  });
+
+  it("refuses at the close write when a forge branch appears after the measurement", async () => {
+    const measurement = await measured();
+    writeFileSync(path.join(seed, "late.txt"), "undelivered\n");
+    git(seed, "add", "late.txt");
+    git(seed, "commit", "-qm", "late other work");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("remote branches changed");
+  });
+
+  it("refuses at the close write when the remote base moves", async () => {
+    const measurement = await measured();
+    writeFileSync(path.join(seed, "base-moved.txt"), "later\n");
+    git(seed, "add", "base-moved.txt");
+    git(seed, "commit", "-qm", "base moved");
+    git(seed, "push", "-q", origin, "main");
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("remote base commit changed");
+  });
+
+  it("refuses when the stash ref cannot be read", async () => {
+    gitFault.onGit = (args) => (args.includes("for-each-ref") && args.includes("refs/stash") ? "fail" : undefined);
+    expectZeroDeltaRefusal(await close(), "the recorded worktree has a stash that could not be read (refs/stash)");
+  });
+
+  it("refuses a broken loose ref that hides a packed ref", async () => {
+    const planted = plantUndelivered();
+    git(repoRoot, "update-ref", "refs/hidden/work", planted);
+    git(repoRoot, "pack-refs", "--all");
+    mkdirSync(path.join(repoRoot, ".git", "refs", "hidden"), { recursive: true });
+    writeFileSync(path.join(repoRoot, ".git", "refs", "hidden", "work"), "not-a-sha\n");
+    expectZeroDeltaRefusal(await close(), "the recorded worktree could not be measured (a local ref could not be read (refs/hidden/work))");
+  });
+
+  it("refuses a packed ref shadowed by a loose ref at the remote base", async () => {
+    const planted = plantUndelivered();
+    const base = git(repoRoot, "rev-parse", "refs/remotes/origin/main");
+    git(repoRoot, "update-ref", "refs/hidden/work", planted);
+    git(repoRoot, "pack-refs", "--all");
+    mkdirSync(path.join(repoRoot, ".git", "refs", "hidden"), { recursive: true });
+    writeFileSync(path.join(repoRoot, ".git", "refs", "hidden", "work"), `${base}\n`);
+    expectZeroDeltaRefusal(await close(), "refs/hidden/work holds a commit the remote base lacks");
+  });
+
+  it("refuses a commit that exists only in the reflog", async () => {
+    plantUndelivered();
+    expectZeroDeltaRefusal(await close(), "logs/refs/heads/SUP-24395-weekly-cycle holds a commit the remote base lacks");
+  });
+
+  it("refuses dirt planted during the close-write remote read", async () => {
+    const measurement = await measured();
+    plantDuringCommitsRead = true;
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("uncommitted changes");
   });
 
   it("refuses undelivered work parked on the local project branch", async () => {
@@ -1029,7 +1092,7 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     git(seed, "push", "-q", origin, `HEAD:refs/heads/${BRANCH}`);
     const verdict = await verify(measurement);
     expect(verdict.ok).toBe(false);
-    expect(verdict.reason).toContain("on the remote");
+    expect(verdict.reason).toContain("remote branches changed");
   });
 
   it("refuses at the close write when the issue's project workspace changed", async () => {

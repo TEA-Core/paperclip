@@ -1146,7 +1146,14 @@ export async function recheckRecordedWorktree(input: {
     siblingRefusal = "the repository's other branches and worktrees could not be re-checked";
   }
   if (deadline.expired) return timedOut;
-  return siblingRefusal ? { ok: false, reason: siblingRefusal } : { ok: true };
+  if (siblingRefusal) return { ok: false, reason: siblingRefusal };
+  const afterSiblings = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, options);
+  if (deadline.expired) return timedOut;
+  if (!afterSiblings.ok) return { ok: false, reason: `the recorded worktree ${afterSiblings.reason}` };
+  if (afterSiblings.branch !== input.branch || afterSiblings.headSha !== input.headSha) {
+    return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
+  }
+  return { ok: true };
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1242,13 +1249,119 @@ interface SiblingRef {
 }
 
 async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): Promise<SiblingRef[]> {
-  return (await runHardenedGit(
+  const listed = (await runHardenedGit(
     ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/"],
     options,
   )).split("\n").filter((line) => line.length > 0).map((line) => {
     const space = line.indexOf(" ");
-    return { sha: line.slice(0, space), refname: line.slice(space + 1) };
+    return { sha: line.slice(0, space).toLowerCase(), refname: line.slice(space + 1) };
   });
+  const rawCommon = (await runHardenedGit(["-C", repoRoot, "rev-parse", "--git-common-dir"], options)).trim();
+  const commonDir = path.isAbsolute(rawCommon) ? rawCommon : path.resolve(repoRoot, rawCommon);
+  const refs = [...listed];
+  const seen = new Set(listed.map((ref) => `${ref.sha} ${ref.refname}`));
+  const packed = await readOptionalRegularFile(path.join(commonDir, "packed-refs"), MAX_EXCLUDE_FILE_BYTES);
+  if (packed !== null) {
+    for (const line of packed.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0 || trimmed.startsWith("#") || trimmed.startsWith("^")) continue;
+      const space = trimmed.indexOf(" ");
+      if (space < 0) throw new Error("packed-refs has a line the close cannot read");
+      const sha = trimmed.slice(0, space).toLowerCase();
+      const refname = trimmed.slice(space + 1);
+      if (!SHA_RE.test(sha) || refname.length === 0 || /\s/.test(refname)) {
+        throw new Error("packed-refs has a line the close cannot read");
+      }
+      const key = `${sha} ${refname}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push({ sha, refname });
+    }
+  }
+  await refuseUnreadableLooseRefs(path.join(commonDir, "refs"), "refs", options);
+  await appendReflogTips(path.join(commonDir, "logs"), "logs", refs, seen, options);
+  return refs;
+}
+
+function refStoreDeadlinePassed(options: HardenedGitOptions): boolean {
+  const deadline = options.deadline;
+  if (!deadline) return false;
+  if (Date.now() <= deadline.at) return false;
+  deadline.expired = true;
+  return true;
+}
+
+async function refuseUnreadableLooseRefs(dir: string, refPrefix: string, options: HardenedGitOptions): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw new Error(`a local ref could not be read (${refPrefix})`);
+  }
+  for (const entry of entries) {
+    if (refStoreDeadlinePassed(options)) throw new Error("the local refs could not be compared within the deadline");
+    const refname = `${refPrefix}/${entry.name}`;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await refuseUnreadableLooseRefs(full, refname, options);
+      continue;
+    }
+    let text: string | null;
+    try {
+      text = await readOptionalRegularFile(full, 256);
+    } catch {
+      throw new Error(`a local ref could not be read (${refname})`);
+    }
+    if (text === null) throw new Error(`a local ref could not be read (${refname})`);
+    const body = text.trim();
+    if (body.startsWith("ref:")) continue;
+    if (!SHA_RE.test(body)) throw new Error(`a local ref could not be read (${refname})`);
+  }
+}
+
+async function appendReflogTips(
+  dir: string,
+  refPrefix: string,
+  refs: SiblingRef[],
+  seen: Set<string>,
+  options: HardenedGitOptions,
+): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw new Error(`a reflog could not be read (${refPrefix})`);
+  }
+  for (const entry of entries) {
+    if (refStoreDeadlinePassed(options)) throw new Error("the local refs could not be compared within the deadline");
+    const name = `${refPrefix}/${entry.name}`;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await appendReflogTips(full, name, refs, seen, options);
+      continue;
+    }
+    let text: string | null;
+    try {
+      text = await readOptionalRegularFile(full, MAX_EXCLUDE_FILE_BYTES);
+    } catch {
+      throw new Error(`a reflog could not be read (${name})`);
+    }
+    if (text === null) continue;
+    for (const line of text.split("\n")) {
+      const fields = line.split(" ");
+      for (const field of fields.slice(0, 2)) {
+        if (!SHA_RE.test(field)) continue;
+        const sha = field.toLowerCase();
+        if (/^0+$/.test(sha)) continue;
+        const key = `${sha} ${name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({ sha, refname: name });
+      }
+    }
+  }
 }
 
 /**
@@ -1264,16 +1377,31 @@ function siblingRefsDigest(refs: readonly SiblingRef[]): string {
   return hash.digest("hex");
 }
 
-/** Why a local ref holds a commit the remote base lacks; null when every tip is that commit or its ancestor. */
+/**
+ * Why a local ref holds a commit the remote base lacks. Fetched
+ * remote-tracking refs that do not name this card are other branches the
+ * clone already has; they are not this card's parked work. Every other ref
+ * must be the remote base or its ancestor. One deadline covers the whole scan.
+ */
 export async function localRefOutsideRemoteBaseRefusal(
   repoRoot: string,
   remoteBaseSha: string,
+  issueIdentifier: string,
+  deadlineAt = Date.now() + 15_000,
 ): Promise<string | null> {
   if (!SHA_RE.test(remoteBaseSha)) return "the remote base commit could not be read";
-  const options: HardenedGitOptions = { cwd: repoRoot };
+  const options: HardenedGitOptions = { cwd: repoRoot, deadline: { at: deadlineAt, expired: false } };
   const refs = await readSiblingRefs(repoRoot, options);
   const seen = new Set<string>();
   for (const ref of refs) {
+    if (Date.now() > deadlineAt) return "the local refs could not be compared with the remote base within the deadline";
+    const storedName = ref.refname.startsWith("logs/") ? ref.refname.slice("logs/".length) : ref.refname;
+    if (storedName.startsWith("refs/remotes/")) {
+      const remoteRef = storedName.slice("refs/remotes/".length);
+      const slash = remoteRef.indexOf("/");
+      const name = slash < 0 ? remoteRef : remoteRef.slice(slash + 1);
+      if (!branchNamesIssue(name, issueIdentifier)) continue;
+    }
     if (!SHA_RE.test(ref.sha) || ref.sha === remoteBaseSha || seen.has(ref.sha)) continue;
     seen.add(ref.sha);
     const ancestor = await runHardenedGit(

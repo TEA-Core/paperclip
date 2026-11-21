@@ -2016,6 +2016,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
   });
 
   it("refuses a zero-delta close that rebinds the execution workspace in the same request", async () => {
