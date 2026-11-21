@@ -1973,6 +1973,9 @@ export function buildHostServices(
             originId: issue.originId,
             billingCode: issue.billingCode,
             blockedByIssueIds: params.blockedByIssueIds ?? [],
+            projectId: issue.projectId ?? null,
+            projectWorkspaceId: issue.projectWorkspaceId ?? null,
+            description: issue.description ?? null,
           },
         });
         return issue;
