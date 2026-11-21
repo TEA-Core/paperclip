@@ -40,3 +40,12 @@ export const AcceptanceAndRelease: Story = {
 export const Parked: Story = { args: { initialPark: true } };
 export const StaleAcceptance: Story = { args: { initialPark: true, stale: true } };
 export const OwnershipConflict: Story = { args: { reject: true } };
+export const TouchDecisionControl: Story = {
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: "Park recovery carrier" }));
+    const decision = canvas.getByRole("combobox", { name: "Historical board decision" });
+    // Keep editable controls at the touch-safe base size to avoid focus zoom.
+    await expect(Number.parseFloat(getComputedStyle(decision).fontSize)).toBeGreaterThanOrEqual(16);
+  },
+};

@@ -130,6 +130,18 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return async () => expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
   }
 
+  async function waitForBlockedPid(blockerPid: number) {
+    let blockedPid: number | null = null;
+    // Await an observed PostgreSQL lock dependency, not a guessed sleep.
+    await expect.poll(async () => {
+      const [row] = await db.execute(sql`select pid from pg_stat_activity
+        where datname = current_database() and ${blockerPid} = any(pg_blocking_pids(pid))`);
+      blockedPid = row ? Number(row.pid) : null;
+      return blockedPid;
+    }, { timeout: 10_000 }).not.toBeNull();
+    return blockedPid!;
+  }
+
   it("accepts an exact board park without a source/action write or fake liveness, and repeats idempotently", async () => {
     const f = await fixture(), before = await snapshot(f);
     const assertNoProtectedWrites = await protectSourceRows(f);
@@ -165,6 +177,77 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(f)).toEqual(before);
     const receipts = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
     expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toHaveLength(1);
+  });
+
+  it("does not assign or wake a source when a park commits before the orphan sweep acquires its row lock", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ capabilities: "Implements repository changes" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ createdByAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    const dependentId = randomUUID();
+    await db.insert(issues).values({ id: dependentId, companyId: f.companyId, title: "Other dependent work", status: "todo" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.sourceId, relatedIssueId: dependentId, type: "blocks" });
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const barrierKey = Number.parseInt(f.companyId.slice(0, 8), 16);
+    await db.execute(sql`create or replace function wait_for_park_barrier() returns trigger language plpgsql as $$
+      begin perform pg_advisory_xact_lock(TG_ARGV[0]::bigint); return new; end $$`);
+    await db.execute(sql.raw(`create trigger park_barrier_${f.carrierId.replaceAll("-", "")}
+      before insert on issue_tree_holds for each row when (new.root_issue_id = '${f.carrierId}')
+      execute function wait_for_park_barrier('${barrierKey}')`));
+    // This test project targets a pre-ES2024 Promise library.
+    let releaseBarrier!: () => void;
+    const released = new Promise<void>(resolve => { releaseBarrier = resolve; });
+    let markReady!: (pid: number) => void;
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    const barrier = db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${barrierKey}::bigint)`);
+      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      markReady(Number(row.pid));
+      await released;
+    });
+    const blockerPid = await ready;
+    const acceptance = park(f).then(response => response);
+    const wakes: string[] = [];
+    const recovery = recoveryService(db, { enqueueWakeup: async agentId => { wakes.push(agentId); return null; } });
+    let sweep: ReturnType<typeof recovery.reconcileStrandedAssignedIssues> | undefined;
+    try {
+      const parkPid = await waitForBlockedPid(blockerPid);
+      sweep = recovery.reconcileStrandedAssignedIssues();
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, sweep]);
+    }
+    expect((await acceptance).status).toBe(201);
+    await assertNoProtectedWrites();
+    expect(await snapshot(f)).toEqual(before);
+    expect(wakes).toEqual([]);
+  }, 30_000);
+
+  it("requires attention when a stale park's changed blocker is otherwise covered", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    await db.update(issues).set({ status: "in_progress", statusVersion: 1, assigneeUserId: "park-operator" }).where(eq(issues.id, f.blockerId));
+    expect(await attention(f)).toMatchObject({
+      state: "needs_attention", reason: "attention_required", unresolvedBlockerCount: 1, blockingTreeLive: true,
+      carrierPark: { state: "stale", recoveryActionId: f.actionId },
+    });
+  });
+
+  it("keeps the typed park visible and replay idempotent after a later ordinary pause at the same root", async () => {
+    const f = await fixture();
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    const ordinary = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/tree-holds`)
+      .send({ mode: "pause", reason: "Separate ordinary pause", releasePolicy: { strategy: "manual" } });
+    expect(ordinary.status).toBe(201);
+    // Give the later fixture hold a distinct timestamp even on a coarse host clock.
+    await db.update(issueTreeHolds).set({ createdAt: new Date(Date.parse(accepted.body.hold.createdAt) + 1) }).where(eq(issueTreeHolds.id, ordinary.body.hold.id));
+    const state = await request(app(f.companyId)).get(`/api/issues/${f.carrierId}/tree-control/state`);
+    expect(state.body.activePauseHold).toMatchObject({ holdId: accepted.body.hold.id, recoveryCarrierPark: { recoveryActionId: f.actionId } });
+    const replay = await park(f);
+    expect(replay.status).toBe(200);
+    expect(replay.body.hold.id).toBe(accepted.body.hold.id);
   });
 
   it("rolls back the hold when the audit write fails", async () => {
