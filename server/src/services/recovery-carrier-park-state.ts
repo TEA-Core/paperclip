@@ -4,6 +4,11 @@ import type { RecoveryCarrierParkSummary } from "@paperclipai/shared";
 
 export const RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED = "Board-parked recovery carrier: native wake suppressed without replay";
 
+/** Compare UUID spellings without casting untrusted JSON. Malformed aliases fail closed. */
+export function recoveryActionIdentityMatches(saved: SQL, actionId: string | SQL) {
+  return sql`translate(lower(${saved}), '{}-', '') = translate(lower((${actionId})::text), '{}-', '')`;
+}
+
 /** Release ends the carrier hold, not automatic source denial. Only independent board resolution uses activeOnly. */
 export function recoveryActionNotBoardParked(companyId: string, actionId: string | SQL, activeOnly = false) {
   return sql`not exists (select 1 from ${issueTreeHolds}
@@ -11,14 +16,14 @@ export function recoveryActionNotBoardParked(companyId: string, actionId: string
       ? sql`${issueTreeHolds.status} = 'active'`
       : sql`${issueTreeHolds.status} in ('active', 'released')`}
       and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.recoveryCarrierPark} is not null
-      and ${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId' = (${actionId})::text)`;
+      and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, actionId)})`;
 }
 
 export async function isRecoveryActionBoardParked(db: Db, companyId: string, actionId: string) {
   const [row] = await db.select({ id: issueTreeHolds.id }).from(issueTreeHolds).where(and(
     eq(issueTreeHolds.companyId, companyId), sql`${issueTreeHolds.status} in ('active', 'released')`, eq(issueTreeHolds.mode, "pause"),
     isNotNull(issueTreeHolds.recoveryCarrierPark),
-    sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId' = ${actionId}`,
+    recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, actionId),
   )).limit(1);
   return Boolean(row);
 }

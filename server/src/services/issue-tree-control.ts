@@ -607,14 +607,14 @@ export function issueTreeControlService(db: Db) {
     while (
       currentIssueId
       && !visited.has(currentIssueId)
-      && visited.size < MAX_PAUSE_HOLD_ANCESTOR_DEPTH
+      && (hasTypedPark || visited.size < MAX_PAUSE_HOLD_ANCESTOR_DEPTH)
     ) {
       visited.add(currentIssueId);
       const hold = holdByRootIssueId.get(currentIssueId);
       if (hold) {
-        effectiveHold ??= hold;
+        if (visited.size <= MAX_PAUSE_HOLD_ANCESTOR_DEPTH) effectiveHold ??= hold;
         // A descendant's ordinary pause cannot weaken an ancestor's typed stop.
-        // Keep the nearest-hold fast path when this company has no typed park.
+        // Keep the legacy ordinary budget/fallback; a typed park has no depth cutoff.
         if (hold.recoveryCarrierPark || !hasTypedPark) {
           effectiveHold = hold;
           break;

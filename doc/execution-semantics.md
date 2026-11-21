@@ -670,6 +670,12 @@ new source repair authority. Independent authorized board resolution remains
 separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
+New bindings store the database's canonical source, action and decision UUIDs.
+Source and admission gates compare uppercase, compact and braced UUID spellings
+consistently, including older bindings, without casting untrusted saved JSON,
+rewriting stored consent or touching the action row. Malformed aliases sharing
+the protected UUID's hex digits fail closed. Admission also checks the
+server-derived action identity in queued wake context.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
 the source's unresolved escalation and from actual dependency counts/tree
@@ -684,6 +690,8 @@ Action-only queue insertion and coalescing share a source-then-carrier locked
 park gate. Coalescing preserves the existing run-first lock order before that
 gate. A typed park takes priority over ordinary holds anywhere in its subtree;
 nested ordinary holds remain active and require their own explicit release.
+Typed inheritance follows the full parent chain with visited-set cycle
+protection; the ordinary non-park search budget and nearest fallback stay unchanged.
 Native dependency/child-completion producers persist a terminal skipped intent
 when the carrier is parked. A native dispatch attempt suppressed by a park also
 marks its original intent skipped; release cannot replay it. Other native

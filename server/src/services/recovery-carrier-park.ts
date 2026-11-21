@@ -5,7 +5,7 @@ import type { ParkRecoveryCarrier, RecoveryCarrierParkBinding, RecoveryCarrierPa
 import { conflict, forbidden, notFound } from "../errors.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
-import { listRecoveryCarrierParks } from "./recovery-carrier-park-state.js";
+import { listRecoveryCarrierParks, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 
 type BoardParkActor = Pick<LogActivityInput, "actorType" | "actorId" | "boardApiKeyId" | "runId">;
 
@@ -91,7 +91,7 @@ export function recoveryCarrierParkService(db: Db) {
           inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`, treeIds),
           inArray(sql<string>`${heartbeatRuns.contextSnapshot} #>> '{paperclipIssue,id}'`, treeIds),
           ...(locks.length ? [inArray(heartbeatRuns.id, locks)] : []),
-          eq(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`, action.id),
+          recoveryActionIdentityMatches(sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`, action.id),
         ),
       )).limit(1);
       const [wake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
@@ -100,14 +100,16 @@ export function recoveryCarrierParkService(db: Db) {
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'taskId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,issueId}'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,paperclipIssue,id}'`, treeIds),
-          eq(sql<string>`${agentWakeupRequests.payload} ->> 'recoveryActionId'`, action.id),
+          recoveryActionIdentityMatches(sql`${agentWakeupRequests.payload} ->> 'recoveryActionId'`, action.id),
+          recoveryActionIdentityMatches(sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,recoveryActionId}'`, action.id),
         ),
       )).limit(1);
       if (run || wake || tree.some(row => row.checkoutRunId || row.executionRunId || row.monitorNextCheckAt)) {
         throw conflict("Carrier has active or queued execution");
       }
       const existing = await treeControl.getActivePauseHoldGate(companyId, carrier.id);
-      const binding: RecoveryCarrierParkBinding = { version: 1, ...input };
+      const binding: RecoveryCarrierParkBinding = { version: 1, ...input, recoveryActionId: action.id,
+        sourceIssueId: source.id, decisionInteractionId: decision.id };
       if (existing) {
         const hold = await treeControl.getHold(companyId, existing.holdId);
         const summary = (await listRecoveryCarrierParks(runner, companyId, [carrierId])).get(carrierId);
