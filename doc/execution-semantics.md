@@ -229,16 +229,20 @@ Only an authenticated run claim is recorded on an `issue.updated` activity
 row or as a card's `originRunId`: an agent JWT is minted for one run, while a
 board request or an agent API key can only claim a run through an
 unauthenticated header, which is never copied into either proof. A plugin
-claim is stored only when the recorded run belongs to the acting agent in
-that company. Other
-actions keep their attribution. A reassignment drops `originRunId`; a later
-self-assign proves itself through its assignee-change row. An adopted stamp
+call never stores a supplied run as `originRunId`: the host holds no
+authenticated run for that call, so a claimed agent and run pair is not
+proof. Other
+actions keep their attribution. A reassignment drops `originRunId`. A later
+self-assign proves itself only through the latest assignee-change row, not
+an older row that names the same assignee. An adopted stamp
 never makes the issue-less author the card's interruptible run, including
 when its recorded context is null or names no issue; a checked-out run that
 did not author the card remains interruptible. A reassignment also drops an
 adopted author's stamped hold, so the new assignee's wakes are not held
-behind the previous author. Wakes
-for a different agent, and wakes after the run has finished, start normally. A
+behind the previous author. A wake for a different agent on a card this run
+holds does not start while the author holds the card. A review wake can be
+queued and then cancelled by the assignee gate. Wakes after the run has
+finished start normally. A
 run whose context names a different issue does not own the cards it creates or
 assigns.
 

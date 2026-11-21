@@ -31,7 +31,8 @@ import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.ts";
+import { findLiveIssueExecutionHolder, listUnlockedIssuesWithDeferredWakesForRun } from "../services/issue-execution-lease.ts";
+import { persistActivity } from "../services/activity-log.js";
 import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -320,6 +321,57 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     // A silent issue-less run occupies a dispatch slot unless the sweep has
     // already released that run's own authored hold. A busy-slot fixture is
     // not an author, so the wake must stay queued.
+    expect(woken?.status).toBe("queued");
+    const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, writerAgentId), eq(heartbeatRuns.status, "running")));
+    expect(running.map((row) => row.id)).toEqual([writerRunId]);
+  });
+
+  it("a silent author of a done card still occupies the only slot", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const doneIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    await db.insert(issues).values([
+      {
+        id: doneIssueId,
+        companyId,
+        title: "Closed card the author created",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: writerAgentId,
+        originRunId: writerRunId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: otherIssueId,
+        companyId,
+        title: "Different card",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: writerAgentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+
+    const woken = await heartbeat.wakeup(writerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: otherIssueId },
+      contextSnapshot: { issueId: otherIssueId, source: "issue.update" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    // A running author still occupies its slot after the card it created is
+    // done. The slot exclusion is only for an open card whose hold the sweep
+    // released so that card's successor can start.
     expect(woken?.status).toBe("queued");
     const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, writerAgentId), eq(heartbeatRuns.status, "running")));
@@ -1115,6 +1167,218 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const wakes = await wakesForCard(issueId, writerAgentId);
     expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
     expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+  });
+
+  it("an old self-assign row does not revive the hold after a board round trip (N7c)", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    const older = new Date(Date.now() - 60_000);
+    const newer = new Date();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Round trip after self-assign",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: writerAgentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        agentId: writerAgentId,
+        runId: writerRunId,
+        createdAt: older,
+        details: { changes: { assigneeAgentId: { from: null, to: writerAgentId } } },
+      },
+      {
+        companyId,
+        actorType: "user",
+        actorId: "board-user",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: newer,
+        details: { changes: { assigneeAgentId: { from: writerAgentId, to: writerAgentId } } },
+      },
+    ]);
+
+    const holder = await findLiveIssueExecutionHolder(db, companyId, issueId);
+    expect(holder?.runId ?? null).not.toBe(writerRunId);
+  });
+
+  it("a proof row from another run does not make this run the holder (M2)", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId, peerAgentId } = await seed();
+    const otherRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: peerAgentId,
+      invocationSource: "timer",
+      status: "succeeded",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Other run's proof",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: peerAgentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: peerAgentId,
+      runId: otherRunId,
+      details: { changes: { assigneeAgentId: { from: null, to: writerAgentId } } },
+    });
+    expect((await findLiveIssueExecutionHolder(db, companyId, issueId))?.runId ?? null).not.toBe(writerRunId);
+  });
+
+  it("a chatty author with an old start still holds the card (M4)", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    await db.update(heartbeatRuns).set({
+      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lastOutputAt: new Date(),
+    }).where(eq(heartbeatRuns.id, writerRunId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Chatty author",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      originRunId: writerRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    expect((await findLiveIssueExecutionHolder(db, companyId, issueId))?.runId).toBe(writerRunId);
+  });
+
+  it("a checkout-only stale lock still promotes the held wake (M8)", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: writerRunId }).where(eq(issues.id, issueId));
+    runningProcesses.delete(writerRunId);
+    const swept = await heartbeat.sweepStaleIssueLocks();
+    expect(swept.cleared).toBe(1);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+  });
+
+  it("an unlocked card assigned to someone else is not this run's promotion list (M10)", async () => {
+    const { companyId, issuePrefix, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Peer assigned",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: peerAgentId,
+      originRunId: writerRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: writerAgentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "issue_commented",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(await listUnlockedIssuesWithDeferredWakesForRun(db, {
+      companyId,
+      runId: writerRunId,
+      agentId: writerAgentId,
+    })).toEqual([]);
+  });
+
+  it("a lock-clear hook is called when the update has no post-commit queue (M16)", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+    const seen: string[] = [];
+    const hooked = issueService(db, {
+      onExecutionLockCleared: async ({ run }) => { seen.push(run.id); },
+    });
+    await hooked.update(issueId, { status: "todo", actorAgentId: writerAgentId });
+    expect(seen).toEqual([writerRunId]);
+  });
+
+  it("the silence lapse does not clear a hold that has no waiting work (M23)", async () => {
+    const { writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns).set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null }).where(eq(heartbeatRuns.id, writerRunId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.payload, sql`jsonb_build_object('issueId', ${issueId}::text)`));
+    await db.delete(agentWakeupRequests);
+    runningProcesses.delete(writerRunId);
+    const swept = await heartbeat.sweepStaleIssueLocks({ now: new Date() });
+    expect(swept.issueIds).not.toContain(issueId);
+  });
+
+  it("recent output keeps a stamped hold even when the run started long ago (M24b)", async () => {
+    const { writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    await db.update(heartbeatRuns).set({
+      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      lastOutputAt: new Date(),
+    }).where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    const swept = await heartbeat.sweepStaleIssueLocks({ now: new Date() });
+    expect(swept.issueIds).not.toContain(issueId);
+    expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+  });
+
+  it("a non-proof action keeps a user-supplied run id (M30)", async () => {
+    const { companyId, writerRunId } = await seed();
+    const { activity } = await persistActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.commented",
+      entityType: "issue",
+      entityId: randomUUID(),
+      runId: writerRunId,
+      details: { body: "note" },
+    });
+    const [row] = await db.select().from(activityLog).where(eq(activityLog.id, activity.id));
+    expect(row?.runId).toBe(writerRunId);
+  });
+
+  it("an unknown run header is not stamped on the activity row (M31)", async () => {
+    const { companyId } = await seed();
+    const missingRunId = randomUUID();
+    const { activity } = await persistActivity(db, {
+      companyId,
+      actorType: "agent",
+      actorId: randomUUID(),
+      action: "issue.commented",
+      entityType: "issue",
+      entityId: randomUUID(),
+      runId: missingRunId,
+      details: { body: "note" },
+    });
+    const [row] = await db.select().from(activityLog).where(eq(activityLog.id, activity.id));
+    expect(row?.runId).toBeNull();
   });
 
   it("a comment-joined non-terminal status update promotes the held wake when it clears the lock", async () => {

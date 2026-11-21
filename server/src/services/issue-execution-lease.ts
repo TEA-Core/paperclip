@@ -94,8 +94,9 @@ export const ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS = 90 * 60 * 1000;
 
 /**
  * SUP-20121: `runId` created the `issues` row in scope (`originRunId`) or
- * changed its assignee to the current assignee (its `issue.updated` activity
- * records an `assigneeAgentId` change to that assignee). A write that only
+ * changed its assignee to the current assignee (its latest `issue.updated`
+ * activity records an `assigneeAgentId` change to that assignee). An older
+ * row is not proof once a later assignee-change row exists. A write that only
  * names the current assignee, with no change, is not proof. Callers add the
  * agent and issue-scope conditions.
  */
@@ -110,6 +111,15 @@ function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
         and ${activityLog.entityId} = ${issues.id}::text
         and ${activityLog.action} = 'issue.updated'
         and ${activityLog.details} -> 'changes' -> 'assigneeAgentId' ->> 'to' = ${issues.assigneeAgentId}::text
+        and not exists (
+          select 1 from activity_log later
+          where later.company_id = ${activityLog.companyId}
+            and later.entity_type = 'issue'
+            and later.entity_id = ${activityLog.entityId}
+            and later.action = 'issue.updated'
+            and later.details -> 'changes' -> 'assigneeAgentId' ->> 'to' is not null
+            and (later.created_at, later.id) > (${activityLog.createdAt}, ${activityLog.id})
+        )
     )
   )`;
 }
@@ -139,9 +149,11 @@ export async function runIsIssueAuthor(
 
 /**
  * A still-running issue-less author no longer occupies a dispatch slot only
- * after the silence lapse has released its hold. Any other silent issue-less
- * run, including a busy-slot fixture that authored nothing, still counts
- * toward maxConcurrentRuns.
+ * after the silence lapse has released its hold on an open card it authored.
+ * A done or cancelled card is not that release: the author still occupies the
+ * slot, so a wake for a different card cannot start a second run. Any other
+ * silent issue-less run, including a busy-slot fixture that authored nothing,
+ * still counts toward maxConcurrentRuns.
  */
 export function releasedSilentAuthorDoesNotOccupyDispatchSlot(): SQL {
   return sql`(
@@ -159,6 +171,7 @@ export function releasedSilentAuthorDoesNotOccupyDispatchSlot(): SQL {
     and exists (
       select 1 from ${issues}
       where ${issues.companyId} = ${heartbeatRuns.companyId}
+        and ${issues.status} not in ('done', 'cancelled')
         and ${runAuthoredIssueAssignment(heartbeatRuns.id)}
     )
   )`;
