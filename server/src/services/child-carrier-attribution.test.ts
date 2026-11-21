@@ -419,6 +419,77 @@ describePg("child carrier attribution", () => {
     expect(advanced.ok).toBe(false);
   });
 
+  it("refuses a compare page that names a next link even when the visible commits are on the pull request", async () => {
+    const headers = { get: (name: string) => name.toLowerCase() === "link" ? '<https://api.github.com/next>; rel="next"' : null };
+    github.mockImplementation(async (url: unknown) => {
+      const target = String(url);
+      if (target.includes("/compare/")) {
+        return { ok: true, status: 200, headers, json: async () => ({ total_commits: 1, commits: [{ sha: COMMIT }] }) };
+      }
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => [{ sha: COMMIT }, { sha: HEAD }] };
+    });
+    const truncated = await realEnumerate({
+      token: "sandbox-token",
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 653,
+      headSha: HEAD,
+      baseRef: "main",
+      childBranch: CHILD_BRANCH,
+    });
+    expect(truncated.ok).toBe(false);
+  });
+
+  it("still blocks the owner when the live head ref differs only by case", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    github.mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => livePr({
+        head: { ref: CARRIER_BRANCH.toLowerCase(), sha: HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      }),
+    }));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER,
+      repo: REPO,
+      number: 653,
+      headSha: HEAD,
+      headRef: CARRIER_BRANCH.toLowerCase(),
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it("does not attach or honor an approval after the carrier claim is deleted", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    const [decision] = await db.insert(issueExecutionDecisions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: childId,
+      stageId: randomUUID(),
+      stageType: "approval",
+      outcome: "approved",
+      body: "approved",
+    }).returning();
+    await db.update(issues).set({
+      executionState: {
+        lastDecisionId: decision!.id,
+        lastDecisionOutcome: "approved",
+        delivery: { prNumber: 77, branch: CHILD_BRANCH },
+      },
+    }).where(eq(issues.id, childId));
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row?.childDecisionId).toBeNull();
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER,
+      repo: REPO,
+      number: 653,
+      headSha: HEAD,
+      headRef: CARRIER_BRANCH,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
   it("does not attach an old decision to a replacement head or keep it after the proof changes", async () => {
     const { childId } = await seedPair();
     await db.update(issues).set({

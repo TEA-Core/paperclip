@@ -1,5 +1,5 @@
 import { isUniqueViolation } from "../db-errors.js";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -238,6 +238,10 @@ async function enumerateChildCarrierCommits(input: {
     return { ok: false, reason: "child branch commit enumeration failed: network_error" };
   }
   if (!compare.ok) return { ok: false, reason: `child branch commit enumeration failed: HTTP ${compare.status}` };
+  const compareLink = compare.headers?.get?.("link") ?? "";
+  if (/<[^>]+>;\s*rel="next"/i.test(compareLink)) {
+    return { ok: false, reason: "child branch commit enumeration is incomplete" };
+  }
   const compared = await compare.json().catch(() => null) as {
     total_commits?: unknown;
     commits?: Array<{ sha?: unknown }>;
@@ -671,7 +675,7 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     .limit(1);
   if (!decision || decision.outcome !== "approved") return;
   const claim = readClaim(state);
-  if (claim?.headSha && claim.headSha !== current.headSha) return;
+  if (!claim || claim.prNumber !== current.pullRequestNumber || claim.headSha !== current.headSha) return;
   await db
     .update(issueChildCarrierAttributions)
     .set({ childDecisionId: decision.id, updatedAt: new Date() })
@@ -710,7 +714,7 @@ export async function carrierOwnerChildAttributionBlock(
 ): Promise<string | null> {
   const owner = await readChildWorkspace(db, companyId, ownerIssueId);
   if (!owner) return null;
-  if (pr.headRef && pr.headRef !== owner.branch) return null;
+  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) return null;
   if (pr.owner.toLowerCase() !== owner.repo.owner.toLowerCase() || pr.repo.toLowerCase() !== owner.repo.repo.toLowerCase()) {
     return null;
   }
@@ -762,8 +766,27 @@ export async function carrierOwnerChildAttributionBlock(
     if (!row || !stored || stored.join() !== shas.join()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.headSha !== headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (pr.headRef && row.branchName !== pr.headRef) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (pr.headRef && row.branchName.toLowerCase() !== pr.headRef.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (!row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    const [childIssue] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(and(eq(issues.id, childId), eq(issues.companyId, companyId)))
+      .limit(1);
+    const claim = readClaim(childIssue?.executionState);
+    if (!claim || claim.prNumber !== row.pullRequestNumber || (claim.headSha !== null && claim.headSha !== row.headSha)) {
+      return CHILD_CARRIER_OWNER_GATE_SKIP;
+    }
+    const [latest] = await db
+      .select({ outcome: issueExecutionDecisions.outcome })
+      .from(issueExecutionDecisions)
+      .where(and(
+        eq(issueExecutionDecisions.issueId, childId),
+        eq(issueExecutionDecisions.companyId, companyId),
+      ))
+      .orderBy(desc(issueExecutionDecisions.createdAt))
+      .limit(1);
+    if (!latest || latest.outcome !== "approved") return CHILD_CARRIER_OWNER_GATE_SKIP;
     const [decision] = await db
       .select({ outcome: issueExecutionDecisions.outcome })
       .from(issueExecutionDecisions)
@@ -778,24 +801,51 @@ export async function carrierOwnerChildAttributionBlock(
   return null;
 }
 
+export async function childCarrierStampBlock(
+  db: Db,
+  companyId: string,
+  pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null },
+  issueId?: string,
+): Promise<string | null> {
+  if (issueId) {
+    const childSkip = await childCarrierMustNotPublish(db, companyId, issueId, pr);
+    if (childSkip) return childSkip;
+    const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, issueId, pr);
+    if (ownerSkip) return ownerSkip;
+  }
+  const rows = await db
+    .select({
+      ancestorIssueId: issueChildCarrierAttributions.ancestorIssueId,
+      childIssueId: issueChildCarrierAttributions.childIssueId,
+    })
+    .from(issueChildCarrierAttributions)
+    .where(and(
+      eq(issueChildCarrierAttributions.companyId, companyId),
+      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
+      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
+      eq(issueChildCarrierAttributions.state, "current"),
+    ));
+  for (const row of rows) {
+    if (row.ancestorIssueId !== issueId) {
+      const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, row.ancestorIssueId, pr);
+      if (ownerSkip) return ownerSkip;
+    }
+    if (row.childIssueId !== issueId) {
+      const childSkip = await childCarrierMustNotPublish(db, companyId, row.childIssueId, pr);
+      if (childSkip) return childSkip;
+    }
+  }
+  return null;
+}
+
 export async function carrierArmBlock(
   db: Db,
   companyId: string,
   issueId: string,
   pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null } | null,
 ): Promise<string | null> {
-  if (pr) {
-    const current = await readCurrent(db, companyId, issueId);
-    if (
-      current
-      && current.owner === pr.owner.toLowerCase()
-      && current.repo === pr.repo.toLowerCase()
-      && current.pullRequestNumber === pr.number
-    ) {
-      return CHILD_CARRIER_STAMP_SKIP;
-    }
-    return carrierOwnerChildAttributionBlock(db, companyId, issueId, pr);
-  }
+  if (pr) return childCarrierStampBlock(db, companyId, pr, issueId);
   if (await readCurrent(db, companyId, issueId)) return CHILD_CARRIER_STAMP_SKIP;
   return null;
 }

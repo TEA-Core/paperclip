@@ -12728,8 +12728,8 @@ export function issueRoutes(
     try {
       outcome = await publishHeadBoundRelease(rdb, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
+        issueId: existing.id,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
-        abandon: scope ? ctx.cancelScope : undefined,
       });
     } catch (error) {
       // A throwing prerequisite (secret lookup, token resolver, lock) must still leave a failed outcome

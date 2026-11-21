@@ -34,9 +34,8 @@ import {
   type DeliveryReceiptClaim,
 } from "./delivery-receipt-recovery.js";
 import {
-  carrierOwnerChildAttributionBlock,
   childCarrierAttributionMatches,
-  childCarrierMustNotPublish,
+  childCarrierStampBlock,
   resolveChildCarrierDecisionHead,
 } from "./child-carrier-attribution.js";
 
@@ -3054,16 +3053,14 @@ async function refuseChildCarrierPublication(
   pr: { owner: string; repo: string; number: number; headRefName?: string | null },
   headSha: string,
 ): Promise<ArmingOutcome | null> {
-  const childSkip = await childCarrierMustNotPublish(db, companyId, issueId, pr);
-  if (childSkip) return { kind: "skipped", message: childSkip, headSha };
-  const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, issueId, {
+  const block = await childCarrierStampBlock(db, companyId, {
     owner: pr.owner,
     repo: pr.repo,
     number: pr.number,
     headSha,
     headRef: pr.headRefName ?? null,
-  });
-  if (ownerSkip) return { kind: "skipped", message: ownerSkip, headSha };
+  }, issueId);
+  if (block) return { kind: "skipped", message: block, headSha };
   return null;
 }
 
@@ -5455,6 +5452,8 @@ export async function publishHeadBoundRelease(
       | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
       | { ok: false; reason: string }
     >;
+    /** The card being released. Every stamp door runs the same child-attribution gate for this card. */
+    issueId?: string;
     /**
      * Destroys the request's database connection (see createRequestScopedDb). Called when the release is
      * abandoned: an open transaction then rolls back on the server and its lock is freed, so work that was
@@ -5591,7 +5590,17 @@ export async function publishHeadBoundRelease(
   };
   // The PR's liveness and the card's eligibility, both as they are now.
   // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
-  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => {
+    const childBlock = await childCarrierStampBlock(db, companyId, {
+      owner,
+      repo,
+      number,
+      headSha: input.headSha,
+      headRef: input.expectedBranch,
+    }, input.issueId);
+    if (childBlock) return { kind: "refused", message: childBlock };
+    return (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  };
   // A success that cannot be confirmed is voided by a failure status; the answer says whether that worked.
   // Single-flight: the deadline's void and the release's own never both write a failure status.
   let voiding: Promise<string> | undefined;
@@ -6365,6 +6374,15 @@ export async function armMergeOnApproval(
       message: `skipped:ambiguous: Multiple linked PRs (${linkedPRs.length}): ${prList}`,
     };
   }
+  const linked = linkedPRs[0]!;
+  const childBlock = await childCarrierStampBlock(db, companyId, {
+    owner: linked.owner,
+    repo: linked.repo,
+    number: linked.number,
+    headSha: options.expectedHeadOid ?? null,
+    headRef: linked.headRefName ?? null,
+  }, issueId);
+  if (childBlock) return { kind: "skipped", message: childBlock };
 
   const pr = linkedPRs[0]!;
 
