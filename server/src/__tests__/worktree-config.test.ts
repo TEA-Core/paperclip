@@ -1604,6 +1604,7 @@ describe("worktree config repair", () => {
       'PAPERCLIP_WORKTREE_NAME="alpha\nDATABASE_URL=postgresql://a/b',
     ];
 
+    let repairedCount = 0;
     for (const shape of shapes) {
       const beforeKeys = new Set(Object.keys(parseEnvFile(shape)));
       let updated: string | null = null;
@@ -1613,6 +1614,7 @@ describe("worktree config repair", () => {
         updated = null;
       }
       if (updated === null) continue;
+      repairedCount += 1;
       const after = parseEnvFile(updated);
       for (const key of Object.keys(after)) {
         if (beforeKeys.has(key)) continue;
@@ -1627,6 +1629,7 @@ describe("worktree config repair", () => {
       expect(after.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
       expect(after.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
     }
+    expect(repairedCount).toBeGreaterThan(0);
   });
 
   it.each([
@@ -2138,5 +2141,181 @@ describe("worktree config repair", () => {
 
     expect(result.repairedConfig).toBe(true);
     expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("sup-24365-quoted");
+  });
+
+  it("does not let a refused env file steer the isolated fallback name or home (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-steer-"));
+    const name = "physical-worktree";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const steeredHome = path.join(tempRoot, "steered-home");
+    const originalEnv = [
+      "PAPERCLIP_IN_WORKTREE=true",
+      "PAPERCLIP_WORKTREE_NAME=steered-sibling",
+      `PAPERCLIP_WORKTREES_DIR=${steeredHome}`,
+      'FOO.BAR="alpha',
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "",
+    ].join("\n");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(envPath, originalEnv, "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    // dotenv already loaded the refused file (override: false, operator unset).
+    process.env.PAPERCLIP_WORKTREE_NAME = "steered-sibling";
+    process.env.PAPERCLIP_WORKTREES_DIR = steeredHome;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PORT;
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    } finally {
+      warning.mockRestore();
+    }
+
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("physical-worktree");
+    expect(process.env.PAPERCLIP_INSTANCE_ID).not.toBe("steered-sibling");
+    expect(process.env.PAPERCLIP_HOME).not.toBe(steeredHome);
+    expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
+  });
+
+  it("honours an operator worktree name that the refused file did not supply (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-operator-name-"));
+    const worktreeRoot = path.join(tempRoot, "directory-basename");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const originalEnv = [
+      "PAPERCLIP_IN_WORKTREE=true",
+      'FOO.BAR="alpha',
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "",
+    ].join("\n");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(envPath, originalEnv, "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = "operator-chosen-name";
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PORT;
+
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("operator-chosen-name");
+    expect(process.env.PAPERCLIP_HOME).toBe(isolatedHome);
+  });
+
+  it("isolates a legacy config when the env path is a directory (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-eisdir-legacy-"));
+    const name = "eisdir-legacy";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const configPath = path.join(paperclipDir, "config.json");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const sharedRoot = path.join(tempRoot, "shared-main");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
+    await fs.rm(envPath, { recursive: true, force: true });
+    await fs.mkdir(envPath);
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.DATABASE_URL;
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+    } finally {
+      warning.mockRestore();
+    }
+
+    const repaired = JSON.parse(await fs.readFile(configPath, "utf8"));
+    expect(repaired.database.embeddedPostgresDataDir).toBe(path.join(isolatedHome, "instances", name, "db"));
+    expect(repaired.database.embeddedPostgresDataDir).not.toBe(path.join(sharedRoot, "db"));
+  });
+
+  it("does not boot loadConfig on a shared data dir when the worktree dir is read-only (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-ro-legacy-"));
+    const name = "readonly-legacy";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const configPath = path.join(paperclipDir, "config.json");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const sharedRoot = path.join(tempRoot, "shared-main");
+    const sharedKey = path.join(sharedRoot, "secrets", "master.key");
+    const fileDatabaseUrl = "postgresql://main.invalid/paperclip";
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
+    await fs.writeFile(
+      envPath,
+      [
+        "PAPERCLIP_IN_WORKTREE=true",
+        `DATABASE_URL=${fileDatabaseUrl}`,
+        `PAPERCLIP_SECRETS_MASTER_KEY_FILE=${sharedKey}`,
+        'FOO.BAR="alpha',
+        "DATABASE_URL=postgresql://attacker.invalid/db",
+        'omega"',
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(paperclipDir, 0o555);
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.DATABASE_URL;
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+
+    try {
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      // config.ts repairs at import, after snapshotting operator env and
+      // before loadConfig. The import has to follow the fixture; a static
+      // import would repair the ambient process before this directory exists.
+      const { loadConfig } = await import("../config.js");
+      // Dotenv has already copied the refused file into process.env by the
+      // time repair runs. Set those values after the operator snapshot.
+      process.env.DATABASE_URL = fileDatabaseUrl;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = sharedKey;
+      maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      warning.mockRestore();
+      const booted = loadConfig();
+      expect(booted.embeddedPostgresDataDir).toBe(path.join(isolatedHome, "instances", name, "db"));
+      expect(booted.embeddedPostgresDataDir).not.toBe(path.join(sharedRoot, "db"));
+      expect(booted.databaseUrl).not.toBe(fileDatabaseUrl);
+      expect(booted.secretsMasterKeyFilePath).not.toBe(sharedKey);
+    } finally {
+      await fs.chmod(paperclipDir, 0o755);
+    }
   });
 });

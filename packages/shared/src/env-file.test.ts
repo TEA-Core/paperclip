@@ -323,4 +323,128 @@ describe("env file editor", () => {
       "",
     ].join("\n"));
   });
+
+  it.each([
+    {
+      name: "dotted",
+      file: [
+        'FOO.BAR="alpha',
+        "PAPERCLIP_HOME=/hidden",
+        "PAPERCLIP_SECRETS_MASTER_KEY=canary-master-key",
+        'omega"',
+        "FOO.BAR=final",
+        "PAPERCLIP_SECRETS_MASTER_KEY=good-master-key",
+        "",
+      ].join("\n"),
+      key: "PAPERCLIP_SECRETS_MASTER_KEY",
+      shadow: "PAPERCLIP_SECRETS_MASTER_KEY=good-master-key",
+    },
+    {
+      name: "digit-led",
+      file: [
+        '1FOO="alpha',
+        "PAPERCLIP_CONTEXT=/hidden",
+        "BETTER_AUTH_SECRET=canary-auth-secret",
+        'omega"',
+        "1FOO=final",
+        "BETTER_AUTH_SECRET=good-auth-secret",
+        "",
+      ].join("\n"),
+      key: "BETTER_AUTH_SECRET",
+      shadow: "BETTER_AUTH_SECRET=good-auth-secret",
+    },
+    {
+      name: "colon",
+      file: [
+        'A.B: "alpha',
+        "PAPERCLIP_HOME=/hidden",
+        "DATABASE_URL=postgresql://canary.invalid/db",
+        'omega"',
+        "A.B=final",
+        "DATABASE_URL=postgresql://good.invalid/db",
+        "",
+      ].join("\n"),
+      key: "DATABASE_URL",
+      shadow: "DATABASE_URL=postgresql://good.invalid/db",
+    },
+    {
+      name: "next-line dotted",
+      file: [
+        "A.B=",
+        '"',
+        "PAPERCLIP_HOME=/old",
+        "DATABASE_URL=postgresql://canary.invalid/db",
+        '"',
+        "A.B=final",
+        "DATABASE_URL=postgresql://good.invalid/db",
+        "",
+      ].join("\n"),
+      key: "DATABASE_URL",
+      shadow: "DATABASE_URL=postgresql://good.invalid/db",
+    },
+  ])("does not plant a $name canary that loads after the shadowing line is deleted (SUP-24365)", ({ file, key, shadow }) => {
+    const managed = {
+      PAPERCLIP_HOME: "/managed/home",
+      PAPERCLIP_INSTANCE_ID: "wt",
+      PAPERCLIP_CONFIG: "/managed/config.json",
+      PAPERCLIP_CONTEXT: "/managed/context.json",
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_DB_BACKUP_ENABLED: "false",
+      PAPERCLIP_WORKTREE_NAME: "wt",
+    };
+
+    const updated = updateEnvFileContents(file, managed);
+    const edited = updated.split("\n").filter((line) => line !== shadow).join("\n");
+
+    expect(parseDotenv(edited)[key]).toBeUndefined();
+  });
+
+  it("keeps an assignment hidden by an escaped quote from becoming a loader key (SUP-24365)", () => {
+    const original = [
+      'NOTE="alpha\\"',
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "PAPERCLIP_HOME=/old",
+      "",
+    ].join("\n");
+
+    const updated = updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" });
+
+    expect(parseDotenv(updated).DATABASE_URL).toBeUndefined();
+    expect(parseDotenv(updated).PAPERCLIP_HOME).toBe("/good");
+  });
+
+  it("keeps a backtick span grouped so a hidden assignment is not a loader key (SUP-24365)", () => {
+    const original = [
+      "NOTE=`alpha",
+      "PAPERCLIP_HOME=/evil",
+      "BETTER_AUTH_SECRET=canary-auth-secret",
+      "omega`",
+      "NOTE=final",
+      "PAPERCLIP_HOME=/good",
+      "",
+    ].join("\n");
+
+    const updated = updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" });
+    const edited = updated.split("\n").filter((line) => line !== "NOTE=final").join("\n");
+
+    expect(updated.startsWith("NOTE=`alpha\nPAPERCLIP_HOME=/evil\nBETTER_AUTH_SECRET=canary-auth-secret\nomega`\n")).toBe(true);
+    expect(parseDotenv(edited).BETTER_AUTH_SECRET).toBeUndefined();
+    expect(parseDotenv(updated).PAPERCLIP_HOME).toBe("/good");
+  });
+
+  it("removes only a dead writer's temp and keeps one whose pid is alive (SUP-24365)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-env-file-orphan-"));
+    const filePath = path.join(dir, ".env");
+    const deadOrphan = path.join(dir, `..env.999999.${"123e4567-e89b-12d3-a456-426614174000"}.tmp`);
+    const liveOrphan = path.join(dir, `..env.1.${"123e4567-e89b-12d3-a456-426614174001"}.tmp`);
+    fs.writeFileSync(filePath, "KEY=old\n");
+    fs.writeFileSync(deadOrphan, "partial\n");
+    fs.writeFileSync(liveOrphan, "partial\n");
+
+    expect(writeEnvFileAtomicallyIfChanged(filePath, "KEY=old\n", "KEY=new\n")).toBe(true);
+
+    expect(fs.existsSync(deadOrphan)).toBe(false);
+    expect(fs.existsSync(liveOrphan)).toBe(true);
+  });
 });

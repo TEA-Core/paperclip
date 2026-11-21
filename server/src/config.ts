@@ -5,7 +5,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
-import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
+import { captureOperatorEnvBeforeDotenv, maybeRepairLegacyWorktreeConfigAndEnvFiles, readWorktreeBootIsolation } from "./worktree-config.js";
 import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -30,6 +30,8 @@ import {
   resolveDefaultStorageDir,
   resolveHomeAwarePath,
 } from "./home-paths.js";
+
+captureOperatorEnvBeforeDotenv(process.env);
 
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
@@ -150,7 +152,8 @@ export function pendingReviewParticipantGraceMsFromEnv(): number {
 }
 
 export function loadConfig(): Config {
-  const fileConfig = readConfigFile();
+  const isolation = readWorktreeBootIsolation();
+  const fileConfig = isolation ?? readConfigFile();
   const fileDatabaseMode =
     (fileConfig?.database.mode === "postgres" ? "postgres" : "embedded-postgres") as DatabaseMode;
 
@@ -421,7 +424,7 @@ export function loadConfig(): Config {
     ),
     authDisableSignUp,
     databaseMode: fileDatabaseMode,
-    databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
+    databaseUrl: process.env.DATABASE_URL ?? (isolation ? undefined : fileDbUrl),
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),

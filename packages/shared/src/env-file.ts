@@ -15,6 +15,11 @@ type EnvLine = {
 };
 
 const ENV_ASSIGNMENT_PATTERN = /^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$/;
+// dotenv's opener class, including dotted, digit-led, hyphenated and colon
+// assignments the writer does not manage. A quoted span opened by one of
+// these must still be grouped, or a later rewrite plants a hidden line as
+// a loadable key.
+const LOADER_ASSIGNMENT_PATTERN = /^(\s*(?:export\s+)?)([\w.-]+)(\s*=\s*|:\s+)(.*)$/;
 const MINIMAL_ENV_VALUE_PATTERN = /^[A-Za-z0-9_./:@-]+$/;
 
 export function encodeEnvValue(value: string, encoding: EnvValueEncoding = "json"): string {
@@ -135,13 +140,17 @@ function groupEnvSegments(lines: EnvLine[]): EnvSegment[] {
   const segments: EnvSegment[] = [];
 
   for (let index = 0; index < lines.length; index += 1) {
-    const match = lines[index].contents.match(ENV_ASSIGNMENT_PATTERN);
+    const canonical = lines[index].contents.match(ENV_ASSIGNMENT_PATTERN);
+    const match = canonical ?? lines[index].contents.match(LOADER_ASSIGNMENT_PATTERN);
     if (!match) {
       segments.push({ key: null, start: index, end: index, quoted: false, quoteClosed: true });
       continue;
     }
 
-    const [, , key, , rawValue] = match;
+    // Non-canonical openers are preserved, never rewritten. Grouping them
+    // still keeps their continuation lines from being treated as keys.
+    const key = canonical ? canonical[2] : null;
+    const rawValue = match[4];
 
     // The loader allows whitespace (including newlines) between the
     // separator and a quoted value, so the opening quote may sit on a
@@ -441,7 +450,10 @@ export function writeEnvFileAtomicallyIfChanged(
       if (!Number.isInteger(ownerPid) || ownerPid === process.pid) continue;
       try {
         process.kill(ownerPid, 0);
-      } catch {
+      } catch (error) {
+        // EPERM means the pid is alive and owned by someone else. Only a
+        // missing process (ESRCH) is a dead writer's orphan.
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") continue;
         try {
           fs.unlinkSync(path.join(directory, entry));
         } catch {
