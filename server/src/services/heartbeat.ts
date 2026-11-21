@@ -732,7 +732,7 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
-import { isRecoveryActionBoardParked } from "./recovery-carrier-park-state.js";
+import { isRecoveryActionBoardParked, RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED } from "./recovery-carrier-park-state.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -32688,6 +32688,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  async function suppressParkedNativeStatusWakeIntent(runner: Db, companyId: string, agentId: string, opts: WakeupOptions) {
+    const intentId = readNonEmptyString(opts.contextSnapshot?.nativeStatusWakeIntentId);
+    if (!intentId || !isUuidLike(intentId) || opts.requestedByActorType !== "system" ||
+        opts.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return;
+    const now = new Date();
+    await runner.update(agentWakeupRequests).set({
+      status: "skipped", finishedAt: now, updatedAt: now, error: RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED,
+    }).where(and(
+      eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.requestedByActorType, "system"),
+      eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+      eq(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, readNonEmptyString(opts.contextSnapshot?.issueId) ?? ""),
+      inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
+    ));
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -32734,7 +32750,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
     const recoveryActionId = readNonEmptyString(enrichedContextSnapshot.recoveryActionId) ?? readNonEmptyString(payload?.recoveryActionId);
-    if (recoveryActionId && await isRecoveryActionBoardParked(db, agent.companyId, recoveryActionId)) return null;
+    if (recoveryActionId && await isRecoveryActionBoardParked(db, agent.companyId, recoveryActionId)) {
+      await suppressParkedNativeStatusWakeIntent(db, agent.companyId, agentId, opts);
+      return null;
+    }
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
@@ -33330,7 +33349,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
       );
       if (activePauseHold) {
-        if (activePauseHold.recoveryCarrierPark) return null;
+        if (activePauseHold.recoveryCarrierPark) {
+          await suppressParkedNativeStatusWakeIntent(db, agent.companyId, agentId, opts);
+          return null;
+        }
         const treeHoldInteractionWake =
           await isVerifiedIssueTreeControlInteractionWake(db, {
             companyId: agent.companyId,
@@ -33398,6 +33420,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const runner = tx as unknown as Db;
           if ((recoveryActionId && await isRecoveryActionBoardParked(runner, agent.companyId, recoveryActionId)) ||
               (await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, issueId))?.recoveryCarrierPark) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
             return { kind: "deferred" as const };
           }
 
@@ -35039,6 +35062,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the context, so the task key and execution context stay unchanged.
     const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
+      if (recoveryActionId) {
+        const [action] = await tx.select({
+          sourceIssueId: issueRecoveryActions.sourceIssueId, recoveryIssueId: issueRecoveryActions.recoveryIssueId,
+        }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, recoveryActionId), eq(issueRecoveryActions.companyId, agent.companyId),
+        )).limit(1);
+        // Match park admission's source-then-carrier order before taking the agent lock.
+        if (action) {
+          await tx.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.id, action.sourceIssueId), eq(issues.companyId, agent.companyId),
+          )).for("update");
+          if (action.recoveryIssueId && action.recoveryIssueId !== action.sourceIssueId) {
+            await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.id, action.recoveryIssueId), eq(issues.companyId, agent.companyId),
+            )).for("update");
+          }
+        }
+        const runner = tx as unknown as Db;
+        if (await isRecoveryActionBoardParked(runner, agent.companyId, recoveryActionId) ||
+            (action?.recoveryIssueId && (await issueTreeControlService(runner)
+              .getActivePauseHoldGate(agent.companyId, action.recoveryIssueId))?.recoveryCarrierPark)) {
+          await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+          return { kind: "deferred" as const };
+        }
+      }
       if (nestedIssueId && isUuidLike(nestedIssueId)) {
         const [nestedIssue] = await tx.select({
           assigneeAgentId: issues.assigneeAgentId,
@@ -35148,7 +35196,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { kind: "queued" as const, run: newRun };
     });
 
-    if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind !== "queued") return null;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -35402,6 +35450,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .orderBy(desc(agentWakeupRequests.requestedAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
+        if (!wakeRun && !delivered) {
+          // A typed-park refusal terminates only the original native intent.
+          // Do not turn that suppression back into a retryable queued outbox.
+          const [intent] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, candidate.id)).limit(1);
+          if (intent?.status === "skipped") {
+            recovered += 1;
+            continue;
+          }
+        }
 
         // The committer intent is the durable outbox entry. When admission is
         // blocked, enqueueWakeup creates a separate deferred dispatch receipt;

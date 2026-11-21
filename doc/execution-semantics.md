@@ -664,8 +664,10 @@ The acceptance binding, ordinary manual pause hold and audit event commit
 together. Source and recovery-action rows are read-only: no resolution,
 cancellation, attempt/evidence refresh, supersession, replacement action, monitor
 or wake is authorized. Repeated identical acceptance returns the same hold.
-An active exact-action binding gates automatic action upserts and source recovery
-re-arm, including exhaustion drain. It is not a general source-task pause.
+The exact-action binding gates automatic action upserts and source recovery
+re-arm, including exhaustion drain, even after carrier release. Release is not
+new source repair authority. Independent authorized board resolution remains
+separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
 
@@ -678,6 +680,11 @@ the manual execution hold; it cannot grant a fresh run.
 Deferred promotion rechecks the typed park under the issue lock. The ordinary
 pause's verified-interaction exception cannot bypass a carrier park: a legacy
 deferred receipt is cancelled without a run and cannot replay on release.
+Action-only wake admission locks the linked source and carrier before the agent,
+then rechecks the exact-action gate. Native dependency/child-completion producers
+persist a terminal skipped intent when the carrier is parked. A native dispatch
+attempt suppressed by a park also marks its original intent skipped; release
+cannot replay it. Other native deferral policies remain unchanged.
 
 A typed park intentionally excludes comment delivery. Existing manual-pause
 admission rejects ordinary issue-comment writes, and the composer stays disabled.

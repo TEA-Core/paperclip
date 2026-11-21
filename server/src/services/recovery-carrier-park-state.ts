@@ -2,17 +2,21 @@ import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
 import { issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds, type Db } from "@paperclipai/db";
 import type { RecoveryCarrierParkSummary } from "@paperclipai/shared";
 
-/** Used in write predicates too: an accepted hold never grants action mutation. */
-export function recoveryActionNotBoardParked(companyId: string, actionId: string | SQL) {
+export const RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED = "Board-parked recovery carrier: native wake suppressed without replay";
+
+/** Release ends the carrier hold, not automatic source denial. Only independent board resolution uses activeOnly. */
+export function recoveryActionNotBoardParked(companyId: string, actionId: string | SQL, activeOnly = false) {
   return sql`not exists (select 1 from ${issueTreeHolds}
-    where ${issueTreeHolds.companyId} = ${companyId} and ${issueTreeHolds.status} = 'active'
+    where ${issueTreeHolds.companyId} = ${companyId} and ${activeOnly
+      ? sql`${issueTreeHolds.status} = 'active'`
+      : sql`${issueTreeHolds.status} in ('active', 'released')`}
       and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.recoveryCarrierPark} is not null
       and ${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId' = (${actionId})::text)`;
 }
 
 export async function isRecoveryActionBoardParked(db: Db, companyId: string, actionId: string) {
   const [row] = await db.select({ id: issueTreeHolds.id }).from(issueTreeHolds).where(and(
-    eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"),
+    eq(issueTreeHolds.companyId, companyId), sql`${issueTreeHolds.status} in ('active', 'released')`, eq(issueTreeHolds.mode, "pause"),
     isNotNull(issueTreeHolds.recoveryCarrierPark),
     sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId' = ${actionId}`,
   )).limit(1);

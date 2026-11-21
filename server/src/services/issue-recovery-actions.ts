@@ -1162,7 +1162,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     if (input.fingerprint) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
-    predicates.push(recoveryActionNotBoardParked(input.companyId, sql`${issueRecoveryActions.id}`));
+    predicates.push(recoveryActionNotBoardParked(input.companyId, sql`${issueRecoveryActions.id}`, input.boardResolution === true));
     if (!input.boardResolution) {
       // SUP-13698: a sweep-escalated action that exhausted its attempt ceiling
       // (`escalated` + `outcome: "exhausted"`) is terminal until an explicit

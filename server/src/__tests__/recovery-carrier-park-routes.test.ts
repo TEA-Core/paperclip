@@ -720,6 +720,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
   it.each(["blocked", "backlog"] as const)("keeps released %s source recovery stopped until independent board authority", async sourceStatus => {
     const f = await fixture();
     await db.update(issues).set({ status: sourceStatus, assigneeAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    // Release restores ordinary carrier attention; isolate that independent lane
+    // without exempting released carriers from ordinary recovery in product code.
+    const [carrier] = await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.carrierId))
+      .returning({ statusVersion: issues.statusVersion });
+    f.body.expectedStatus = "backlog";
+    f.body.expectedStatusVersion = carrier!.statusVersion;
     const parked = await park(f);
     expect(parked.status).toBe(201);
     expect((await request(app(f.companyId))
