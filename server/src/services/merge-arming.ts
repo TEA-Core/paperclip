@@ -3782,6 +3782,11 @@ const finalDeliveryLiveSchema = z.object({
  * stands unless exactly one card-owned draft mention is live-merged and passes
  * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
+ *
+ * SUP-24825: a merged carrier whose PR URL names a repository other than the
+ * card's project repository is a citation, not this card's delivery (ADR-091
+ * D5), so the original no-pr verdict stands and that PR gets no live check.
+ * The comparison uses the PR's URL repository, never its head repository.
  */
 export async function preflightFinalDelivery(
   db: Db, companyId: string, issueId: string, identifier: string,
@@ -3802,6 +3807,11 @@ export async function preflightFinalDelivery(
   if (resolved.reason.startsWith("no-pr:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
     if (carrier.kind === "resolved") {
+      const { repo } = await resolveDeliveryIdentity(db, companyId, issueId);
+      if (repo && (repo.owner.toLowerCase() !== carrier.pr.owner.toLowerCase() ||
+          repo.repo.toLowerCase() !== carrier.pr.repo.toLowerCase())) {
+        return resolved;
+      }
       return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
     }
     if (carrier.kind === "unresolvable") return carrier;
