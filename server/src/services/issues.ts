@@ -1,3 +1,4 @@
+import { listRecoveryCarrierParks } from "./recovery-carrier-park-state.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -4170,6 +4171,7 @@ function createIssueBlockerAttention(
     directBlockerIssueId: input.directBlockerIssueId ?? null,
     terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
     terminalBlocker: input.terminalBlocker ?? null,
+    ...(input.carrierPark ? { carrierPark: input.carrierPark } : {}),
   };
 }
 
@@ -4322,9 +4324,12 @@ async function listIssueBlockerAttentionMap(
     (row) => row.companyId === companyId && row.status === "blocked",
   );
   const attentionMap = new Map<string, IssueBlockerAttention>();
+  const carrierParks = await listRecoveryCarrierParks(dbOrTx, companyId, issueRows.map(row => row.id));
   for (const row of issueRows) {
     if (row.status !== "blocked") {
-      attentionMap.set(row.id, createIssueBlockerAttention({ computed: false }));
+      const carrierPark = carrierParks.get(row.id);
+      attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
+        ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
     }
   }
   if (roots.length === 0) return attentionMap;
@@ -4930,6 +4935,11 @@ async function listIssueBlockerAttentionMap(
     });
     if (topLevelEdges.length === 0) {
       const allEdges = edgesByIssueId.get(root.id) ?? [];
+      const carrierPark = carrierParks.get(root.id);
+      if (carrierPark?.state === "accepted") {
+        attentionMap.set(root.id, createIssueBlockerAttention({ computed: true, carrierPark }));
+        continue;
+      }
       if (allEdges.length > 0) {
         const terminalSampleNode = nodesById.get(allEdges[0].blockerIssueId);
         attentionMap.set(root.id, createIssueBlockerAttention({
@@ -5035,6 +5045,10 @@ async function listIssueBlockerAttentionMap(
     }));
   }
 
+  for (const [id, carrierPark] of carrierParks) {
+    const attention = attentionMap.get(id);
+    if (attention) attention.carrierPark = carrierPark;
+  }
   return attentionMap;
 }
 

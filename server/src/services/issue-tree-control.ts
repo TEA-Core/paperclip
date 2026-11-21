@@ -35,7 +35,9 @@ export type ActiveIssueTreePauseHoldGate = {
   mode: "pause";
   reason: string | null;
   releasePolicy: IssueTreeHoldReleasePolicy | null;
+  recoveryCarrierPark?: IssueTreeHold["recoveryCarrierPark"];
 };
+
 type ActorInput = {
   actorType: "user" | "agent" | "system";
   actorId: string;
@@ -258,6 +260,7 @@ function toHold(row: HoldRow, members?: HoldMemberRow[]): IssueTreeHold {
     status: row.status as IssueTreeHold["status"],
     reason: row.reason,
     releasePolicy: (row.releasePolicy as IssueTreeHoldReleasePolicy | null) ?? null,
+    ...(row.recoveryCarrierPark ? { recoveryCarrierPark: row.recoveryCarrierPark } : {}),
     createdByActorType: row.createdByActorType as IssueTreeHold["createdByActorType"],
     createdByAgentId: row.createdByAgentId,
     createdByUserId: row.createdByUserId,
@@ -575,6 +578,7 @@ export function issueTreeControlService(db: Db) {
         rootIssueId: issueTreeHolds.rootIssueId,
         reason: issueTreeHolds.reason,
         releasePolicy: issueTreeHolds.releasePolicy,
+        recoveryCarrierPark: issueTreeHolds.recoveryCarrierPark,
       })
       .from(issueTreeHolds)
       .where(
@@ -607,6 +611,7 @@ export function issueTreeControlService(db: Db) {
           mode: "pause",
           reason: hold.reason,
           releasePolicy: (hold.releasePolicy as IssueTreeHoldReleasePolicy | null) ?? null,
+          ...(hold.recoveryCarrierPark ? { recoveryCarrierPark: hold.recoveryCarrierPark } : {}),
         };
       }
 
@@ -729,6 +734,9 @@ export function issueTreeControlService(db: Db) {
     if (input.mode === "resume") {
       const issueIds = [...new Set(holdPreview.issues.map((issue) => issue.id))];
       const activePauseHolds = await activePauseHoldsForIssueIds(companyId, issueIds);
+      if (activePauseHolds.some(hold => hold.recoveryCarrierPark)) {
+        throw conflict("Release the accepted recovery carrier park explicitly; resume cannot authorize source repair");
+      }
       const releaseReason = input.reason ?? "Subtree resume applied.";
 
       const { hold: resumeHold } = await db.transaction(async (tx) => {
@@ -1138,6 +1146,9 @@ export function issueTreeControlService(db: Db) {
     if (!existing) throw notFound("Issue tree hold not found");
     if (existing.rootIssueId !== rootIssueId) {
       throw unprocessable("Issue tree hold does not belong to the requested root issue");
+    }
+    if (existing.recoveryCarrierPark) {
+      throw conflict("Release this board park through its recovery-carrier-park release operation");
     }
     if (existing.status === "released") {
       throw conflict("Issue tree hold is already released");

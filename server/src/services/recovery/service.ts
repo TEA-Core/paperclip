@@ -92,7 +92,8 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
+import { runRecoverySweepIssue as runIsolatedRecoverySweepIssue, type RecoverySweepName } from "../../lib/recovery-sweep-isolation.js";
+import { hasBoardParkedRecoveryAction, isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "../recovery-carrier-park-state.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -1616,6 +1617,18 @@ export function recoveryService(
   // first-sight again; open recovery actions themselves are persisted and
   // unaffected by the restart.
   const undispatchableAssignedSightCounts = new Map<string, number>();
+
+  async function runRecoverySweepIssue(
+    issue: { id: string; identifier?: string | null },
+    sweep: RecoverySweepName,
+    run: () => Promise<void>,
+  ) {
+    return runIsolatedRecoverySweepIssue(issue, sweep, async () => {
+      const [row] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, issue.id));
+      if (row && await hasBoardParkedRecoveryAction(db, row.companyId, issue.id)) return;
+      await run();
+    });
+  }
 
   async function getAgent(agentId: string, runner: Db = db) {
     return runner
@@ -5837,6 +5850,8 @@ export function recoveryService(
     agentInvokability?: AgentInvokability | null;
     boardEscalation?: boolean;
   }) {
+    if (await hasBoardParkedRecoveryAction(db, input.issue.companyId, input.issue.id) ||
+        await isAutomaticRecoverySuppressedByPauseHold(db, input.issue.companyId, input.issue.id, treeControlSvc)) return null;
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -5880,6 +5895,7 @@ export function recoveryService(
         .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
         .for("update").limit(1);
       if (!current) return null;
+      if (await hasBoardParkedRecoveryAction(txDb, current.companyId, current.id)) return null;
       const pendingState = parseIssueExecutionState(current.executionState);
       const pendingParticipant = pendingState?.currentParticipant;
       // The board may have restored this participant while the stale quota
@@ -9699,12 +9715,27 @@ export function recoveryService(
   // as the board attention/decision-queue item, so the stranded card's
   // dispatchable artifact is that item until an operator assigns an owner.
   // Returns the armed check time, or null when no monitor was armed.
-  async function armExhaustedBoardMonitor(input: {
+  type ExhaustedBoardMonitorInput = {
     issue: typeof issues.$inferSelect;
     recoveryActionId: string;
     nextCheckAt: Date;
     notes: string;
-  }): Promise<Date | null> {
+  };
+
+  async function armExhaustedBoardMonitor(input: ExhaustedBoardMonitorInput): Promise<Date | null> {
+    return db.transaction(async tx => {
+      const [source] = await tx.select().from(issues).where(and(
+        eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId),
+      )).for("update");
+      if (!source) return null;
+      const runner = tx as unknown as Db; // Retain the source lock through monitor persistence.
+      return armExhaustedBoardMonitorLocked({ ...input, issue: source }, runner);
+    });
+  }
+
+  async function armExhaustedBoardMonitorLocked(input: ExhaustedBoardMonitorInput, db: Db): Promise<Date | null> {
+    const issuesSvc = issueService(db);
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return null;
     if (
       !isMonitorableIssueShape({
         status: input.issue.status,
@@ -9914,11 +9945,36 @@ export function recoveryService(
     return result;
   }
 
-  async function ensureExhaustedRecoveryIssue(input: {
+  type ExhaustedRecoveryIssueInput = {
     issue: typeof issues.$inferSelect;
     recoveryActionId: string;
     existingRecoveryIssueId?: string | null;
-  }): Promise<string | null> {
+  };
+
+  async function ensureExhaustedRecoveryIssue(input: ExhaustedRecoveryIssueInput): Promise<string | null> {
+    const postCommitActions: Array<() => Promise<void>> = [];
+    const result = await db.transaction(async tx => {
+      const [source] = await tx.select().from(issues).where(and(
+        eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId),
+      )).for("update");
+      if (!source) return null;
+      const runner = tx as unknown as Db; // Serialize carrier/action writes with board acceptance.
+      return ensureExhaustedRecoveryIssueLocked({ ...input, issue: source }, runner, postCommitActions);
+    });
+    if (!await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) {
+      for (const action of postCommitActions) await action();
+    }
+    return result;
+  }
+
+  async function ensureExhaustedRecoveryIssueLocked(
+    input: ExhaustedRecoveryIssueInput,
+    db: Db,
+    postCommitActions: Array<() => Promise<void>>,
+  ): Promise<string | null> {
+    const issuesSvc = issueService(db);
+    const instanceSettings = instanceSettingsService(db);
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return null;
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
     const findOpenRecoveryIssue = async () => {
@@ -9964,6 +10020,7 @@ export function recoveryService(
           and(
             eq(issueRecoveryActions.id, input.recoveryActionId),
             eq(issueRecoveryActions.companyId, input.issue.companyId),
+            recoveryActionNotBoardParked(input.issue.companyId, input.recoveryActionId),
           ),
         );
     };
@@ -9977,6 +10034,7 @@ export function recoveryService(
         return false;
       }
 
+      postCommitActions.push(async () => {
       await deps.enqueueWakeup(ownerAgentId, {
         source: "automation",
         triggerDetail: "system",
@@ -9998,6 +10056,7 @@ export function recoveryService(
           },
           "status_only",
         ),
+      });
       });
       return true;
     };
@@ -10239,6 +10298,7 @@ export function recoveryService(
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
+        if (existingAction && await isRecoveryActionBoardParked(db, companyId, existingAction.id)) return;
         // This park has an assignee-owned disposition path, not a generic board
         // escalation or an auto-heal into another suppressed timer run.
         if (existingAction?.kind === TIMER_DISPATCH_PARK_RECOVERY_KIND &&

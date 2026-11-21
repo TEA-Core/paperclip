@@ -5,7 +5,7 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, heartbeatRuns,
   issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
@@ -16,7 +16,9 @@ import { issueRoutes } from "../routes/issues.js";
 import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
 import type { StorageService } from "../storage/types.js";
@@ -27,6 +29,7 @@ interface Fixture {
   body: {
     sourceIssueId: string; recoveryActionId: string; decisionInteractionId: string;
     expectedStatus: string; expectedStatusVersion: number;
+    expectedAssigneeAgentId: string | null; expectedAssigneeUserId: string | null;
     expectedActionUpdatedAt: string; expectedDecisionUpdatedAt: string;
     expectedBlockers: Array<{ id: string; status: string; statusVersion: number }>;
     reason: string;
@@ -52,6 +55,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await db?.$client.end();
     await postgres?.cleanup();
     if (storageRoot) await rm(storageRoot, { recursive: true, force: true });
+  });
+  afterEach(async () => {
+    // A released fixture must not become work for the next fixture's global sweep.
+    await truncateWithLockRetry(db, "TRUNCATE TABLE companies CASCADE");
   });
 
   function app(companyId: string, agentId?: string) {
@@ -93,6 +100,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return { companyId, sourceId, carrierId, blockerId, actionId, decisionId, agentId,
       body: { sourceIssueId: sourceId, recoveryActionId: actionId, decisionInteractionId: decisionId,
         expectedStatus: "blocked", expectedStatusVersion: carrier.statusVersion,
+        expectedAssigneeAgentId: null, expectedAssigneeUserId: "park-operator",
         expectedActionUpdatedAt: old.toISOString(), expectedDecisionUpdatedAt: old.toISOString(),
         expectedBlockers: [{ id: blockerId, status: "done", statusVersion: 0 }],
         reason: "Intentionally unresolved; manual board release only" } };
@@ -102,7 +110,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return {
       source: await db.select().from(issues).where(eq(issues.id, f.sourceId)),
       actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)),
-      cards: await db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, f.companyId)),
+      cards: await db.select().from(issues).where(eq(issues.companyId, f.companyId)).orderBy(issues.id),
       wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
     };
   }
@@ -112,13 +120,19 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return response.body.blockerAttention;
   }
 
+  async function protectSourceRows(f: Fixture) {
+    // Sequences survive transaction rollback, including a sweep's caught error.
+    const counter = `park_write_attempts_${f.actionId.replaceAll("-", "")}`;
+    await db.execute(sql.raw(`create sequence ${counter}`));
+    await db.execute(sql`create or replace function reject_park_source_write() returns trigger language plpgsql as $$ begin perform nextval(TG_ARGV[0]); raise exception 'protected park row written'; end $$`);
+    await db.execute(sql.raw(`create trigger protect_action_${f.actionId.replaceAll("-", "")} before update or delete on issue_recovery_actions for each row when (old.id = '${f.actionId}') execute function reject_park_source_write('${counter}')`));
+    await db.execute(sql.raw(`create trigger protect_source_${f.sourceId.replaceAll("-", "")} before update or delete on issues for each row when (old.id = '${f.sourceId}') execute function reject_park_source_write('${counter}')`));
+    return async () => expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
+  }
+
   it("accepts an exact board park without a source/action write or fake liveness, and repeats idempotently", async () => {
     const f = await fixture(), before = await snapshot(f);
-    // Even an UPDATE that restores the same values is forbidden. The trigger is
-    // company-fixture scoped and disappears with this dedicated database.
-    await db.execute(sql`create or replace function reject_park_source_write() returns trigger language plpgsql as $$ begin raise exception 'protected park row written'; end $$`);
-    await db.execute(sql.raw(`create trigger protect_action_${f.actionId.replaceAll("-", "")} before update or delete on issue_recovery_actions for each row when (old.id = '${f.actionId}') execute function reject_park_source_write()`));
-    await db.execute(sql.raw(`create trigger protect_source_${f.sourceId.replaceAll("-", "")} before update or delete on issues for each row when (old.id = '${f.sourceId}') execute function reject_park_source_write()`));
+    const assertNoProtectedWrites = await protectSourceRows(f);
     const response = await park(f);
     expect(response.status).toBe(201);
     expect(response.body.hold).toMatchObject({ mode: "pause", status: "active", releasePolicy: { strategy: "manual" }, recoveryCarrierPark: { recoveryActionId: f.actionId, sourceIssueId: f.sourceId, decisionInteractionId: f.decisionId } });
@@ -127,6 +141,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(repeated.body.hold.id).toBe(response.body.hold.id);
     expect(await snapshot(f)).toEqual(before);
     expect(await attention(f)).toMatchObject({ state: "none", unresolvedBlockerCount: 0, blockingTreeLive: false, carrierPark: { state: "accepted", recoveryActionId: f.actionId } });
+    expect(await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId: f.companyId, sourceIssueId: f.sourceId, actionId: f.actionId,
+      status: "resolved", outcome: "restored", boardResolution: true,
+    })).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
     const receipts = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
     expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toHaveLength(1);
   });
@@ -137,7 +157,37 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, f.companyId))).toEqual([]);
   });
 
-  it.each(["agent", "cross-company", "decision", "action", "run", "queued", "blocker", "owner"])("rejects %s without partial state", async mode => {
+  it("serializes concurrent acceptance into one hold and one audited board decision", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    const responses = await Promise.all([park(f), park(f)]);
+    expect(responses.map(row => row.status).sort()).toEqual([200, 201]);
+    expect(responses[0].body.hold.id).toBe(responses[1].body.hold.id);
+    expect(await snapshot(f)).toEqual(before);
+    const receipts = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toHaveLength(1);
+  });
+
+  it("rolls back the hold when the audit write fails", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    await db.execute(sql`create or replace function reject_park_audit() returns trigger language plpgsql as $$ begin raise exception 'audit refused'; end $$`);
+    await db.execute(sql.raw(`create trigger protect_audit_${f.companyId.replaceAll("-", "")} before insert on activity_log for each row when (new.company_id = '${f.companyId}' and new.action = 'issue.recovery_carrier_parked') execute function reject_park_audit()`));
+    expect((await park(f)).status).toBe(500);
+    expect(await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, f.companyId))).toEqual([]);
+    expect(await snapshot(f)).toEqual(before);
+  });
+
+  it("invalidates stale ownership visibly but retains the manual execution hold", async () => {
+    const f = await fixture();
+    const response = await park(f);
+    expect(response.status).toBe(201);
+    await db.update(issues).set({ assigneeUserId: "another-operator" }).where(eq(issues.id, f.carrierId));
+    expect(await attention(f)).toMatchObject({ state: "needs_attention", carrierPark: { state: "stale" } });
+    const state = await request(app(f.companyId)).get(`/api/issues/${f.carrierId}/tree-control/state`);
+    expect(state.body.activePauseHold.holdId).toBe(response.body.hold.id);
+    expect((await park(f)).status).toBe(409);
+  });
+
+  it.each(["agent", "cross-company", "decision", "action", "run", "scheduled", "queued", "blocker", "owner"])("rejects %s without partial state", async mode => {
     const f = await fixture();
     let body = f.body, client = app(f.companyId);
     if (mode === "agent") client = app(f.companyId, f.agentId);
@@ -147,17 +197,24 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     if (mode === "blocker") body = { ...body, expectedBlockers: [] };
     if (mode === "owner") await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null, statusVersion: 1 }).where(eq(issues.id, f.carrierId));
     if (mode === "run") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment", status: "running", contextSnapshot: { issueId: f.carrierId } });
+    if (mode === "scheduled") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment", status: "scheduled_retry", nativeIssueId: f.carrierId });
     if (mode === "queued") await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "assignment", status: "queued", payload: { issueId: f.carrierId } });
     const before = await snapshot(f);
     const response = await park(f, body, client);
-    expect(response.status).toBe(mode === "agent" || mode === "cross-company" ? 403 : 409);
+    expect(response.status).toBe(mode === "agent" ? 403 : mode === "cross-company" ? 404 : 409);
     expect(await snapshot(f)).toEqual(before);
     expect(await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, f.companyId))).toEqual([]);
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual([]);
   });
 
-  it("survives sweeps, ticks, comments and service restart without successors, then releases without source repair", async () => {
+  it.each(["board", "agent"])("survives sweeps, ticks, comments and service restart with %s ownership, then releases without source repair", async owner => {
     const f = await fixture();
+    if (owner === "agent") {
+      await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+      f.body.expectedAssigneeAgentId = f.agentId;
+      f.body.expectedAssigneeUserId = null;
+    }
+    const assertNoProtectedWrites = await protectSourceRows(f);
     const response = await park(f);
     expect(response.status).toBe(201);
     const before = await snapshot(f);
@@ -167,6 +224,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
       await recovery.reconcileStaleRecoveryActionWakes();
       await recovery.reconcileStrandedAssignedIssues();
+      const heartbeat = heartbeatService(db);
+      expect(await heartbeat.wakeup(f.agentId, { source: "automation", reason: "recovery", payload: { issueId: f.sourceId, recoveryActionId: f.actionId } })).toBeNull();
+      expect(await heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_comment_added", payload: { issueId: f.carrierId } })).toBeNull();
+      await heartbeat.tickTimers(new Date(Date.now() + tick * 60_000));
     }
     const comment = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/comments`).send({ body: "Unrelated update" });
     expect(comment.status).toBe(409); // existing manual-pause admission remains authoritative
@@ -174,6 +235,9 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       cause: "new-failure", fingerprint: "new-fingerprint", kind: "blocked_without_blockers", nextAction: "Retry", supersedeOnIdentityChange: true });
     expect(changedIdentity.id).toBe(f.actionId);
     expect(await snapshot(f)).toEqual(before);
+    const genericRelease = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/tree-holds/${response.body.hold.id}/release`)
+      .send({ metadata: { wakeAgents: true } });
+    expect(genericRelease.status).toBe(409);
     const release = await request(app(f.companyId)).post(`/api/issues/${f.carrierId}/recovery-carrier-park/${response.body.hold.id}/release`)
       .send({ recoveryActionId: f.actionId, reason: "Board releases this disposition; no repair authorized" });
     expect(release.status).toBe(200);
@@ -182,6 +246,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       .send({ recoveryActionId: f.actionId, reason: "Board releases this disposition; no repair authorized" });
     expect(repeat.status).toBe(200);
     expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
     expect(await attention(f)).toMatchObject({ state: "needs_attention" });
   }, 30_000);
 

@@ -6,6 +6,14 @@ Run scope: `ui/src/components/` and `ui/src/pages/` on branch `design/token-extr
 
 ## Counts
 
+### Board recovery carrier park — 2026-11-21
+
+`RecoveryCarrierParkForm` composes existing form primitives for affirmative board
+acceptance of intentionally unresolved recovery. `TaskChatPausedTakeover` renders
+the separate accepted/stale carrier disposition and its explicit no-wake release.
+Source escalation is unchanged. See `/design-guide` and Storybook
+**Tasks / Recovery carrier park**.
+
 ### Connection recovery — 2026-09-29
 
 `CloudAccessGate.tsx` contains the startup `CloudAccessError` composition, using

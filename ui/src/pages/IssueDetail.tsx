@@ -1,3 +1,5 @@
+import type { ParkRecoveryCarrier, ReleaseIssueTreeHoldResponse } from "@paperclipai/shared";
+import { RecoveryCarrierParkForm } from "../components/RecoveryCarrierParkForm";
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
@@ -3570,6 +3572,23 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!issueId,
     retry: false,
   });
+  const carrierParkCandidate = useQuery({
+    queryKey: ["issues", "recovery-carrier-park-candidate", issueId],
+    queryFn: () => issuesApi.recoveryCarrierParkCandidate(issueId!),
+    enabled: !!issueId && canManageTreeControl && !!issue?.originKind?.includes("recovery") && !treeControlState?.activePauseHold,
+    retry: false,
+  });
+  const parkRecoveryCarrier = useMutation({
+    mutationFn: (input: ParkRecoveryCarrier) => issuesApi.parkRecoveryCarrier(issueId!, input),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
+        queryClient.invalidateQueries({ queryKey: ["issues", "tree-control-state", issueId] }),
+        queryClient.invalidateQueries({ queryKey: ["issues", "tree-holds", issueId] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(issueId!) }),
+      ]);
+    },
+  });
   const { data: activeRootPauseHolds = [] } = useQuery({
     queryKey: [
       "issues",
@@ -4298,6 +4317,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           throw new Error(
             "No active subtree pause hold is available to resume.",
           );
+        }
+        const binding = treeControlState?.activePauseHold?.recoveryCarrierPark;
+        if (binding) {
+          const released: ReleaseIssueTreeHoldResponse = await issuesApi.releaseRecoveryCarrierPark(issueId!, pauseHoldId, {
+            recoveryActionId: binding.recoveryActionId,
+            reason: "Board explicitly released the carrier park. Source repair is not authorized by this release.",
+          });
+          return { kind: "release" as const, hold: released };
         }
         const releasedHold = await issuesApi.releaseTreeHold(
           issueId!,
@@ -7890,6 +7917,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               {issue.executionBlocker && (
                 <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
               )}
+              {!activePauseHold && carrierParkCandidate.data ? (
+                <RecoveryCarrierParkForm key={issue.id} candidate={carrierParkCandidate.data}
+                  onPark={input => parkRecoveryCarrier.mutate(input)} pending={parkRecoveryCarrier.isPending}
+                  error={parkRecoveryCarrier.error?.message} />
+              ) : carrierParkCandidate.error ? <p role="alert" className="text-sm text-destructive">{carrierParkCandidate.error.message}</p> : null}
               {resolvedDetailTab === "chat" ? (
                 <DispositionRecoveryProvider value={{
                   issue,
@@ -8048,8 +8080,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   conversationMode={!!issue.conversationAgentId}
                   composerPause={activePauseHold ? {
                     scope: activePauseHold.isRoot && childIssues.length === 0 ? "leaf" : "subtree",
+                    carrierPark: activePauseHold.isRoot && activePauseHold.recoveryCarrierPark ? {
+                      state: issue.blockerAttention?.carrierPark?.state ?? "stale",
+                      reason: activePauseHold.recoveryCarrierPark.reason,
+                    } : null,
                     pending: executeTreeControl.isPending && executeTreeControl.variables?.mode === "resume",
+                    error: activePauseHold.recoveryCarrierPark ? executeTreeControl.error?.message : null,
                     onResume: activePauseHold.isRoot && canManageTreeControl ? () => {
+                      if (activePauseHold.recoveryCarrierPark) {
+                        executeTreeControl.mutate({ mode: "resume", scope: "leaf", wakeAgents: false });
+                        return;
+                      }
                       executeTreeControl.reset();
                       setTreeControlMode("resume");
                       setTreeControlWakeAgentsOnResume(isAgentOwnedNonTerminalIssue || canShowSubtreeControls);

@@ -12,6 +12,7 @@ import type {
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
 import { REVIEW_PARTICIPANT_LIVE_WINDOW_MS, participantRanSince } from "./recovery/participant-liveness.js";
 
+import { isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "./recovery-carrier-park-state.js";
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
@@ -678,6 +679,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      if (await isRecoveryActionBoardParked(db, input.companyId, existing.id)) return existing;
       // A distinct failure identity must not overwrite the active action of a
       // prior identity. Resolve the prior action and insert a new one, so the
       // operator gets a new notice for the new failure.
@@ -1124,6 +1126,23 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction | null> {
+    if (!issueRowLocked && dbOrTx === db) {
+      return db.transaction(async tx => {
+        const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId),
+        )).for("update");
+        if (!source) return null;
+        const runner = tx as unknown as Db; // The source lock also serializes board park admission.
+        return createIssueRecoveryActionService(runner, true).resolveActiveForIssue(input);
+      });
+    }
+    if (!issueRowLocked) {
+      // Explicit transaction callers must retain the same source lock through
+      // resolution; a statement snapshot taken before park commit is not enough.
+      await dbOrTx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId),
+      )).for("update");
+    }
     const now = new Date();
     const predicates = [
       eq(issueRecoveryActions.companyId, input.companyId),
@@ -1142,6 +1161,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     if (input.fingerprint) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
+    predicates.push(recoveryActionNotBoardParked(input.companyId, sql`${issueRecoveryActions.id}`));
     if (!input.boardResolution) {
       // SUP-13698: a sweep-escalated action that exhausted its attempt ceiling
       // (`escalated` + `outcome: "exhausted"`) is terminal until an explicit
