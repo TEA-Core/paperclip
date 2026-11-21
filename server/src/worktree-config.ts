@@ -56,10 +56,6 @@ function sanitizeWorktreeInstanceId(rawValue: string): string {
   return normalized || "worktree";
 }
 
-function readEnvEntries(envPath: string): Record<string, string> {
-  if (!fs.existsSync(envPath)) return {};
-  return parseEnvFile(fs.readFileSync(envPath, "utf8"));
-}
 
 function parsedSigningSecret(envPath: string): string | null {
   try {
@@ -68,6 +64,12 @@ function parsedSigningSecret(envPath: string): string | null {
   } catch {
     return null;
   }
+}
+// The single signing-secret resolution site: the vetted own file first, then
+// the operator's exported value, then one fresh mint. Every repair path
+// (clean and refused) resolves through here so there is exactly one mint.
+function resolveToolActionSigningSecret(fileValue: string | null, inheritedValue: string | null): string {
+  return nonEmpty(fileValue) ?? nonEmpty(inheritedValue) ?? randomBytes(32).toString("hex");
 }
 
 function emptyWorktreeEnvFileContents(): string {
@@ -202,33 +204,6 @@ function contextFromWorktreeLayout(_env: NodeJS.ProcessEnv): WorktreeRuntimeCont
   });
 }
 
-function findWorktreeStateDir(startDir: string): string | null {
-  let currentDir = path.resolve(startDir);
-  while (true) {
-    const candidate = path.join(currentDir, ".paperclip");
-    try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
-    } catch {
-      // An unreadable ancestor is not this worktree. Keep walking.
-    }
-    const nextDir = path.resolve(currentDir, "..");
-    if (nextDir === currentDir) return null;
-    currentDir = nextDir;
-  }
-}
-
-function resolveWorktreeConfigPath(env: NodeJS.ProcessEnv, overrideConfigPath?: string): string {
-  if (overrideConfigPath) return path.resolve(overrideConfigPath);
-  if (env.PAPERCLIP_CONFIG) return path.resolve(env.PAPERCLIP_CONFIG);
-  // A worktree may not have written config.json yet. The ancestor file
-  // lookup then falls back to the default instance. Prefer the nearest
-  // `.paperclip` directory so the repair does not silently disengage.
-  if (env.PAPERCLIP_IN_WORKTREE === "true") {
-    const stateDir = findWorktreeStateDir(process.cwd());
-    if (stateDir) return path.join(stateDir, "config.json");
-  }
-  return resolvePaperclipConfigPath();
-}
 
 function resolveWorktreeRuntimeContext(
   env: NodeJS.ProcessEnv,
@@ -581,7 +556,6 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   worktreeBootIsolation = null;
   const ledger = ensureRepairLedger();
   let refused = ledger.refused;
-  let fileEnv: Record<string, string> = {};
   let context: WorktreeRuntimeContext | null;
   let skipEnvRepair = refused;
   try {
@@ -621,16 +595,15 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   const fileToolActionSigningSecret = nonEmpty(stagedOwnValue("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"))
     ?? parsedSigningSecret(context.envPath);
   const inheritedToolActionSigningSecret = nonEmpty(operatorEnvValue("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"));
-  let toolActionSigningSecret =
-    fileToolActionSigningSecret ??
-    inheritedToolActionSigningSecret ??
-    randomBytes(32).toString("hex");
+  let toolActionSigningSecret = resolveToolActionSigningSecret(
+    fileToolActionSigningSecret,
+    inheritedToolActionSigningSecret,
+  );
   if (!skipEnvRepair) {
     try {
       existingContents = fs.existsSync(context.envPath)
         ? fs.readFileSync(context.envPath, "utf8")
         : null;
-      fileEnv = parseEnvFile(existingContents ?? "");
       const managedEnvEntries: Record<string, string> = {
         PAPERCLIP_HOME: context.homeDir,
         PAPERCLIP_INSTANCE_ID: context.instanceId,
@@ -663,8 +636,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
         });
       }
       effectiveContext = resolveWorktreeIsolatedFallbackContext(context);
-      toolActionSigningSecret =
-        inheritedToolActionSigningSecret ?? randomBytes(32).toString("hex");
+      toolActionSigningSecret = resolveToolActionSigningSecret(null, inheritedToolActionSigningSecret);
     }
   } else {
     effectiveContext = resolveWorktreeIsolatedFallbackContext(context);

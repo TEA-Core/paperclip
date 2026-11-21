@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 import { resolveDatabaseTarget } from "./runtime-config.js";
 
 const ORIGINAL_CWD = process.cwd();
@@ -17,6 +18,15 @@ function writeText(filePath: string, value: string) {
   fs.writeFileSync(filePath, value);
 }
 
+beforeEach(() => {
+  resetBootEnvForTests();
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("PAPERCLIP_") || key.startsWith("DATABASE_")) {
+      delete process.env[key];
+    }
+  }
+});
+
 afterEach(() => {
   process.chdir(ORIGINAL_CWD);
   for (const key of Object.keys(process.env)) {
@@ -26,7 +36,61 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  vi.restoreAllMocks();
 });
+
+function writeLegacyEmbeddedConfig(configPath: string, sharedRoot: string) {
+  writeJson(configPath, {
+    $meta: { version: 1, updatedAt: "2026-03-26T00:00:00.000Z", source: "configure" },
+    database: {
+      mode: "embedded-postgres",
+      embeddedPostgresDataDir: path.join(sharedRoot, "db"),
+      embeddedPostgresPort: 54329,
+      backup: {
+        enabled: true,
+        intervalMinutes: 60,
+        retentionDays: 30,
+        dir: path.join(sharedRoot, "data", "backups"),
+      },
+    },
+    logging: { mode: "file", logDir: path.join(sharedRoot, "logs") },
+    server: {
+      deploymentMode: "local_trusted",
+      exposure: "private",
+      host: "127.0.0.1",
+      port: 3100,
+      allowedHostnames: [],
+      serveUi: true,
+    },
+    auth: {
+      baseUrlMode: "explicit",
+      publicBaseUrl: "http://127.0.0.1:3100",
+      disableSignUp: false,
+    },
+    storage: {
+      provider: "local_disk",
+      localDisk: { baseDir: path.join(sharedRoot, "data", "storage") },
+      s3: { bucket: "paperclip", region: "us-east-1", prefix: "", forcePathStyle: false },
+    },
+    secrets: {
+      provider: "local_encrypted",
+      strictMode: false,
+      localEncrypted: { keyFilePath: path.join(sharedRoot, "secrets", "master.key") },
+    },
+  });
+}
+
+function makeWorktreeFixture(envContents: string): { worktreeRoot: string; configPath: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-target-"));
+  const worktreeRoot = path.join(root, "repo", "wt");
+  const stateDir = path.join(worktreeRoot, ".paperclip");
+  fs.mkdirSync(path.join(root, "repo", ".git"), { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  writeText(path.join(stateDir, ".env"), envContents);
+  const configPath = path.join(stateDir, "config.json");
+  writeLegacyEmbeddedConfig(configPath, path.join(root, "shared-main"));
+  return { worktreeRoot, configPath };
+}
 
 describe("resolveDatabaseTarget", () => {
   it("uses DATABASE_URL from process env first", () => {
@@ -124,6 +188,41 @@ describe("resolveDatabaseTarget", () => {
       source: "embedded-postgres@54329",
       configPath: path.join(home, "instances", "default", "config.json"),
       envPath: path.join(home, "instances", "default", ".env"),
+    });
+  });
+
+  it("never picks a refused worktree env file's DATABASE_URL (SUP-24365)", () => {
+    const { worktreeRoot, configPath } = makeWorktreeFixture(
+      [
+        "PAPERCLIP_IN_WORKTREE=true",
+        "DATABASE_URL=postgresql://refused-file.invalid/db",
+        'FOO="unterminated',
+        "",
+      ].join("\n"),
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_CONFIG = configPath;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const target = resolveDatabaseTarget();
+    expect(target.mode).toBe("embedded-postgres");
+    expect(target.source).toContain("embedded-postgres@");
+  });
+
+  it("still uses a clean worktree env file's DATABASE_URL (SUP-24365)", () => {
+    const { worktreeRoot, configPath } = makeWorktreeFixture(
+      ["PAPERCLIP_IN_WORKTREE=true", "DATABASE_URL=postgresql://clean-file.invalid/db", ""].join("\n"),
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_CONFIG = configPath;
+
+    const target = resolveDatabaseTarget();
+    expect(target).toMatchObject({
+      mode: "postgres",
+      connectionString: "postgresql://clean-file.invalid/db",
+      source: "paperclip-env",
     });
   });
 });

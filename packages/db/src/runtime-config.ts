@@ -67,42 +67,10 @@ function resolvePaperclipEnvPath(configPath: string): string {
   return resolvePaperclipEnvPathForConfig(configPath);
 }
 
-function parseEnvFile(contents: string): Record<string, string> {
-  const entries: Record<string, string> = {};
-
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-
-    const match = rawLine.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-
-    const [, key, rawValue] = match;
-    const value = rawValue.trim();
-    if (!value) {
-      entries[key] = "";
-      continue;
-    }
-
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      entries[key] = value.slice(1, -1);
-      continue;
-    }
-
-    entries[key] = value.replace(/\s+#.*$/, "").trim();
-  }
-
-  return entries;
-}
-
-function readEnvEntries(envPath: string): Record<string, string> {
-  if (!existsSync(envPath)) return {};
-  return parseEnvFile(readFileSync(envPath, "utf8"));
-}
-function vettedEnvEntries(envPath: string): Record<string, string> | null {
+// Reads DATABASE_URL from the instance env file only when the boot ledger
+// stages that file clean. A refused (unvetted, unreadable, not-a-file) env
+// file never supplies a database target.
+export function vettedEnvEntries(envPath: string): Record<string, string> | null {
   if (!existsSync(envPath)) return {};
   try {
     if (!statSync(envPath).isFile()) return null;
