@@ -388,7 +388,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it("retires only the released action gate while another park in the same company remains protected", async () => {
+  it("allows independent board resolution after release while another park remains protected", async () => {
     const f = await fixture(), control = await fixture(f.companyId);
     const protectedSource = await db.select().from(issues).where(eq(issues.id, f.sourceId));
     const protectedAction = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
@@ -714,6 +714,102 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
     expect(await attention(f)).toMatchObject({ state: "needs_attention" });
   }, 30_000);
+
+  it.each(["blocked", "backlog"] as const)("keeps released %s source recovery stopped until independent board authority", async sourceStatus => {
+    const f = await fixture();
+    await db.update(issues).set({ status: sourceStatus, assigneeAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    const parked = await park(f);
+    expect(parked.status).toBe(201);
+    expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "Carrier release is not source repair authority" })).status).toBe(200);
+    // Exercise both monitorable sources and the legacy missing-carrier successor path.
+    if (sourceStatus === "backlog") await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    for (let tick = 0; tick < 2; tick++) {
+      const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Released source must not wake"); } });
+      await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      await recovery.reconcileBlockedWithoutBlockers({ companyId: f.companyId });
+    }
+    await assertNoProtectedWrites();
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.sourceId, cause: "different-failure", fingerprint: "different-failure",
+      kind: "blocked_without_blockers", nextAction: "Automatic retry", supersedeOnIdentityChange: true,
+    });
+    expect(action.id).toBe(f.actionId);
+    expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { recoveryActionId: f.actionId } })).toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+    await assertNoAdmission();
+  });
+
+  it("serializes action-only wake admission with a park that wins the carrier lock", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    let settled = false;
+    const wake = heartbeatService(db).wakeup(f.agentId, {
+      source: "automation", reason: "recovery", payload: { recoveryActionId: f.actionId },
+    }).then(run => { settled = true; return { run, error: null }; },
+      error => { settled = true; return { run: null, error }; });
+    try {
+      // A broken queue reaches the tripwire; a correct queue waits behind admission.
+      await expect.poll(async () => settled || (await db.execute(sql`select exists (
+        select 1 from pg_stat_activity where datname = current_database()
+        and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked,
+      { timeout: 10_000 }).toBe(true);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, wake]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await wake).toEqual({ run: null, error: null });
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it.each(["issue_blockers_resolved", "issue_children_completed"])("does not replay a native %s intent suppressed during a park after release", async reason => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    const parked = await park(f);
+    expect(parked.status).toBe(201);
+    // Persist the real native committer outbox shape; dispatch uses the actual scheduler.
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId: f.agentId, source: "automation", triggerDetail: "system", reason,
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-park:${randomUUID()}`, status: "queued",
+      payload: { issueId: f.carrierId, taskId: f.carrierId, _paperclipWakeContext: {
+        issueId: f.carrierId, taskId: f.carrierId, wakeReason: reason,
+        source: "native_status_decision", statusDecisionSource: "native_status_decision",
+      } },
+    }).returning();
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const [suppressed] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
+    expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "Release must not replay suppressed native work" })).status).toBe(200);
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const after = await snapshot(f);
+    expect(suppressed.status).toBe("skipped");
+    expect(suppressed.finishedAt).not.toBeNull();
+    expect(after.wakes).toEqual([suppressed]);
+    expect(after.source).toEqual(before.source);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.cards).toEqual(before.cards);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual([]);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
 
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
