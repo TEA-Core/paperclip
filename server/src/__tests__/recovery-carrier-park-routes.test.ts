@@ -83,7 +83,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
 
   async function fixture(existingCompanyId?: string): Promise<Fixture> {
     const companyId = existingCompanyId ?? randomUUID(), sourceId = randomUUID(), carrierId = randomUUID();
-    const blockerId = randomUUID(), actionId = randomUUID(), decisionId = randomUUID(), agentId = randomUUID();
+    // Casing coverage must always have a hexadecimal letter, not a random chance of one.
+    const blockerId = randomUUID(), actionId = `a${randomUUID().slice(1)}`, decisionId = randomUUID(), agentId = randomUUID();
     if (!existingCompanyId) {
       await db.insert(companies).values({ id: companyId, name: "Park fixture", issuePrefix: `P${companyId.slice(0, 6)}` });
       await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "park-operator", status: "active", membershipRole: "operator" });
@@ -787,14 +788,14 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
-  it("preserves action-only coalescing into an unscoped run when no park exists", async () => {
+  it.each(["lowercase", "uppercase"])("preserves %s action-only coalescing into an unscoped run when no park exists", async casing => {
     const f = await fixture();
     const [queued] = await db.insert(heartbeatRuns).values({
       companyId: f.companyId, agentId: f.agentId, status: "queued", invocationSource: "on_demand", contextSnapshot: {},
     }).returning();
     const assertNoProtectedWrites = await protectSourceRows(f);
     const wake = await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
-      payload: { recoveryActionId: f.actionId } });
+      payload: { recoveryActionId: casing === "uppercase" ? f.actionId.toUpperCase() : f.actionId } });
     expect(wake?.id).toBe(queued!.id);
     expect(await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
@@ -840,17 +841,22 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it.each(["dependency", "child", "nested child"] as const)("persists native %s suppression before dispatch so release cannot revive it", async shape => {
+  it.each(["dependency", "child", "nested child", "deep nested child"] as const)("persists native %s suppression before dispatch so release cannot revive it", async shape => {
     const f = await fixture(), completedIssueId = randomUUID(), runId = randomUUID(), contractId = randomUUID();
     const resultId = randomUUID(), assessmentId = randomUUID();
     let nativeParentId = f.carrierId, nestedHoldId: string | null = null;
     await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
     f.body.expectedAssigneeAgentId = f.agentId;
     f.body.expectedAssigneeUserId = null;
-    if (shape === "nested child") {
-      nativeParentId = randomUUID();
-      await db.insert(issues).values({ id: nativeParentId, companyId: f.companyId, title: "Independently paused descendant",
-        status: "blocked", assigneeAgentId: f.agentId, parentId: f.carrierId });
+    if (shape.endsWith("nested child")) {
+      const descendants: Array<typeof issues.$inferInsert> = [];
+      for (let depth = 0; depth < (shape === "deep nested child" ? 101 : 1); depth++) {
+        const id = randomUUID();
+        descendants.push({ id, companyId: f.companyId, title: "Independently paused descendant",
+          status: "blocked", assigneeAgentId: f.agentId, parentId: nativeParentId });
+        nativeParentId = id;
+      }
+      await db.insert(issues).values(descendants);
     }
     await db.insert(issues).values({ id: completedIssueId, companyId: f.companyId, title: "Late native finalization",
       status: "in_progress", assigneeAgentId: f.agentId, deliveryRequirement: "record_only",
@@ -873,7 +879,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       assessmentJson: {}, inputDigest: assessmentId });
     await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: completedIssueId,
       phase: "assessing", resultId, assessmentId });
-    if (shape === "nested child") {
+    if (shape.endsWith("nested child")) {
       const pause = await request(app(f.companyId)).post(`/api/issues/${nativeParentId}/tree-holds`)
         .send({ mode: "pause", reason: "Independent descendant pause" });
       expect(pause.status).toBe(201);
@@ -910,6 +916,45 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(after.wakes).toEqual([intent]);
     expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
       .toEqual([{ id: runId }]);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("treats uppercase action UUID admission as the same board acceptance", async () => {
+    const f = await fixture();
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const parked = await park(f, { ...f.body, recoveryActionId: f.actionId.toUpperCase() });
+    expect(parked.status).toBe(201);
+    expect(await attention(f)).toMatchObject({ state: "none", carrierPark: { state: "accepted" } });
+    const repeated = await park(f);
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.hold.id).toBe(parked.body.hold.id);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["canonical", "legacy uppercase"])("protects released UUID identity with %s stored binding", async stored => {
+    const f = await fixture(), parked = await park(f);
+    expect(parked.status).toBe(201);
+    expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "No automatic source repair authorized" })).status).toBe(200);
+    if (stored === "legacy uppercase") {
+      await db.update(issueTreeHolds).set({ recoveryCarrierPark: {
+        ...parked.body.hold.recoveryCarrierPark, recoveryActionId: f.actionId.toUpperCase(),
+      } }).where(eq(issueTreeHolds.id, parked.body.hold.id));
+    }
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    expect((await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.sourceId, cause: "different-identity", fingerprint: "different-identity",
+      kind: "blocked_without_blockers", nextAction: "Automatic retry", supersedeOnIdentityChange: true,
+    })).id).toBe(f.actionId);
+    for (const actionId of [f.actionId, f.actionId.toUpperCase()]) {
+      expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+        payload: { recoveryActionId: actionId } })).toBeNull();
+    }
+    expect(await snapshot(f)).toEqual(before);
     await assertNoAdmission();
     await assertNoProtectedWrites();
   });
