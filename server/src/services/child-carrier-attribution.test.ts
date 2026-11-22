@@ -1423,4 +1423,110 @@ describePg("child carrier attribution", () => {
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
   });
+  describe("owner gate with a deleted descendant branch", () => {
+    const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    const OWN_PR = 700;
+
+    async function terminalChild(childId: string, opts: { status?: string; recorded?: boolean } = {}) {
+      await db.update(issues).set({
+        status: opts.status ?? "done",
+        executionState: opts.recorded === false ? {} : {
+          delivery: {
+            branch: CHILD_BRANCH,
+            prNumber: OWN_PR,
+            prUrl: `https://github.com/${OWNER}/${REPO}/pull/${OWN_PR}`,
+          },
+        },
+      }).where(eq(issues.id, childId));
+    }
+
+    function mockDeletedChildBranch(opts: { childStatus?: number; ownPrMerged?: boolean; childBody?: unknown } = {}) {
+      childCarrierCommits.enumerate = realEnumerate;
+      mockCommitSources();
+      const sources = github.getMockImplementation()!;
+      github.mockImplementation(async (url: unknown, ...rest: unknown[]) => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith(`/pulls/${OWN_PR}`)) {
+          return {
+            ok: true, status: 200,
+            json: async () => livePr({
+              state: opts.ownPrMerged === false ? "open" : "closed",
+              merged: opts.ownPrMerged !== false,
+              head: { ref: CHILD_BRANCH, sha: "9".repeat(40), repo: { full_name: `${OWNER}/${REPO}` } },
+            }),
+          };
+        }
+        if (path.endsWith(`/commits/${encodeURIComponent(CHILD_BRANCH)}`)) {
+          const status = opts.childStatus ?? 404;
+          return { ok: status < 400, status, headers: { get: () => null }, json: async () => opts.childBody ?? {} };
+        }
+        return sources(url, ...rest);
+      });
+    }
+
+    it("does not let a done child with a verified merged own PR and a deleted branch block the owner", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it("still refuses a deleted branch when the own PR is not verified merged", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockDeletedChildBranch({ ownPrMerged: false });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("still refuses a deleted branch when the done child has no recorded own PR", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId, { recorded: false });
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("still refuses a deleted branch for a non-terminal child", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId, { status: "in_review" });
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each([403, 429, 500, 503])("still refuses a done child with a merged own PR when its branch lookup is HTTP %s", async (childStatus) => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockDeletedChildBranch({ childStatus });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("still refuses a malformed child branch lookup", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockDeletedChildBranch({ childStatus: 200, childBody: { sha: "not-a-sha" } });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("does not treat a missing base branch as a deleted child branch", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockDeletedChildBranch();
+      const inner = github.getMockImplementation()!;
+      github.mockImplementation(async (url: unknown, ...rest: unknown[]) => {
+        const path = new URL(String(url)).pathname;
+        if (path.includes("/commits/") && !path.endsWith(`/commits/${encodeURIComponent(CHILD_BRANCH)}`)) {
+          return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}) };
+        }
+        return inner(url, ...rest);
+      });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("keeps refusing a deleted branch when a current attribution row already exists", async () => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      await terminalChild(childId);
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+  });
 });
