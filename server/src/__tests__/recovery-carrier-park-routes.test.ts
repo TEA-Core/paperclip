@@ -1365,8 +1365,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     const select = new Proxy(db.select, { apply(target, receiver, args) {
       const builder = Reflect.apply(target, receiver, args);
       const fields = args[0];
-      if (fields?.issueId === issueRelations.relatedIssueId && fields?.blockerIssueId === issues.id &&
-          fields?.parentId === issues.parentId && fields?.executionRunId === issues.executionRunId) {
+      const graphRead = fields?.issueId === issueRelations.relatedIssueId && fields?.blockerIssueId === issues.id &&
+        fields?.parentId === issues.parentId && fields?.executionRunId === issues.executionRunId;
+      const snapshotRead = fields?.carrier && fields?.hold && fields?.blockers;
+      if (graphRead || snapshotRead) {
         builder.from = new Proxy(builder.from, { apply(from, fromReceiver, fromArgs) {
           const query = Reflect.apply(from, fromReceiver, fromArgs);
           if (!query || typeof query !== "object") throw new Error("Expected the real Drizzle query object");
@@ -1736,7 +1738,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       if (graphRead || snapshotRead) {
         builder.from = new Proxy(builder.from, { apply(from, fromReceiver, fromArgs) {
           const query = Reflect.apply(from, fromReceiver, fromArgs);
-          const execute = Reflect.get(query, "then").bind(query);
+          if (!query || typeof query !== "object") throw new Error("Expected the real Drizzle query object");
+          const then = Reflect.get(query, "then");
+          if (typeof then !== "function") throw new Error("Expected the real Drizzle query promise");
+          const execute = then.bind(query);
           Object.defineProperty(query, "then", { value: (
             fulfilled?: (value: unknown) => unknown, rejected?: (reason: unknown) => unknown,
           ) => {
@@ -1836,7 +1841,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(after.actions).toEqual([expectedAction]);
     expect(after.cards).toEqual(before.cards);
     expect(after.wakes).toEqual(before.wakes);
-    await expect(drain!).resolves.toMatchObject({ monitorArmed: 0, recoveryIssueMinted: 0, noInvokableOwner: 0 });
+    await expect(drain!).resolves.toMatchObject({ monitorArmed: 0, recoveryIssueMinted: 0, noInvokableOwner: 0, staleActionSkipped: 1 });
   }, 30_000);
 
   it("keeps a monitor that became due after the sweep's clock sample", async () => {

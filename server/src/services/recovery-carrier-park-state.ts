@@ -1,6 +1,12 @@
 import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
 import { issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds, type Db } from "@paperclipai/db";
 import type { RecoveryCarrierParkSummary } from "@paperclipai/shared";
+import { alias } from "drizzle-orm/pg-core";
+
+type RecoveryCarrierParkBlocker = Pick<typeof issues.$inferSelect,
+  "id" | "companyId" | "parentId" | "identifier" | "title" | "status" | "statusVersion" |
+  "executionRunId" | "assigneeAgentId" | "assigneeUserId">;
+const parkCarrier = alias(issues, "recovery_park_carrier");
 
 export const RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED = "Board-parked recovery carrier: native wake suppressed without replay";
 
@@ -37,32 +43,45 @@ export async function hasBoardParkedRecoveryAction(db: Db, companyId: string, so
   )).limit(1);
   return Boolean(action);
 }
-/** Staleness removes consent from presentation, never the persisted safety hold. */
-export async function listRecoveryCarrierParks(db: Db, companyId: string, carrierIds: string[]) {
-  const result = new Map<string, RecoveryCarrierParkSummary>();
-  if (!carrierIds.length) return result;
-  const holds = await db.select().from(issueTreeHolds).where(and(
-    eq(issueTreeHolds.companyId, companyId), inArray(issueTreeHolds.rootIssueId, carrierIds),
+/** Consent and its direct blocker facts share one statement, including caller-owned transactions. */
+export async function readRecoveryCarrierParkSnapshot(db: Db, companyId: string, carrierIds: string[]) {
+  const parks = new Map<string, RecoveryCarrierParkSummary>();
+  const blockers = new Map<string, RecoveryCarrierParkBlocker[]>();
+  if (!carrierIds.length) return { parks, blockers };
+  const rows = await db.select({
+    carrier: { id: parkCarrier.id, hiddenAt: parkCarrier.hiddenAt, status: parkCarrier.status,
+      statusVersion: parkCarrier.statusVersion, assigneeAgentId: parkCarrier.assigneeAgentId, assigneeUserId: parkCarrier.assigneeUserId },
+    hold: { id: issueTreeHolds.id, releasePolicy: issueTreeHolds.releasePolicy, recoveryCarrierPark: issueTreeHolds.recoveryCarrierPark },
+    action: { sourceIssueId: issueRecoveryActions.sourceIssueId, recoveryIssueId: issueRecoveryActions.recoveryIssueId,
+      status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome, ownerType: issueRecoveryActions.ownerType,
+      ownerAgentId: issueRecoveryActions.ownerAgentId, wakePolicy: issueRecoveryActions.wakePolicy,
+      monitorPolicy: issueRecoveryActions.monitorPolicy, resolvedAt: issueRecoveryActions.resolvedAt, updatedAt: issueRecoveryActions.updatedAt },
+    decision: { issueId: issueThreadInteractions.issueId, kind: issueThreadInteractions.kind, status: issueThreadInteractions.status,
+      resolvedByUserId: issueThreadInteractions.resolvedByUserId, resolvedByAgentId: issueThreadInteractions.resolvedByAgentId,
+      resolvedAt: issueThreadInteractions.resolvedAt, updatedAt: issueThreadInteractions.updatedAt },
+    blockers: sql<RecoveryCarrierParkBlocker[]>`case when ${parkCarrier.status} = 'blocked' or ${issueTreeHolds.id} is not null then
+      coalesce((select jsonb_agg(jsonb_build_object(
+        'id', ${issues.id}, 'companyId', ${issues.companyId}, 'parentId', ${issues.parentId},
+        'identifier', ${issues.identifier}, 'title', ${issues.title}, 'status', ${issues.status},
+        'statusVersion', ${issues.statusVersion}, 'executionRunId', ${issues.executionRunId},
+        'assigneeAgentId', ${issues.assigneeAgentId}, 'assigneeUserId', ${issues.assigneeUserId}))
+        from ${issueRelations} inner join ${issues} on ${issues.id} = ${issueRelations.issueId}
+        where ${issueRelations.companyId} = ${companyId} and ${issues.companyId} = ${companyId}
+          and ${issueRelations.relatedIssueId} = ${parkCarrier.id} and ${issueRelations.type} = 'blocks'), '[]'::jsonb)
+      else '[]'::jsonb end`,
+  }).from(parkCarrier).leftJoin(issueTreeHolds, and(
+    eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.rootIssueId, parkCarrier.id),
     eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"), isNotNull(issueTreeHolds.recoveryCarrierPark),
-  ));
-  if (!holds.length) return result;
-  const bindings = holds.flatMap(hold => hold.recoveryCarrierPark ? [hold.recoveryCarrierPark] : []);
-  const [carriers, actions, decisions, blockers] = await Promise.all([
-    db.select().from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, carrierIds))),
-    db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.id, bindings.map(b => b.recoveryActionId)))),
-    db.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.companyId, companyId), inArray(issueThreadInteractions.id, bindings.map(b => b.decisionInteractionId)))),
-    db.select({ carrierId: issueRelations.relatedIssueId, id: issues.id, status: issues.status, statusVersion: issues.statusVersion })
-      .from(issueRelations).innerJoin(issues, and(eq(issues.id, issueRelations.issueId), eq(issues.companyId, companyId)))
-      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks"), inArray(issueRelations.relatedIssueId, carrierIds))),
-  ]);
-  const carrierMap = new Map(carriers.map(row => [row.id, row]));
-  const actionMap = new Map(actions.map(row => [row.id, row]));
-  const decisionMap = new Map(decisions.map(row => [row.id, row]));
-  for (const hold of holds) {
-    const b = hold.recoveryCarrierPark!;
-    const carrier = carrierMap.get(hold.rootIssueId), action = actionMap.get(b.recoveryActionId.toLowerCase()), decision = decisionMap.get(b.decisionInteractionId.toLowerCase());
-    const currentBlockers = blockers.filter(row => row.carrierId === hold.rootIssueId);
-    const accepted = b.version === 1 && hold.releasePolicy?.strategy === "manual" && carrier && !carrier.hiddenAt &&
+  )).leftJoin(issueRecoveryActions, and(eq(issueRecoveryActions.companyId, companyId),
+    sql`lower(${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId') = ${issueRecoveryActions.id}::text`,
+  )).leftJoin(issueThreadInteractions, and(eq(issueThreadInteractions.companyId, companyId),
+    sql`lower(${issueTreeHolds.recoveryCarrierPark} ->> 'decisionInteractionId') = ${issueThreadInteractions.id}::text`,
+  )).where(and(eq(parkCarrier.companyId, companyId), inArray(parkCarrier.id, carrierIds)));
+  for (const { carrier, hold, action, decision, blockers: currentBlockers } of rows) {
+    blockers.set(carrier.id, currentBlockers);
+    const b = hold?.recoveryCarrierPark;
+    if (!hold || !b) continue;
+    const accepted = b.version === 1 && hold.releasePolicy?.strategy === "manual" && !carrier.hiddenAt &&
       carrier.status === b.expectedStatus && carrier.statusVersion === b.expectedStatusVersion &&
       carrier.assigneeAgentId === b.expectedAssigneeAgentId && carrier.assigneeUserId === b.expectedAssigneeUserId &&
       action?.sourceIssueId === b.sourceIssueId.toLowerCase() && action.recoveryIssueId === carrier.id &&
@@ -73,8 +92,8 @@ export async function listRecoveryCarrierParks(db: Db, companyId: string, carrie
       decision.updatedAt.toISOString() === b.expectedDecisionUpdatedAt &&
       currentBlockers.length === b.expectedBlockers.length && currentBlockers.every(row => b.expectedBlockers.some(expected =>
         row.id === expected.id.toLowerCase() && row.status === expected.status && row.statusVersion === expected.statusVersion));
-    result.set(hold.rootIssueId, { state: accepted ? "accepted" : "stale", holdId: hold.id,
+    parks.set(carrier.id, { state: accepted ? "accepted" : "stale", holdId: hold.id,
       sourceIssueId: b.sourceIssueId, recoveryActionId: b.recoveryActionId, decisionInteractionId: b.decisionInteractionId, reason: b.reason });
   }
-  return result;
+  return { parks, blockers };
 }

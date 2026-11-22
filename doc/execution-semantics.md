@@ -689,15 +689,19 @@ wake preflight use the lock-holding transaction; wake publication follows commit
 Locked preflight distinguishes a board park, an existing live monitor and ordinary
 unavailability. Park refusal posts no missing-owner notice or fallback audit.
 An existing monitor keeps its schedule and metadata without creating a carrier.
+Monitor admission rereads the exact action under the source lock and skips a
+stale or independently resolved action without falling back to a new carrier.
+Due and future checks use one clock sample taken after acquiring that lock.
 Recovery notices recheck the exact source/action under the source lock, including
 the comment's source-recency update.
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.
 Stale execution-pointer cleanup and healthy-child blocker repair recheck the
-source-action gate under the source lock. Active typed parks also prevent
-automatic stale-review carrier archival;
-ordinary unparked cleanup and review-stage archival rules are unchanged.
+source-action gate under the source lock. Healthy-child repair also preserves an
+operator's terminal source close that won that lock. Active typed parks prevent
+automatic stale-review carrier archival; ordinary unparked cleanup and review-stage
+archival rules are unchanged.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
 the source's unresolved escalation and from actual dependency counts/tree
@@ -705,8 +709,10 @@ liveness. Terminal blocker history is retained; the ordinary all-done re-block
 PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
 rejection never create acceptance. A stale binding surfaces attention and keeps
 the manual execution hold; it cannot grant a fresh run.
-Attention revalidates park consent after reading blocker facts, so a concurrent
-blocker reopen cannot retain an obsolete accepted projection.
+Attention reads direct blocker facts and park consent in one company-scoped
+statement, including when the caller already owns a transaction. The graph uses
+that same root-blocker snapshot, so neither a concurrent reopen nor a late park
+acceptance can combine live blocker facts with unrelated accepted consent.
 Deferred promotion rechecks the typed park under the issue lock. The ordinary
 pause's verified-interaction exception cannot bypass a carrier park: a legacy
 deferred receipt is cancelled without a run and cannot replay on release.

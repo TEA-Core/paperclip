@@ -1789,9 +1789,9 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
-  function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined) {
+  function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined, nowMs = Date.now()) {
     if (!monitorNextCheckAt) return false;
-    return new Date(monitorNextCheckAt).getTime() > Date.now();
+    return new Date(monitorNextCheckAt).getTime() > nowMs;
   }
 
   async function hasOccupiedExecutionWorkspace(
@@ -5402,11 +5402,12 @@ export function recoveryService(
         cyclicChildBlockersSkipped = safeChildren.length !== healthyChildren.length;
         if (safeChildren.length > 0) {
           const blockerWriteAllowed = await db.transaction(async tx => {
-            const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+            const [source] = await tx.select({ id: issues.id, status: issues.status }).from(issues).where(and(
               eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
             )).for("update");
             const runner = tx as unknown as Db; // Match board acceptance's source lock order.
-            if (!source || await isRecoveryActionBoardParked(runner, issue.companyId, action.id)) return false;
+            if (!source || source.status === "done" || source.status === "cancelled" ||
+                await isRecoveryActionBoardParked(runner, issue.companyId, action.id)) return false;
             const blockerIds = (await unresolvedBlockerIssues(runner, issue.companyId, issue.id)).map(row => row.id);
             await issueService(runner).update(issue.id, {
               status: "blocked",
@@ -9762,6 +9763,7 @@ export function recoveryService(
   type ExhaustedBoardMonitorOutcome =
     | typeof EXHAUSTED_RECOVERY_PARKED
     | typeof EXHAUSTED_RECOVERY_UNAVAILABLE
+    | { kind: "stale_action" }
     | { kind: "live"; checkAt: Date | null; dueAwaitingClaim: boolean }
     | { kind: "armed"; checkAt: Date };
   type ExhaustedRecoveryIssueOutcome =
@@ -9783,6 +9785,13 @@ export function recoveryService(
   async function armExhaustedBoardMonitorLocked(input: ExhaustedBoardMonitorInput, db: Db): Promise<ExhaustedBoardMonitorOutcome> {
     const issuesSvc = issueService(db);
     if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return EXHAUSTED_RECOVERY_PARKED;
+    const [action] = await db.select({ sourceIssueId: issueRecoveryActions.sourceIssueId,
+      status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, input.issue.companyId), eq(issueRecoveryActions.id, input.recoveryActionId),
+    ));
+    if (!action || action.sourceIssueId !== input.issue.id || action.status !== "escalated" || action.outcome !== "exhausted") {
+      return { kind: "stale_action" };
+    }
     if (
       !isMonitorableIssueShape({
         status: input.issue.status,
@@ -9792,8 +9801,9 @@ export function recoveryService(
     ) {
       return EXHAUSTED_RECOVERY_UNAVAILABLE;
     }
-    const dueAwaitingClaim = isDueSelfArmedBoardMonitor(input.issue, input.now);
-    if (hasFutureMonitorCheck(input.issue.monitorNextCheckAt) || dueAwaitingClaim) {
+    const lockedNow = new Date();
+    const dueAwaitingClaim = isDueSelfArmedBoardMonitor(input.issue, lockedNow);
+    if (hasFutureMonitorCheck(input.issue.monitorNextCheckAt, lockedNow.getTime()) || dueAwaitingClaim) {
       return { kind: "live", checkAt: input.issue.monitorNextCheckAt, dueAwaitingClaim };
     }
     const normalized = input.issue.executionPolicy
@@ -9895,6 +9905,7 @@ export function recoveryService(
       alreadyLive: 0,
       monitorDueAwaitingClaim: 0,
       noInvokableOwner: 0,
+      staleActionSkipped: 0,
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -9962,6 +9973,10 @@ export function recoveryService(
           now,
         });
         if (monitor.kind === "parked") return;
+        if (monitor.kind === "stale_action") {
+          result.staleActionSkipped++;
+          return;
+        }
         if (monitor.kind === "live") {
           result.alreadyLive++;
           if (monitor.dueAwaitingClaim) result.monitorDueAwaitingClaim++;
@@ -10400,7 +10415,7 @@ export function recoveryService(
                 notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
                 now,
               });
-              if (monitor.kind === "parked") return;
+              if (monitor.kind === "parked" || monitor.kind === "stale_action") return;
               if (monitor.kind === "live") {
                 result.livePathSkipped++;
                 return;
@@ -12117,7 +12132,7 @@ export function recoveryService(
           notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
           now,
         });
-    if (monitor.kind === "parked") return;
+    if (monitor.kind === "parked" || monitor.kind === "stale_action") return;
     const armedBoardCheckAt = monitor.kind === "armed" || monitor.kind === "live" ? monitor.checkAt : null;
     // A live monitor already owns the next step; only unavailability falls back to a carrier.
     const carrier = monitor.kind === "unavailable"

@@ -5,7 +5,7 @@ import type { ParkRecoveryCarrier, RecoveryCarrierParkBinding, RecoveryCarrierPa
 import { conflict, forbidden, notFound } from "../errors.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
-import { listRecoveryCarrierParks, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
+import { readRecoveryCarrierParkSnapshot, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 import { DEFERRABLE_WAKE_SKIP_REASONS } from "./wake-skip-classification.js";
 
 type BoardParkActor = Pick<LogActivityInput, "actorType" | "actorId" | "boardApiKeyId" | "runId">;
@@ -122,7 +122,7 @@ export function recoveryCarrierParkService(db: Db) {
           .sort((left, right) => left.id.localeCompare(right.id)) };
       if (existing) {
         const hold = await treeControl.getHold(companyId, existing.holdId);
-        const summary = (await listRecoveryCarrierParks(runner, companyId, [carrierId])).get(carrierId);
+        const summary = (await readRecoveryCarrierParkSnapshot(runner, companyId, [carrierId])).parks.get(carrierId);
         if (hold?.recoveryCarrierPark && summary?.state === "accepted" &&
             isDeepStrictEqual({ ...hold.recoveryCarrierPark,
               expectedBlockers: hold.recoveryCarrierPark.expectedBlockers.map(row => ({ ...row, id: row.id.toLowerCase() }))
