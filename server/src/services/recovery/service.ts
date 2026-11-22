@@ -5398,13 +5398,25 @@ export function recoveryService(
         const safeChildren = healthyChildren.filter((child) => !reachable.has(child.id));
         cyclicChildBlockersSkipped = safeChildren.length !== healthyChildren.length;
         if (safeChildren.length > 0) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([...blockerIds, ...safeChildren.map((child) => child.id)]),
-            ],
+          const blockerWriteAllowed = await db.transaction(async tx => {
+            const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+            )).for("update");
+            const runner = tx as unknown as Db; // Match board acceptance's source lock order.
+            if (!source || await isRecoveryActionBoardParked(runner, issue.companyId, action.id)) return false;
+            const blockerIds = (await unresolvedBlockerIssues(runner, issue.companyId, issue.id)).map(row => row.id);
+            await issueService(runner).update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([...blockerIds, ...safeChildren.map((child) => child.id)]),
+              ],
+            });
+            return true;
           });
+          if (!blockerWriteAllowed) {
+            result.skipped += 1;
+            continue;
+          }
         }
       }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({

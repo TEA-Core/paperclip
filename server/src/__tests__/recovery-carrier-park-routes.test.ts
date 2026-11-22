@@ -1404,9 +1404,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it("keeps healthy-child repair exact to the parked action while repairing an ordinary same-company source", async () => {
+  it.each([false, true])("keeps healthy-child repair exact while repairing an ordinary same-company source, released %s", async released => {
     const f = await fixture(), ordinary = await fixture(f.companyId);
-    expect((await park(f)).status).toBe(201);
+    const parked = await park(f);
+    expect(parked.status).toBe(201);
+    if (released) expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "Carrier release does not authorize automatic source repair" })).status).toBe(200);
     const protectedChild = randomUUID(), ordinaryChild = randomUUID();
     await db.insert(issues).values([
       { id: protectedChild, companyId: f.companyId, title: "Human-owned parked source child",

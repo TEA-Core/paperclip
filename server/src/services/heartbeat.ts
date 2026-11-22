@@ -33436,12 +33436,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const outcome = await db
         .transaction(async (tx) => {
+          const runner = tx as unknown as Db;
+          if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+            return { kind: "deferred" as const };
+          }
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
-          const runner = tx as unknown as Db;
-          if ((recoveryActionId && await isRecoveryActionBoardParked(runner, agent.companyId, recoveryActionId)) ||
-              (await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, issueId))?.recoveryCarrierPark) {
+          if ((await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, issueId))?.recoveryCarrierPark) {
             await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
             return { kind: "deferred" as const };
           }

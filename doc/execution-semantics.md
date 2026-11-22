@@ -683,8 +683,9 @@ wake preflight use the lock-holding transaction; wake publication follows commit
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.
-Stale execution-pointer cleanup rechecks the source-action gate under the source
-lock. Active typed parks also prevent automatic stale-review carrier archival;
+Stale execution-pointer cleanup and healthy-child blocker repair recheck the
+source-action gate under the source lock. Active typed parks also prevent
+automatic stale-review carrier archival;
 ordinary unparked cleanup and review-stage archival rules are unchanged.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
@@ -698,9 +699,10 @@ blocker reopen cannot retain an obsolete accepted projection.
 Deferred promotion rechecks the typed park under the issue lock. The ordinary
 pause's verified-interaction exception cannot bypass a carrier park: a legacy
 deferred receipt is cancelled without a run and cannot replay on release.
-Action-only queue insertion and coalescing share a source-then-carrier locked
-park gate. Coalescing preserves the existing run-first lock order before that
-gate. A typed park takes priority over ordinary holds anywhere in its subtree;
+Action-associated wake admission locks the source and carrier before an
+issue-scoped target or queue insertion. Action-only coalescing preserves its
+existing run-first order before that gate. A typed park takes priority over
+ordinary holds anywhere in its subtree;
 nested ordinary holds remain active and require their own explicit release.
 Typed inheritance follows the full same-company parent chain in one recursive
 read for non-root lookups, using UNION cycle deduplication and a visited set.
