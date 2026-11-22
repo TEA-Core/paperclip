@@ -693,35 +693,57 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     }
   }, 20_000);
 
-  it("serializes a marked agent insertion with the metadata-fallback adoption", async () => {
-    const { company, maintainer } = await seedWikiCompany("maintainer");
-    await db.delete(pluginManagedResources);
-    await db.delete(pluginEntities);
-    const stub = await seedUnassignedHandoff(company.id);
-    let created: Promise<unknown> | undefined;
-    const res = await holdPatchAtUpdate(stub.id, company.id, { description: "Repair pointer" }, async () => {
-      created = agentService(db).create(company.id, {
-        name: "Second Wiki Maintainer",
-        role: "engineer",
-        status: "idle",
-        adapterType: "process",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-        metadata: maintainerMetadata(randomUUID()),
-      });
-      created.catch(() => undefined);
-      // The insertion must wait for the guarded write; row locks alone let it land.
-      const outcome = await Promise.race([
-        created.then(() => "inserted"),
-        new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_500)),
-      ]);
-      expect(outcome).toBe("blocked");
-    });
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
-    await created;
-  }, 30_000);
+  it.each(["marked", "unmarked-then-marked"])(
+    "serializes a %s agent insertion with the metadata-fallback adoption",
+    async (insertion) => {
+      const { company, maintainer } = await seedWikiCompany("maintainer");
+      await db.delete(pluginManagedResources);
+      await db.delete(pluginEntities);
+      const stub = await seedUnassignedHandoff(company.id);
+      const metadata = maintainerMetadata(randomUUID());
+      let created: Promise<unknown> | undefined;
+      let settled = false;
+      try {
+        const res = await holdPatchAtUpdate(stub.id, company.id, { description: "Repair pointer" }, async () => {
+          const svc = agentService(db);
+          created = svc.create(company.id, {
+            name: "Second Wiki Maintainer",
+            role: "engineer",
+            status: "idle",
+            adapterType: "process",
+            adapterConfig: {},
+            runtimeConfig: {},
+            permissions: {},
+            metadata: insertion === "marked" ? metadata : {},
+          }).then((agent) => insertion === "marked" ? agent : svc.update(agent.id, { metadata }))
+            .finally(() => { settled = true; });
+          created.catch(() => undefined);
+          // Observe the insert's exclusive lock waiting on the guard's shared
+          // lock, or its completion. Elapsed time alone proves neither.
+          let outcome = "pending";
+          await expect.poll(async () => {
+            const waiting = await db.execute(sql`
+              SELECT 1 FROM pg_locks AS waiter
+              JOIN pg_locks AS holder
+                USING (locktype, database, classid, objid, objsubid)
+              WHERE waiter.locktype = 'advisory'
+                AND waiter.mode = 'ExclusiveLock' AND NOT waiter.granted
+                AND holder.mode = 'ShareLock' AND holder.granted
+                AND waiter.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            `);
+            outcome = waiting.length > 0 ? "blocked" : settled ? "completed" : "pending";
+            return outcome;
+          }, { timeout: 10_000 }).not.toBe("pending");
+          expect(outcome).toBe("blocked");
+        });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+      } finally {
+        if (created) expect(await created).toMatchObject({ metadata });
+      }
+    },
+    30_000,
+  );
 
   it("fails closed when the adopted fallback maintainer loses its marker before the locked write", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");
