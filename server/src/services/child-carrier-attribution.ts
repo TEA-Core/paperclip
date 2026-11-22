@@ -35,6 +35,13 @@ export type ChildCarrierLivePullRequest = {
   baseRef: string | null;
 };
 
+export type ChildCarrierProof = {
+  attributionId: string;
+  ancestorIssueId: string;
+  branchName: string;
+  commitShas: string[];
+};
+
 export type ChildCarrierResolution =
   | { kind: "absent" }
   | {
@@ -43,6 +50,7 @@ export type ChildCarrierResolution =
       displayName: string;
       pr: { owner: string; repo: string; number: number };
       childCarrierAttribution: true;
+      childCarrierProof: ChildCarrierProof;
     }
   | { kind: "unresolvable"; reason: string };
 
@@ -210,22 +218,25 @@ async function enumerateChildCarrierCommits(input: {
     "user-agent": "paperclip-child-carrier-attribution",
     "x-github-api-version": "2022-11-28",
   };
-  // The PR-commits endpoint stops at 250 in total. Large comparisons instead
-  // page between immutable commits, never between refs that can move mid-read.
+  // Both comparisons share one pinned base and page between immutable commits.
+  // Each is bounded to 20 pages / 2,000 commits; larger complete sets are
+  // deliberately refused to bound verification work, not treated as partial proof.
   let baseSha: string | null = null;
   const completeComparison = async (headRef: string): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }> => {
     const root = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}`;
     try {
       if (!baseSha) {
         const response = await ghFetch(`${root}/commits/${encodeURIComponent(input.baseRef!)}`, { headers, signal: AbortSignal.timeout(8_000) });
-        const body = response.ok ? await response.json().catch(() => null) : null;
+        if (!response.ok) return { ok: false, reason: `child carrier comparison failed: HTTP ${response.status}` };
+        const body = await response.json().catch(() => null);
         if (typeof body?.sha !== "string" || !SHA_RE.test(body.sha)) return { ok: false, reason: "child carrier comparison has no immutable base" };
         baseSha = body.sha.toLowerCase();
       }
       let headSha = headRef.toLowerCase();
       if (!SHA_RE.test(headSha)) {
         const response = await ghFetch(`${root}/commits/${encodeURIComponent(headRef)}`, { headers, signal: AbortSignal.timeout(8_000) });
-        const body = response.ok ? await response.json().catch(() => null) : null;
+        if (!response.ok) return { ok: false, reason: `child carrier comparison failed: HTTP ${response.status}` };
+        const body = await response.json().catch(() => null);
         if (typeof body?.sha !== "string" || !SHA_RE.test(body.sha)) return { ok: false, reason: "child carrier comparison has no immutable head" };
         headSha = body.sha.toLowerCase();
       }
@@ -234,9 +245,10 @@ async function enumerateChildCarrierCommits(input: {
       let total: number | undefined;
       for (let page = 1; page <= 20; page += 1) {
         const response = await ghFetch(`${root}/compare/${baseSha}...${headSha}?per_page=100&page=${page}`, { headers, signal: AbortSignal.timeout(8_000) });
-        const body = response.ok ? await response.json().catch(() => null) as {
+        if (!response.ok) return { ok: false, reason: `child carrier comparison failed: HTTP ${response.status}` };
+        const body = await response.json().catch(() => null) as {
           total_commits?: number; base_commit?: { sha?: string }; commits?: Array<{ sha?: string }>;
-        } | null : null;
+        } | null;
         if (!body || !Array.isArray(body.commits) || !Number.isInteger(body.total_commits)
           || body.total_commits! < 0 || body.total_commits! > 2_000
           || body.base_commit?.sha?.toLowerCase() !== baseSha
@@ -266,77 +278,17 @@ async function enumerateChildCarrierCommits(input: {
     }
     return { ok: false, reason: "child carrier comparison is incomplete" };
   };
-  let prShas: string[] = [];
-  for (let page = 1; page <= 20; page += 1) {
-    const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/pulls/${input.pullRequestNumber}/commits?per_page=100&page=${page}`;
-    let response: Response;
-    try {
-      response = await ghFetch(url, { headers, signal: AbortSignal.timeout(8_000) });
-    } catch {
-      return { ok: false, reason: "child carrier commit enumeration failed: network_error" };
-    }
-    if (!response.ok) return { ok: false, reason: `child carrier commit enumeration failed: HTTP ${response.status}` };
-    const body = await response.json().catch(() => null);
-    if (!Array.isArray(body)) return { ok: false, reason: "child carrier commit enumeration returned an unreadable list" };
-    for (const row of body) {
-      const sha = (row as { sha?: unknown }).sha;
-      if (typeof sha !== "string" || !SHA_RE.test(sha.toLowerCase())) {
-        return { ok: false, reason: "child carrier commit enumeration returned a non-sha" };
-      }
-      prShas.push(sha.toLowerCase());
-    }
-    const link = response.headers?.get?.("link") ?? "";
-    const hasNext = /<[^>]+>;\s*rel="next"/i.test(link);
-    if (body.length < 100 && hasNext) {
-      return { ok: false, reason: "child carrier commit enumeration is incomplete" };
-    }
-    if (body.length < 100) break;
-    if (page === 20) return { ok: false, reason: "child carrier commit enumeration is incomplete" };
-  }
   if (!input.baseRef) return { ok: false, reason: "child carrier commit enumeration has no base branch" };
-  if (prShas.at(-1) !== input.headSha && prShas.length === 250) {
-    const complete = await completeComparison(input.headSha);
-    if (!complete.ok) return complete;
-    prShas = complete.shas;
-  }
-  if (prShas.at(-1) !== input.headSha) {
+  const carrier = await completeComparison(input.headSha);
+  if (!carrier.ok) return carrier;
+  if (carrier.shas.length === 0) {
     return { ok: false, reason: "child carrier head is not the tip of the enumerated pull request commits" };
   }
-  const compareUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/compare/${encodeURIComponent(input.baseRef)}...${encodeURIComponent(input.childBranch)}`;
-  let compare: Response;
-  try {
-    compare = await ghFetch(compareUrl, { headers, signal: AbortSignal.timeout(8_000) });
-  } catch {
-    return { ok: false, reason: "child branch commit enumeration failed: network_error" };
-  }
-  if (!compare.ok) return { ok: false, reason: `child branch commit enumeration failed: HTTP ${compare.status}` };
-  const compareLink = compare.headers?.get?.("link") ?? "";
-  const compared = await compare.json().catch(() => null) as {
-    total_commits?: unknown;
-    commits?: Array<{ sha?: unknown }>;
-  } | null;
-  if (!compared || !Array.isArray(compared.commits) || typeof compared.total_commits !== "number") {
-    return { ok: false, reason: "child branch commit enumeration is incomplete" };
-  }
-  let childShas: Set<string>;
-  if (compared.total_commits > 250) {
-    const complete = await completeComparison(input.childBranch);
-    if (!complete.ok) return complete;
-    childShas = new Set(complete.shas);
-  } else {
-    if (compared.total_commits !== compared.commits.length || /<[^>]+>;\s*rel="next"/i.test(compareLink)) {
-      return { ok: false, reason: "child branch commit enumeration is incomplete" };
-    }
-    childShas = new Set<string>();
-    for (const row of compared.commits) {
-      if (typeof row.sha !== "string" || !SHA_RE.test(row.sha.toLowerCase())) {
-        return { ok: false, reason: "child branch commit enumeration returned a non-sha" };
-      }
-      childShas.add(row.sha.toLowerCase());
-    }
-  }
-  const prShaSet = new Set(prShas);
-  const intersection = normalizeShas([...childShas].filter((sha) => prShaSet.has(sha)));
+  const child = await completeComparison(input.childBranch);
+  if (!child.ok) return child;
+  const childShas = child.shas;
+  const prShaSet = new Set(carrier.shas);
+  const intersection = normalizeShas(childShas.filter((sha) => prShaSet.has(sha)));
   // A complete disjoint branch is not a contributor. A partial contribution is
   // still incomplete proof and must not be confused with that empty result.
   if (!intersection) return { ok: true, shas: [] };
@@ -670,8 +622,9 @@ export async function resolveChildCarrierDecisionHead(
       return { kind: "unresolvable", reason: "delivery_identity_unresolved: child carrier commit enumeration is missing or extra" };
     }
   }
+  let attributionId: string;
   try {
-    await writeCurrent(db, {
+    attributionId = await writeCurrent(db, {
       companyId,
       childIssueId: issueId,
       ancestorIssueId: ancestors[0]!,
@@ -694,6 +647,7 @@ export async function resolveChildCarrierDecisionHead(
     displayName: `${card.repo.owner}/${card.repo.repo}#${claim.prNumber}`,
     pr: { owner: card.repo.owner, repo: card.repo.repo, number: claim.prNumber },
     childCarrierAttribution: true,
+    childCarrierProof: { attributionId, ancestorIssueId: ancestors[0]!, branchName: live.headRef, commitShas: shas },
   };
 }
 
@@ -768,6 +722,13 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     || certificate.number !== current.pullRequestNumber
     || typeof certificate.owner !== "string" || certificate.owner.toLowerCase() !== current.owner
     || typeof certificate.repo !== "string" || certificate.repo.toLowerCase() !== current.repo) return;
+  const proof = certificate.childCarrierProof as Record<string, unknown> | null | undefined;
+  const certifiedShas = Array.isArray(proof?.commitShas) && proof.commitShas.every((sha) => typeof sha === "string")
+    ? normalizeShas(proof.commitShas)
+    : null;
+  if (!proof || proof.attributionId !== current.id || proof.ancestorIssueId !== current.ancestorIssueId
+    || proof.branchName !== current.branchName || !certifiedShas
+    || certifiedShas.join() !== normalizeShas(current.commitShas)?.join()) return;
   const binding = readBindingPr(state, card.branch);
   if (binding && binding.branch !== current.branchName) return;
   await db
@@ -859,6 +820,8 @@ export async function carrierOwnerChildAttributionBlock(
     .where(and(
       eq(issueChildCarrierAttributions.companyId, companyId),
       eq(issueChildCarrierAttributions.ancestorIssueId, ownerIssueId),
+      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
+      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
       eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
       eq(issueChildCarrierAttributions.state, "current"),
     ));

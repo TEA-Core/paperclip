@@ -37,6 +37,7 @@ import {
   childCarrierAttributionMatches,
   childCarrierStampBlock,
   resolveChildCarrierDecisionHead,
+  type ChildCarrierProof,
 } from "./child-carrier-attribution.js";
 
 export {
@@ -1349,7 +1350,7 @@ export function isArmRecordRefusal(message: string): boolean {
 }
 
 export type ArmRecordOpening =
-  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number }) => Promise<void> }
+  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number; mayHaveApplied: boolean }) => Promise<void> }
   | { ok: false; kind: "failed" | "skipped"; message: string };
 
 /**
@@ -1439,7 +1440,7 @@ export async function openArmRecord(
     forget: settle,
     settleEnable: async (result) => {
       if (result.success) return;
-      if (result.error === "network_error" || result.error?.startsWith("timeout after ") || isTransientArmingStatus(result.status)) {
+      if (result.mayHaveApplied) {
         await startRetries();
       } else {
         await settle();
@@ -1552,18 +1553,24 @@ export async function disableAutoMerge(
   return { success: result.success, error: result.error };
 }
 
+function mutationMayHaveApplied(result: { success: boolean; error: string | null; status: number }): boolean {
+  return result.success || result.error === "network_error"
+    || result.error?.startsWith("timeout after ") === true
+    || result.status === 408 || isTransientArmingStatus(result.status);
+}
+
 export async function enableAutoMerge(
   token: string,
   nodeId: string,
   options: EnableAutoMergeOptions = {},
-): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
+): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number; mayHaveApplied: boolean }> {
   const maxAttempts = options.maxAttempts ?? 3;
   const baseDelay = options.retryDelayMs ?? 250;
   const attemptTimeoutMs = options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {
-    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0 };
+    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0, mayHaveApplied: false };
   }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
     const refusal = await options.beforeAttempt?.();
@@ -1624,11 +1631,13 @@ export async function enableAutoMerge(
   };
 
   let result = await attempt();
+  let mayHaveApplied = mutationMayHaveApplied(result);
   for (let attemptNo = 1; attemptNo < maxAttempts && isTransientArmingStatus(result.status); attemptNo++) {
     await sleep(baseDelay * 2 ** (attemptNo - 1));
     result = await attempt();
+    mayHaveApplied ||= mutationMayHaveApplied(result);
   }
-  return result;
+  return { ...result, mayHaveApplied };
 }
 
 /**
@@ -3086,7 +3095,7 @@ async function writeAttributionGuardedApprovalStatus(
     owner: pr.owner, repo: pr.repo, number: pr.number, headSha, headRef: pr.headRefName ?? null,
   }, issueId);
   const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, { beforeAttempt: authority });
-  if (!result.success) return result;
+  if (!result.success && !result.mayHaveApplied) return result;
   let changed: string | null;
   try {
     changed = await authority();
@@ -3094,8 +3103,8 @@ async function writeAttributionGuardedApprovalStatus(
     changed = "child attribution could not be verified after publication";
   }
   if (!changed) return result;
-  // PostgreSQL and GitHub cannot commit atomically. Void a success observed
-  // after revocation, and explicitly report an unconfirmed compensation.
+  // PostgreSQL and GitHub cannot commit atomically. Void a confirmed or possible
+  // publication after revocation, and explicitly report unconfirmed compensation.
   const voided = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, {
     state: "failure", description: `approval voided: ${changed}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX),
   });
@@ -3527,7 +3536,13 @@ export async function publishApprovalStatus(
 }
 
 export type DecisionHeadResolution =
-  | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
+  | {
+      kind: "resolved";
+      headSha: string;
+      displayName: string;
+      pr: { owner: string; repo: string; number: number };
+      childCarrierProof?: ChildCarrierProof;
+    }
   | {
       kind: "unresolvable";
       reason: string;
@@ -3634,14 +3649,7 @@ export async function resolveApprovalDecisionHead(
 ): Promise<DecisionHeadResolution> {
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   const childCarrier = await resolveChildCarrierDecisionHead(db, companyId, issueId);
-  if (childCarrier.kind === "resolved") {
-    return {
-      kind: "resolved",
-      headSha: childCarrier.headSha,
-      displayName: childCarrier.displayName,
-      pr: childCarrier.pr,
-    };
-  }
+  if (childCarrier.kind === "resolved") return childCarrier;
   if (childCarrier.kind === "unresolvable") {
     return { kind: "unresolvable", reason: childCarrier.reason };
   }
@@ -3903,7 +3911,7 @@ async function verifyLiveFinalDeliveryHead(
   db: Db,
   companyId: string,
   issueId: string,
-  resolved: { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } },
+  resolved: Extract<DecisionHeadResolution, { kind: "resolved" }>,
 ): Promise<DecisionHeadResolution> {
   const { pr } = resolved;
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
@@ -3917,6 +3925,9 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
+    if (resolved.childCarrierProof && (live.merged || live.state !== "open")) {
+      return { kind: "unresolvable", reason: "head_not_open: child carrier delivery must remain OPEN and unmerged" };
+    }
     if (live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
@@ -5091,9 +5102,8 @@ async function writeCommitStatus(
       signal,
     });
   } catch {
-    // No response at all — the request never reached GitHub. Transient by
-    // definition: the network path is the only thing standing between us and a
-    // write, so a retry is warranted (SUP-16081 fix #2).
+    // A lost response does not prove that GitHub rejected the write. Retry the
+    // transport failure, while retaining that it may already have applied.
     return { success: false, error: "network_error", status: 0, transient: true };
   }
 
@@ -5246,6 +5256,8 @@ export interface WriteCommitStatusResult {
   transient: boolean;
   /** HTTP attempts actually made; zero when authority refuses before the first write. */
   attempts: number;
+  /** Any sent attempt accepted the write or could have applied despite a failed response. */
+  mayHaveApplied: boolean;
   /** GitHub's id for the status it accepted, when the answer carried one. */
   statusId?: string | null;
 }
@@ -5271,6 +5283,7 @@ export async function writeCommitStatusWithRetry(
   const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
   let made = 0;
+  let mayHaveApplied = false;
   const attempt = async () => {
     let refusal: string | null;
     try {
@@ -5280,7 +5293,9 @@ export async function writeCommitStatusWithRetry(
     }
     if (refusal) return { success: false, error: `authority_changed:${refusal}`, status: 0, transient: false };
     made += 1;
-    return writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
+    const result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
+    mayHaveApplied ||= mutationMayHaveApplied(result);
+    return result;
   };
   let result = await attempt();
   while (!result.success && result.transient && made < attempts && !options.signal?.aborted) {
@@ -5288,7 +5303,7 @@ export async function writeCommitStatusWithRetry(
     if (options.signal?.aborted) break;
     result = await attempt();
   }
-  return { ...result, attempts: made };
+  return { ...result, attempts: made, mayHaveApplied };
 }
 
 // GitHub rejects a commit-status description over 140 characters.
@@ -5590,7 +5605,7 @@ export async function publishHeadBoundRelease(
         delayMs: input.retryDelayMs ?? 1000,
         signal,
       }),
-      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       compensation(),
     );
   const timedOut = (what: string) => ({ ok: false as const, status: 0, message: `timeout: ${what} did not answer within ${deadlines.fetchMs}ms` });
@@ -5719,7 +5734,7 @@ export async function publishHeadBoundRelease(
         delayMs: input.retryDelayMs ?? 1000,
         signal,
       }),
-      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1 },
+      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       compensation(),
     );
   let confirmedStatusId: string | null = null;
@@ -5773,7 +5788,7 @@ export async function publishHeadBoundRelease(
           attempts: 1,
           signal,
         })),
-        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       );
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
@@ -6599,6 +6614,12 @@ export async function armMergeOnApproval(
       return {
         kind: "armed",
         message: `armed: Auto-merge enabled for ${pr.displayName}`,
+      };
+    }
+    if (result.mayHaveApplied) {
+      return {
+        kind: "failed",
+        message: `failed:arm-unconfirmed: ${pr.displayName} — an enable attempt may have applied (${result.error ?? "unknown"}); the take-back record is retained`,
       };
     }
     if (result.error?.startsWith("authority_changed:")) {

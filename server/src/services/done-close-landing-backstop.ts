@@ -1698,6 +1698,13 @@ export function createDoneCloseLandingBackstopService(
       await armRecord.forget();
     }
     if (!result.success) {
+      if (result.mayHaveApplied) {
+        logger.warn(
+          { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
+          "done-close backstop: re-enqueue unconfirmed; the take-back record is retained",
+        );
+        return false;
+      }
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
         "done-close backstop: re-enqueue failed",

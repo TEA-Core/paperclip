@@ -4957,7 +4957,10 @@ export function issueRoutes(
       approvalStatus: {
         ...prior, approvedHeadSha: verdict.headSha,
         ...(decisionId
-          ? { finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId } }
+          ? { finalDelivery: {
+            ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId,
+            ...(verdict.childCarrierProof ? { childCarrierProof: verdict.childCarrierProof } : {}),
+          } }
           : {}),
       },
     };
@@ -21072,7 +21075,7 @@ export function issueRoutes(
         }
       } else {
         updateFields.executionState = {
-          ...existingExecutionState,
+          ...(updateFields.executionState ?? existingExecutionState),
           reviewRequest,
         };
       }

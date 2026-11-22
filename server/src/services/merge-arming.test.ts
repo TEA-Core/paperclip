@@ -4801,6 +4801,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       // The prompt retries are timers; the tests that do not look at them keep them off.
       beforeEach(() => { disarmTiming.promptDelaysMs = []; });
       afterEach(async () => {
+        vi.useRealTimers();
         disarmTiming.promptDelaysMs = defaultPromptDelays;
         // Records are instance-wide (the sweep takes them all): none may outlive its test.
         await db.execute(sql`update issues set execution_state = execution_state #- '{approvalStatus,autoMergeDisarm}' where execution_state -> 'approvalStatus' -> 'autoMergeDisarm' is not null`);
@@ -4942,8 +4943,11 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
         const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
 
-        expect(outcome.kind).toBe("skipped");
-        expect(outcome.message).toContain("skipped:authority-changed");
+        expect(outcome.kind).toBe("failed");
+        const [card] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        const state = card!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+        expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight", headSha: AUTH_HEAD, number: 125 });
+        expect(disables()).toHaveLength(0);
         expect(enables()).toHaveLength(1);
       });
 
@@ -4991,9 +4995,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD, authorityGuard });
 
           if (timing === "before a transient retry") {
-            // Refused before the retry: no enable was ever accepted, nothing to take back.
-            expect(outcome.kind).toBe("skipped");
-            expect(outcome.message).toContain("skipped:authority-changed");
+            // The retry is refused, but the earlier 502 can hide an applied enable.
+            // Recovery must retain its exact target instead of closing the record.
+            expect(outcome.kind).toBe("failed");
+            const [card] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+            const state = card!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+            expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight", headSha: AUTH_HEAD, number: 125 });
             expect(disables()).toHaveLength(0);
           } else {
             // The revocation committed inside the accepted call: it is accepted, seen at the recheck and taken back. The window
@@ -5185,9 +5192,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
 
         for (const [label, result] of [
-          ["timed out", { success: false, error: "timeout after 10000ms", status: 0 }],
-          ["failed on the network", { success: false, error: "network_error", status: 0 }],
-          ["got a 502", { success: false, error: "HTTP 502", status: 502 }],
+          ["timed out", { success: false, error: "timeout after 10000ms", status: 0, mayHaveApplied: true }],
+          ["failed on the network", { success: false, error: "network_error", status: 0, mayHaveApplied: true }],
+          ["got a 502", { success: false, error: "HTTP 502", status: 502, mayHaveApplied: true }],
         ] as const) {
           it(`keeps the record when the enable call ${label}: the arm may be in force`, async () => {
             const { issueId } = await seedAuthorityCard();
@@ -5207,7 +5214,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           const opening = await openArmRecord(db, companyId, issueId, { owner: OWNER, repo: REPO, number: 125 }, "test", "PR_node_125", AUTH_HEAD, guard);
           if (!opening.ok) throw new Error(opening.message);
 
-          await opening.settleEnable({ success: false, error: "Resource not accessible", status: 403 });
+          await opening.settleEnable({ success: false, error: "Resource not accessible", status: 403, mayHaveApplied: false });
 
           expect(await disarmRecord(issueId)).toBeUndefined();
         });
@@ -5251,6 +5258,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
 
         it("holds the cap under concurrent admissions and a default sweep tries every record at it", async () => {
+          // This exercises admission/sweep limits, not wall-clock movement.
+          vi.useFakeTimers({ toFake: ["Date"] });
           disarmBacklog.cap = 7;
           const cards: string[] = [];
           for (let i = 0; i < 20; i++) cards.push((await seedAuthorityCard(`SUP-${1100 + i}`)).issueId);

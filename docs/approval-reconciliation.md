@@ -73,28 +73,38 @@ host. The attribution record is not a delivery receipt or publication authority.
 The child's decision attaches only to the proof it read: a concurrent change to
 the PR, branch, head, ancestor or commit set leaves the replacement proof pending.
 Refresh and reactivation compare-and-set the complete stored proof before
-preserving its decision. The control-plane final-delivery certificate must bind
-that decision to the same repository, PR and head; moving a claim and attribution
-row cannot move an older approval with them. A delivery-only binding must also
-match the live carrier branch. Child approval never publishes
-`paperclip/approved` or arms the carrier.
+preserving its decision. The control-plane final-delivery certificate binds
+that decision to the same repository, PR, head, attribution row, ancestor, carrier
+branch and exact child commit set. Moving a claim or refreshing the proof cannot
+move an older approval to a different set. A delivery-only binding must also
+match the live carrier branch. The untrusted claim survives stage transitions;
+it is not authority. Callers cannot supply the certificate through issue or
+plugin patches. Child approval never publishes `paperclip/approved` or arms the
+carrier, and the carrier must remain open and unmerged through final preflight.
 
 The carrier owner's separate gate requires every contributing child to have a
 current, complete approved proof. A completely enumerated, disjoint child branch
 does not contribute; partial or unreadable contribution still refuses. The live
 carrier branch must match even when a caller does not provide a branch.
-Required attribution rows are read after remote enumeration. The PR-commits API's
-250-commit cap does not become an ownership limit: larger carrier/child comparisons
-are paged between immutable base/head SHAs and must prove their complete count,
-unique commits and pinned tip. Truncated or inconsistent comparisons still refuse.
+Required attribution rows are read after remote enumeration and scoped to the
+target repository. Both carrier and child comparisons use one pinned base SHA
+and immutable head SHAs, including small comparisons. Each comparison supports
+up to 20 pages of 100 commits (2,000 commits). A larger complete comparison is
+unsupported and refuses, just as truncated or inconsistent data refuses.
+Every supported comparison must prove its complete count, unique commits and
+pinned tip; the PR-commits API's capped list is not used as complete proof.
 
-Status publication checks attribution before each write attempt and after an
-accepted write. A changed child decision voids the success with a failure status;
-an unconfirmed void is reported as a failure, never as publication. Head-bound
-release applies the same post-write gate before recording its confirmation.
+Status publication checks attribution before each write attempt and after a
+confirmed or possibly accepted write. A changed child decision voids the possible
+success with a failure status; an unconfirmed void is reported as a failure,
+never as publication.
+Head-bound release applies the same post-write gate before recording its confirmation.
 The approval actuator and landing backstop check attribution before each enable
 attempt and after an accepted enable. Direct-merge retries recheck authority too.
 A new block takes an arm back through the existing disarm/fence recovery path.
+A lost response or transient enable failure retains the take-back record even
+when a later retry refuses on changed authority. The outcome stays unconfirmed;
+it does not claim that nothing was armed.
 GitHub has no atomic comparison with the instance database: a merge inside the
 in-flight window cannot be undone, and a failed take-back retains the pending
 disarm record rather than claiming success. These are bounded fresh checks and
