@@ -180,9 +180,11 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       markReady(Number(row.pid));
       await released;
     });
-    const blockerPid = await ready;
-    const acceptance = park(f).then(response => response);
+    let acceptance: Promise<Awaited<ReturnType<typeof park>>> | undefined;
     try {
+      const blockerPid = await Promise.race([ready,
+        barrier.then(() => { throw new Error("Park barrier ended before readiness"); })]);
+      acceptance = park(f).then(response => response);
       const parkPid = await waitForBlockedPid(blockerPid);
       return { parkPid, acceptance, barrier, releaseBarrier };
     } catch (error) {
@@ -599,7 +601,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       drain = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
       await waitForBlockedPid(handoffPid);
       releaseBarrier();
-      await Promise.all([barrier, acceptance, sourceReady]);
+      await Promise.all([barrier, acceptance, Promise.race([sourceReady,
+        handoff.then(() => { throw new Error("Source handoff ended before readiness"); })])]);
       // Independent fixture drift makes acceptance stale; its manual hold must still fence remint.
       await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
       before = await snapshot(f);
