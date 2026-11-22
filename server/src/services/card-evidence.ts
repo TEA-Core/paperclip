@@ -45,7 +45,7 @@ const FORGE_DOMAINS = [
   "gerrithub.io",
 ];
 
-const FORGE_LABEL = /^(git|gitlab|github|gerrit|gitea|gogs|forgejo|bitbucket|stash|scm|hg|svn|phabricator|review|reviews|code|cgit|gitweb)\d*$/;
+const FORGE_LABEL = /^(git|gitlab|github|gerrit|gitea|gogs|forgejo|bitbucket|stash|scm|hg|svn|phabricator|code|cgit|gitweb)\d*$/;
 const FORGE_PATH = /\/(pulls?|pull-requests?|pullrequests?|merge_requests|merge-requests|changes|commits?|tree|blob|compare|branches|tags|releases|_git)(\/|$)|\/c\/.+\/\+\/\d+|\/\+\/\d+|\.git(\/|$|[?#])|\/-\/(commit|tree|blob|merge_requests)/i;
 const TAIL = String.raw`\s*(?:(?:no\.?|number|num\.?|id)\s*)?[:#!№]?\s*[#!]?\s*\d+`;
 const CHANGE_REQUEST_LONG = new RegExp(String.raw`(?<![\p{L}\p{N}_])(?:pull[\s_-]*requests?|merge[\s_-]*requests?)` + TAIL, "iu");
@@ -58,8 +58,10 @@ const UUID_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/
 const SHA_PROSE = /(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i;
 const SHA_CUE = /(?:commit|sha|rev|HEAD|merged|pushed|cherry-pick).{0,24}(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i;
 const SHA_BARE_40 = /(?<![\w-])[0-9a-f]{40}(?![\w-])/i;
-const KEY_CONTAINS = ["workspace", "worktree", "repo", "branch", "pullrequest", "mergerequest", "commit", "project"];
-const KEY_EXACT = new Set(["pr", "mr", "sha", "ref", "baseref", "headref", "headsha"]);
+const KEY_CONTAINS = ["workspace", "worktree", "repository", "branch", "pullrequest", "mergerequest", "commit", "project"];
+const KEY_EXACT: Record<string, true> = {
+  pr: true, mr: true, sha: true, ref: true, baseref: true, headref: true, headsha: true, repo: true,
+};
 const PROSE_COLUMNS = new Set([
   "issues.title",
   "issues.description",
@@ -157,8 +159,12 @@ export function normalizedEvidenceKey(key: string): string {
 export function evidenceKey(key: string): boolean {
   const normalized = normalizedEvidenceKey(key);
   if (normalized.length === 0) return false;
-  if (KEY_EXACT.has(normalized)) return true;
-  return KEY_CONTAINS.some((token) => normalized.includes(token));
+  if (Object.hasOwn(KEY_EXACT, normalized)) return true;
+  if (KEY_CONTAINS.some((token) => normalized.includes(token))) return true;
+  // The abbreviation is a field-name word, not the start of "report".
+  // Preserve compact spellings of the usual reference fields as well.
+  if (/repo(?:id|url|path|name|root|dir|ref|slug|branch)$/.test(normalized)) return true;
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).includes("repo");
 }
 
 function provablyEmpty(value: unknown): boolean {
@@ -174,6 +180,11 @@ function provablyEmpty(value: unknown): boolean {
 
 function benignMachineValue(key: string, value: unknown): boolean {
   const normalized = normalizedEvidenceKey(key);
+  // This is the close audit's typed proof container, not a repository
+  // binding. detectEvidence still recursively scans every carried field.
+  if (normalized === "norepositorylanding" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return (value as Record<string, unknown>).proof === "never_had_execution_workspace";
+  }
   if (normalized === "paperclipworkspace" || normalized === "paperclipworkspaces") {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return provablyEmpty(value);
     const record = value as Record<string, unknown>;

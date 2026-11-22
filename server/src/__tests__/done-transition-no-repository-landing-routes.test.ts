@@ -2152,6 +2152,60 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(mockRecheckRecordedWorktree).not.toHaveBeenCalled();
     });
 
+    describe("assurance regression: ordinary record workflows", () => {
+      it.each([false, true])("re-checks a board-reopened card with repository evidence in its prior proof: %s", async (hasRepositoryEvidence) => {
+        const fixture = await seedAdmissible();
+        const first = await close(fixture.identifier);
+        expect(first.status, JSON.stringify(first.body)).toBe(200);
+        expect(await statusOf(fixture.issueId)).toBe("done");
+        asBoard();
+        const reopened = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "in_progress" });
+        expect(reopened.status, JSON.stringify(reopened.body)).toBe(200);
+        expect(await statusOf(fixture.issueId)).toBe("in_progress");
+        if (hasRepositoryEvidence) {
+          await db.update(activityLog).set({
+            details: sql`jsonb_set(${activityLog.details}, '{noRepositoryLanding,repository}', '"records"'::jsonb)`,
+          }).where(and(eq(activityLog.entityId, fixture.issueId), eq(activityLog.action, "issue.done_transition_tier1_close")));
+        }
+        currentActor = fixture.actor;
+        const second = await close(fixture.identifier);
+        expect(second.status, JSON.stringify(second.body)).toBe(hasRepositoryEvidence ? 422 : 200);
+        expect(await statusOf(fixture.issueId)).toBe(hasRepositoryEvidence ? "in_progress" : "done");
+        expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(hasRepositoryEvidence ? 1 : 2);
+      });
+
+      it.each(["report: weekly staffing totals", "summary: weekly staffing totals", "repo: records"])(
+        "checks staffing explanation %s without confusing report with repo",
+        async (authorizationReason) => {
+          const fixture = await seedAdmissible();
+          await db.insert(issueComments).values({
+            companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId,
+            body: "Staffing totals accepted.",
+            metadata: { version: 1, sections: [], authorizationReason },
+          });
+          const result = await close(fixture.identifier);
+          const evidence = authorizationReason.startsWith("repo:");
+          expect(result.status, JSON.stringify(result.body)).toBe(evidence ? 422 : 200);
+          expect(await statusOf(fixture.issueId)).toBe(evidence ? "in_progress" : "done");
+        },
+      );
+
+      it.each([
+        ["https://review.example.org/policies/retention", 200],
+        ["https://example.org/policies/retention", 200],
+        ["https://review.example.org/c/records/+/12345", 422],
+      ] as const)("checks policy URL %s by citation shape", async (url, status) => {
+        const fixture = await seedAdmissible();
+        await db.insert(issueComments).values({
+          companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId,
+          body: `Benefits policy: ${url}`,
+        });
+        const result = await close(fixture.identifier);
+        expect(result.status, JSON.stringify(result.body)).toBe(status);
+        expect(await statusOf(fixture.issueId)).toBe(status === 200 ? "done" : "in_progress");
+      });
+    });
+
     const UNKNOWN_CREATION_SNAPSHOT =
       `Tier 1 "no-repository-landing" cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.`;
     const REWRITE_WITHOUT_OLD_VALUE =
