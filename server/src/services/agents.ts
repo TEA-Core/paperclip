@@ -1,5 +1,6 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -61,7 +62,7 @@ import {
   builtInAgentMarkersEqual,
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
-import { lockWikiMaintainerResolution, metadataMarksWikiMaintainer } from "./issue-assignee-review-gate.js";
+import { lockWikiMaintainerResolution } from "./issue-assignee-review-gate.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 
 function hashToken(token: string) {
@@ -801,7 +802,10 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const changesWikiMaintainerMarker = Object.prototype.hasOwnProperty.call(data, "metadata")
-      && metadataMarksWikiMaintainer(data.metadata) !== metadataMarksWikiMaintainer(existing.metadata);
+      && !isDeepStrictEqual(
+        isPlainRecord(data.metadata) ? data.metadata.pluginManagedAgent : undefined,
+        isPlainRecord(existing.metadata) ? existing.metadata.pluginManagedAgent : undefined,
+      );
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
       if (changesWikiMaintainerMarker) {
         await lockWikiMaintainerResolution(txDb, existing.companyId, "exclusive");

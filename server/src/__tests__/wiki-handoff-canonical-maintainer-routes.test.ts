@@ -27,7 +27,6 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { agentService } from "../services/agents.js";
-import { lockWikiMaintainerResolution } from "../services/issue-assignee-review-gate.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { StorageService } from "../storage/types.js";
@@ -497,16 +496,72 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     20_000,
   );
 
-  it("serializes a Maintainer marker update with a fallback resolver holding the shared lock", async () => {
-    const { company, intruder } = await seedWikiCompany("maintainer");
-    const advisoryWaiters = async () => (await db.execute(sql`SELECT 1 FROM pg_locks
+  it("serializes a marker update on a second agent with a fallback-resolved guarded PATCH", async () => {
+    const { company, maintainer, intruder } = await seedWikiCompany("maintainer");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    const stub = await seedUnassignedHandoff(company.id);
+    const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+    const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+      unsafe: (query: string) => Promise<unknown>;
+      end: (options?: { timeout?: number }) => Promise<unknown>;
+    };
+    const locker = postgres(tempDb!.connectionString, { max: 1 });
+    const barrier = 2493602;
+    const waiters = async () => (await db.execute(sql`SELECT 1 FROM pg_locks
       WHERE locktype = 'advisory' AND NOT granted`)).length;
+    let pending: Promise<request.Response> | undefined;
+    let markerUpdate: Promise<unknown> | undefined;
+    try {
+      await locker.unsafe(`
+        CREATE FUNCTION wiki_handoff_marker_barrier() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(${barrier});
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER wiki_handoff_marker_barrier BEFORE UPDATE ON issues
+        FOR EACH ROW WHEN (NEW.id = '${stub.id}'::uuid)
+        EXECUTE FUNCTION wiki_handoff_marker_barrier();
+        SELECT pg_advisory_lock(${barrier});
+      `);
+      pending = request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" })
+        .then((res) => res);
+      await expect.poll(waiters, { timeout: 10_000 }).toBe(1);
+
+      let markerDone = false;
+      const marker = maintainerMetadata(randomUUID());
+      markerUpdate = agentService(db)
+        .update(intruder.id, { metadata: marker })
+        .then((row) => { markerDone = true; return row; });
+      await expect.poll(waiters, { timeout: 10_000 }).toBe(2);
+      expect(markerDone).toBe(false);
+      await locker.unsafe(`SELECT pg_advisory_unlock(${barrier})`);
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+      await markerUpdate;
+      expect(markerDone).toBe(true);
+      const [stored] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, intruder.id));
+      expect(stored?.metadata).toEqual(marker);
+    } finally {
+      await locker.end({ timeout: 1 });
+      await pending;
+      await markerUpdate;
+      await db.execute(sql`DROP TRIGGER IF EXISTS wiki_handoff_marker_barrier ON issues`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS wiki_handoff_marker_barrier()`);
+    }
+  }, 30_000);
+
+  it("does not take the resolution lock for unrelated or key-reordered marker metadata updates", async () => {
+    const { company, intruder, maintainer } = await seedWikiCompany("maintainer");
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let acquired!: () => void;
     const holding = new Promise<void>((resolve) => { acquired = resolve; });
-    const resolver = db.transaction(async (tx) => {
-      await lockWikiMaintainerResolution(tx as unknown as Db, company.id, "shared");
+    const mutex = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`wiki-maintainer-resolution:${company.id}`}, 0))`);
       acquired();
       await held;
     });
@@ -514,21 +569,16 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     try {
       const unrelated = await agentService(db).update(intruder.id, { metadata: { note: "unrelated" } });
       expect(unrelated?.metadata).toEqual({ note: "unrelated" });
-      expect(await advisoryWaiters()).toBe(0);
-
-      let markerDone = false;
-      const markerUpdate = agentService(db)
-        .update(intruder.id, { metadata: maintainerMetadata(randomUUID()) })
-        .then((row) => { markerDone = true; return row; });
-      await expect.poll(advisoryWaiters, { timeout: 10_000 }).toBe(1);
-      expect(markerDone).toBe(false);
-      release();
-      await resolver;
-      await markerUpdate;
-      expect(markerDone).toBe(true);
+      const [row] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, maintainer.id));
+      const marker = (row!.metadata as { pluginManagedAgent: Record<string, unknown> }).pluginManagedAgent;
+      const reordered = Object.fromEntries(Object.entries(marker).reverse());
+      const result = await agentService(db).update(maintainer.id, {
+        metadata: { ...(row!.metadata as object), pluginManagedAgent: reordered },
+      });
+      expect(result?.id).toBe(maintainer.id);
     } finally {
       release();
-      await resolver;
+      await mutex;
     }
   }, 20_000);
 
