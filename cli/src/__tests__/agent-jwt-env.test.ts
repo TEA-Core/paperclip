@@ -11,6 +11,7 @@ import {
   resolveAgentJwtEnvFile,
 } from "../config/env.js";
 import { agentJwtSecretCheck } from "../checks/agent-jwt-secret-check.js";
+import { bootEnvOrigin, captureOperatorEnv, loadBootEnv, operatorEnvValue, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -23,6 +24,7 @@ function tempConfigPath(): string {
 
 describe("agent jwt env helpers", () => {
   beforeEach(() => {
+    resetBootEnvForTests();
     process.env = { ...ORIGINAL_ENV };
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
@@ -42,6 +44,35 @@ describe("agent jwt env helpers", () => {
     expect(fs.existsSync(envPath)).toBe(true);
     const contents = fs.readFileSync(envPath, "utf-8");
     expect(contents).toContain("PAPERCLIP_AGENT_JWT_SECRET=");
+  });
+
+  it("publishes a newly minted secret for the frozen boot target without operator promotion", () => {
+    const configPath = tempConfigPath();
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: path.dirname(configPath) });
+
+    const result = ensureAgentJwtSecret(configPath);
+
+    expect(result.created).toBe(true);
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET === result.secret).toBe(true);
+    expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBe("boot");
+    expect(operatorEnvValue("PAPERCLIP_AGENT_JWT_SECRET")).toBeUndefined();
+  });
+
+  it("does not publish a newly minted secret for a different config into the boot target", () => {
+    const configPath = tempConfigPath();
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: path.dirname(configPath) });
+    const otherConfig = tempConfigPath();
+
+    const result = ensureAgentJwtSecret(otherConfig);
+
+    expect(result.created).toBe(true);
+    expect(readPaperclipEnvEntries(resolveAgentJwtEnvFile(otherConfig)).PAPERCLIP_AGENT_JWT_SECRET === result.secret).toBe(true);
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+    expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBeNull();
   });
 
   it("creates an independent tool-action signing secret next to the config", () => {

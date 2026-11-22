@@ -1008,9 +1008,9 @@ The server, CLI and database command entrypoints capture the operator environmen
 once, before loading any file. Explicit CLI flags are recorded before the source
 plan is frozen. Repair and later reads cannot recapture file-loaded values as
 operator values, change the plan, or stage additional files.
-If doctor creates a missing agent JWT secret after that load, it publishes the
-newly generated value with boot origin for the current run. It does not reload
-the file or promote an existing file value.
+If setup or doctor creates a missing agent JWT secret after that load, it
+publishes the newly generated value with boot origin only for the frozen plan's
+own file. It does not reload the file or promote an existing file value.
 
 Worktree evidence includes the exported worktree flag, the own-file declaration,
 the managed worktree layout, and an existing port-registry entry. With evidence

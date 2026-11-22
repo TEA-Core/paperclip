@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { parse as parseEnvFileContents } from "dotenv";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
-import { readEnvFileVetted } from "@paperclipai/shared/boot-env";
+import { currentBootEnvPlan, readEnvFileVetted, setBootDerivedEnv } from "@paperclipai/shared/boot-env";
 import { resolveConfigPath } from "./store.js";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
@@ -78,6 +78,9 @@ export function ensureAgentJwtSecret(configPath?: string): { secret: string; cre
 
   if (!existingFile) {
     writeAgentJwtEnv(secret, envFilePath);
+    if (currentBootEnvPlan()?.sources[0]?.path === envFilePath) {
+      setBootDerivedEnv(JWT_SECRET_ENV_KEY, secret);
+    }
   }
 
   return { secret, created };
