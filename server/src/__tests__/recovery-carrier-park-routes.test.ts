@@ -1094,6 +1094,101 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
+  it("drains eligible exhausted work after 500 older exact-action board parks", async () => {
+    const f = await fixture(), eligible = await fixture(f.companyId);
+    const old = new Date("2026-01-01T00:00:00Z");
+    await db.update(issues).set({ createdAt: old }).where(eq(issues.id, f.sourceId));
+    await db.update(issues).set({ createdAt: new Date(old.getTime() + 1000) }).where(eq(issues.id, eligible.sourceId));
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    const [source] = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+    const [carrier] = await db.select().from(issues).where(eq(issues.id, f.carrierId));
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    const [decision] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.decisionId));
+    const [hold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, accepted.body.hold.id));
+    // Seed additional already-accepted, internally consistent persisted states;
+    // the first acceptance above uses the real board route, not a mock gate.
+    const copies = Array.from({ length: 499 }, () => ({
+      sourceId: randomUUID(), carrierId: randomUUID(), actionId: randomUUID(), decisionId: randomUUID(), holdId: randomUUID(),
+    }));
+    const cards = copies.flatMap(copy => [
+      { ...source, id: copy.sourceId },
+      { ...carrier, id: copy.carrierId, originId: copy.sourceId },
+    ]);
+    for (let offset = 0; offset < cards.length; offset += 100) {
+      await db.insert(issues).values(cards.slice(offset, offset + 100));
+    }
+    await db.insert(issueRecoveryActions).values(copies.map(copy => ({
+      ...action, id: copy.actionId, sourceIssueId: copy.sourceId, recoveryIssueId: copy.carrierId,
+    })));
+    await db.insert(issueThreadInteractions).values(copies.map(copy => ({ ...decision, id: copy.decisionId, issueId: copy.carrierId })));
+    await db.insert(issueRelations).values(copies.map(copy => ({ companyId: f.companyId, issueId: f.blockerId, relatedIssueId: copy.carrierId, type: "blocks" as const })));
+    await db.insert(issueTreeHolds).values(copies.map(copy => ({
+      ...hold, id: copy.holdId, rootIssueId: copy.carrierId,
+      recoveryCarrierPark: { ...hold.recoveryCarrierPark!, sourceIssueId: copy.sourceId,
+        recoveryActionId: copy.actionId, decisionInteractionId: copy.decisionId },
+    })));
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const result = await recoveryService(db, { enqueueWakeup: async () => { throw new Error("A reused board carrier must not be woken"); } })
+      .reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+    expect(result).toMatchObject({ checked: 1, alreadyLive: 1, candidateLimitSkipped: 0, monitorArmed: 0, recoveryIssueMinted: 0, noInvokableOwner: 0 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("mints an unparked exhausted carrier with one pool connection and queues only after commit", async () => {
+    const f = await fixture();
+    await db.update(issueRecoveryActions).set({ recoveryIssueId: null }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.delete(issues).where(eq(issues.id, f.carrierId));
+    await db.update(agents).set({ role: "cto", status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "backlog", assigneeAgentId: f.agentId, createdByAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    const applicationName = `exhausted-carrier-one-${randomUUID()}`;
+    const limited = createDb(postgres.connectionString, { maxConnections: 1, applicationName });
+    const recovery = recoveryService(limited, { enqueueWakeup: async (agentId, opts) => {
+      const carrierId = opts?.payload?.issueId;
+      if (!opts || typeof carrierId !== "string") throw new Error("Exhausted carrier wake lacks its issue identity");
+      // The independent connection must see the link and acquire the source
+      // lock immediately: receipt publication is a post-commit operation.
+      await db.transaction(async tx => {
+        await tx.execute(sql`select id from issues where id = ${f.sourceId} for update nowait`);
+        const [linked] = await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+        const [carrier] = await tx.select().from(issues).where(eq(issues.id, carrierId));
+        expect(linked.recoveryIssueId).toBe(carrierId);
+        expect(carrier).toMatchObject({ parentId: f.sourceId, assigneeAgentId: f.agentId, deliveryRequirement: "record_only" });
+        await tx.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: "automation",
+          status: "queued", reason: opts.reason, payload: opts.payload });
+      });
+      return null;
+    } });
+    const work = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+    let expire!: () => void;
+    const deadline = new Promise<{ kind: "timed_out" }>(resolve => { expire = () => resolve({ kind: "timed_out" }); });
+    const timer = setTimeout(expire, 4000);
+    try {
+      const outcome = await Promise.race([deadline, work.then(
+        value => ({ kind: "completed" as const, value }),
+        error => ({ kind: "failed" as const, error }),
+      )]);
+      if (outcome.kind === "timed_out") {
+        // Bound and interrupt only this disposable fixture's named pool; settle
+        // its transaction before cleanup instead of leaving a dangling query.
+        await db.execute(sql`select pg_terminate_backend(pid) from pg_stat_activity where application_name = ${applicationName}`);
+        await work.catch(() => undefined);
+      }
+      expect(outcome.kind).toBe("completed");
+      if (outcome.kind === "failed") throw outcome.error;
+      if (outcome.kind === "completed") expect(outcome.value).toMatchObject({ recoveryIssueMinted: 1, monitorArmed: 0, noInvokableOwner: 0 });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toMatchObject([{ agentId: f.agentId, reason: "exhausted_recovery_issue",
+        payload: { sourceIssueId: f.sourceId, recoveryActionId: f.actionId } }]);
+    } finally {
+      clearTimeout(timer);
+      await limited.$client.end({ timeout: 0 });
+    }
+  }, 15_000);
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
