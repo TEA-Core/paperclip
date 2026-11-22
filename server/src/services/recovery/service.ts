@@ -71,6 +71,7 @@ import {
   issueWatchdogs,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issueLabels,
   issues,
   labels,
@@ -10284,6 +10285,34 @@ export function recoveryService(
     const filters = [
       eq(issues.status, "blocked"),
       visibleIssueCondition(),
+      // Protected work must not consume the bounded ordinary-recovery window.
+      // Descendants are discovered now rather than relying on admission members.
+      sql`not exists (
+        with recursive park_ancestors(id, parent_id) as (
+          select ${issues.id}, ${issues.parentId}
+          union
+          select park_parent.id, park_parent.parent_id
+          from ${issues} as park_parent
+          join park_ancestors on park_parent.id = park_ancestors.parent_id
+          where park_parent.company_id = ${issues.companyId}
+        )
+        select 1 from park_ancestors
+        join ${issueTreeHolds} on ${issueTreeHolds.rootIssueId} = park_ancestors.id
+        where ${issueTreeHolds.companyId} = ${issues.companyId}
+          and ${issueTreeHolds.status} = 'active'
+          and ${issueTreeHolds.mode} = 'pause'
+          and ${issueTreeHolds.recoveryCarrierPark} is not null
+      )`,
+      sql`not exists (
+        select 1 from ${issueRecoveryActions}
+        where ${issueRecoveryActions.companyId} = ${issues.companyId}
+          and ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+          and ${issueRecoveryActions.status} in ('active', 'escalated')
+          and not (${recoveryActionNotBoardParked(
+            sql`${issues.companyId}`,
+            sql`${issueRecoveryActions.id}`,
+          )})
+      )`,
     ];
     if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
 

@@ -100,6 +100,12 @@ export function recoveryCarrierParkService(db: Db) {
           inArray(agentWakeupRequests.status, ["pending", "queued", "claimed", "deferred_issue_execution"]),
           and(eq(agentWakeupRequests.status, "skipped"), sql`${agentWakeupRequests.finishedAt} is null`,
             inArray(agentWakeupRequests.reason, [...DEFERRABLE_WAKE_SKIP_REASONS])),
+          and(eq(agentWakeupRequests.status, "coalesced"), sql`exists (
+            select 1 from ${heartbeatRuns}
+            where ${heartbeatRuns.id} = ${agentWakeupRequests.runId}
+              and ${heartbeatRuns.companyId} = ${companyId}
+              and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+          )`),
         ), or(
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'taskId'`, treeIds),

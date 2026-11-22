@@ -1,4 +1,5 @@
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { isTransactionHandle } from "./db-handle.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
@@ -15467,6 +15468,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // diagnostic persistence: a driver-level failure must be recorded (with its error class chain,
   // since drizzle/postgres.js keep the real Postgres error and SQLSTATE on `.cause`) and the run
   // must continue (SUP-15284). The guard never throws.
+  async function recordHeartbeatRunContextSnapshotFailure(
+    failure: Parameters<typeof buildContextSnapshotWriteFailureEvent>[0],
+    agentId?: string | null,
+    companyId?: string | null,
+  ) {
+    try {
+      logger.error(
+        {
+          err: failure.error,
+          runId: failure.runId,
+          agentId: agentId ?? null,
+          companyId: companyId ?? null,
+          writeSite: failure.writeSite,
+          errorClasses: contextSnapshotWriteErrorClasses(failure.error),
+        },
+        `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
+      );
+      // Retain one agent-readable run-log event on failure only. Callers owning
+      // a transaction record after it settles, never through a second pool
+      // connection while that transaction still holds the first one.
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, failure.runId))
+        .then((rows) => rows[0] ?? null);
+      if (run) await appendRunEvent(run, buildContextSnapshotWriteFailureEvent(failure));
+    } catch {
+      // A diagnostic failure must not abort the original wake or guarded write.
+    }
+  }
+
   async function guardHeartbeatRunContextSnapshotWrite<T>(input: {
     writeSite: string;
     runId: string;
@@ -15480,33 +15512,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runId: input.runId,
       write: input.write,
       fallback: input.fallback,
-      record: async (failure) => {
-        logger.error(
-          {
-            err: failure.error,
-            runId: failure.runId,
-            agentId: input.agentId ?? null,
-            companyId: input.companyId ?? null,
-            writeSite: failure.writeSite,
-            errorClasses: contextSnapshotWriteErrorClasses(failure.error),
-          },
-          `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
-        );
-        // Also retain the failure where an agent can read it (SUP-15431): append one
-        // heartbeat_run_events row so a future guarded failure is diagnosable from
-        // GET /api/heartbeat-runs/{runId}/events, not only container logs. Load the
-        // full run row here (failure path only — no happy-path cost) so appendRunEvent
-        // gets a complete row; skip the append if the row is already gone. A failure
-        // in this append is swallowed by the guard's outer catch, so it can never
-        // re-enter the guarded write path.
-        const run = await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, failure.runId))
-          .then((rows) => rows[0] ?? null);
-        if (!run) return;
-        await appendRunEvent(run, buildContextSnapshotWriteFailureEvent(failure));
-      },
+      record: failure => recordHeartbeatRunContextSnapshotFailure(failure, input.agentId, input.companyId),
     });
   }
 
@@ -32918,7 +32924,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
       executor: WakeupWriteExecutor = db,
-    ) => {
+    ): Promise<{ created: boolean }> => {
       // Upstream #13270: a saved user message waiting on execution is updated in place with the
       // current wait reason; it never becomes a skipped row, so it precedes the fork's SUP-15552
       // write-time coalescing of skipped rows.
@@ -32945,6 +32951,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // does not contain.
       const storedPayload = patch.payload !== undefined ? patch.payload : payload;
       const coalescingIssueId = readWakeIssueIdFromPayload(storedPayload);
+      if (deferrable && (recoveryActionId || coalescingIssueId || issueId)) {
+        if (!isTransactionHandle(executor)) {
+          return db.transaction(tx => writeSkippedRequest(skipReason, patch, waitCondition, tx));
+        }
+        const runner = executor as unknown as Db;
+        if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+          await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+          return { created: false };
+        }
+        const scopedIssueId = coalescingIssueId ?? issueId;
+        if (scopedIssueId && isUuidLike(scopedIssueId)) {
+          await executor.execute(sql`select id from issues where id = ${scopedIssueId} and company_id = ${agent.companyId} for update`);
+          const hold = await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, scopedIssueId);
+          if (hold?.recoveryCarrierPark) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+            return { created: false };
+          }
+        }
+      }
       if (deferrable) {
         // Write-time coalescing (SUP-15552): while the transient condition
         // persists an agent can be skipped repeatedly (timer, assignment and
@@ -33060,12 +33085,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       if (waitCondition && issueId && isUuidLike(issueId)) {
         const waitIssueId = issueId;
-        return db.transaction(async (tx) => {
+        const recordWait = async (tx: WakeupWriteExecutor) => {
           await tx.execute(sql`select id from issues where id = ${waitIssueId} and company_id = ${agent.companyId} for update`);
           return recordExecutionWait(tx as unknown as Db, {
             issueId: waitIssueId, request, condition: waitCondition, coalesce: coalesceExecutionWait,
           });
-        });
+        };
+        return isTransactionHandle(executor) ? recordWait(executor) : db.transaction(recordWait);
       }
       await executor.insert(agentWakeupRequests).values(request);
       return { created: true };
@@ -35017,23 +35043,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             coalescedTargetRun.status === "scheduled_retry",
         },
       );
+      let snapshotFailure: Parameters<typeof buildContextSnapshotWriteFailureEvent>[0] | undefined;
       const persistCoalescedWake = async (executor: Db) => {
-        const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+        const writeSnapshot = (runner: Db) => runner
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+          .returning()
+          .then((rows) => rows[0] ?? coalescedTargetRun);
+        const mergedRun = await runContextSnapshotWriteGuarded({
           writeSite: "enqueueWakeup:same-scope-coalesce",
           runId: coalescedTargetRun.id,
-          agentId,
-          companyId: agent.companyId,
-          write: () =>
-            executor
-              .update(heartbeatRuns)
-              .set({
-                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-                updatedAt: new Date(),
-              })
-              .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-              .returning()
-              .then((rows) => rows[0] ?? coalescedTargetRun),
+          // Roll back only this diagnostic update if PostgreSQL rejects it;
+          // the outer action-gated transaction must remain usable for receipt.
+          write: () => isTransactionHandle(executor)
+            ? executor.transaction(tx => writeSnapshot(tx as unknown as Db))
+            : writeSnapshot(executor),
           fallback: coalescedTargetRun,
+          record: async failure => { snapshotFailure = failure; },
         });
         await executor.insert(agentWakeupRequests).values({
           ...durableReceiptFields,
@@ -35055,8 +35085,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       const nestedIssueId = readNonEmptyString(parseObject(mergedContextSnapshot.paperclipIssue).id);
       let parkRefused = false;
-      const mergedRun = recoveryActionId || (nestedIssueId && isUuidLike(nestedIssueId))
-        ? await db.transaction(async (tx) => {
+      const mergedRun = await (recoveryActionId || (nestedIssueId && isUuidLike(nestedIssueId))
+        ? db.transaction(async (tx) => {
             // Match restore's run-then-issue lock order even when this queued run
             // was previously unbound and therefore absent from its first scan.
             await tx.execute(sql`select id from heartbeat_runs where company_id = ${agent.companyId} and id = ${coalescedTargetRun.id} for update`);
@@ -35084,7 +35114,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             return persistCoalescedWake(tx as unknown as Db);
           })
-        : await persistCoalescedWake(db);
+        : persistCoalescedWake(db)).finally(async () => {
+          if (snapshotFailure) {
+            await recordHeartbeatRunContextSnapshotFailure(snapshotFailure, agentId, agent.companyId);
+          }
+        });
       if (!mergedRun) {
         if (!parkRefused) await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
         return null;

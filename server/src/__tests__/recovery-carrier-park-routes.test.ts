@@ -2070,7 +2070,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       if (outcome.kind === "failed") throw outcome.error;
       if (outcome.kind === "completed") expect(outcome.value?.id).toBe(queued.id);
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
-        .toEqual([expect.objectContaining({ status: "coalesced", runId: queued.id, payload: { recoveryActionId: f.actionId } })]);
+        .toEqual([expect.objectContaining({ status: "coalesced", runId: queued.id,
+          payload: expect.objectContaining({ recoveryActionId: f.actionId }) })]);
       expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, queued.id), eq(heartbeatRunEvents.eventType, "error"))))
         .toEqual([expect.objectContaining({ level: "error", payload: { writeSite: "enqueueWakeup:same-scope-coalesce",
           runId: queued.id, errorClasses: expect.arrayContaining([expect.objectContaining({ code: "22001" })]) } })]);

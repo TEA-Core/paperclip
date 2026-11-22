@@ -729,6 +729,24 @@ when the carrier is parked. A native dispatch attempt suppressed by a park also
 marks its original intent skipped; release cannot replay it. Other native
 deferral policies remain unchanged.
 
+Early scheduling, cutoff and budget deferrals take the same exact-action and
+issue locks before coalescing or persisting replay work. A typed park refuses
+that work and terminally skips the original native intent; ordinary quiescence
+still defers normally. The dormant wake-queue module preserves the same typed
+fence instead of granting its ordinary verified-interaction exception.
+
+Action-only coalescing isolates a nonfatal context-snapshot update in a
+savepoint when it already owns a transaction. Its diagnostic run-log event is
+recorded after that transaction settles, including with a one-connection pool.
+A coalesced receipt associated with a queued, running or scheduled-retry run
+still counts as active admission work even if its diagnostic snapshot failed.
+
+Blocked-recovery candidate selection excludes the current typed paused subtree
+and sources with an exact protected active/escalated action before applying
+its bounded ordinary-work limit. The source fence includes released parks.
+This is not a bare-source or global exhausted-action exemption; locked per-issue
+checks still handle parks accepted after candidate selection.
+
 A typed park intentionally excludes comment delivery. Existing manual-pause
 admission rejects ordinary issue-comment writes, and the composer stays disabled.
 Internal wake attempts do not create a deferred delivery queue. Board release
