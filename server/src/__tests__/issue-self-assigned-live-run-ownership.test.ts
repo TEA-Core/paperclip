@@ -1265,6 +1265,48 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
   });
 
+  it.each([
+    ["board", "create"],
+    ["board", "child"],
+    ["board", "update"],
+    ["agent", "create"],
+    ["agent", "child"],
+    ["agent", "update"],
+  ] as const)(
+    "%s %s request bodies cannot supply creation origin",
+    async (principal, surface) => {
+      const { companyId, writerAgentId, writerRunId, issueId } = await seedForgedHeaderCard();
+      const app = appFor(principal === "board"
+        ? boardActor(companyId)
+        : agentActor(companyId, writerAgentId, writerRunId));
+      const createBody = {
+        title: "Caller-supplied origin",
+        status: "todo",
+        assigneeAgentId: writerAgentId,
+        originRunId: writerRunId,
+      };
+      const response = surface === "update"
+        ? await request(app).patch(`/api/issues/${issueId}`).send({
+          title: "Uncommitted title",
+          assigneeAgentId: writerAgentId,
+          originRunId: writerRunId,
+        })
+        : await request(app).post(surface === "create"
+          ? `/api/companies/${companyId}/issues`
+          : `/api/issues/${issueId}/children`).send(createBody);
+      expect(response.status, JSON.stringify(response.body)).toBe(400);
+      const stored = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(stored.map((row) => row.id)).toEqual([issueId]);
+      expect(stored[0]).toMatchObject({
+        title: "Forged header card",
+        assigneeAgentId: null,
+        originRunId: null,
+        executionRunId: null,
+      });
+      expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+    },
+  );
+
   it("a board round trip away and back does not revive the origin proof", async () => {
     const { companyId, writerAgentId, peerAgentId, writerRunId } = await seed();
     const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));

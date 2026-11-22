@@ -11976,7 +11976,10 @@ export function issueService(
 
     update: async (
       id: string,
-      data: Partial<typeof issues.$inferInsert> & {
+      data: Omit<Partial<typeof issues.$inferInsert>, "originRunId"> & {
+        // Creation provenance is immutable through the typed update API.
+        // Reassignment may clear it below, but no caller may establish it.
+        originRunId?: never;
         labelIds?: string[];
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
