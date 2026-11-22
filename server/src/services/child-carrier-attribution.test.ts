@@ -659,9 +659,9 @@ describePg("child carrier attribution", () => {
     }).returning();
     await db.update(issues).set({
       executionState: {
-        lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD },
+        lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: proof.pullRequestNumber, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${proof.pullRequestNumber}`, headSha: proof.headSha },
         approvalStatus: { finalDelivery: {
-          decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD,
+          decisionId: decision!.id, owner: OWNER, repo: REPO, number: proof.pullRequestNumber, headSha: proof.headSha,
           childCarrierProof: { attributionId: proof.id, ancestorIssueId: proof.ancestorIssueId, branchName: proof.branchName, commitShas: proof.commitShas },
         } },
       },
@@ -1137,5 +1137,249 @@ describePg("child carrier attribution", () => {
       lastDecisionId: intermediate!.id, lastDecisionOutcome: "approved", childCarrierClaim: claim,
     } }).where(eq(issues.id, childId));
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  describe("independent owner authority boundaries", () => {
+    const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+
+    async function approvedPair() {
+      const pair = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, pair.childId);
+      const decisionId = await approveChild(pair.childId);
+      await recordChildCarrierDecision(db, companyId, pair.childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, pair.ownerId, target)).toBeNull();
+      return { ...pair, decisionId };
+    }
+
+    async function childState(childId: string) {
+      const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+      return child!.executionState!;
+    }
+
+    async function addSibling(ownerId: string) {
+      const [owner] = await db.select().from(issues).where(eq(issues.id, ownerId));
+      const childId = randomUUID();
+      await db.insert(issues).values({
+        id: childId, companyId, projectId: owner!.projectId, parentId: ownerId,
+        identifier: "SUP-22879", title: "Second child", status: "in_review",
+        executionState: { childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653` } },
+      });
+      const [workspace] = await db.insert(executionWorkspaces).values({
+        companyId, projectId: owner!.projectId!, sourceIssueId: childId,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: "second child",
+        status: "active", branchName: "second-child", repoUrl: `https://github.com/${OWNER}/${REPO}`,
+      }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, childId));
+      return childId;
+    }
+
+    it.each(["owner", "child"] as const)("does not constrain an unrelated PR through an unreadable %s workspace", async (which) => {
+      const { ownerId, childId } = await seedPair();
+      await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, which === "owner" ? ownerId : childId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it.each(["branch", "repository owner", "repository"] as const)("leaves a caller's different %s outside this carrier owner's gate", async (field) => {
+      const { ownerId } = await approvedPair();
+      const other = field === "branch" ? { ...target, headRef: "other-carrier" }
+        : field === "repository owner" ? { ...target, owner: "other-owner" } : { ...target, repo: "other-repository" };
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, other)).toBeNull();
+    });
+
+    it.each(["repository owner", "repository"] as const)("does not make a foreign child %s depend on the carrier provider being available", async (field) => {
+      const { ownerId } = await seedPair();
+      await db.update(executionWorkspaces).set({
+        repoUrl: field === "repository owner" ? `https://github.com/other-owner/${REPO}` : `https://github.com/${OWNER}/other-repository`,
+      }).where(eq(executionWorkspaces.branchName, CHILD_BRANCH));
+      github.mockResolvedValue({ ok: false, status: 503, json: async () => ({}) });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it("refuses an unreadable live carrier instead of throwing or admitting its approved child", async () => {
+      const { ownerId } = await approvedPair();
+      github.mockResolvedValue({ ok: false, status: 503, json: async () => ({}) });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses an approved historical branch after its owner's workspace changes only case", async () => {
+      const { ownerId } = await approvedPair();
+      await db.update(executionWorkspaces).set({ branchName: CARRIER_BRANCH.toLowerCase() })
+        .where(eq(executionWorkspaces.sourceIssueId, ownerId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each([undefined, null])("accepts a verified live head when the caller head is %s", async (headSha) => {
+      const { ownerId } = await approvedPair();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, { ...target, headSha })).toBeNull();
+    });
+
+    it("refuses an unreadable carrier head even when the child comparison is empty", async () => {
+      const { ownerId } = await seedPair();
+      github.mockResolvedValue({
+        ok: true, status: 200,
+        json: async () => livePr({ head: { ref: CARRIER_BRANCH, sha: null, repo: { full_name: `${OWNER}/${REPO}` } } }),
+      });
+      childCarrierCommits.enumerate = async () => ({ ok: true, shas: [] });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses malformed enumerated commits instead of treating them as noncontributing", async () => {
+      const { ownerId } = await seedPair();
+      childCarrierCommits.enumerate = async () => ({ ok: true, shas: ["not-a-sha"] });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["company", "ancestor"] as const)("does not accept an approved attribution from another %s", async (field) => {
+      const { ownerId } = await approvedPair();
+      const foreignId = randomUUID();
+      if (field === "company") {
+        await db.insert(companies).values({ id: foreignId, name: "Other company", issuePrefix: "OTH" });
+      } else {
+        await db.insert(issues).values({ id: foreignId, companyId, title: "Other carrier", identifier: "SUP-900", status: "backlog" });
+      }
+      await db.update(issueChildCarrierAttributions).set(field === "company" ? { companyId: foreignId } : { ancestorIssueId: foreignId });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("ignores another repository owner's historical row for a completely disjoint child", async () => {
+      const { ownerId } = await approvedPair();
+      await db.update(issueChildCarrierAttributions).set({ owner: "other-owner" });
+      childCarrierCommits.enumerate = async () => ({ ok: true, shas: [] });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it("does not borrow a fully certified child contribution from another exact PR", async () => {
+      const { ownerId, childId } = await seedPair();
+      await db.update(issues).set({ executionState: {
+        ...await childState(childId), childCarrierClaim: { prNumber: 654, prUrl: `https://github.com/${OWNER}/${REPO}/pull/654` },
+      } }).where(eq(issues.id, childId));
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      await approveChild(childId);
+      await recordChildCarrierDecision(db, companyId, childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, { ...target, number: 654 })).toBeNull();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("admits both contributing children only with each child's own approved attribution", async () => {
+      const { ownerId } = await approvedPair();
+      const secondId = await addSibling(ownerId);
+      await resolveChildCarrierDecisionHead(db, companyId, secondId);
+      await approveChild(secondId);
+      await recordChildCarrierDecision(db, companyId, secondId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it("refuses malformed stored commits instead of throwing through owner publication", async () => {
+      const { ownerId } = await approvedPair();
+      await db.update(issueChildCarrierAttributions).set({ commitShas: ["not-a-sha"] });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["decision ID", "outcome", "missing certificate", "certificate ID"] as const)("independently refuses a changed protected child %s", async (field) => {
+      const { ownerId, childId } = await approvedPair();
+      const state = { ...await childState(childId) };
+      const approval = state.approvalStatus as { finalDelivery: Record<string, unknown> };
+      if (field === "decision ID") {
+        const [next] = await db.insert(issueExecutionDecisions).values({
+          companyId, issueId: childId, stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "New decision",
+        }).returning();
+        state.lastDecisionId = next!.id;
+      } else if (field === "outcome") state.lastDecisionOutcome = "changes_requested";
+      else if (field === "missing certificate") state.approvalStatus = {};
+      else state.approvalStatus = { ...approval, finalDelivery: { ...approval.finalDelivery, decisionId: randomUUID() } };
+      await db.update(issues).set({ executionState: state }).where(eq(issues.id, childId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["repository", "branch"] as const)("refuses a conflicting delivery binding %s even with a valid child claim", async (field) => {
+      const { ownerId, childId } = await approvedPair();
+      await db.update(issues).set({ executionState: {
+        ...await childState(childId), delivery: {
+          prNumber: 653, headSha: HEAD,
+          prUrl: field === "repository" ? `https://github.com/${OWNER}/other-repository/pull/653` : `https://github.com/${OWNER}/${REPO}/pull/653`,
+          branch: field === "branch" ? "other-carrier" : CARRIER_BRANCH,
+        },
+      } }).where(eq(issues.id, childId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["missing", "pull request", "head"] as const)("refuses a %s child claim independently of the approved stored proof", async (field) => {
+      const { ownerId, childId } = await approvedPair();
+      const state = { ...await childState(childId) };
+      if (field === "missing") delete state.childCarrierClaim;
+      else state.childCarrierClaim = field === "pull request"
+        ? { prNumber: 654, prUrl: `https://github.com/${OWNER}/${REPO}/pull/654`, headSha: HEAD }
+        : { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "b".repeat(40) };
+      await db.update(issues).set({ executionState: state }).where(eq(issues.id, childId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["no latest", "other issue", "other company"] as const)("refuses a foreign decision reference with %s authority", async (scope) => {
+      const { ownerId, childId, decisionId } = await approvedPair();
+      let decisionCompanyId = companyId;
+      if (scope === "other company") {
+        const [foreignCompany] = await db.insert(companies).values({ name: "Other decision company", issuePrefix: "OTH" }).returning();
+        decisionCompanyId = foreignCompany!.id;
+      }
+      const [foreign] = await db.insert(issueExecutionDecisions).values({
+        companyId: decisionCompanyId, issueId: scope === "other company" ? childId : ownerId,
+        stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "Foreign decision",
+      }).returning();
+      await db.update(issueChildCarrierAttributions).set({ childDecisionId: foreign!.id });
+      const state = await childState(childId);
+      const approval = state.approvalStatus as { finalDelivery: Record<string, unknown> };
+      await db.update(issues).set({ executionState: {
+        ...state, lastDecisionId: foreign!.id,
+        approvalStatus: { ...approval, finalDelivery: { ...approval.finalDelivery, decisionId: foreign!.id } },
+      } }).where(eq(issues.id, childId));
+      if (scope === "no latest") await db.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, decisionId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["same child", "other issue", "other company"] as const)("uses only the latest rejection for the %s scope", async (scope) => {
+      const { ownerId, childId, decisionId } = await approvedPair();
+      const [approved] = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, decisionId));
+      let decisionCompanyId = companyId;
+      if (scope === "other company") {
+        const [foreignCompany] = await db.insert(companies).values({ name: "Other decision company", issuePrefix: "OTH" }).returning();
+        decisionCompanyId = foreignCompany!.id;
+      }
+      await db.insert(issueExecutionDecisions).values({
+        companyId: decisionCompanyId, issueId: scope === "other issue" ? ownerId : childId,
+        stageId: randomUUID(), stageType: "approval", outcome: "changes_requested", body: "New rejection",
+        createdAt: new Date(approved!.createdAt.getTime() + 1_000),
+      });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target))
+        .toBe(scope === "same child" ? CHILD_CARRIER_OWNER_GATE_SKIP : null);
+    });
+
+    it("refuses a rejected attached decision even when a newer decision approves", async () => {
+      const { ownerId, childId, decisionId } = await approvedPair();
+      const [attached] = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, decisionId));
+      await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.id, decisionId));
+      await db.insert(issueExecutionDecisions).values({
+        companyId, issueId: childId, stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "New approval",
+        createdAt: new Date(attached!.createdAt.getTime() + 1_000),
+      });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses protected state that moves to another company during enumeration", async () => {
+      const { ownerId, childId } = await approvedPair();
+      const [foreignCompany] = await db.insert(companies).values({ name: "New issue company", issuePrefix: "OTH" }).returning();
+      childCarrierCommits.enumerate = async () => {
+        await db.update(issues).set({ companyId: foreignCompany!.id }).where(eq(issues.id, childId));
+        return { ok: true, shas: [COMMIT] };
+      };
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("does not erase an unapproved child contribution when the named base moves", async () => {
+      const { ownerId } = await seedPair();
+      childCarrierCommits.enumerate = realEnumerate;
+      const controls = mockCommitSources();
+      controls.namedBaseMoved = true;
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
   });
 });
