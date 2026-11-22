@@ -4875,6 +4875,39 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(enables()).toHaveLength(moment === "node lookup" ? 0 : 1);
         expect(disables()).toHaveLength(moment === "accepted enable" ? 1 : 0);
       });
+      it("refuses a direct-merge retry when a child-only attribution appears after a transient merge failure", async () => {
+        const { issueId } = await seedAuthorityCard();
+        const ancestorId = await insertIssue({ identifier: "SUP-900", branchName: "SUP-900-carrier" });
+        const mergeQueries: string[] = [];
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url === `https://api.github.com/repos/${OWNER}/${REPO}`) {
+            return { ok: true, status: 200, json: async () => ({ default_merge_method: "squash" }) } as Response;
+          }
+          if (url !== GRAPHQL_URL) throw new Error(`Unexpected GitHub request: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("enablePullRequestAutoMerge")) {
+            return { ok: true, status: 200, json: async () => ({ errors: [{ message: "Pull request Pull request is in clean status" }] }) } as Response;
+          }
+          if (query.includes("mergePullRequest")) {
+            mergeQueries.push(query);
+            if (mergeQueries.length === 1) {
+              await db.insert(issueChildCarrierAttributions).values({
+                companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+                owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: 125,
+                branchName: "SUP-42-branch", headSha: AUTH_HEAD, commitShas: [AUTH_HEAD],
+                writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+              });
+              return { ok: false, status: 502, json: async () => ({}) } as Response;
+            }
+          }
+          return okBody();
+        });
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+        expect(outcome.kind).not.toBe("armed");
+        expect(mergeQueries).toHaveLength(1);
+        expect(mergeQueries[0]).toContain(`expectedHeadOid: "${AUTH_HEAD}"`);
+        expect(mergeQueries[0]).toContain("mergeMethod: SQUASH");
+      });
       it.each(revocations)("is refused before the first attempt when %s", async (_name, revoke) => {
         const { issueId, reviewerId } = await seedAuthorityCard();
         mockGhFetch.mockImplementation(async (url: string) => {

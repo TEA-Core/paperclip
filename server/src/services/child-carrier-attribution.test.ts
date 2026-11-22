@@ -29,7 +29,7 @@ import {
   recordChildCarrierDecision,
   resolveChildCarrierDecisionHead,
 } from "./child-carrier-attribution.js";
-import { publishApprovalStatus } from "./merge-arming.js";
+import { publishApprovalStatus, resolveApprovalDecisionHead } from "./merge-arming.js";
 
 const github = vi.hoisted(() => vi.fn());
 vi.mock("./github-fetch.js", () => ({
@@ -491,7 +491,7 @@ describePg("child carrier attribution", () => {
     })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
-  it("does not attach an old decision to a replacement head or keep it after the proof changes", async () => {
+  it("refuses a mismatched claim head and clears approval when the commit proof changes", async () => {
     const { childId } = await seedPair();
     await db.update(issues).set({
       executionState: { childCarrierClaim: { prNumber: 653, headSha: HEAD } },
@@ -613,7 +613,10 @@ describePg("child carrier attribution", () => {
       companyId, issueId: childId, stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "approved",
     }).returning();
     await db.update(issues).set({
-      executionState: { lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, headSha: HEAD } },
+      executionState: {
+        lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, headSha: HEAD },
+        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
+      },
     }).where(eq(issues.id, childId));
     return decision!.id;
   }
@@ -711,6 +714,7 @@ describePg("child carrier attribution", () => {
       executionState: {
         lastDecisionId: decisionId, lastDecisionOutcome: "approved",
         delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD },
+        approvalStatus: { finalDelivery: { decisionId, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
       },
     }).where(eq(issues.id, childId));
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
@@ -720,5 +724,142 @@ describePg("child carrier attribution", () => {
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
       owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
     })).toBeNull();
+  });
+  it("keeps the certified decision at its old head when claim and stored proof both move", async () => {
+    const { childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    const moved = "d".repeat(40);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, childId));
+    await db.update(issues).set({ executionState: {
+      ...issue!.executionState, childCarrierClaim: { prNumber: 653, headSha: moved },
+    } }).where(eq(issues.id, childId));
+    await db.update(issueChildCarrierAttributions).set({ headSha: moved, childDecisionId: null });
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row?.headSha).toBe(moved);
+    expect(row?.childDecisionId).toBeNull();
+  });
+
+  it("refuses a delivery-only branch mismatch before returning child approval proof", async () => {
+    const { childId } = await seedPair();
+    await db.update(issues).set({ executionState: { delivery: {
+      prNumber: 653, branch: "release-old", headSha: HEAD,
+    } } }).where(eq(issues.id, childId));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    expect((await resolveApprovalDecisionHead(db, companyId, childId, "SUP-22878", true)).kind).toBe("unresolvable");
+    expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
+  });
+
+  it.each(["current", "invalidated"] as const)("does not let a stale %s refresh overwrite a newly approved proof", async (state) => {
+    const { childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    const decisionId = await approveChild(childId);
+    await db.update(issueChildCarrierAttributions).set({ state, childDecisionId: null });
+    let writes = 0;
+    const replacement = [COMMIT, "b".repeat(40)];
+    const racingDb = new Proxy(db, { get(target, key, receiver) {
+      if (key !== "update") return Reflect.get(target, key, receiver);
+      return (...args: Parameters<Db["update"]>) => {
+        const query = target.update(...args);
+        return new Proxy(query, { get(builder, property, builderReceiver) {
+          if (property !== "set") return Reflect.get(builder, property, builderReceiver);
+          return (values: Parameters<typeof query.set>[0]) => {
+            const filtered = query.set(values);
+            return new Proxy(filtered, { get(setter, clause, setterReceiver) {
+              if (clause !== "where") return Reflect.get(setter, clause, setterReceiver);
+              return (...conditions: Parameters<typeof filtered.where>) => {
+                const run = async (returning?: Parameters<typeof filtered.returning>) => {
+                  if (++writes === 2) await db.update(issueChildCarrierAttributions).set({
+                    state: "current", commitShas: replacement, childDecisionId: decisionId,
+                  });
+                  const pending = filtered.where(...conditions);
+                  return returning ? pending.returning(...returning) : pending;
+                };
+                return {
+                  then: (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) => run().then(resolve, reject),
+                  returning: (...fields: Parameters<typeof filtered.returning>) => run(fields),
+                };
+              };
+            } });
+          };
+        } });
+      };
+    } });
+    expect((await resolveChildCarrierDecisionHead(racingDb, companyId, childId)).kind).toBe("unresolvable");
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row?.commitShas).toEqual(replacement);
+    expect(row?.childDecisionId).toBe(decisionId);
+  });
+
+  it.each(["invalidated", "pending", "changed commits"])("refuses owner publication when remote enumeration outlives a proof becoming %s", async (change) => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    childCarrierCommits.enumerate = async () => {
+      await db.update(issueChildCarrierAttributions).set(change === "invalidated" ? { state: "invalidated" }
+        : change === "pending" ? { childDecisionId: null } : { commitShas: ["b".repeat(40)] });
+      return { ok: true, shas: [COMMIT] };
+    };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it.each(["retry", "accepted write"])("does not retain an owner stamp when child approval changes during %s", async (moment) => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    const decisionId = await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    await mention(ownerId);
+    const states: string[] = [];
+    github.mockImplementation(async (_url: unknown, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const state = JSON.parse(String(init.body)).state as string;
+        states.push(state);
+        if (states.length === 1) {
+          await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.id, decisionId));
+          if (moment === "retry") return { ok: false, status: 502, json: async () => ({}) };
+        }
+        return { ok: true, status: 201, json: async () => ({ id: 1 }) };
+      }
+      return { ok: true, status: 200, json: async () => livePr() };
+    });
+    const result = await publishApprovalStatus(db, companyId, ownerId, "SUP-22864", {
+      enforceDeliveryIdentity: true, expectedHeadSha: HEAD,
+    });
+    expect(result.kind).not.toBe("armed");
+    expect(states).toEqual(moment === "retry" ? ["success"] : ["success", "failure"]);
+  });
+
+  it.each([1, 251])("verifies a 251-commit carrier with a complete %i-commit child source and rejects a truncated comparison", async (childCount) => {
+    const commits = Array.from({ length: 250 }, (_, index) => (index + 1).toString(16).padStart(40, "0"));
+    commits[0] = COMMIT;
+    const all = [...commits, HEAD];
+    const base = "f".repeat(40);
+    let truncate = false;
+    github.mockImplementation(async (url: unknown) => {
+      const target = new URL(String(url));
+      let body: unknown;
+      let next = false;
+      const page = Number(target.searchParams.get("page") ?? 1);
+      if (target.pathname.includes("/pulls/")) body = commits.slice((page - 1) * 100, page * 100).map((sha) => ({ sha }));
+      else if (target.pathname.includes("/commits/")) body = { sha: target.pathname.endsWith(CHILD_BRANCH) ? HEAD : base };
+      else if (!target.searchParams.has("per_page")) body = {
+        total_commits: childCount, commits: all.slice(0, Math.min(childCount, 250)).map((sha) => ({ sha })),
+      };
+      else {
+        const slice = all.slice((page - 1) * 100, page * 100);
+        if (truncate && page === 3) slice.pop();
+        body = { total_commits: 251, base_commit: { sha: base }, commits: slice.map((sha) => ({ sha })) };
+        next = page < 3;
+      }
+      return { ok: true, status: 200, headers: { get: () => next ? '<https://api.github.com/next>; rel="next"' : null }, json: async () => body };
+    });
+    const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
+    expect(await realEnumerate(input)).toEqual({ ok: true, shas: childCount === 1 ? [COMMIT] : [...all].sort() });
+    truncate = true;
+    expect((await realEnumerate(input)).ok).toBe(false);
   });
 });

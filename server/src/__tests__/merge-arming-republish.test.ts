@@ -23,6 +23,7 @@ import {
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
+  issueChildCarrierAttributions,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issueExecutionDecisions,
@@ -1990,6 +1991,34 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     const requestRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_requested");
     const outcomeRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_outcome");
+
+    it("voids a success instead of confirming release when child-only authority appears during the write", async () => {
+      const { issueId, companyId } = await seedReleasable();
+      const ancestorId = randomUUID();
+      await db.insert(issues).values({
+        id: ancestorId, companyId, identifier: "SUP-24619-carrier", issueNumber: 24619,
+        title: "Carrier", status: "in_progress", priority: "medium",
+      });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER,
+        branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA], state: "invalidated",
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      installReleaseTransport();
+      const transport = mockGhFetch.getMockImplementation()!;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          await db.update(issueChildCarrierAttributions).set({ state: "current" }).where(eq(issueChildCarrierAttributions.id, proof!.id));
+        }
+        return transport(url, init);
+      });
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(response.body.outcome).toBe("stale");
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
+    });
 
     it("publishes paperclip/approved for exactly the live head with the release description, and logs it", async () => {
       const { issueId } = await seedReleasable();
@@ -5213,6 +5242,44 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
     expect(delivery).toBeDefined();
     expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
+  });
+
+  it.each([true, false])("preserves the forked child's delivered head only when stall escalation is %s", async (stallPolicy) => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, stallPolicy });
+    const [child] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const ownerId = randomUUID();
+    const workspaceId = randomUUID();
+    const branch = "SUP-14823-carrier-branch";
+    await db.insert(issues).values({
+      id: ownerId, companyId, identifier: "SUP-14823-carrier", issueNumber: 2, title: "Carrier",
+      status: "in_progress", priority: "medium", projectId: child!.projectId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId, companyId, projectId: child!.projectId!, sourceIssueId: ownerId, mode: "isolated",
+      strategyType: "git_worktree", name: "carrier", status: "active", branchName: branch, repoUrl: REPO_URL,
+    });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, ownerId));
+    await db.update(issues).set({ parentId: ownerId }).where(eq(issues.id, issueId));
+    await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, child!.executionWorkspaceId!));
+    currentActor = agentActor(companyId, agentId, runId);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockImplementation(async () => createMockResponse({
+      state: "open", draft: false, merged: false,
+      head: { ref: branch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } }, base: { ref: "main" },
+    }));
+    const response = await request(app).patch(`/api/issues/${issueId}`).send({
+      status: "in_review", deliveryIdentity: {
+        repo: { owner: OWNER, repo: REPO }, branch, headSha: HEAD_SHA,
+        prNumber: PR_NUMBER, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+      },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+    expect(row!.executionState?.deliveredHeadSha).toBe(stallPolicy ? HEAD_SHA : undefined);
+    expect(row!.executionWorkspaceId).toBe(child!.executionWorkspaceId);
   });
 
   it("still writes as05_bound_pr for a shared-workspace child binding its ancestor carrier's PR, with no carrier claim (SUP-24619)", async () => {
