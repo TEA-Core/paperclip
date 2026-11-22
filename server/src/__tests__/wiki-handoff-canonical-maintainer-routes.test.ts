@@ -226,6 +226,66 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     return row;
   }
 
+  it.each(["retitled", "reused"])("refuses adoption of a %s title-shaped manual card", async (shape) => {
+    const { company } = await seedWikiCompany("maintainer");
+    issueCounter += 1;
+    const [manual] = await db.insert(issues).values({
+      companyId: company.id,
+      title: shape === "retitled" ? "Unrelated manual follow-up" : HANDOFF_TITLE,
+      description: "Ordinary manually created work",
+      originKind: "manual",
+      originId: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      issueNumber: issueCounter,
+      identifier: `WM-${issueCounter}`,
+      executionPolicy: userReviewPolicy(),
+      executionState: null,
+    }).returning();
+    const app = createApp(db, { ...boardActor(company.id), isInstanceAdmin: false });
+    const res = await request(app).patch(`/api/issues/${manual!.id}`).send({
+      ...(shape === "retitled" ? { title: HANDOFF_TITLE } : {}),
+      description: "Repair an unrelated manual card",
+    });
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({ reason: "wiki_handoff_unassigned" });
+    expect(await readAssignee(manual!.id)).toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      status: "todo",
+    });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id))).toEqual([]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).toEqual([]);
+  });
+
+  it("ignores a foreign marked maintainer when resolving the company-local fallback", async () => {
+    const { company, maintainer } = await seedWikiCompany("unresolvable");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    const [foreignCompany] = await db.insert(companies).values({
+      name: "Foreign Wiki company",
+      issuePrefix: `FW${randomUUID().slice(0, 6).toUpperCase()}`,
+    }).returning();
+    await db.insert(agents).values({
+      companyId: foreignCompany!.id,
+      name: "Foreign Wiki Maintainer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      metadata: maintainer.metadata,
+    });
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`).send({ description: "Repair the local handoff" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+  });
+
   it.each([{}, { comment: "Observation only" }])("keeps a field-less PATCH unassigned: %j", async (body) => {
     const { company } = await seedWikiCompany("maintainer");
     const stub = await seedUnassignedHandoff(company.id);
