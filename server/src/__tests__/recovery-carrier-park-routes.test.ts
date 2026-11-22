@@ -1486,6 +1486,101 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
+  it("does not publish missing-owner fallback after a park wins the blocked sweep source lock", async () => {
+    const f = await fixture();
+    // Keep the independent carrier lane out of this blocked-source sweep.
+    const [carrier] = await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.carrierId))
+      .returning({ statusVersion: issues.statusVersion });
+    f.body.expectedStatus = "backlog";
+    f.body.expectedStatusVersion = carrier.statusVersion;
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const sweep = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park must not dispatch"); } })
+      .reconcileBlockedWithoutBlockers({ companyId: f.companyId });
+    try {
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, sweep]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.sourceId))).toEqual([]);
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.sourceId),
+      eq(activityLog.action, "issue.blocked_without_blockers_suppressed")))).toEqual([]);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("retains the board decision notice when an unparked source genuinely has no recovery owner", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
+    const before = await snapshot(f);
+    await recoveryService(db, { enqueueWakeup: async () => { throw new Error("No owner can be dispatched"); } })
+      .reconcileBlockedWithoutBlockers({ companyId: f.companyId });
+    const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, f.sourceId));
+    expect(notices).toEqual([expect.objectContaining({ authorType: "system", body: expect.stringContaining(f.actionId) })]);
+    const after = await snapshot(f);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.wakes).toEqual(before.wakes);
+    expect(after.cards.map(row => row.id)).toEqual(before.cards.map(row => row.id));
+    expect(after.source[0]).toMatchObject({ status: "blocked", monitorNextCheckAt: null, assigneeAgentId: null });
+  });
+
+  it.each([false, true])("preserves a competing live monitor and otherwise still arms a fresh source, competitor %s", async competitor => {
+    const f = await fixture(), now = new Date(), future = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+    await db.update(issueRecoveryActions).set({ recoveryIssueId: null }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.delete(issues).where(eq(issues.id, f.carrierId));
+    await db.update(agents).set({ role: "cto", status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_review", assigneeAgentId: f.agentId, createdByAgentId: f.agentId })
+      .where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f);
+    const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("A live monitor must not mint or dispatch a carrier"); } });
+    let result: Awaited<ReturnType<typeof recovery.reconcileExhaustedRecoveryDrain>>;
+    let expectedSource: typeof issues.$inferSelect | undefined;
+    if (competitor) {
+      let release!: () => void;
+      const released = new Promise<void>(resolve => { release = resolve; });
+      let markReady!: (pid: number) => void;
+      const ready = new Promise<number>(resolve => { markReady = resolve; });
+      const barrier = db.transaction(async tx => {
+        [expectedSource] = await tx.update(issues).set({
+          monitorNextCheckAt: future, monitorNotes: "Preserve the existing board schedule", monitorScheduledBy: "board",
+          monitorAttemptCount: 1, executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor: {
+            nextCheckAt: future.toISOString(), notes: "Preserve the existing board schedule", scheduledBy: "board",
+            kind: null, serviceName: null, externalRef: null, timeoutAt: null, maxAttempts: 3, recoveryPolicy: null,
+          } },
+        }).where(eq(issues.id, f.sourceId)).returning();
+        const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+        markReady(Number(row.pid));
+        await released;
+      });
+      let drain: ReturnType<typeof recovery.reconcileExhaustedRecoveryDrain> | undefined;
+      try {
+        const holderPid = await Promise.race([ready, barrier.then(() => { throw new Error("Monitor competitor ended before readiness"); })]);
+        drain = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId, now });
+        await waitForBlockedPid(holderPid);
+      } finally {
+        release();
+        await Promise.allSettled([barrier, ...(drain ? [drain] : [])]);
+      }
+      result = await drain!;
+    } else {
+      result = await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId, now });
+    }
+    const after = await snapshot(f);
+    if (competitor) {
+      expect(after.source[0]).toEqual(expectedSource);
+      expect(result).toMatchObject({ monitorArmed: 0, alreadyLive: 1, recoveryIssueMinted: 0, noInvokableOwner: 0 });
+    } else {
+      expect(after.source[0].monitorNextCheckAt!.getTime()).toBeGreaterThan(now.getTime());
+      expect(after.source[0].monitorScheduledBy).toBe("board");
+      expect(result).toMatchObject({ monitorArmed: 1, recoveryIssueMinted: 0, noInvokableOwner: 0 });
+    }
+    expect(after.actions).toEqual(before.actions);
+    expect(after.wakes).toEqual(before.wakes);
+    expect(after.cards.filter(row => row.id !== f.sourceId)).toEqual(before.cards.filter(row => row.id !== f.sourceId));
+  }, 30_000);
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
