@@ -23,6 +23,7 @@ import {
   CHILD_CARRIER_STAMP_SKIP,
   carrierArmBlock,
   carrierOwnerChildAttributionBlock,
+  childCarrierStampBlock,
   childCarrierCommits,
   classifyAncestorCarrierHead,
   recordChildCarrierDecision,
@@ -584,5 +585,140 @@ describePg("child carrier attribution", () => {
     const { childId } = await seedPair();
     await db.update(executionWorkspaces).set({ repoUrl: `https://github.com/${OWNER}/tools` }).where(eq(executionWorkspaces.branchName, CARRIER_BRANCH));
     expect(await classifyAncestorCarrierHead(db, companyId, childId, CARRIER_BRANCH)).toBe("absent");
+  });
+  it.each([
+    "https://notgithub.com/TEA-Core/paperclip",
+    "https://example.com/github.com/TEA-Core/paperclip",
+    "ssh://git@notgithub.com/TEA-Core/paperclip.git",
+  ])("does not mint GitHub proof for workspace host %s", async (repoUrl) => {
+    const { childId } = await seedPair();
+    await db.update(executionWorkspaces).set({ repoUrl }).where(eq(executionWorkspaces.branchName, CHILD_BRANCH));
+    expect(await resolveChildCarrierDecisionHead(db, companyId, childId)).toEqual({ kind: "absent" });
+    expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
+    expect(github).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://github.com/TEA-Core/paperclip.git",
+    "git@github.com:TEA-Core/paperclip.git",
+    "ssh://git@github.com/TEA-Core/paperclip.git",
+  ])("accepts an exact GitHub workspace host in %s", async (repoUrl) => {
+    const { childId } = await seedPair();
+    await db.update(executionWorkspaces).set({ repoUrl }).where(eq(executionWorkspaces.branchName, CHILD_BRANCH));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+  });
+
+  async function approveChild(childId: string) {
+    const [decision] = await db.insert(issueExecutionDecisions).values({
+      companyId, issueId: childId, stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "approved",
+    }).returning();
+    await db.update(issues).set({
+      executionState: { lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, headSha: HEAD } },
+    }).where(eq(issues.id, childId));
+    return decision!.id;
+  }
+
+  it("does not attach a decision when a concurrent writer replaces the same-head commit proof", async () => {
+    const { childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    const replacement = [COMMIT, "b".repeat(40)];
+    // Pause only the final attachment UPDATE, after its reads. The competing
+    // writer changes real persisted proof before the original predicate executes.
+    const racingDb = new Proxy(db, {
+      get(target, key, receiver) {
+        if (key !== "update") return Reflect.get(target, key, receiver);
+        return (...args: Parameters<Db["update"]>) => {
+          const query = target.update(...args);
+          return new Proxy(query, {
+            get(builder, property, builderReceiver) {
+              if (property !== "set") return Reflect.get(builder, property, builderReceiver);
+              return (values: Parameters<typeof query.set>[0]) => {
+                const filtered = query.set(values);
+                return new Proxy(filtered, {
+                  get(setter, clause, setterReceiver) {
+                    if (clause !== "where") return Reflect.get(setter, clause, setterReceiver);
+                    return async (...conditions: Parameters<typeof filtered.where>) => {
+                      await db.update(issueChildCarrierAttributions).set({ commitShas: replacement, childDecisionId: null });
+                      return filtered.where(...conditions);
+                    };
+                  },
+                });
+              };
+            },
+          });
+        };
+      },
+    });
+    await recordChildCarrierDecision(racingDb, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row?.commitShas).toEqual(replacement);
+    expect(row?.childDecisionId).toBeNull();
+  });
+
+  it("ignores a verified noncontributing branch but refuses its empty child claim and a partial contribution", async () => {
+    const { ownerId, childId } = await seedPair();
+    childCarrierCommits.enumerate = realEnumerate;
+    let childCommits = ["b".repeat(40)];
+    github.mockImplementation(async (url: unknown) => ({
+      ok: true, status: 200, headers: { get: () => null },
+      json: async () => String(url).includes("/commits?")
+        ? [{ sha: COMMIT }, { sha: HEAD }]
+        : String(url).includes("/compare/")
+          ? { total_commits: childCommits.length, commits: childCommits.map((sha) => ({ sha })) }
+          : livePr(),
+    }));
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    childCommits = [COMMIT, "b".repeat(40)];
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it("checks the live carrier branch without a caller headRef and admits only the acting approved owner", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+    expect(await childCarrierStampBlock(db, companyId, pr, ownerId)).toBeNull();
+    expect(await childCarrierStampBlock(db, companyId, pr, childId)).toBe(CHILD_CARRIER_STAMP_SKIP);
+    for (const ref of ["other-carrier", null]) {
+      github.mockImplementation(async () => ({
+        ok: true, status: 200, json: async () => livePr({ head: { ref, sha: HEAD, repo: { full_name: `${OWNER}/${REPO}` } } }),
+      }));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    }
+  });
+
+  it.each(["other-carrier", null])("refuses the owner's live branch %s when headRef was omitted", async (ref) => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    github.mockImplementation(async () => ({
+      ok: true, status: 200, json: async () => livePr({ head: { ref, sha: HEAD, repo: { full_name: `${OWNER}/${REPO}` } } }),
+    }));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+  it("attaches and honors the same immutable delivery-only proof accepted by the child resolver", async () => {
+    const { ownerId, childId } = await seedPair();
+    const decisionId = await approveChild(childId);
+    await db.update(issues).set({
+      executionState: {
+        lastDecisionId: decisionId, lastDecisionOutcome: "approved",
+        delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD },
+      },
+    }).where(eq(issues.id, childId));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row?.childDecisionId).toBe(decisionId);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
   });
 });

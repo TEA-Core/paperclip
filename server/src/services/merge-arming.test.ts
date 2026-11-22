@@ -19,6 +19,7 @@ import {
   externalObjectMentions,
   externalObjects,
   issueComments,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issueThreadInteractions,
   issues,
@@ -4840,6 +4841,40 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const enables = () => graphqlQueries().filter((q) => q.includes("enablePullRequestAutoMerge"));
       const disables = () => graphqlQueries().filter((q) => q.includes("disablePullRequestAutoMerge"));
 
+      it.each(["node lookup", "retry", "accepted enable"])("refuses or compensates a new child attribution during %s", async (moment) => {
+        const { issueId } = await seedAuthorityCard();
+        const ancestorId = await insertIssue({ identifier: "SUP-900", branchName: "SUP-900-carrier" });
+        let installed = false;
+        const install = async () => {
+          if (installed) return;
+          installed = true;
+          await db.insert(issueChildCarrierAttributions).values({
+            companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+            owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: 125,
+            branchName: "SUP-42-branch", headSha: AUTH_HEAD, commitShas: [AUTH_HEAD],
+            writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+          });
+        };
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith("/pulls/125")) {
+            await install();
+            return { ok: true, status: 200, json: async () => ({ node_id: "PR_node_125" }) } as Response;
+          }
+          if (url !== GRAPHQL_URL) throw new Error(`Unexpected GitHub request: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("enablePullRequestAutoMerge")) {
+            await install();
+            if (moment === "retry") return { ok: false, status: 502, json: async () => ({}) } as Response;
+          }
+          return okBody();
+        });
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide,
+          { ...certifiedPr, ...(moment === "node lookup" ? { nodeId: null } : {}) },
+          { expectedHeadOid: AUTH_HEAD });
+        expect(outcome.kind).toBe(moment === "accepted enable" ? "failed" : "skipped");
+        expect(enables()).toHaveLength(moment === "node lookup" ? 0 : 1);
+        expect(disables()).toHaveLength(moment === "accepted enable" ? 1 : 0);
+      });
       it.each(revocations)("is refused before the first attempt when %s", async (_name, revoke) => {
         const { issueId, reviewerId } = await seedAuthorityCard();
         mockGhFetch.mockImplementation(async (url: string) => {
