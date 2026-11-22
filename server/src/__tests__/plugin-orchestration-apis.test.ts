@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -68,6 +68,10 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-orchestration-");
     db = createDb(tempDb.connectionString);
+    const [identity] = await db.execute<{ port: number }>(sql`select inet_server_port() as port`);
+    expect(identity.port).toBe(Number(new URL(tempDb.connectionString).port));
+    expect(identity.port).not.toBe(54329);
+    console.info(`Plugin orchestration private Postgres port: ${identity.port}`);
   }, 20_000);
 
   function isHeartbeatRunDependentFkError(error: unknown) {
@@ -352,7 +356,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
   });
 
-  it("does not store a plugin interaction sourceRunId as the child's origin proof", async () => {
+  it.each(["new", "legacy"] as const)("does not store a %s plugin interaction sourceRunId as the child's origin proof", async (provenance) => {
     const { companyId } = await seedCompanyAndAgent();
     const victimAgentId = randomUUID();
     const victimRunId = randomUUID();
@@ -401,6 +405,12 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         },
       },
     });
+    if (provenance === "legacy") {
+      // A pending pre-upgrade row retained the plugin's claimed run/agent pair.
+      await db.update(issueThreadInteractions)
+        .set({ sourceRunId: victimRunId })
+        .where(eq(issueThreadInteractions.id, created.id));
+    }
     const accepted = await issueThreadInteractionService(db).acceptInteraction(
       { id: parentId, companyId, projectId: null, goalId: null, status: "in_progress" },
       created.id,
@@ -410,8 +420,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     const childId = accepted.createdIssues[0]?.id;
     expect(childId).toBeTruthy();
     const [child] = await db.select().from(issues).where(eq(issues.id, childId!));
-    expect(child?.originRunId).toBeNull();
-    expect(await findLiveIssueExecutionHolder(db, companyId, childId!)).toBeNull();
+    const holder = await findLiveIssueExecutionHolder(db, companyId, childId!);
+    expect({ originRunId: child?.originRunId, holderRunId: holder?.runId ?? null })
+      .toEqual({ originRunId: null, holderRunId: null });
   });
 
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {

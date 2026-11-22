@@ -232,7 +232,10 @@ unauthenticated header, which is never copied into either proof. A plugin
 call never stores a supplied run as `originRunId`. A plugin interaction
 drops a supplied `sourceRunId`, so accepting it does not copy that run onto
 the child. The host holds no authenticated run for that call, so a claimed
-agent and run pair is not proof. An agent API key cannot release an adopted
+agent and run pair is not proof. Task acceptance never copies a stored
+interaction's run/agent pair into the child's `originRunId`, including pending
+pre-upgrade rows. The interaction retains its source attribution.
+An agent API key cannot release an adopted
 author hold by naming its run in a header; that release requires the
 authenticated author run or board authority. Other activity actions keep their
 attribution. A reassignment drops `originRunId`. A later

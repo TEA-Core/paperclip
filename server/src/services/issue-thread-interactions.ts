@@ -4037,21 +4037,6 @@ export function issueThreadInteractionService(
         SuggestTasksResultCreatedTask
       >();
       const createdWakeTargets: IssueWakeTarget[] = [];
-      // originRunId is ownership proof. A board create may name any run in
-      // sourceRunId; only a run the host recorded for the interaction's
-      // creating agent is stored on the child.
-      let verifiedOriginRunId: string | null = null;
-      if (interaction.sourceRunId && interaction.createdByAgentId) {
-        const [sourceRun] = await db
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.id, interaction.sourceRunId),
-            eq(heartbeatRuns.companyId, issue.companyId),
-            eq(heartbeatRuns.agentId, interaction.createdByAgentId),
-          ));
-        verifiedOriginRunId = sourceRun?.id ?? null;
-      }
 
       await db.transaction(async (tx) => {
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
@@ -4106,7 +4091,9 @@ export function issueThreadInteractionService(
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
             originIdentityContextId: interaction.sourceIdentityContextId ?? null,
-            originRunId: verifiedOriginRunId,
+            // Stored source attribution is not authenticated run proof: legacy
+            // plugin interactions could supply both the run and creating agent.
+            originRunId: null,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.userId ?? null,
           } as Parameters<ReturnType<typeof issueService>["createChild"]>[1]);
