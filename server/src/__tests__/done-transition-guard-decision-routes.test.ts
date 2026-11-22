@@ -1071,12 +1071,18 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.body.code).toBe("done_transition_record_only_probe_contradiction");
       expect(res.body.error).toContain(marker);
       expect(res.body.error).toContain("record-only probe `<probe command>`");
+      const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "done_transition_record_only_probe_contradiction",
+        httpStatus: 422,
+      });
       expect(res.body.details?.remedy).toContain("Report the non-clean cycle and do not close");
       expect(await statusOf(issueId)).toBe("in_review");
       expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
     });
 
-    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42", "anon request refused 401; failed closed on anon request"])(
+    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42", "scanned=0.5 failed=0.0", "anon request refused 401; failed closed on anon request"])(
       "PATCH closes honest evidence at Tier 2 and records its class: %s",
       async (prose) => {
         const { companyId, reviewerAgentId, issueId, identifier } =

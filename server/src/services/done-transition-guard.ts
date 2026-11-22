@@ -710,7 +710,10 @@ export async function writeDoneTransitionRefusedAuditLog(
   issue: { id: string; companyId: string; identifier: string | null },
   details:
     | {
-        code: "done_transition_missing_tier_declaration";
+        code:
+          | "done_transition_missing_tier_declaration"
+          | typeof DONE_TRANSITION_TIER_CONFLICT_CODE
+          | "done_transition_record_only_probe_contradiction";
         httpStatus: 422;
         reason: string;
         decisionCarried: boolean;
@@ -1962,19 +1965,34 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
 // Named, token-anchored contradictions in the record-only declaration's trailing
 // predicate/result only. This is a bounded denylist, NOT natural-language verdict
 // inference: command/target text and unrelated comment prose are not evidence.
-// Numeric markers accept integer tokens (including leading zeroes); only exit
-// codes may be signed. Zero exits/failed counts and nonzero scanned counts pass.
-// Keep these eight names and forms synchronized with the done-close documentation.
+// Numeric markers capture one COMPLETE signed decimal token (integer, fraction,
+// or exponent form) and judge its numeric value, so `scanned=0.5` is not zero and
+// `failed=0.0` / `exit -0` are zero. Keep these eight names and forms synchronized
+// with the done-close documentation.
+const DECIMAL = String.raw`([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w]|\.\d)`;
+const numericMarker = (name: string, label: string, test: (value: number) => boolean) => ({
+  name,
+  matches: (text: string) => {
+    for (const m of text.matchAll(new RegExp(String.raw`\b${label}${DECIMAL}`, "gi"))) {
+      if (test(Number(m[1]))) return true;
+    }
+    return false;
+  },
+});
+const phraseMarker = (name: string, pattern: RegExp) => ({
+  name,
+  matches: (text: string) => pattern.test(text),
+});
 const RECORD_ONLY_PASS_CONTRADICTIONS = [
-  { name: "exit_nonzero", pattern: /\bexit[ \t]+[+-]?0*[1-9]\d*\b/i },
-  { name: "exited_nonzero", pattern: /\bexited[ \t]+[+-]?0*[1-9]\d*\b/i },
-  { name: "failed_positive", pattern: /\bfailed=0*[1-9]\d*\b/i },
-  { name: "scanned_zero", pattern: /\bscanned=0+\b/i },
-  { name: "non_clean", pattern: /\bnon-clean\b/i },
+  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (v) => v !== 0),
+  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (v) => v !== 0),
+  numericMarker("failed_positive", "failed=", (v) => v > 0),
+  numericMarker("scanned_zero", "scanned=", (v) => v === 0),
+  phraseMarker("non_clean", /\bnon-clean\b/i),
   // Literal scan-failure contexts only; bare expected-negative "failed closed" stays valid.
-  { name: "failed_closed", pattern: /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i },
-  { name: "refused", pattern: /\bREFUSED\b/ },
-  { name: "partial_failure", pattern: /\bpartial[ \t]+failure\b/i },
+  phraseMarker("failed_closed", /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i),
+  phraseMarker("refused", /\bREFUSED\b/),
+  phraseMarker("partial_failure", /\bpartial[ \t]+failure\b/i),
 ] as const;
 
 function refuseTier2(reason: string): DoneTierDeclarationResult {
@@ -2157,7 +2175,7 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
     );
   }
   for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
-    if (marker.pattern.test(predicateResult!)) {
+    if (marker.matches(predicateResult!)) {
       const remedy =
         "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
         `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;

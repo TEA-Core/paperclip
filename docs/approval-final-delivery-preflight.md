@@ -53,20 +53,20 @@ The guard refuses a `result: pass` declaration with `done_transition_record_only
 
 | Marker name | Recognized form |
 | --- | --- |
-| `exit_nonzero` | `exit <integer>` with a nonzero value |
-| `exited_nonzero` | `exited <integer>` with a nonzero value |
-| `failed_positive` | `failed=<integer>` with a positive value |
-| `scanned_zero` | `scanned=0` |
+| `exit_nonzero` | `exit <number>` with a nonzero value |
+| `exited_nonzero` | `exited <number>` with a nonzero value |
+| `failed_positive` | `failed=<number>` with a positive value |
+| `scanned_zero` | `scanned=<number>` whose value is zero |
 | `non_clean` | `non-clean` |
 | `failed_closed` | `failed closed. All` or `scan failed closed on all 4 repos` (literal probe-failure contexts) |
 | `refused` | `REFUSED` |
 | `partial_failure` | `partial failure` |
 
-Numbers may have leading zeroes; exit codes may have a sign. Words have word-boundary anchors; phrase separators accept spaces or tabs. Lowercase `refused` (for example `anon request refused 401`) and a bare `failed closed` (for example a predicate confirming an expected negative path) do not contradict a pass; a failed-closed outcome with an explicit failing exit is caught by the `exit`/`exited` markers. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
+A `<number>` is one complete signed decimal token (integer, fraction such as `.5` or `0.5`, or exponent form such as `1e2`) judged by its numeric value, not by an integer prefix: `scanned=0.5`, `scanned=1e2`, `failed=0.0`, `failed=-1`, `exit 0.0`, and `exit -0` do not contradict a pass, while `scanned=0.0`, `scanned=-0`, `scanned=0e5`, `failed=1.5`, and `exit -0.5` do. Words have word-boundary anchors; phrase separators accept spaces or tabs. Lowercase `refused` (for example `anon request refused 401`) and a bare `failed closed` (for example a predicate confirming an expected negative path) do not contradict a pass; a failed-closed outcome with an explicit failing exit is caught by the `exit`/`exited` markers. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
 
 The added `scan failed closed on all 4 repos` context names the failed scan itself even when no exit code or failed count follows it. It does not turn bare `failed closed` into a contradiction marker. A clean declaration with `scanned=4 failed=0 matched=29 armed=0 exit 0` can still close when separate vet lines in the comment report `REFUSED missing paperclip/approved; exit 1`: those lines describe another operation outside the matched declaration predicate.
 
-The refusal names the marker, repeats the accepted form verbatim, and states the honest alternative: **Report the non-clean cycle and do not close.** Re-probe before claiming a genuine pass; do not relabel a failed probe to force a close.
+The refusal names the marker, persists the same specific code (`done_transition_record_only_probe_contradiction`) as `details.code` of its `issue.done_transition_refused` audit row, repeats the accepted form verbatim, and states the honest alternative: **Report the non-clean cycle and do not close.** Re-probe before claiming a genuine pass; do not relabel a failed probe to force a close.
 
 Every accepted Tier 2 record-only close retains the existing machine-readable `issue.done_transition_tier2_close` activity row with `details.tierForm: "record-only"`, probe evidence, observation, and closing-run identity. The row commits atomically with the terminal status, including approval and system-backstop closes. Count that action and `tierForm` to count this class. No contradiction is accepted, so no `issue.done_transition_declared_pass_with_failed_evidence` row is needed.
 
