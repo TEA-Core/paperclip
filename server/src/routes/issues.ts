@@ -290,7 +290,7 @@ import {
 import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
-  unpaidLandingDebt,
+  prepareLandingDebtClose,
   evaluateDoneTierDeclaration,
   resolveCitedCommits,
   DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
@@ -5619,45 +5619,20 @@ export function issueRoutes(
       storedDeliveryRequirement,
     } = input;
 
-    const debtWhere = and(
-      eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"),
-      eq(activityLog.entityId, issue.id), unpaidLandingDebt(),
-    );
-    // Fresh-create IDs are server-generated; a deduplicated create never updates
-    // the existing issue. Every existing-issue close must recheck under its lock.
-    const debt = input.createDoor ? [] : await db.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
+    // Fresh-create IDs cannot carry pre-existing debt.
+    const debt = await prepareLandingDebtClose(db, issue, input.createDoor);
     const guardResult = await evaluateDoneTransitionGuard(
       db,
       issue,
       override,
       decisionCarried,
       storedDeliveryRequirement,
-      debt.length > 0,
+      debt.owed,
     );
     // `locked` is the row the terminal write just returned: that UPDATE holds the
     // issue row lock until commit, so the debt rows read here are serialized.
-    const finalizeLandingDebt = async (tx: Db, locked: IssueRowForLandingDebt) => {
-      const outstanding = await tx.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
-      if (
-        locked.deliveryRequirement !== issue.deliveryRequirement ||
-        (outstanding.length > 0 && (
-          !guardResult.landingVerified ||
-          outstanding.some((row) => !debt.some((checked) => checked.id === row.id)) ||
-          locked.executionWorkspaceId !== issue.executionWorkspaceId ||
-          locked.projectWorkspaceId !== issue.projectWorkspaceId ||
-          locked.projectId !== issue.projectId
-        ))
-      ) throw conflict("Landing obligation changed or remains unverified; retry the close.", {
-        code: "done_transition_missing_delivery", issueId: issue.id,
-      });
-      if (outstanding.length > 0) {
-        await tx.update(activityLog).set({
-          details: sql`${activityLog.details} || jsonb_build_object(
-            'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
-            'closeStatusVersion', ${locked.statusVersion}::int)`,
-        }).where(debtWhere);
-      }
-    };
+    const finalizeLandingDebt = (tx: Db, locked: IssueRowForLandingDebt) =>
+      debt.finalize(tx, locked, guardResult);
     const overrideAccepted =
       !!override && guardResult.allowed && guardResult.reason === `Override accepted: ${override.disposition}`;
     // SUP-24298: `issue.done_transition_guard_skipped` is the guard's "transition

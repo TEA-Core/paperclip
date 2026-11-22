@@ -457,6 +457,27 @@ describeEmbeddedPostgres(
         .limit(1)
         .then((rows) => rows[0]);
 
+    it.each([false, true])("enforces durable landing debt on a stranded record-only task (owed=%s)", async (owed) => {
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const past = new Date(Date.now() - 20 * 60_000);
+      await db.update(issues).set({ deliveryRequirement: "record_only", updatedAt: past }).where(eq(issues.id, issueId));
+      if (owed) await db.insert(activityLog).values({
+        companyId, actorType: "system", actorId: "test", createdAt: past,
+        action: "issue.delivery_requirement_reclassified", entityType: "issue", entityId: issueId,
+        details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" },
+      });
+      try {
+        await reapStrandedSummaryGenerationIssues(db);
+        expect((await getIssue(issueId))?.status).toBe(owed ? "in_progress" : "done");
+        if (owed) {
+          const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+          expect(rows.find((row) => row.action === "issue.delivery_requirement_reclassified")?.details?.landingDebtDisposition).toBe("outstanding");
+        }
+      } finally {
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      }
+    });
+
     it("terminalizes a summary task stranded in changes_requested with no live run", async () => {
 
       const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });

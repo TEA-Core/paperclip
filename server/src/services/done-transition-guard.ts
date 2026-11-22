@@ -16,6 +16,7 @@ import {
   projectWorkspaces,
   type Db,
 } from "@paperclipai/db";
+import { conflict } from "../errors.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { readBuildCommit } from "../build-commit.js";
 import {
@@ -232,6 +233,8 @@ export interface DoneTransitionGuardResult {
   allowed: boolean;
   /** Positive repository evidence, never a waiver or an unmeasured fail-open. */
   landingVerified?: boolean;
+  /** Repository binding actually used by the positive landing probe. */
+  landingContext?: IssueRepoContext;
   reason: string;
   aheadBy: number | null;
   branch: string | null;
@@ -278,16 +281,15 @@ export interface DoneTransitionGuardResult {
 }
 
 /**
- * Durable audit-row debt: no status-version or time-window exemption. A row
- * older than the issue's latest accepted done transition is settled legacy
- * history (read-side cutoff, never rewritten) and is ignored.
+ * Durable audit-row debt: explicit outstanding debt has no history exemption.
+ * Only pre-deploy rows without a disposition use the accepted-close cutoff.
  */
 export function unpaidLandingDebt() {
   return and(
     eq(activityLog.action, "issue.delivery_requirement_reclassified"),
     sql`${activityLog.details}->>'landingCheckOwed' = 'true'`,
     sql`${activityLog.details}->>'landingDebtDisposition' IS DISTINCT FROM 'discharged'`,
-    sql`NOT EXISTS (
+    sql`(${activityLog.details}->>'landingDebtDisposition' IS NOT NULL OR NOT EXISTS (
       SELECT 1 FROM activity_log AS done_close
       WHERE done_close.company_id = ${activityLog.companyId}
         AND done_close.entity_type = 'issue'
@@ -295,8 +297,61 @@ export function unpaidLandingDebt() {
         AND done_close.action = 'issue.updated'
         AND done_close.details->>'status' = 'done'
         AND done_close.created_at > ${activityLog.createdAt}
-    )`,
+    ))`,
   );
+}
+
+type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
+  "executionWorkspaceId" | "projectWorkspaceId" | "projectId" | "statusVersion"> & { deliveryRequirement: string };
+
+/** Prepare outside the close transaction; finalize only while holding the issue row lock. */
+export async function prepareLandingDebtClose(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuard>[1],
+  createDoor = false,
+) {
+  const debtWhere = and(
+    eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"),
+    eq(activityLog.entityId, issue.id), unpaidLandingDebt(),
+  );
+  const debt = createDoor ? [] : await db.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
+  return {
+    owed: debt.length > 0,
+    async finalize(
+      tx: Db,
+      locked: LandingDebtCloseRow,
+      result: DoneTransitionGuardResult,
+      closeStatusVersion = locked.statusVersion,
+    ) {
+      const outstanding = await tx.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
+      if (locked.deliveryRequirement !== issue.deliveryRequirement || (outstanding.length > 0 && (
+        !result.landingVerified ||
+        outstanding.some((row) => !debt.some((checked) => checked.id === row.id)) ||
+        locked.executionWorkspaceId !== issue.executionWorkspaceId ||
+        locked.projectWorkspaceId !== issue.projectWorkspaceId ||
+        locked.projectId !== issue.projectId
+      ))) throw conflict("Landing obligation changed or remains unverified; retry the close.", {
+        code: "done_transition_missing_delivery", issueId: issue.id,
+      });
+      if (outstanding.length === 0) return;
+      // Positive probes require an execution branch. Lock that binding through
+      // commit so an in-place repo/base/branch update cannot invalidate the proof.
+      const [workspace] = locked.executionWorkspaceId ? await tx.select().from(executionWorkspaces)
+        .where(and(eq(executionWorkspaces.id, locked.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
+        .for("share") : [];
+      const binding = result.landingContext;
+      if (!workspace || !binding || closeStatusVersion === undefined ||
+        workspace.repoUrl !== binding.repoUrl || workspace.baseRef !== binding.defaultRef ||
+        workspace.branchName !== binding.branch) throw conflict("Repository binding changed; retry the landing check.", {
+        code: "done_transition_missing_delivery", issueId: issue.id,
+      });
+      await tx.update(activityLog).set({
+        details: sql`${activityLog.details} || jsonb_build_object(
+          'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+          'closeStatusVersion', ${closeStatusVersion}::int)`,
+      }).where(debtWhere);
+    },
+  };
 }
 
 /**
@@ -580,10 +635,13 @@ async function githubMergedPrCountForIdentifier(
   repo: string,
   identifier: string,
   token: string,
+  expectedHead?: string | null,
+  defaultRef?: string | null,
 ): Promise<number | null> {
+  if (expectedHead !== undefined && (!expectedHead || !defaultRef)) return null;
   const apiBase = gitHubApiBase(hostname);
   const query = `repo:${owner}/${repo} is:pr is:merged in:title,body "${identifier}"`;
-  const url = `${apiBase}/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  const url = `${apiBase}/search/issues?q=${encodeURIComponent(query)}&per_page=${expectedHead === undefined ? 1 : 100}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-done-transition-guard",
@@ -595,10 +653,32 @@ async function githubMergedPrCountForIdentifier(
     if (!response.ok) return null;
     const body = await response.json().catch(() => null);
     const total = (body as Record<string, unknown> | null)?.total_count;
-    return typeof total === "number" ? total : null;
+    if (expectedHead === undefined) return typeof total === "number" ? total : null;
+    if (!Array.isArray(body?.items)) return null;
+    for (const item of body.items) {
+      if (!Number.isSafeInteger(item?.number)) continue;
+      const response = await ghFetch(`${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${item.number}`, { headers });
+      if (!response.ok) return null;
+      const pr = await response.json();
+      if (!pr?.merged || !pr.head?.sha || pr.base?.ref !== defaultRef?.replace(/^origin\//, "")) continue;
+      // The carrier may have a different branch and may have been squash-merged.
+      // Its pre-merge head must contain the checked delivery, not just its identifier.
+      if (await githubCompareAheadBy(hostname, owner, repo, pr.head.sha, expectedHead!, token) === 0) return 1;
+    }
+    return 0;
   } catch {
     return null;
   }
+}
+
+async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRepository, token: string) {
+  if (ctx.worktreePath) {
+    try {
+      const head = (await runGit(["rev-parse", "HEAD"], ctx.worktreePath)).trim();
+      if (/^[0-9a-f]{40}$/i.test(head)) return head;
+    } catch { /* The remote branch can still provide the delivery head. */ }
+  }
+  return ctx.branch ? resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
 }
 
 /**
@@ -627,6 +707,8 @@ export async function githubBranchHasMergedPr(
   repo: string,
   branch: string,
   token: string,
+  expectedHead?: string,
+  defaultRef?: string,
 ): Promise<BranchMergedPrProbe> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=closed&per_page=100`;
@@ -651,6 +733,10 @@ export async function githubBranchHasMergedPr(
     const record = pr as Record<string, unknown>;
     const merged = record.merged === true || typeof record.merged_at === "string";
     if (!merged) continue;
+    if (expectedHead !== undefined && (
+      (record.head as { sha?: string } | null)?.sha !== expectedHead ||
+      (record.base as { ref?: string } | null)?.ref !== defaultRef?.replace(/^origin\//, "")
+    )) continue;
     hasMergedPr = true;
     if (mergedPrNumber === null && typeof record.number === "number") {
       mergedPrNumber = record.number;
@@ -3906,12 +3992,14 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       // caller persists them on the SAME transaction as its terminal write, so
       // a refused or raced sweep close can never leave an orphan close row.
       closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+      finalizeLandingDebt: (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion?: number) => Promise<void>;
     }
   | {
       allowed: true;
       closeComment: string | null;
       doneTierSkipAudit: Parameters<typeof logActivity>[1];
       closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+      finalizeLandingDebt: (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion?: number) => Promise<void>;
     }
   | {
       allowed: false;
@@ -3923,7 +4011,8 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     }
 > {
   const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
-  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false);
+  const debt = await prepareLandingDebtClose(db, issue);
+  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false, undefined, debt.owed);
   if (!guardResult.allowed) {
     return {
       allowed: false,
@@ -3931,6 +4020,8 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       reason: guardResult.reason,
     };
   }
+  const finalizeLandingDebt = (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion = locked.statusVersion) =>
+    debt.finalize(tx, locked, guardResult, closeStatusVersion);
   if (structuredDoneTier) {
     const renderedComment = renderDoneTierDeclaration(closeComment, structuredDoneTier);
     const tierResult = await evaluateDoneTierDeclaration(
@@ -3991,7 +4082,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         },
       });
     }
-    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits };
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits, finalizeLandingDebt };
   }
   return {
     allowed: true,
@@ -4015,6 +4106,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       },
     },
     closeRowAudits: [],
+    finalizeLandingDebt,
   };
 }
 
@@ -4938,7 +5030,7 @@ async function evaluateDoneTransitionGuardCore(
   // ADR-103 M3.6: out-parameter the census the core already computed, so the
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
-  observer?: { census?: DoneTransitionCensus },
+  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext },
   // SUP-24429: the requirement stored before the close request; undefined when
   // the caller's request does not change it.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
@@ -5287,6 +5379,7 @@ async function evaluateDoneTransitionGuardCore(
   const getCtx = async (): Promise<IssueRepoContext | null> => {
     if (cachedCtx === undefined) {
       cachedCtx = await resolveIssueRepoContext(db, issue);
+      if (observer && cachedCtx) observer.landingContext = cachedCtx;
     }
     return cachedCtx;
   };
@@ -5632,6 +5725,8 @@ async function evaluateDoneTransitionGuardCore(
               parsed.repo,
               issue.identifier,
               token,
+              landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined,
+              ctx.defaultRef,
             )
           : null;
         if (mergedPrCount === null) {
@@ -5768,7 +5863,7 @@ async function evaluateDoneTransitionGuardCore(
       : null;
     const attributableCount = attribution?.attributableCount ?? 0;
 
-    if (attributableCount > 0) {
+    if (attributableCount > 0 && !landingDebtOwed) {
       return {
         allowed: true,
         reason:
@@ -5821,6 +5916,8 @@ async function evaluateDoneTransitionGuardCore(
       parsed.repo,
       identifier,
       token,
+      landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined,
+      ctx.defaultRef,
     );
 
     if (mergedPrCount !== null && mergedPrCount > 0) {
@@ -5924,7 +6021,12 @@ async function evaluateDoneTransitionGuardCore(
 
   let hasMergedPr: boolean;
   try {
-    hasMergedPr = (await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token)).hasMergedPr;
+    const head = landingDebtOwed
+      ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, branch, token)
+      : undefined;
+    hasMergedPr = head !== null && (await githubBranchHasMergedPr(
+      parsed.hostname, parsed.owner, parsed.repo, branch, token, head, ctx.defaultRef,
+    )).hasMergedPr;
   } catch (err) {
     if (err instanceof GitHubAuthError) {
       return fallback(
@@ -6016,7 +6118,7 @@ export async function evaluateDoneTransitionGuard(
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
   landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
-  const observer: { census?: DoneTransitionCensus } = {};
+  const observer: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext } = {};
   const result = await evaluateDoneTransitionGuardCore(
     db,
     issue,
@@ -6026,6 +6128,7 @@ export async function evaluateDoneTransitionGuard(
     storedDeliveryRequirement,
     landingDebtOwed,
   );
+  if (landingDebtOwed && result.landingVerified) result.landingContext = observer.landingContext;
   if (landingDebtOwed && result.allowed && !result.landingVerified) {
     return {
       ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",

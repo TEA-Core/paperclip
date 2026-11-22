@@ -280,14 +280,18 @@ retain their titles and default to no generation request.
 Repository landing debt survives a change from `repository_delivery` to
 `record_only` while an issue is open. The reclassification activity row records
 `landingCheckOwed` and an outstanding/discharged disposition. Every existing-issue
-done door rechecks that debt under the issue-row lock and discharges it only in
-the transaction that accepts a close with positive repository landing evidence.
+done door, including automatic reconciliation backstops, rechecks that debt under
+the issue-row lock and discharges it only in the transaction that accepts a close
+with positive repository landing evidence. The proof's repository, base, and
+branch binding is locked and checked before discharge. Merged-PR evidence must
+cover the checked delivery head; an older merge on the same branch is insufficient.
 Reopening and status-version changes never waive unpaid debt. The landing backstop
 includes debt-bearing record-only cards without expiring the obligation.
-A reclassification row older than the issue's latest accepted done transition is
-settled legacy history: it is ignored on read, never rewritten. A debt-bearing
-issue with no probe-able repository/branch or merged PR is refused fail-closed;
-the refusal names the exits (verify landing, or cancel).
+A legacy reclassification row without a disposition, older than the issue's latest
+accepted done transition, is settled history: it is ignored on read, never
+rewritten. A later close audit cannot settle explicit outstanding debt. A
+debt-bearing issue with no probe-able repository/branch or merged PR is refused
+fail-closed; the refusal names the exits (verify landing, or cancel).
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 

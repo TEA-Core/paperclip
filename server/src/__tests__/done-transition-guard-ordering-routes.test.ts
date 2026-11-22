@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2021,34 +2025,118 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
-    it("ignores settled legacy debt rows older than the latest done close, but a fresh flip still owes", async () => {
-      const { issueId, companyId } = await seedIssue("LEGACY");
+    it("keeps a legacy flip-back settled after verified landing, backstop discovery, and reopen/reclose", async () => {
+      const { issueId } = await seedIssue("LEGACY");
       board();
       await flip(issueId);
-      // Pre-change row shape: owed, no disposition, followed by an accepted done close, then reopened.
+      // Pre-deploy debt has no disposition. Flip back before a real verified close.
       await db.update(activityLog).set({
         createdAt: new Date("2020-01-01"),
         details: sql`${activityLog.details} - 'landingDebtDisposition'`,
       }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
-      await db.insert(activityLog).values({
-        companyId, actorType: "user", actorId: "local-board", action: "issue.updated", entityType: "issue",
-        entityId: issueId, details: { status: "done" }, createdAt: new Date("2020-02-01"),
-      });
-      await db.update(issues).set({ status: "done", statusVersion: 41 }).where(eq(issues.id, issueId));
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      landing();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+      // Preserve a settled historical row in its pre-deploy shape.
+      await db.update(activityLog).set({ details: sql`${activityLog.details} - 'landingDebtDisposition'` })
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      expect((await patch(issueId, { deliveryRequirement: "record_only" })).status).toBe(200);
       const now = new Date();
       const rows = await buildDiscoveryQuery(db, new Date(now.getTime() - 86_400_000), now);
       expect(selectLandingCandidates(rows, now, now).map((row) => row.issue.id)).not.toContain(issueId);
       expect((await patch(issueId, { status: "todo" })).status).toBe(200);
-      landing();
+      mockGetByName.mockResolvedValue(null);
       expect((await patch(issueId, { status: "done" })).status).toBe(200);
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBeUndefined();
-      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
-      // A fresh post-deploy flip on the open card owes debt again.
+      const afterClose = new Date();
+      const afterRows = await buildDiscoveryQuery(db, new Date(0), afterClose);
+      expect(selectLandingCandidates(afterRows, new Date(0), afterClose).map((row) => row.issue.id)).not.toContain(issueId);
+    });
+
+    it.each(["repoUrl", "baseRef"] as const)("refuses debt discharge when the bound workspace %s changes during the probe", async (field) => {
+      const { issueId, executionWorkspaceId } = await seedIssue("BINDING");
+      board();
+      await flip(issueId);
+      landing();
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          await db.update(executionWorkspaces).set({
+            [field]: field === "repoUrl" ? "https://github.com/TEA-Core/other" : "other-base",
+          }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        }
+        return new Response(JSON.stringify(url.includes("/compare/") ? { ahead_by: 0 } : []), { status: 200 });
+      });
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it.each([false, true])("requires merged-PR evidence for the current branch head (matches=%s)", async (matches) => {
+      const { issueId, defaultRef } = await seedIssue("HEAD");
+      board();
+      await flip(issueId);
+      landing(2);
+      mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+        url.includes("/compare/") ? { ahead_by: 2 } :
+          url.includes("state=closed") ? [{
+            merged: true, number: 404, base: { ref: defaultRef },
+            head: { sha: matches ? "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" : "1".repeat(40) },
+          }] : [],
+      ), { status: 200 }));
+      expect((await patch(issueId, { status: "done" })).status).toBe(matches ? 200 : 409);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(matches ? "discharged" : "outstanding");
+    });
+
+    it.each([false, true])("checks attributable shared-branch work against carrier contents (landed=%s)", async (landed) => {
+      const { issueId, identifier, executionWorkspaceId } = await seedIssue("CARRIER");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-debt-carrier-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        writeFileSync(join(cwd, "delivery.txt"), "base\n");
+        git("add", "delivery.txt");
+        git("commit", "-qm", "base");
+        const base = git("rev-parse", "HEAD");
+        git("checkout", "-qb", "shared-carrier");
+        writeFileSync(join(cwd, "delivery.txt"), "delivered content\n");
+        git("commit", "-qam", `Implement ${identifier}`);
+        const head = git("rev-parse", "HEAD");
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: "shared-carrier", baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) && landed ? 0 : 1 } :
+            url.includes("/search/issues") ? { total_count: 1, items: [{ number: 404 }] } :
+              url.endsWith("/pulls/404") ? { merged: true, base: { ref: "main" }, head: { sha: landed ? head : base } } : [],
+        ), { status: 200 }));
+        expect((await patch(issueId, { status: "done" })).status).toBe(landed ? 200 : 409);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(landed ? "discharged" : "outstanding");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps a fresh post-deploy flip on an open card owed even after a delayed older-close audit", async () => {
+      const { issueId, companyId } = await seedIssue("FRESH");
+      board();
       expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
       await flip(issueId);
+      await db.insert(activityLog).values({
+        companyId, actorType: "user", actorId: "local-board", action: "issue.updated", entityType: "issue",
+        entityId: issueId, details: { status: "done" }, createdAt: new Date(Date.now() + 1_000),
+      });
       mockGetByName.mockResolvedValue(null);
       const refused = await patch(issueId, { status: "done" });
       expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
     it("names the exit when landing cannot be verified", async () => {
