@@ -34,6 +34,7 @@ import {
   type CandidateRow,
 } from "./approval-status-reconciler.js";
 import { clearAutoMergeDisarmRecord, recordPendingAutoMergeDisarm } from "./merge-arming.js";
+import { disarmTiming } from "./auto-merge-disarm.js";
 
 // SUP-15851 C1: `latestDecisionPerStage` is a pure helper (rows in, one Map by
 // stage out); this probe needs no DB and runs regardless of embedded-Postgres
@@ -430,6 +431,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   let db: Db;
   let companyId: string;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const promptDelays = disarmTiming.promptDelaysMs;
 
   function approvedState(overrides: Record<string, unknown> = {}) {
     return {
@@ -498,6 +500,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   beforeEach(async () => {
+    // Exercise the tick explicitly; do not leak prompt retries past fixture cleanup.
+    disarmTiming.promptDelaysMs = [];
     vi.resetAllMocks();
 
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -545,6 +549,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   afterEach(async () => {
+    disarmTiming.promptDelaysMs = promptDelays;
     // SUP-15211: clear audit rows first (they FK-reference the company).
     await db.delete(activityLog);
     await db.delete(issueDeliveryReceiptLinks);
@@ -3532,7 +3537,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
           throw new Error(`unmocked ghFetch URL: ${url}`);
         });
         const summary = await runApprovalStatusReconcilerTick(db);
-        return { summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
+        return { issueId, summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
       }
 
       it("is taken back when it is revoked while the enable call is in flight", async () => {
@@ -3543,11 +3548,19 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
       });
 
-      it("is not armed by the retry after a transient failure", async () => {
-        const { enables, summary } = await seedAndTick({ revokeOn: "first-attempt-502" });
+      it("stops retries without abandoning a possibly accepted arm", async () => {
+        const { issueId, enables, queries } = await seedAndTick({ revokeOn: "first-attempt-502" });
 
         expect(enables()).toBe(1);
-        expect(summary.rearmDetails.join("\n")).toContain("authority-changed");
+        const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        const state = row?.executionState;
+        const approval = state && typeof state === "object" && "approvalStatus" in state ? state.approvalStatus : null;
+        expect(approval).toMatchObject({ armOutcome: { kind: "failed" } });
+        if (approval && typeof approval === "object" && "autoMergeDisarm" in approval && approval.autoMergeDisarm) {
+          expect(approval.autoMergeDisarm).toMatchObject({ headSha: NEW_HEAD, number: 42 });
+        } else {
+          expect(queries().some((query) => query.includes("disablePullRequestAutoMerge"))).toBe(true);
+        }
       });
     });
 
@@ -3611,13 +3624,20 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
               expect(details).toContain("authority-revoked");
               expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
             } else {
-              // The retry never reached the provider.
+              // This retry never reached the provider; its earlier 502 is still uncertain.
               expect(enables).toBe(1);
-              expect(details).toContain("authority-changed");
-              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(false);
             }
             const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
-            expect(((row!.executionState as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {}).autoMergeDisarm).toBeUndefined();
+            const state = row?.executionState;
+            const approval = state && typeof state === "object" && "approvalStatus" in state ? state.approvalStatus : null;
+            const record = approval && typeof approval === "object" && "autoMergeDisarm" in approval ? approval.autoMergeDisarm : undefined;
+            if (moment === "enable") {
+              expect(record).toBeUndefined();
+            } else if (record) {
+              expect(record).toMatchObject({ headSha: NEW_HEAD, number: 42 });
+            } else {
+              expect(queries.some((query) => query.includes("disablePullRequestAutoMerge"))).toBe(true);
+            }
           });
         }
       }
