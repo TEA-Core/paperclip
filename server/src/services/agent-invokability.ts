@@ -86,9 +86,8 @@ export function evaluateAgentInvokability(
 
   if (eligibility.invokable) return { invokable: true };
 
-  const directStatusReason = eligibility.invokabilityReason === "unknown_status"
-    ? "unknown_status"
-    : statusBlockReason(agent.status);
+  const directStatusReason = statusBlockReason(agent.status)
+    ?? (eligibility.invokabilityReason === "unknown_status" ? "unknown_status" : null);
   if (directStatusReason) {
     return blocked(
       directStatusReason,

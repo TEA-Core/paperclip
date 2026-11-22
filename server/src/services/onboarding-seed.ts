@@ -130,7 +130,7 @@ export function onboardingSeedService(db: Db) {
       const recorded = await dbx
         .select({ id: agents.id })
         .from(agents)
-        .where(and(eq(agents.id, recordedAgentId), eq(agents.companyId, companyId)))
+        .where(and(eq(agents.id, recordedAgentId), eq(agents.companyId, companyId), ne(agents.status, "deleted")))
         .then((rows) => rows[0] ?? null);
       if (recorded) return recorded.id;
     }

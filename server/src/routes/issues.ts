@@ -6158,7 +6158,7 @@ export function issueRoutes(
       }),
       resolvesInCompany: async (agentId) => {
         const agent = await agentsSvc.getById(agentId);
-        return Boolean(agent && agent.companyId === input.companyId);
+        return Boolean(agent && agent.companyId === input.companyId && agent.status !== "deleted");
       },
     });
   // R20: whether the policy's stall arbiter can take work right now. The engine
