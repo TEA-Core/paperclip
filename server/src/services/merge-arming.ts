@@ -6319,7 +6319,13 @@ export async function armMergeOnApproval(
   // lookups take time, and a card whose decision, ladder, head, certificate or release changed in that
   // time is not what was authorized. It is read again right before the merge lever is pulled.
   const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: options.expectedHeadOid });
-  const authorityChanged = () => guard.stillHolds();
+  let attributionPr: LinkedPullRequest | undefined;
+  const authorityChanged = async () => (await guard.stillHolds()) ?? (attributionPr
+    ? await childCarrierStampBlock(db, companyId, {
+        owner: attributionPr.owner, repo: attributionPr.repo, number: attributionPr.number,
+        headSha: options.expectedHeadOid ?? null, headRef: attributionPr.headRefName ?? null,
+      }, issueId)
+    : null);
 
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   if (deliveryIdentity.recordedUnusable) {
@@ -6375,6 +6381,7 @@ export async function armMergeOnApproval(
     };
   }
   const linked = linkedPRs[0]!;
+  attributionPr = linked;
   const childBlock = await childCarrierStampBlock(db, companyId, {
     owner: linked.owner,
     repo: linked.repo,

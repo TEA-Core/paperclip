@@ -134,6 +134,8 @@ type DbState = {
  */
 function makeDb(state: DbState) {
   return {
+    // These fixtures have no descendants; the owner gate's recursive query is empty.
+    execute: vi.fn().mockResolvedValue([]),
     select: vi.fn((cols?: Record<string, unknown>) => {
       // The guard reads the issue without a projection before resolving its
       // execution workspace; preserve the table distinction in this fake DB.

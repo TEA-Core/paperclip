@@ -63,6 +63,31 @@ A card-bound PR that cannot get a stamp through the normal path (a receipt that 
 
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
 
+## Child-owned carrier delivery
+
+A self-sourced child can record delivery on one strict ancestor's carrier PR.
+The control plane verifies the exact GitHub.com repository, branch, PR, head and
+complete child commit set. HTTPS and SSH repository URLs must name that exact
+host. The attribution record is not a delivery receipt or publication authority.
+
+The child's decision attaches only to the proof it read: a concurrent change to
+the PR, branch, head, ancestor or commit set leaves the replacement proof pending.
+Both a carrier claim and a delivery-only binding must name the same immutable head
+when that decision attaches. Child approval never publishes `paperclip/approved`
+or arms the carrier.
+
+The carrier owner's separate gate requires every contributing child to have a
+current, complete approved proof. A completely enumerated, disjoint child branch
+does not contribute; partial or unreadable contribution still refuses. The live
+carrier branch must match even when a caller does not provide a branch.
+
+The approval actuator and landing backstop check attribution before each enable
+attempt and after an accepted enable. A new block takes the arm back through the
+existing disarm/fence recovery path. GitHub has no atomic comparison with the
+instance database: a merge inside the in-flight window cannot be undone, and a
+failed take-back retains the pending disarm record rather than claiming success.
+
+
 ## Override label and the reconciler
 
 A PR carrying `override:paperclip-approval` (see [branch protection](branch-protection.md#override-label-sup-20897)) clears the CI enforcer without a `paperclip/approved` status. The reconciler is unaffected: it reads and writes only the status, never the label, and an overridden PR gets no status. Do not publish one to "match" the override. If the control plane later approves the head, the stamp passes the enforcer on its own and the label is not consulted.

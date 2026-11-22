@@ -1,5 +1,5 @@
 import { isUniqueViolation } from "../db-errors.js";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -62,9 +62,16 @@ export const childCarrierCommits: { enumerate: CommitEnumerator } = {
 
 function parseRepoUrl(repoUrl: string | null): { owner: string; repo: string } | null {
   if (!repoUrl) return null;
-  const match = repoUrl.match(/github\.com[:/](?<owner>[^/]+)\/(?<repo>[^/#?]+?)(?:\.git)?\/?$/i);
-  if (!match?.groups) return null;
-  return { owner: match.groups.owner!, repo: match.groups.repo! };
+  try {
+    const url = new URL(repoUrl.replace(/^git@([^:]+):/, "ssh://git@$1/"));
+    if (url.hostname.toLowerCase() !== "github.com" || !["https:", "ssh:"].includes(url.protocol)
+      || url.search || url.hash || (url.port && !(url.protocol === "ssh:" && url.port === "22"))) return null;
+    const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url.pathname);
+    if (!match || [match[1], match[2]].some((part) => !part || part === "." || part === "..")) return null;
+    return { owner: match[1]!, repo: match[2]! };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeShas(shas: string[]): string[] | null {
@@ -119,7 +126,7 @@ function readClaim(executionState: unknown): { prNumber: number; headSha: string
   return { prNumber, headSha };
 }
 
-function readBindingPr(executionState: unknown, cardBranch: string): { prNumber: number } | null {
+function readBindingPr(executionState: unknown, cardBranch: string): { prNumber: number; headSha: string | null } | null {
   if (!executionState || typeof executionState !== "object" || Array.isArray(executionState)) return null;
   const delivery = (executionState as Record<string, unknown>).delivery;
   if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
@@ -127,7 +134,10 @@ function readBindingPr(executionState: unknown, cardBranch: string): { prNumber:
   const branch = typeof record.branch === "string" ? record.branch : null;
   const prNumber = record.prNumber;
   if (!branch || branch === cardBranch) return null;
-  return typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0 ? { prNumber } : null;
+  const headSha = typeof record.headSha === "string" && SHA_RE.test(record.headSha.toLowerCase())
+    ? record.headSha.toLowerCase()
+    : null;
+  return typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0 ? { prNumber, headSha } : null;
 }
 
 async function fetchLivePullRequest(
@@ -261,13 +271,15 @@ async function enumerateChildCarrierCommits(input: {
     childShas.add(row.sha.toLowerCase());
   }
   const prShaSet = new Set(prShas);
+  const intersection = normalizeShas([...childShas].filter((sha) => prShaSet.has(sha)));
+  // A complete disjoint branch is not a contributor. A partial contribution is
+  // still incomplete proof and must not be confused with that empty result.
+  if (!intersection) return { ok: true, shas: [] };
   for (const sha of childShas) {
     if (!prShaSet.has(sha)) {
       return { ok: false, reason: "child carrier commit enumeration is missing a child commit" };
     }
   }
-  const intersection = normalizeShas([...childShas].filter((sha) => prShaSet.has(sha)));
-  if (!intersection) return { ok: true, shas: [] };
   return { ok: true, shas: intersection };
 
 }
@@ -655,12 +667,9 @@ export async function childCarrierAttributionMatches(
 
 
 export async function recordChildCarrierDecision(db: Db, companyId: string, issueId: string): Promise<void> {
-  const [issue] = await db
-    .select({ executionState: issues.executionState })
-    .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
-    .limit(1);
-  const state = issue?.executionState as Record<string, unknown> | null | undefined;
+  const card = await readChildWorkspace(db, companyId, issueId);
+  if (!card) return;
+  const state = card.issue.executionState as Record<string, unknown> | null | undefined;
   const decisionId = typeof state?.lastDecisionId === "string" ? state.lastDecisionId : null;
   if (!decisionId || state?.lastDecisionOutcome !== "approved") return;
   const current = await readCurrent(db, companyId, issueId);
@@ -675,7 +684,7 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     ))
     .limit(1);
   if (!decision || decision.outcome !== "approved") return;
-  const claim = readClaim(state);
+  const claim = readClaim(state) ?? readBindingPr(state, card.branch);
   if (!claim || claim.prNumber !== current.pullRequestNumber || claim.headSha !== current.headSha) return;
   await db
     .update(issueChildCarrierAttributions)
@@ -683,6 +692,16 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     .where(and(
       eq(issueChildCarrierAttributions.id, current.id),
       eq(issueChildCarrierAttributions.state, "current"),
+      eq(issueChildCarrierAttributions.companyId, companyId),
+      eq(issueChildCarrierAttributions.childIssueId, issueId),
+      eq(issueChildCarrierAttributions.ancestorIssueId, current.ancestorIssueId),
+      eq(issueChildCarrierAttributions.owner, current.owner),
+      eq(issueChildCarrierAttributions.repo, current.repo),
+      eq(issueChildCarrierAttributions.pullRequestNumber, current.pullRequestNumber),
+      eq(issueChildCarrierAttributions.branchName, current.branchName),
+      eq(issueChildCarrierAttributions.headSha, current.headSha),
+      eq(issueChildCarrierAttributions.commitShas, current.commitShas),
+      isNull(issueChildCarrierAttributions.childDecisionId),
     ));
 }
 
@@ -743,12 +762,14 @@ export async function carrierOwnerChildAttributionBlock(
   if (sameRepo.length === 0) return null;
   const live = await fetchLivePullRequest(db, companyId, owner.repo.owner, owner.repo.repo, pr.number);
   if (!live.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  if (!live.live.headRef || live.live.headRef !== owner.branch
+    || (pr.headRef && pr.headRef !== live.live.headRef)) return CHILD_CARRIER_OWNER_GATE_SKIP;
   if (pr.headSha && live.live.headSha && pr.headSha.toLowerCase() !== live.live.headSha) {
     return CHILD_CARRIER_OWNER_GATE_SKIP;
   }
   const headSha = live.live.headSha;
   if (!headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
-  const required = new Map<string, string[]>();
+  const required = new Map<string, { shas: string[]; branch: string }>();
   for (const { descendant, card } of sameRepo) {
     const enumerated = await enumerateWithCredentials({
       db,
@@ -762,24 +783,28 @@ export async function carrierOwnerChildAttributionBlock(
     });
     if (!enumerated.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
     const shas = normalizeShas(enumerated.shas);
-    if (!shas) continue;
-    required.set(descendant.id, shas);
+    if (enumerated.shas.length === 0) {
+      if (attributions.some((row) => row.childIssueId === descendant.id)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      continue;
+    }
+    if (!shas) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    required.set(descendant.id, { shas, branch: card.branch });
   }
   if (required.size === 0) return null;
-  for (const [childId, shas] of required) {
+  for (const [childId, { shas, branch }] of required) {
     const row = attributions.find((item) => item.childIssueId === childId);
     const stored = row ? normalizeShas(row.commitShas) : null;
     if (!row || !stored || stored.join() !== shas.join()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.headSha !== headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (pr.headRef && row.branchName.toLowerCase() !== pr.headRef.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (row.branchName !== live.live.headRef) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (!row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
     const [childIssue] = await db
       .select({ executionState: issues.executionState })
       .from(issues)
       .where(and(eq(issues.id, childId), eq(issues.companyId, companyId)))
       .limit(1);
-    const claim = readClaim(childIssue?.executionState);
+    const claim = readClaim(childIssue?.executionState) ?? readBindingPr(childIssue?.executionState, branch);
     if (!claim || claim.prNumber !== row.pullRequestNumber || (claim.headSha !== null && claim.headSha !== row.headSha)) {
       return CHILD_CARRIER_OWNER_GATE_SKIP;
     }
@@ -836,10 +861,6 @@ export async function childCarrierStampBlock(
     if (row.ancestorIssueId !== issueId) {
       const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, row.ancestorIssueId, pr);
       if (ownerSkip) return ownerSkip;
-    }
-    if (row.childIssueId !== issueId) {
-      const childSkip = await childCarrierMustNotPublish(db, companyId, row.childIssueId, pr);
-      if (childSkip) return childSkip;
     }
   }
   return null;
