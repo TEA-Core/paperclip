@@ -284,6 +284,10 @@ done door rechecks that debt under the issue-row lock and discharges it only in
 the transaction that accepts a close with positive repository landing evidence.
 Reopening and status-version changes never waive unpaid debt. The landing backstop
 includes debt-bearing record-only cards without expiring the obligation.
+A reclassification row older than the issue's latest accepted done transition is
+settled legacy history: it is ignored on read, never rewritten. A debt-bearing
+issue with no probe-able repository/branch or merged PR is refused fail-closed;
+the refusal names the exits (verify landing, or cancel).
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 
