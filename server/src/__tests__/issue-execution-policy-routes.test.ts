@@ -334,6 +334,11 @@ const HANDOFF_AGENT_ROWS = [{
   // Also used for closing-run attribution by the real done-tier guard.
   startedAt: new Date("2026-11-04T09:00:00Z"),
   createdAt: new Date("2026-11-04T08:58:00Z"),
+}, {
+  // The live, marker-carrying canonical Wiki Maintainer the resolver requires.
+  id: "33333333-3333-4333-8333-333333333333",
+  status: "idle",
+  metadata: { pluginManagedAgent: { pluginKey: "paperclipai.plugin-llm-wiki", agentKey: "wiki-maintainer" } },
 }];
 
 // SUP-17410: ids that exercise the agent-reference guard. PHANTOM is the live

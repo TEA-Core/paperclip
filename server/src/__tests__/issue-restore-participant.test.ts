@@ -190,6 +190,10 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
       resourceId: agentId,
       defaultsJson: {},
     });
+    // A live managed reference is canonical only when the agent carries the plugin marker.
+    await db.update(agents).set({
+      metadata: { pluginManagedAgent: { pluginKey: "paperclipai.plugin-llm-wiki", agentKey: "wiki-maintainer" } },
+    }).where(eq(agents.id, agentId));
   }
   // The BEFORE UPDATE trigger pauses *after* restore's final live-run read while
   // its transaction still holds the issue row. Only the disposable test DB has it.
