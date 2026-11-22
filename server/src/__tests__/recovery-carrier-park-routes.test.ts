@@ -1189,6 +1189,82 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }
   }, 15_000);
 
+  it("rechecks a park winning the source lock before stale pointer cleanup can write", async () => {
+    const f = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "assignment", status: "succeeded", contextSnapshot: { issueId: f.sourceId } }).returning();
+    await db.update(issues).set({ checkoutRunId: run.id, executionRunId: run.id }).where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let markReady!: (pid: number) => void;
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    const barrier = db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.sourceId)).for("update");
+      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      markReady(Number(row.pid));
+      await released;
+    });
+    let acceptance: Promise<{ status: number }> | undefined;
+    let sweep: Promise<{ cleared: number }> | undefined;
+    try {
+      const holderPid = await Promise.race([ready, barrier.then(() => { throw new Error("Source barrier ended before readiness"); })]);
+      acceptance = park(f).then(response => response);
+      const parkPid = await waitForBlockedPid(holderPid);
+      sweep = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Stale pointer cleanup must not wake"); } }).sweepStaleIssueLocks();
+      await waitForBlockedPid(parkPid);
+      release();
+      expect((await acceptance).status).toBe(201);
+      expect(await sweep).toMatchObject({ cleared: 0 });
+      expect(await snapshot(f)).toEqual(before);
+      await assertNoProtectedWrites();
+    } finally {
+      release();
+      await Promise.allSettled([barrier, ...(acceptance ? [acceptance] : []), ...(sweep ? [sweep] : [])]);
+    }
+  }, 30_000);
+
+  it("still clears ordinary unparked terminal source pointers without changing the action", async () => {
+    const f = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "assignment", status: "succeeded", contextSnapshot: { issueId: f.sourceId } }).returning();
+    await db.update(issues).set({ checkoutRunId: run.id, executionRunId: run.id }).where(eq(issues.id, f.sourceId));
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    const result = await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Stale pointer cleanup must not wake"); } }).sweepStaleIssueLocks();
+    expect(result).toMatchObject({ cleared: 1, issueIds: [f.sourceId] });
+    const [source] = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+    expect(source).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId)))[0]).toEqual(action);
+  });
+
+  it.each([true, false])("keeps an active board park visible during stale review archival, accepted %s", async accepted => {
+    const f = await fixture(), old = new Date("2026-01-01T00:00:00Z");
+    await db.update(issues).set({ status: "in_review", parentId: f.sourceId, updatedAt: old,
+      executionState: { status: "pending", currentStageId: randomUUID(), currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: null, returnAssignee: null, reviewRequest: null,
+        completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, monitor: null, pendingSince: old.toISOString() },
+    }).where(eq(issues.id, f.carrierId));
+    if (accepted) {
+      // The database trigger advances statusVersion on the review transition.
+      const [carrier] = await db.select().from(issues).where(eq(issues.id, f.carrierId));
+      const response = await park(f, { ...f.body, expectedStatus: carrier.status, expectedStatusVersion: carrier.statusVersion });
+      expect(response.status, response.body.error).toBe(201);
+    }
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const result = await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Review archival must not wake"); } }).ingestStaleInReviewChildIssues();
+    expect(result.archived).toBe(accepted ? 0 : 1);
+    if (accepted) {
+      expect(await snapshot(f)).toEqual(before);
+      expect(await parkRecords(f)).toEqual(records);
+    } else {
+      const [carrier] = await db.select().from(issues).where(eq(issues.id, f.carrierId));
+      expect(carrier.hiddenAt).not.toBeNull();
+      expect(carrier.status).toBe("in_review");
+    }
+    await assertNoProtectedWrites();
+  });
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
