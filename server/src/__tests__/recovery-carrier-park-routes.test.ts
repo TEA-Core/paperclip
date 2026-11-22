@@ -1721,4 +1721,141 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(f)).toEqual(before);
     await assertNoProtectedWrites();
   });
+
+  it("never combines pre-acceptance live blockers with a later accepted park", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ status: "in_progress", statusVersion: 1, assigneeUserId: "park-operator" })
+      .where(eq(issues.id, f.blockerId));
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    let transitioned = false;
+    const select = new Proxy(db.select, { apply(target, receiver, args) {
+      const builder = Reflect.apply(target, receiver, args), fields = args[0];
+      const graphRead = fields?.issueId === issueRelations.relatedIssueId && fields?.blockerIssueId === issues.id &&
+        fields?.parentId === issues.parentId && fields?.executionRunId === issues.executionRunId;
+      const snapshotRead = fields?.carrier && fields?.hold && fields?.blockers;
+      if (graphRead || snapshotRead) {
+        builder.from = new Proxy(builder.from, { apply(from, fromReceiver, fromArgs) {
+          const query = Reflect.apply(from, fromReceiver, fromArgs);
+          const execute = Reflect.get(query, "then").bind(query);
+          Object.defineProperty(query, "then", { value: (
+            fulfilled?: (value: unknown) => unknown, rejected?: (reason: unknown) => unknown,
+          ) => {
+            const read = async () => {
+              const rows = await new Promise<unknown>((resolve, reject) => { execute(resolve, reject); });
+              if (!transitioned) {
+                transitioned = true;
+                await db.update(issues).set({ status: "done", statusVersion: 2 }).where(eq(issues.id, f.blockerId));
+                f.body.expectedBlockers[0].statusVersion = 2;
+                expect((await park(f)).status).toBe(201);
+              }
+              return rows;
+            };
+            return read().then(fulfilled, rejected);
+          } });
+          return query;
+        } });
+      }
+      return builder;
+    } });
+    const spy = vi.spyOn(db, "select").mockImplementation(select);
+    try {
+      const projected = await attention(f);
+      expect([0, 1]).toContain(projected.unresolvedBlockerCount);
+      if (projected.carrierPark?.state === "accepted") expect(projected.unresolvedBlockerCount).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await attention(f)).toMatchObject({ unresolvedBlockerCount: 0, carrierPark: { state: "accepted" } });
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["done", "cancelled"] as const)("preserves an operator's %s close while healthy-child repair waits", async status => {
+    const f = await fixture();
+    await db.insert(issues).values({ companyId: f.companyId, title: "Healthy delegated work",
+      status: "in_progress", assigneeUserId: "park-operator", parentId: f.sourceId });
+    const before = await snapshot(f);
+    let release!: () => void, markReady!: (pid: number) => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    let expectedSource: typeof issues.$inferSelect | undefined;
+    const barrier = db.transaction(async tx => {
+      [expectedSource] = await tx.update(issues).set({ status, statusVersion: 1,
+        completedAt: status === "done" ? new Date() : null }).where(eq(issues.id, f.sourceId)).returning();
+      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      markReady(Number(row.pid));
+      await released;
+    });
+    let repair: ReturnType<ReturnType<typeof recoveryService>["reconcileActiveRecoveryActions"]> | undefined;
+    try {
+      const holderPid = await Promise.race([ready, barrier.then(() => { throw new Error("Close ended before readiness"); })]);
+      repair = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Closed source must not dispatch"); } })
+        .reconcileActiveRecoveryActions();
+      await waitForBlockedPid(holderPid);
+    } finally {
+      release();
+      await Promise.allSettled([barrier, ...(repair ? [repair] : [])]);
+    }
+    expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual([expectedSource]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toEqual(before.actions);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(before.wakes);
+    await expect(repair!).resolves.toMatchObject({ resolved: 0 });
+  }, 30_000);
+
+  it("does not arm a monitor for an action independently resolved during the source-lock wait", async () => {
+    const f = await fixture();
+    await db.update(issueRecoveryActions).set({ recoveryIssueId: null }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.delete(issues).where(eq(issues.id, f.carrierId));
+    await db.update(agents).set({ role: "cto", status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_review", assigneeAgentId: f.agentId, createdByAgentId: f.agentId })
+      .where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f);
+    let release!: () => void, markReady!: (pid: number) => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    let expectedAction: typeof issueRecoveryActions.$inferSelect | undefined;
+    const barrier = db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.sourceId)).for("update");
+      [expectedAction] = await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored",
+        resolvedAt: new Date(), updatedAt: new Date() }).where(eq(issueRecoveryActions.id, f.actionId)).returning();
+      const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      markReady(Number(row.pid));
+      await released;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Resolved action must not dispatch"); } });
+    let drain: ReturnType<typeof recovery.reconcileExhaustedRecoveryDrain> | undefined;
+    try {
+      const holderPid = await Promise.race([ready, barrier.then(() => { throw new Error("Resolution ended before readiness"); })]);
+      drain = recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      await waitForBlockedPid(holderPid);
+    } finally {
+      release();
+      await Promise.allSettled([barrier, ...(drain ? [drain] : [])]);
+    }
+    const after = await snapshot(f);
+    expect(after.source).toEqual(before.source);
+    expect(after.actions).toEqual([expectedAction]);
+    expect(after.cards).toEqual(before.cards);
+    expect(after.wakes).toEqual(before.wakes);
+    await expect(drain!).resolves.toMatchObject({ monitorArmed: 0, recoveryIssueMinted: 0, noInvokableOwner: 0 });
+  }, 30_000);
+
+  it("keeps a monitor that became due after the sweep's clock sample", async () => {
+    const f = await fixture(), sampledNow = new Date(Date.now() - 60_000), due = new Date(sampledNow.getTime() + 30_000);
+    await db.update(issueRecoveryActions).set({ recoveryIssueId: null }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.delete(issues).where(eq(issues.id, f.carrierId));
+    await db.update(agents).set({ role: "cto", status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_review", assigneeAgentId: f.agentId, createdByAgentId: f.agentId,
+      monitorNextCheckAt: due, monitorScheduledBy: "board", monitorNotes: "Preserve the due board check", monitorAttemptCount: 1,
+      executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor: {
+        nextCheckAt: due.toISOString(), notes: "Preserve the due board check", scheduledBy: "board", kind: null,
+        serviceName: null, externalRef: null, timeoutAt: null, maxAttempts: 3, recoveryPolicy: null,
+      } },
+    }).where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const result = await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Due monitor must not mint or dispatch"); } })
+      .reconcileExhaustedRecoveryDrain({ companyId: f.companyId, now: sampledNow });
+    expect(await snapshot(f)).toEqual(before);
+    expect(result).toMatchObject({ monitorArmed: 0, monitorDueAwaitingClaim: 1, alreadyLive: 1, recoveryIssueMinted: 0 });
+    await assertNoProtectedWrites();
+  });
 });
