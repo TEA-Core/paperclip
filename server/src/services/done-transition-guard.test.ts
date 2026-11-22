@@ -6354,6 +6354,7 @@ describe("evaluateDoneTierDeclaration", () => {
         "exit criteria met",
         "anon request refused 401",
         "failed closed on anon request, expected negative path confirmed",
+        "the scan failed closed on anonymous requests as expected",
         "exit 0; exited 0; exit -0; exited +00; failed=0; scanned=12",
         "preexit 2; failed=0; scanned=01; unREFUSED; non-cleanliness",
       ])("accepts harmless trailing prose: %s", async (prose) => {
@@ -6364,6 +6365,39 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.allowed).toBe(true);
         expect(result.tier).toBe("tier2");
         expect(result.tier2Audit).toMatchObject({ tierForm: "record-only" });
+      });
+
+      it.each([
+        "scanned=0, failed=4 because required check-run App token was unavailable",
+        "scan failed closed with exit 2 in all four repos due unavailable GH_CI_ONLY_TOKEN/GH_TOKEN",
+        "the scan failed closed on all 4 repos because GH_CI_ONLY_TOKEN and GH_TOKEN are unavailable",
+        "scan failed with exit 2 due to missing check-run App token",
+        "all four scans exited 2 because the CheckRun App token is unavailable",
+        "scan executed but failed closed (exit 2; scanned=0, failed=4, check-run App token unavailable)",
+        "exited 2 with check-run App token unavailable for all four repositories (scan failure recorded, not a clean scan)",
+      ])("refuses recurrence evidence: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.tier2Audit).toBeUndefined();
+      });
+
+      it("accepts a clean recurrence scan with separate REFUSED-vet lines", async () => {
+        const evidence = RECORD_ONLY_EVIDENCE.replace(
+          "the sweep consumption point served 42 fresh records",
+          "scanned=4 failed=0 matched=29 armed=0 exit 0",
+        );
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(),
+          `${tier2Line(evidence)}\n\nVet: REFUSED missing paperclip/approved; exit 1`,
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only", probeEvidence: evidence });
       });
     });
 

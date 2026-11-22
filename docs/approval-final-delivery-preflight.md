@@ -58,11 +58,13 @@ The guard refuses a `result: pass` declaration with `done_transition_record_only
 | `failed_positive` | `failed=<integer>` with a positive value |
 | `scanned_zero` | `scanned=0` |
 | `non_clean` | `non-clean` |
-| `failed_closed` | `failed closed. All` (literal context) |
+| `failed_closed` | `failed closed. All` or `scan failed closed on all 4 repos` (literal probe-failure contexts) |
 | `refused` | `REFUSED` |
 | `partial_failure` | `partial failure` |
 
 Numbers may have leading zeroes; exit codes may have a sign. Words have word-boundary anchors; phrase separators accept spaces or tabs. Lowercase `refused` (for example `anon request refused 401`) and a bare `failed closed` (for example a predicate confirming an expected negative path) do not contradict a pass; a failed-closed outcome with an explicit failing exit is caught by the `exit`/`exited` markers. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
+
+The added `scan failed closed on all 4 repos` context names the failed scan itself even when no exit code or failed count follows it. It does not turn bare `failed closed` into a contradiction marker. A clean declaration with `scanned=4 failed=0 matched=29 armed=0 exit 0` can still close when separate vet lines in the comment report `REFUSED missing paperclip/approved; exit 1`: those lines describe another operation outside the matched declaration predicate.
 
 The refusal names the marker, repeats the accepted form verbatim, and states the honest alternative: **Report the non-clean cycle and do not close.** Re-probe before claiming a genuine pass; do not relabel a failed probe to force a close.
 
