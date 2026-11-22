@@ -12456,6 +12456,16 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Auto-adoption was decided against an unassigned read. A concurrent
+        // owner that landed since must not be overwritten.
+        if (
+          wikiHandoffAutoAdoption === true &&
+          (receiptExisting.assigneeAgentId != null || receiptExisting.assigneeUserId != null)
+        ) {
+          throw conflict("Issue was assigned since it was read; retry the Wiki handoff repair", {
+            reason: "wiki_handoff_adoption_conflict",
+          });
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

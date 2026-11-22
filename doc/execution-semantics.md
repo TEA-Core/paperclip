@@ -877,7 +877,24 @@ inside the issue-update transaction and holds shared locks on existing
 resource rows, entity bindings, and the candidate agent rows through the
 issue UPDATE. A concurrent repoint or agent metadata change must wait for that
 write to commit. A changed canonical target before the locked check refuses
-the stale assignment instead of persisting it.
+the stale assignment instead of persisting it. This includes an adopted
+fallback Maintainer that no longer resolves (for example its marker was
+removed): auto-adoption fails closed with 422, while an ordinary write keeps the
+historical no-canonical exception below.
+
+The metadata fallback also takes a company-scoped advisory lock (shared) before
+it scans agents, and creating a Maintainer-marked agent takes the same lock
+(exclusive). A marked agent therefore cannot be inserted between the guard's
+resolution and the issue UPDATE, because row locks cannot cover a row that does
+not exist yet.
+
+Adoption is decided against an unassigned read. If an agent or user owner lands
+before the locked write, the repair returns 409 `wiki_handoff_adoption_conflict`
+and the concurrent owner is preserved, with no wake. Adoption derives an
+assignee after the `record_only` self-assignment check, so that check is
+repeated for the derived assignee: an agent that is the adopted Maintainer
+cannot select `record_only` (403 `record_only_self_assignee`). The board is
+unaffected.
 
 A stale reference with no marked live agent, or an ambiguous result, cannot
 be adopted and the repair is refused. Historical exception: if there is no

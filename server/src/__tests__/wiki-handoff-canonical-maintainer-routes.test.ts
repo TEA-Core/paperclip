@@ -26,6 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { agentService } from "../services/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { StorageService } from "../storage/types.js";
@@ -572,4 +573,187 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     const stored = await readAssignee(stub.id);
     expect(stored?.assigneeAgentId).toBeNull();
   });
+  // Hold a PATCH inside its service transaction at the issue UPDATE (after the
+  // service guard resolved), run `whileHeld`, then release it.
+  async function holdPatchAtUpdate(
+    stubId: string,
+    companyId: string,
+    body: Record<string, unknown>,
+    whileHeld: () => Promise<void>,
+  ) {
+    const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+    const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+      unsafe: (query: string) => Promise<unknown>;
+      end: (options?: { timeout?: number }) => Promise<unknown>;
+    };
+    const locker = postgres(tempDb!.connectionString, { max: 1 });
+    const barrier = 2493602;
+    let pending: Promise<request.Response> | undefined;
+    try {
+      await locker.unsafe(`
+        CREATE FUNCTION wiki_handoff_update_barrier() RETURNS trigger AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(${barrier});
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER wiki_handoff_update_barrier BEFORE UPDATE ON issues
+        FOR EACH ROW WHEN (NEW.id = '${stubId}'::uuid)
+        EXECUTE FUNCTION wiki_handoff_update_barrier();
+        SELECT pg_advisory_lock(${barrier});
+      `);
+      pending = request(createApp(db, boardActor(companyId)))
+        .patch(`/api/issues/${stubId}`).send(body).then((res) => res);
+      await expect.poll(async () => {
+        const rows = await db.execute(sql`SELECT 1 FROM pg_locks
+          WHERE locktype = 'advisory' AND objid = ${barrier} AND NOT granted`);
+        return rows.length;
+      }, { timeout: 10_000 }).toBe(1);
+      await whileHeld();
+      await locker.unsafe(`SELECT pg_advisory_unlock(${barrier})`);
+      return await pending;
+    } finally {
+      await locker.end({ timeout: 1 });
+      await pending;
+      await db.execute(sql`DROP TRIGGER IF EXISTS wiki_handoff_update_barrier ON issues`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS wiki_handoff_update_barrier()`);
+    }
+  }
+
+  it("refuses record_only when the adopted maintainer is the calling creator agent", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    const stub = await seedUnassignedHandoff(company.id);
+    await db.update(issues).set({ createdByAgentId: maintainer.id }).where(eq(issues.id, stub.id));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company.id,
+      agentId: maintainer.id,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: stub.id },
+    });
+    const agentActor = {
+      type: "agent",
+      agentId: maintainer.id,
+      companyId: company.id,
+      source: "agent_key",
+      runId,
+    } as unknown as Express.Request["actor"];
+    const body = { description: "Repair pointer", deliveryRequirement: "record_only" };
+
+    const refused = await request(createApp(db, agentActor))
+      .patch(`/api/issues/${stub.id}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send(body);
+    expect(refused.status, JSON.stringify(refused.body)).toBe(403);
+    expect(refused.body.details).toMatchObject({ reason: "record_only_self_assignee" });
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+
+    // Lawful board repair of the same shape still adopts.
+    const repaired = await request(createApp(db, boardActor(company.id))).patch(`/api/issues/${stub.id}`).send(body);
+    expect(repaired.status, JSON.stringify(repaired.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+  });
+
+  it("does not overwrite an owner that lands between route preflight and the locked write", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    const stub = await seedUnassignedHandoff(company.id);
+    const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+    const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+      unsafe: (query: string) => Promise<unknown>;
+      end: (options?: { timeout?: number }) => Promise<unknown>;
+    };
+    const owner = postgres(tempDb!.connectionString, { max: 1 });
+    let pending: Promise<request.Response> | undefined;
+    try {
+      await owner.unsafe(`BEGIN; SELECT id FROM issues WHERE id = '${stub.id}' FOR UPDATE;`);
+      pending = request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" }).then((res) => res);
+      await expect.poll(async () => {
+        const rows = await db.execute(sql`SELECT 1 FROM pg_locks
+          WHERE locktype = 'transactionid' AND NOT granted`);
+        return rows.length;
+      }, { timeout: 10_000 }).toBeGreaterThan(0);
+      await owner.unsafe(
+        `UPDATE issues SET assignee_user_id = '${REVIEWER_USER_ID}' WHERE id = '${stub.id}'; COMMIT;`,
+      );
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({ reason: "wiki_handoff_adoption_conflict" });
+      expect(await readAssignee(stub.id)).toMatchObject({
+        assigneeAgentId: null,
+        assigneeUserId: REVIEWER_USER_ID,
+      });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, maintainer.id));
+      expect(wakes).toEqual([]);
+    } finally {
+      await owner.end({ timeout: 1 });
+      await pending;
+    }
+  }, 20_000);
+
+  it("serializes a marked agent insertion with the metadata-fallback adoption", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    const stub = await seedUnassignedHandoff(company.id);
+    let created: Promise<unknown> | undefined;
+    const res = await holdPatchAtUpdate(stub.id, company.id, { description: "Repair pointer" }, async () => {
+      created = agentService(db).create(company.id, {
+        name: "Second Wiki Maintainer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+        metadata: maintainerMetadata(randomUUID()),
+      });
+      created.catch(() => undefined);
+      // The insertion must wait for the guarded write; row locks alone let it land.
+      const outcome = await Promise.race([
+        created.then(() => "inserted"),
+        new Promise((resolve) => setTimeout(() => resolve("blocked"), 1_500)),
+      ]);
+      expect(outcome).toBe("blocked");
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+    await created;
+  }, 30_000);
+
+  it("fails closed when the adopted fallback maintainer loses its marker before the locked write", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    await db.delete(pluginManagedResources);
+    await db.delete(pluginEntities);
+    const stub = await seedUnassignedHandoff(company.id);
+    const requireFromDb = createRequire(new URL("../../../packages/db/package.json", import.meta.url));
+    const postgres = requireFromDb("postgres") as (url: string, options: { max: number }) => {
+      unsafe: (query: string) => Promise<unknown>;
+      end: (options?: { timeout?: number }) => Promise<unknown>;
+    };
+    const locker = postgres(tempDb!.connectionString, { max: 1 });
+    let pending: Promise<request.Response> | undefined;
+    try {
+      // Block the service's issue row lock so the marker removal lands after
+      // route preflight chose the maintainer and before the locked check.
+      await locker.unsafe(`BEGIN; SELECT id FROM issues WHERE id = '${stub.id}' FOR UPDATE;`);
+      pending = request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" }).then((res) => res);
+      await expect.poll(async () => {
+        const rows = await db.execute(sql`SELECT 1 FROM pg_locks
+          WHERE locktype = 'transactionid' AND NOT granted`);
+        return rows.length;
+      }, { timeout: 10_000 }).toBeGreaterThan(0);
+      await db.update(agents).set({ metadata: {} }).where(eq(agents.id, maintainer.id));
+      await locker.unsafe(`COMMIT`);
+      const res = await pending;
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+    } finally {
+      await locker.end({ timeout: 1 });
+      await pending;
+    }
+  }, 20_000);
 });

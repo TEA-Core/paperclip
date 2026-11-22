@@ -20387,6 +20387,19 @@ export function issueRoutes(
         },
       );
       if (adoptedMaintainerId) {
+        // The self-assignment check above ran before adoption chose this
+        // assignee; apply the same refusal to the derived one.
+        if (
+          req.body.deliveryRequirement === "record_only" &&
+          req.actor.type === "agent" &&
+          req.actor.agentId === adoptedMaintainerId
+        ) {
+          res.status(403).json({
+            error: "Only the board or an authorized non-assignee may select record_only delivery",
+            details: { reason: "record_only_self_assignee" },
+          });
+          return;
+        }
         updateFields.assigneeAgentId = adoptedMaintainerId;
         updateFields.assigneeUserId = null;
         wikiHandoffAutoAdoption = true;

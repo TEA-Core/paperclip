@@ -1,5 +1,5 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, pluginEntities, pluginManagedResources, plugins } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
@@ -156,7 +156,7 @@ const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
 export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
 const UNRESOLVED_WIKI_MAINTAINER_AGENT_ID = "unresolved-wiki-maintainer";
 
-function metadataMarksWikiMaintainer(metadata: unknown): boolean {
+export function metadataMarksWikiMaintainer(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
   const record = metadata as Record<string, unknown>;
   return [record.paperclipManagedResource, record.pluginManagedAgent].some((marker) => {
@@ -170,6 +170,26 @@ function metadataMarksWikiMaintainer(metadata: unknown): boolean {
       (resourceKind === undefined || resourceKind === "agent")
     );
   });
+}
+
+/**
+ * Row locks cannot cover an agent that does not exist yet. The metadata
+ * fallback therefore takes this company-scoped advisory lock (shared) before
+ * it scans agents, and agent creation takes it (exclusive) before inserting a
+ * Maintainer-marked agent. A marked insert then cannot land between the
+ * guard's resolution and the issue UPDATE that relies on it.
+ */
+export async function lockWikiMaintainerResolution(
+  db: Db,
+  companyId: string,
+  mode: "shared" | "exclusive",
+): Promise<void> {
+  const key = `wiki-maintainer-resolution:${companyId}`;
+  await db.execute(
+    mode === "shared"
+      ? sql`select pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`
+      : sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`,
+  );
 }
 
 function bindingAgentId(data: unknown): string | null {
@@ -244,6 +264,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
     if (resolved && isAvailable(resolved.status)) return resolved.id;
     return UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
   }
+  if (options?.lockRows) await lockWikiMaintainerResolution(db, companyId, "shared");
   const fallbackQuery = db
     .select({ id: agents.id, metadata: agents.metadata, status: agents.status })
     .from(agents)
@@ -445,15 +466,19 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
-  const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
-    input.db as Db,
-    input.companyId,
-    input.issue,
-    {
-      lockRows: input.lockCanonicalResolution,
-      requireAvailable: input.requireAvailableCanonical,
-    },
-  );
+  // An auto-adopted assignee was chosen from a Maintainer that the route saw
+  // earlier. If the locked resolution no longer finds one, the adopted id is
+  // stale: fail closed. Ordinary writes keep the no-canonical exception.
+  const canonicalMaintainerAgentId =
+    (await resolveCanonicalWikiMaintainerAgentId(
+      input.db as Db,
+      input.companyId,
+      input.issue,
+      {
+        lockRows: input.lockCanonicalResolution,
+        requireAvailable: input.requireAvailableCanonical,
+      },
+    )) ?? (input.requireAvailableCanonical ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null);
   if (!canonicalMaintainerAgentId) return;
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
