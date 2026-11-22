@@ -225,36 +225,38 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   const boundIds = bindings.map((row) => bindingAgentId(row.data)).filter((id): id is string => id !== null);
   const candidateIds = [resourceId, ...boundIds].filter((id): id is string => id !== null);
   const candidateQuery = db
-    .select({ id: agents.id, metadata: agents.metadata })
+    .select({ id: agents.id, metadata: agents.metadata, status: agents.status })
     .from(agents)
     .where(and(
       eq(agents.companyId, companyId),
       ne(agents.status, "terminated"),
-      options?.requireAvailable ? ne(agents.status, "paused") : undefined,
       inArray(agents.id, candidateIds),
     ));
   const liveCandidates = candidateIds.length === 0
     ? []
     : await (options?.lockRows ? candidateQuery.for("share") : candidateQuery);
-  const markedIds = new Set(liveCandidates
-    .filter((agent) => metadataMarksWikiMaintainer(agent.metadata))
-    .map((agent) => agent.id));
-  const resolved = candidateIds.find((id) => markedIds.has(id));
-  if (resolved) return resolved;
+  const isAvailable = (status: string) => !options?.requireAvailable || status !== "paused";
+  if (liveCandidates.length > 0) {
+    const markedById = new Map(liveCandidates
+      .filter((agent) => metadataMarksWikiMaintainer(agent.metadata))
+      .map((agent) => [agent.id, agent]));
+    const resolved = candidateIds.map((id) => markedById.get(id)).find((agent) => agent !== undefined);
+    if (resolved && isAvailable(resolved.status)) return resolved.id;
+    return UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
+  }
   const fallbackQuery = db
-    .select({ id: agents.id, metadata: agents.metadata })
+    .select({ id: agents.id, metadata: agents.metadata, status: agents.status })
     .from(agents)
     .where(and(
       eq(agents.companyId, companyId),
       ne(agents.status, "terminated"),
-      options?.requireAvailable ? ne(agents.status, "paused") : undefined,
     ));
   const liveAgents = await (options?.lockRows ? fallbackQuery.for("share") : fallbackQuery);
   const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
-  if (marked.length === 1) return marked[0]!.id;
+  if (marked.length === 1) {
+    return isAvailable(marked[0]!.status) ? marked[0]!.id : UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
+  }
   if (marked.length > 1) return AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID;
-  // Retain a refusal when a reference exists but no marked agent resolves.
-  // With neither a reference nor a marker, the legacy guard remains inactive.
   return candidateIds.length > 0 ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null;
 }
 

@@ -254,6 +254,21 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
   });
 
+  it("fails closed when a live unmarked reference has no marked binding and another agent carries a forged marker", async () => {
+    const { company, intruder, stale } = await seedWikiCompany("maintainer");
+    await db.delete(pluginEntities);
+    await db.update(pluginManagedResources).set({ resourceId: stale.id });
+    await db.update(agents).set({ metadata: {} }).where(eq(agents.companyId, company.id));
+    await db.update(agents).set({ metadata: maintainerMetadata(randomUUID()) }).where(eq(agents.id, intruder.id));
+    const app = createApp(db, boardActor(company.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const repaired = await request(app).patch(`/api/issues/${stub.id}`).send({ description: "Repair pointer" });
+    expect(repaired.status, JSON.stringify(repaired.body)).toBe(422);
+    const explicit = await request(app).patch(`/api/issues/${stub.id}`).send({ assigneeAgentId: intruder.id });
+    expect(explicit.status, JSON.stringify(explicit.body)).toBe(422);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+  });
+
   it("refuses adoption of a paused maintainer", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, maintainer.id));

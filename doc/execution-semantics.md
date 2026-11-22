@@ -853,9 +853,12 @@ marks both `pluginKey` `paperclipai.plugin-llm-wiki` and agent key
 `wiki-maintainer`. Among marked agents, the `plugin_managed_resources` row's
 `resourceId` takes precedence, then the
 `managed:agent:<companyId>:wiki-maintainer` plugin entity binding. A live but
-unmarked resource target is not canonical. Only when neither reference
-resolves to a marked live agent does the guard use a unique marked live agent
-in the company. More than one fallback match is ambiguous and refuses writes,
+unmarked resource target is not canonical. When a reference resolves to a
+live agent but none of the live referenced agents is marked, the guard fails
+closed and refuses; it never falls back to another agent that only carries the
+metadata marker. Only when no reference exists or every reference is missing
+or terminated does the guard use a unique marked live agent in the company.
+A paused canonical target is not replaced by another agent. More than one fallback match is ambiguous and refuses writes,
 including when no resource reference exists. A terminated agent is not live.
 
 A field repair of an unassigned Wiki handoff adopts an available canonical
