@@ -12491,6 +12491,11 @@ export function issueService(db: Db) {
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,
+            lockCanonicalResolution: true,
+            requireAvailableCanonical:
+              receiptExisting.assigneeAgentId === null &&
+              issueData.assigneeAgentId != null &&
+              issueData.status === undefined,
             companyId: receiptExisting.companyId,
             issue: {
               title:

@@ -145,7 +145,16 @@ describeEmbeddedPostgres("Wiki handoff board stage decision on an unassigned car
       permissions: {},
     };
     const [maintainer, reviewer, intruder] = await db.insert(agents).values([
-      { ...agentBase, name: "Wiki Maintainer" },
+      {
+        ...agentBase,
+        name: "Wiki Maintainer",
+        metadata: {
+          pluginManagedAgent: {
+            pluginKey: "paperclipai.plugin-llm-wiki",
+            agentKey: "wiki-maintainer",
+          },
+        },
+      },
       { ...agentBase, name: "Reviewer" },
       { ...agentBase, name: "coder-LE" },
     ]).returning();

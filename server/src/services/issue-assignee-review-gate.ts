@@ -154,6 +154,7 @@ const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
   `${WIKI_LLM_WIKI_PLUGIN_KEY}:agent:${WIKI_MAINTAINER_AGENT_KEY}` as const;
 
 export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
+const UNRESOLVED_WIKI_MAINTAINER_AGENT_ID = "unresolved-wiki-maintainer";
 
 function metadataMarksWikiMaintainer(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
@@ -183,85 +184,96 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
   issue: { title?: string | null; description?: string | null } | null | undefined,
+  options?: { lockRows?: boolean; requireAvailable?: boolean },
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
   if (!isWikiHandoffTitle(issue.title)) return null;
+  // The service guard holds these locks on its issue-update transaction.
+  // Preflight callers do not lock; the service repeats their check at commit.
+  const resourceQuery = db
+    .select({
+      resourceKey: pluginManagedResources.resourceKey,
+      resourceId: pluginManagedResources.resourceId,
+    })
+    .from(pluginManagedResources)
+    .where(and(
+      eq(pluginManagedResources.companyId, companyId),
+      eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+      eq(pluginManagedResources.resourceKind, "agent"),
+      inArray(pluginManagedResources.resourceKey, [
+        WIKI_MAINTAINER_AGENT_KEY,
+        WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY,
+      ]),
+    ));
+  const bindingQuery = db
+    .select({ data: pluginEntities.data })
+    .from(pluginEntities)
+    .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
+    .where(and(
+      eq(pluginEntities.companyId, companyId),
+      eq(pluginEntities.entityType, "managed_agent"),
+      eq(pluginEntities.externalId, `managed:agent:${companyId}:${WIKI_MAINTAINER_AGENT_KEY}`),
+      eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+    ));
   const [resourceRows, bindings] = await Promise.all([
-    db
-      .select({
-        resourceKey: pluginManagedResources.resourceKey,
-        resourceId: pluginManagedResources.resourceId,
-      })
-      .from(pluginManagedResources)
-      .where(and(
-        eq(pluginManagedResources.companyId, companyId),
-        eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
-        eq(pluginManagedResources.resourceKind, "agent"),
-        inArray(pluginManagedResources.resourceKey, [
-          WIKI_MAINTAINER_AGENT_KEY,
-          WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY,
-        ]),
-      )),
-    db
-      .select({ data: pluginEntities.data })
-      .from(pluginEntities)
-      .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
-      .where(and(
-        eq(pluginEntities.companyId, companyId),
-        eq(pluginEntities.entityType, "managed_agent"),
-        eq(pluginEntities.externalId, `managed:agent:${companyId}:${WIKI_MAINTAINER_AGENT_KEY}`),
-        eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
-      )),
+    options?.lockRows ? resourceQuery.for("share") : resourceQuery,
+    options?.lockRows ? bindingQuery.for("share") : bindingQuery,
   ]);
   const resourceId = resourceRows.find((row) => row.resourceKey === WIKI_MAINTAINER_AGENT_KEY)?.resourceId
     ?? resourceRows[0]?.resourceId
     ?? null;
   const boundIds = bindings.map((row) => bindingAgentId(row.data)).filter((id): id is string => id !== null);
   const candidateIds = [resourceId, ...boundIds].filter((id): id is string => id !== null);
-  const liveCandidates = candidateIds.length === 0
-    ? []
-    : await db
-      .select({ id: agents.id })
-      .from(agents)
-      .where(and(
-        eq(agents.companyId, companyId),
-        ne(agents.status, "terminated"),
-        inArray(agents.id, candidateIds),
-      ));
-  const liveIds = new Set(liveCandidates.map((agent) => agent.id));
-  const resolved = candidateIds.find((id) => liveIds.has(id));
-  if (resolved) return resolved;
-  const liveAgents = await db
+  const candidateQuery = db
     .select({ id: agents.id, metadata: agents.metadata })
     .from(agents)
-    .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+    .where(and(
+      eq(agents.companyId, companyId),
+      ne(agents.status, "terminated"),
+      options?.requireAvailable ? ne(agents.status, "paused") : undefined,
+      inArray(agents.id, candidateIds),
+    ));
+  const liveCandidates = candidateIds.length === 0
+    ? []
+    : await (options?.lockRows ? candidateQuery.for("share") : candidateQuery);
+  const markedIds = new Set(liveCandidates
+    .filter((agent) => metadataMarksWikiMaintainer(agent.metadata))
+    .map((agent) => agent.id));
+  const resolved = candidateIds.find((id) => markedIds.has(id));
+  if (resolved) return resolved;
+  const fallbackQuery = db
+    .select({ id: agents.id, metadata: agents.metadata })
+    .from(agents)
+    .where(and(
+      eq(agents.companyId, companyId),
+      ne(agents.status, "terminated"),
+      options?.requireAvailable ? ne(agents.status, "paused") : undefined,
+    ));
+  const liveAgents = await (options?.lockRows ? fallbackQuery.for("share") : fallbackQuery);
   const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
   if (marked.length === 1) return marked[0]!.id;
   if (marked.length > 1) return AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID;
-  return resourceId ?? boundIds[0] ?? null;
+  // Retain a refusal when a reference exists but no marked agent resolves.
+  // With neither a reference nor a marker, the legacy guard remains inactive.
+  return candidateIds.length > 0 ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null;
 }
 
 /**
- * Live id only. The resolver's last fallback can be a stale resource id; a
- * field repair must not adopt that id, or the guard would treat the dead row
- * as canonical and admit it.
+ * Adoption requires a marked, non-paused live agent. Sentinel results can
+ * enforce a refusal but must never become an assignee id.
  */
 export async function resolveLiveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
   issue: { title?: string | null; description?: string | null } | null | undefined,
 ): Promise<string | null> {
-  const resolved = await resolveCanonicalWikiMaintainerAgentId(db, companyId, issue);
-  if (!resolved || resolved === AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID) return null;
-  const [live] = await db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(and(
-      eq(agents.id, resolved),
-      eq(agents.companyId, companyId),
-      ne(agents.status, "terminated"),
-    ));
-  return live?.id ?? null;
+  const resolved = await resolveCanonicalWikiMaintainerAgentId(db, companyId, issue, { requireAvailable: true });
+  if (
+    !resolved ||
+    resolved === AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID ||
+    resolved === UNRESOLVED_WIKI_MAINTAINER_AGENT_ID
+  ) return null;
+  return resolved;
 }
 
 function isWorkflowControlledPendingReviewParticipant(input: {
@@ -407,6 +419,9 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
+  /** Only set on the transaction that will persist the guarded issue write. */
+  lockCanonicalResolution?: boolean;
+  requireAvailableCanonical?: boolean;
   /**
    * SUP-24280: the persisted status and assignee shape of this write, so the
    * guard can admit an unassigned-stub cancellation. Omit it at doors that
@@ -432,6 +447,10 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     input.db as Db,
     input.companyId,
     input.issue,
+    {
+      lockRows: input.lockCanonicalResolution,
+      requireAvailable: input.requireAvailableCanonical,
+    },
   );
   if (!canonicalMaintainerAgentId) return;
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0

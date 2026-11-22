@@ -13932,6 +13932,7 @@ export function issueRoutes(
         ) throw conflict("Pending participant cannot approve their own work");
         await assertWikiHandoffWriteIntegrity({
           db: tx as unknown as Db,
+          lockCanonicalResolution: true,
           companyId: issue.companyId,
           issue: {
             title: issue.title,
@@ -20349,6 +20350,11 @@ export function issueRoutes(
     const requestOmitsAssignee =
       normalizedAssigneeAgentId === undefined && req.body.assigneeUserId === undefined;
     const requestOmitsStatus = req.body.status === undefined;
+    const requestHasRepairField =
+      req.body.description !== undefined ||
+      req.body.projectId !== undefined ||
+      req.body.executionPolicy !== undefined ||
+      req.body.deliveryRequirement !== undefined;
     const storedUnassigned = existing.assigneeAgentId == null && existing.assigneeUserId == null;
     const transitionLeftAssigneeUnset =
       (updateFields.assigneeAgentId === undefined || updateFields.assigneeAgentId === null) &&
@@ -20362,6 +20368,7 @@ export function issueRoutes(
     if (
       requestOmitsAssignee &&
       requestOmitsStatus &&
+      requestHasRepairField &&
       storedUnassigned &&
       transitionLeftAssigneeUnset &&
       fieldRepairActorMayAdopt &&

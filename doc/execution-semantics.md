@@ -848,25 +848,45 @@ when its value is `undefined`, because the update normalizes that value to
 and clears the stored policy, as the paragraph above states. That behavior
 predates the field-less skip, and the field-less skip does not change it.
 
-The canonical Wiki Maintainer is the live company agent that the plugin
-`paperclipai.plugin-llm-wiki` manages under `wiki-maintainer`: the
-`plugin_managed_resources` row's `resourceId`, else the
-`managed:agent:<companyId>:wiki-maintainer` plugin entity binding. Agent
-metadata never outranks that row or binding. Only when neither resolves to a
-live agent does the guard fall back to the single live agent whose metadata
+The canonical Wiki Maintainer must be a live company agent whose metadata
 marks both `pluginKey` `paperclipai.plugin-llm-wiki` and agent key
-`wiki-maintainer`. More than one such agent is ambiguous, and the guard refuses
-every assignee write until it is resolved. A terminated agent is not a live
-match.
+`wiki-maintainer`. Among marked agents, the `plugin_managed_resources` row's
+`resourceId` takes precedence, then the
+`managed:agent:<companyId>:wiki-maintainer` plugin entity binding. A live but
+unmarked resource target is not canonical. Only when neither reference
+resolves to a marked live agent does the guard use a unique marked live agent
+in the company. More than one fallback match is ambiguous and refuses writes,
+including when no resource reference exists. A terminated agent is not live.
 
-A field repair of an unassigned Wiki handoff adopts that live Maintainer as
-`assigneeAgentId` in the same `PATCH /api/issues/:id` when the request omits
-assignee and status, the stored assignees are both null, and the actor is the
-board or the agent that created the card. The route writes the adopted id
-before the guard runs, and it does not change status. A missing, stale, or
-ambiguous resolver result does not adopt, so the unassigned write is still
-refused. An explicit non-canonical assignee is not this repair and stays
-refused. A status-only write is not this repair either.
+A field repair of an unassigned Wiki handoff adopts an available canonical
+Maintainer as `assigneeAgentId` in the same `PATCH /api/issues/:id`. The
+request must contain at least one repair field: `description`, `projectId`,
+`executionPolicy`, or `deliveryRequirement`. It must omit assignee and status,
+both stored assignees must be null, and the actor must be the board or the
+agent that created the card. An empty or comment-only request is not a field
+repair and does not acquire an assignee through this path. An explicit
+non-canonical assignee or a status-only write is not this repair either.
+A paused Maintainer is not available for adoption; the repair returns 422
+without assigning it.
+
+The route's lookup is preliminary. The service repeats the canonical check
+inside the issue-update transaction and holds shared locks on existing
+resource rows, entity bindings, and the candidate agent rows through the
+issue UPDATE. A concurrent repoint or agent metadata change must wait for that
+write to commit. A changed canonical target before the locked check refuses
+the stale assignment instead of persisting it.
+
+A stale reference with no marked live agent, or an ambiguous result, cannot
+be adopted and the repair is refused. Historical exception: if there is no
+resource or entity reference and no marked agent, the Wiki guard is inactive;
+a field write can return 200 and leave the card unassigned. This is not a
+successful adoption and does not establish a canonical return assignee.
+
+The repair does not change status, but it is an assignment. Normal assignment
+wakeup rules still apply: a repair of an unassigned `todo`, `in_progress`,
+`blocked`, or `in_review` card can create a Maintainer wake request and run.
+Thus a statusless repair can dispatch work. Repairs of `backlog`, `done`, or
+`cancelled` cards do not request an assignment wake or run.
 
 When a Wiki handoff enters human review in the same write that names the
 canonical Wiki Maintainer, and the workflow seats the user reviewer, that
