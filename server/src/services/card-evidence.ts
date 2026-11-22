@@ -46,6 +46,9 @@ const FORGE_DOMAINS = [
 ];
 
 const FORGE_LABEL = /^(git|gitlab|github|gerrit|gitea|gogs|forgejo|bitbucket|stash|scm|hg|svn|phabricator|code|cgit|gitweb)\d*$/;
+const REVIEW_LABEL = /^reviews?\d*$/;
+const REVIEW_CHANGE_PATH = /^\/(?:\d+|q)(?:[/?#]|$)/;
+const REVIEW_CHANGE_HASH = /^#\/c\//;
 const FORGE_PATH = /\/(pulls?|pull-requests?|pullrequests?|merge_requests|merge-requests|changes|commits?|tree|blob|compare|branches|tags|releases|_git)(\/|$)|\/c\/.+\/\+\/\d+|\/\+\/\d+|\.git(\/|$|[?#])|\/-\/(commit|tree|blob|merge_requests)/i;
 const TAIL = String.raw`\s*(?:(?:no\.?|number|num\.?|id)\s*)?[:#!№]?\s*[#!]?\s*\d+`;
 const CHANGE_REQUEST_LONG = new RegExp(String.raw`(?<![\p{L}\p{N}_])(?:pull[\s_-]*requests?|merge[\s_-]*requests?)` + TAIL, "iu");
@@ -60,7 +63,7 @@ const SHA_CUE = /(?:commit|sha|rev|HEAD|merged|pushed|cherry-pick).{0,24}(?=[0-9
 const SHA_BARE_40 = /(?<![\w-])[0-9a-f]{40}(?![\w-])/i;
 const KEY_CONTAINS = ["workspace", "worktree", "repository", "branch", "pullrequest", "mergerequest", "commit", "project"];
 const KEY_EXACT: Record<string, true> = {
-  pr: true, mr: true, sha: true, ref: true, baseref: true, headref: true, headsha: true, repo: true,
+  pr: true, mr: true, sha: true, ref: true, baseref: true, headref: true, headsha: true, repo: true, repos: true,
 };
 const PROSE_COLUMNS = new Set([
   "issues.title",
@@ -140,6 +143,10 @@ function urlCitation(candidate: string): EvidenceFinding | null {
   if (citedPath && citedPath !== "a repository path") return finding(citedPath, "forge-path");
   if (forgeDomain(host)) return finding(hostLabel(host), "forge-domain");
   if (host.split(".").some((label) => FORGE_LABEL.test(label))) return finding(hostLabel(host), "forge-label");
+  if (
+    host.split(".").some((label) => REVIEW_LABEL.test(label))
+    && (REVIEW_CHANGE_PATH.test(url.pathname) || REVIEW_CHANGE_HASH.test(url.hash))
+  ) return finding("a Gerrit change", "forge-label");
   return citedPath ? finding(citedPath, "forge-path") : null;
 }
 
@@ -164,7 +171,7 @@ export function evidenceKey(key: string): boolean {
   // The abbreviation is a field-name word, not the start of "report".
   // Preserve compact spellings of the usual reference fields as well.
   if (/repo(?:id|url|path|name|root|dir|ref|slug|branch)$/.test(normalized)) return true;
-  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).includes("repo");
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).some((word) => word === "repo" || word === "repos");
 }
 
 function provablyEmpty(value: unknown): boolean {

@@ -61,6 +61,25 @@ describe("card evidence parser", () => {
     expect(detectEvidence("https://review.example.org/c/records/+/12345", "prose")?.arm).toBe("forge-path");
   });
 
+  it("refuses numeric and Gerrit-shaped paths on review hosts", () => {
+    for (const url of [
+      "https://review.example.org/12345",
+      "https://review.opendev.org/q/12345",
+      "https://review.example.org/#/c/12345/",
+      "https://reviews.example.org/12345",
+    ]) {
+      expect(detectEvidence(url, "prose")?.arm, url).toBe("forge-label");
+    }
+  });
+
+  it("detects plural repos keys without flagging report keys", () => {
+    for (const key of ["repos", "repos_touched", "reposTouched"]) {
+      expect(detectEvidence({ [key]: ["records"] }, "machine")?.arm, key).toBe("key");
+    }
+    expect(detectEvidence({ reportTitle: "Weekly staffing totals" }, "machine")).toBeNull();
+    expect(detectEvidence({ reports: ["totals"] }, "machine")).toBeNull();
+  });
+
   it("scans a typed no-workspace audit proof without mistaking its container for a binding", () => {
     const proof = { proof: "never_had_execution_workspace", executionWorkspaceId: null };
     expect(detectEvidence({ noRepositoryLanding: proof }, "machine")).toBeNull();
