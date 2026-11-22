@@ -18,6 +18,7 @@ import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryCarrierParkService } from "../services/recovery-carrier-park.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueService } from "../services/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -787,11 +788,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }).then(run => { settled = true; return { run, error: null }; },
       error => { settled = true; return { run: null, error }; });
     try {
-      // A broken queue reaches the tripwire; a correct queue waits behind admission.
-      await expect.poll(async () => settled || (await db.execute(sql`select exists (
-        select 1 from pg_stat_activity where datname = current_database()
-        and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked,
-      { timeout: 10_000 }).toBe(true);
+      await expect.poll(async () => {
+        if (settled) throw new Error("Wake settled before requesting the park's source lock");
+        return (await db.execute(sql`select exists (
+          select 1 from pg_stat_activity where datname = current_database()
+          and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked;
+      }, { timeout: 10_000 }).toBe(true);
     } finally {
       releaseBarrier();
       await Promise.all([barrier, acceptance, wake]);
@@ -1439,8 +1441,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
 
   it("rechecks exact action consent under the source lock before healthy-child blocker repair", async () => {
     const f = await fixture();
-    await db.insert(issues).values({ companyId: f.companyId, title: "Human-owned child",
-      status: "in_progress", assigneeUserId: "park-operator", parentId: f.sourceId });
+    const [child] = await db.insert(issues).values({ companyId: f.companyId, title: "Human-owned child",
+      status: "in_progress", assigneeUserId: "park-operator", parentId: f.sourceId }).returning({ id: issues.id });
     const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
     const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
     const repair = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Child repair must not dispatch"); } }).reconcileActiveRecoveryActions();
@@ -1452,6 +1454,9 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }
     expect((await acceptance).status).toBe(201);
     expect(await snapshot(f)).toEqual(before);
+    expect(await db.select({ id: issueRelations.issueId }).from(issueRelations).where(and(
+      eq(issueRelations.issueId, child!.id), eq(issueRelations.relatedIssueId, f.sourceId), eq(issueRelations.type, "blocks"),
+    ))).toEqual([]);
     await assertNoProtectedWrites();
   }, 30_000);
 
@@ -1471,10 +1476,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }).then(run => { settled = true; return { run, error: null }; },
       error => { settled = true; return { run: null, error }; });
     try {
-      await expect.poll(async () => settled || (await db.execute(sql`select exists (
-        select 1 from pg_stat_activity where datname = current_database()
-        and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked,
-      { timeout: 10_000 }).toBe(true);
+      await expect.poll(async () => {
+        if (settled) throw new Error("Wake settled before requesting the park's source lock");
+        return (await db.execute(sql`select exists (
+          select 1 from pg_stat_activity where datname = current_database()
+          and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked;
+      }, { timeout: 10_000 }).toBe(true);
     } finally {
       releaseBarrier();
       await Promise.all([barrier, acceptance, wake]);
@@ -1586,5 +1593,132 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
     expect(response.status).toBe(422);
     expect(response.body.details.reason).toBe("blocked_on_resolved_blockers");
+  });
+
+  it.each([false, true])("refuses carrier deletion without retiring its park fence, released %s", async released => {
+    const f = await fixture(), parked = await park(f);
+    expect(parked.status).toBe(201);
+    if (released) {
+      expect((await request(app(f.companyId))
+        .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
+        .send({ recoveryActionId: f.actionId, reason: "Carrier release leaves unresolved source effects" })).status).toBe(200);
+    }
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await request(app(f.companyId)).delete(`/api/issues/${f.carrierId}`)).status).toBe(409);
+    await expect(issueService(db).remove(f.carrierId)).rejects.toMatchObject({ status: 409 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
+  it("refuses a late carrier delete after board acceptance wins the lock", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const deletion = request(app(f.companyId)).delete(`/api/issues/${f.carrierId}`).then(response => response);
+    try {
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, deletion]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect((await deletion).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    const records = await parkRecords(f);
+    expect(records.holds).toEqual([expect.objectContaining({ id: (await acceptance).body.hold.id, status: "active" })]);
+    expect(records.audit).toEqual([expect.objectContaining({ action: "issue.recovery_carrier_parked" })]);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("still deletes an unrelated ordinary card beside a protected carrier", async () => {
+    const f = await fixture(), ordinaryId = randomUUID();
+    await db.insert(issues).values({ id: ordinaryId, companyId: f.companyId, title: "Ordinary card", status: "todo" });
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const deleted = await request(app(f.companyId)).delete(`/api/issues/${ordinaryId}`);
+    expect(deleted.status).toBe(200);
+    expect(deleted.body.id).toBe(ordinaryId);
+    const after = await snapshot(f);
+    expect(after.cards).toEqual(before.cards.filter(row => row.id !== ordinaryId));
+    expect(after.source).toEqual(before.source);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.wakes).toEqual(before.wakes);
+    expect((await parkRecords(f)).holds).toEqual(records.holds);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["carrier", "descendant", "action-only"] as const)("rejects unfinished cutoff deferral admission atomically for %s", async scope => {
+    const f = await fixture();
+    const childId = randomUUID();
+    if (scope === "descendant") await db.insert(issues).values({
+      id: childId, companyId: f.companyId, title: "Paused descendant", status: "blocked", parentId: f.carrierId,
+    });
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: "heartbeat.worktree_execution_cutoff", status: "skipped", finishedAt: null,
+      payload: scope === "action-only" ? { recoveryActionId: f.actionId.toUpperCase() }
+        : { heartbeatSkip: { issueId: scope === "descendant" ? childId : f.carrierId } },
+    });
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["finished", "terminal reason", "bare source"] as const)("does not treat %s skipped work as pending carrier execution", async scope => {
+    const f = await fixture();
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: scope === "terminal reason" ? "agent.not_invokable" : "heartbeat.worktree_execution_cutoff",
+      status: "skipped", finishedAt: scope === "finished" ? new Date() : null,
+      payload: { heartbeatSkip: { issueId: scope === "bare source" ? f.sourceId : f.carrierId } },
+    });
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(201);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  });
+
+  it("reuses the accepted park for equivalent reordered blocker snapshots", async () => {
+    const f = await fixture(), secondId = randomUUID();
+    await db.insert(issues).values({ id: secondId, companyId: f.companyId, title: "Second historical repair", status: "done" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: secondId, relatedIssueId: f.carrierId, type: "blocks" });
+    f.body.expectedBlockers.push({ id: secondId, status: "done", statusVersion: 0 });
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    const records = await parkRecords(f);
+    const repeated = await park(f, { ...f.body, expectedBlockers: [...f.body.expectedBlockers].reverse() });
+    expect(repeated.ok).toBe(true);
+    expect(repeated.body.hold.id).toBe(accepted.body.hold.id);
+    expect(await parkRecords(f)).toEqual(records);
+    expect((await park(f, { ...f.body, expectedBlockers: f.body.expectedBlockers.map(row =>
+      row.id === secondId ? { ...row, statusVersion: row.statusVersion + 1 } : row) })).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  });
+
+  it("accepts equivalent assignee UUID spelling and persists canonical ownership", async () => {
+    const f = await fixture(), ownerId = `e${randomUUID().slice(1)}`;
+    await db.insert(agents).values({ id: ownerId, companyId: f.companyId, name: "Carrier owner",
+      role: "engineer", adapterType: "process", status: "idle" });
+    await db.update(issues).set({ assigneeAgentId: ownerId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = ownerId.toUpperCase();
+    f.body.expectedAssigneeUserId = null;
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    expect(accepted.body.hold.recoveryCarrierPark.expectedAssigneeAgentId).toBe(ownerId);
+    expect((await attention(f)).carrierPark.state).toBe("accepted");
+    const records = await parkRecords(f);
+    const repeated = await park(f, { ...f.body, expectedAssigneeAgentId: ownerId });
+    expect(repeated.ok).toBe(true);
+    expect(repeated.body.hold.id).toBe(accepted.body.hold.id);
+    expect(await parkRecords(f)).toEqual(records);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
   });
 });
