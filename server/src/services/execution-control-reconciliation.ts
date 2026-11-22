@@ -343,19 +343,19 @@ async function reapUnboundSummaryGenerationIssues(
  * SUP-17698 contract terminalizes a blocked strand whose continuation paths
  * have all died.
  *
- * A card the done-transition guard already refused for an unsatisfied review
- * ladder is deferred only while the ladder state that refusal evaluated is
- * still the card's current ladder state. The refusal audit row stores that
- * state's key (`ladderStateKey`: stage, completed, skipped, and unsatisfied
- * ids, with durable approved decisions folded in); the reaper recomputes the
- * current key and skips the card only on an exact match. No timestamps are
- * compared — the audit row's `created_at` is stamped by the database clock
- * when the fire-and-forget insert lands, while `issues.updated_at` is stamped
- * by the application clock, so ordering those two values can strand a card
- * whose approval committed between the reaper tick and the audit insert.
- * Any ladder-state change (an approval, a skip, a policy change) re-arms the
- * card for the next sweep. A refusal row written before state keys existed
- * carries no key and never defers a card.
+ * A previously refused card defers only while its current evaluated ladder
+ * key matches the latest refusal's durable cursor. The key includes the
+ * completed/skipped/unsatisfied sets (with durable decisions folded in), stage
+ * count, and first unsatisfied id/type/index, so a changed refusal re-arms it.
+ * Capped evaluations refresh `lastEvaluatedLadderStateKey` without changing the
+ * original audit evidence, its DB timestamp, or the three-row/hour INSERT cap.
+ * Legacy keyless rows therefore converge on the first refused evaluation even
+ * after the audit cap is exhausted. Keys do not expire or compare clocks.
+ *
+ * Recovery evidence from a decision-only approval is returned with the other
+ * close audits and persisted inside the successful close transaction, after
+ * the settle read. It cannot keep its own close perpetually unsettled. The
+ * quiet-window reference time is read from the database, not the app clock.
  */
 export async function reapStrandedSummaryGenerationIssues(
   db: Db,
@@ -409,12 +409,11 @@ export async function reapStrandedSummaryGenerationIssues(
           eq(activityLog.action, "issue.done_transition_ladder_refused"),
         ),
       )
-      .orderBy(desc(activityLog.createdAt))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
       .limit(1);
-    const refusedKey =
-      latestRefusal && typeof latestRefusal.details?.ladderStateKey === "string"
-        ? latestRefusal.details.ladderStateKey
-        : null;
+    const cachedKey = latestRefusal?.details?.lastEvaluatedLadderStateKey
+      ?? latestRefusal?.details?.ladderStateKey;
+    const refusedKey = typeof cachedKey === "string" ? cachedKey : null;
     if (refusedKey === null) {
       candidates.push(candidate);
       continue;
@@ -646,6 +645,7 @@ export async function reapStrandedSummaryGenerationIssues(
             const [logRow] = await tx
               .select({
                 latestLogAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+                databaseNow: sql<Date>`clock_timestamp()`.mapWith(issues.updatedAt),
               })
               .from(activityLog)
               .where(
@@ -680,7 +680,7 @@ export async function reapStrandedSummaryGenerationIssues(
               activeRecoveryAction,
               successfulRunHandoff,
               lastActivityAt,
-            });
+            }, { now: logRow!.databaseNow });
             if (continuation.ok) return false;
 
             // SUP-21901 / SUP-21910: the audited system tier-bypass row (the

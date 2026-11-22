@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, createDb, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, issueExecutionDecisions, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -117,6 +117,128 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
   // before they count. Fake timers cannot help: the insert waits on the
   // database, not on a timer. The current guard awaits the write.
   const drainAuditWrites = () => new Promise((resolve) => setTimeout(resolve, 250));
+
+  const readIssue = async (issueId: string) => {
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
+    expect(issue).toBeDefined();
+    return issue!;
+  };
+
+  const policy = (stages: Array<{ id: string; type: "review" | "approval" }>) => ({
+    mode: "normal",
+    commentRequired: true,
+    stages: stages.map((stage) => ({
+      ...stage,
+      participants: [{ type: "agent", agentId: reviewerAgentId }],
+    })),
+  });
+
+  it.each([false, true])("refreshes capped deferral state, including legacy rows (%s), without bypassing the guard", async (legacy) => {
+    const { issueId, stageId } = await seedLadderCard();
+    for (let call = 0; call < 5; call++) {
+      expect((await evaluateDoneTransitionGuardForBackstopClose({
+        db, issue: await readIssue(issueId), closeComment: null,
+      })).allowed).toBe(false);
+    }
+    if (legacy) {
+      await db.update(activityLog).set({
+        details: sql`${activityLog.details} - 'ladderStateKey' - 'lastEvaluatedLadderStateKey'`,
+      }).where(eq(activityLog.entityId, issueId));
+    }
+    const stages: Array<{ id: string; type: "review" }> = [{ id: stageId, type: "review" }];
+    // Refresh twice AFTER the escalation exists. Reading its original key
+    // alone cannot cache the second state. Old rows cannot settle-mask a bypass.
+    for (let change = 0; change < 2; change++) {
+      stages.push({ id: randomUUID(), type: "review" });
+      await db.update(issues).set({ executionPolicy: policy(stages) }).where(eq(issues.id, issueId));
+      await ageActivity(issueId, 10);
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+      expect(await statusOf(issueId)).toBe("in_progress");
+      for (let tick = 0; tick < 3; tick++) {
+        expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+      }
+    }
+    expect(await rows(issueId, REFUSED)).toHaveLength(3);
+    expect(await rows(issueId, REPEATED)).toHaveLength(1);
+  });
+
+  it("uses the latest refusal rather than an older differently evaluated state", async () => {
+    const { issueId, stageId } = await seedLadderCard();
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    await ageActivity(issueId, 10);
+    await db.update(issues).set({
+      executionPolicy: policy([{ id: stageId, type: "review" }, { id: randomUUID(), type: "review" }]),
+    }).where(eq(issues.id, issueId));
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    expect(await rows(issueId, REFUSED)).toHaveLength(2);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+  });
+
+  it("re-arms when a later stage changes completion while the first refused stage stays the same", async () => {
+    const { issueId, stageId } = await seedLadderCard();
+    const later = randomUUID();
+    await db.update(issues).set({
+      executionPolicy: policy([{ id: stageId, type: "review" }, { id: later, type: "review" }]),
+    }).where(eq(issues.id, issueId));
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    const issue = await readIssue(issueId);
+    await db.update(issues).set({
+      executionState: { ...issue.executionState, completedStageIds: [later] },
+    }).where(eq(issues.id, issueId));
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    expect(await statusOf(issueId)).toBe("in_progress");
+  });
+
+  it("re-evaluates reordered and retyped ladders whose refusal wording changes", async () => {
+    const { issueId, stageId } = await seedLadderCard();
+    const secondId = randomUUID();
+    await db.update(issues).set({
+      executionPolicy: policy([{ id: stageId, type: "review" }, { id: secondId, type: "review" }]),
+    }).where(eq(issues.id, issueId));
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    for (const type of ["approval", "review"] as const) {
+      await db.update(issues).set({
+        executionPolicy: policy([{ id: secondId, type }, { id: stageId, type: "review" }]),
+      }).where(eq(issues.id, issueId));
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+      const refusals = await rows(issueId, REFUSED);
+      expect(refusals.some((row) => row.details?.stageType === type && row.details?.reason === `review_ladder_unsatisfied:${secondId}`)).toBe(true);
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    }
+    expect(await statusOf(issueId)).toBe("in_progress");
+  });
+
+  it.each(["agent", "operator"] as const)("closes after a durable %s approval with stale projection without self-settling recovery audits", async (actor) => {
+    const { issueId, stageId } = await seedLadderCard();
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    await ageActivity(issueId, 10);
+    await db.insert(issueExecutionDecisions).values({
+      companyId, issueId, stageId, stageType: "review",
+      actorAgentId: actor === "agent" ? reviewerAgentId : null,
+      actorUserId: actor === "operator" ? "test-board-operator" : null,
+      outcome: "approved", body: "Approved independently of the execution-state projection.",
+      createdAt: sql`now() - interval '10 minutes'`,
+    });
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 1 });
+    expect(await statusOf(issueId)).toBe("done");
+    expect(await rows(issueId, "issue.done_transition_ladder_recovered_from_decisions")).toHaveLength(1);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+  });
+
+  it.each([-2, 2])("uses the database clock to settle external activity despite %s-hour application skew", async (hours) => {
+    const { issueId } = await seedLadderCard();
+    await db.update(issues).set({ executionPolicy: null, deliveryRequirement: "record_only" }).where(eq(issues.id, issueId));
+    await db.insert(activityLog).values({
+      companyId, actorType: "user", actorId: "test-board-operator",
+      action: "issue.updated", entityType: "issue", entityId: issueId,
+    });
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + hours * 60 * 60_000 });
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
+    await ageActivity(issueId, 10);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 1 });
+    expect(await statusOf(issueId)).toBe("done");
+  });
 
   it("defers an unchanged ladder state on later sweep ticks, while the guard still caps repeated direct evaluations", async () => {
     const { issueId, stageId } = await seedLadderCard();
@@ -268,6 +390,9 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
         completedStageIds: [],
         skippedStageIds: [],
         ladderStateKey: JSON.stringify({
+          totalStages: 1,
+          firstUnsatisfiedIndex: 0,
+          firstUnsatisfiedStage: { id: second.stageId, type: "review" },
           stages: [second.stageId],
           completedStageIds: [],
           skippedStageIds: [],

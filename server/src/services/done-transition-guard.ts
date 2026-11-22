@@ -635,20 +635,26 @@ export async function githubBranchHasMergedPr(
   return { hasMergedPr, mergedPrNumber, mergedPrRepository: `${owner}/${repo}` };
 }
 
+type DoneTransitionAuditProvenance = {
+  actorId: string;
+  runId: string | null;
+  closeRowAudits?: Array<Parameters<typeof logActivity>[1]>;
+};
+
 async function writeAuditLog(
   db: Db,
   issue: {
     id: string;
     companyId: string;
     identifier: string | null;
-    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
+    doneTransitionAuditProvenance?: DoneTransitionAuditProvenance;
   },
   action: string,
   details: Record<string, unknown>,
 ) {
   const isLadderRefusal = action === "issue.done_transition_ladder_refused";
   try {
-    await logActivity(db, {
+    const audit: Parameters<typeof logActivity>[1] = {
       companyId: issue.companyId,
       actorType: "system",
       actorId: isLadderRefusal
@@ -664,7 +670,18 @@ async function writeAuditLog(
         identifier: issue.identifier ?? null,
         ...details,
       },
-    });
+    };
+    // Recovery evidence belongs to the successful backstop close, just like
+    // the tier audit. Writing it before settling makes every attempt look
+    // freshly active and prevents a decision-only approval from ever closing.
+    if (
+      action === "issue.done_transition_ladder_recovered_from_decisions"
+      && issue.doneTransitionAuditProvenance?.closeRowAudits
+    ) {
+      issue.doneTransitionAuditProvenance.closeRowAudits.push(audit);
+      return;
+    }
+    await logActivity(db, audit);
   } catch (err) {
     logger.warn({ err, issueId: issue.id, action }, "failed to write done-transition audit log");
   }
@@ -761,7 +778,7 @@ async function writeRepeatCappedAuditLog(
     signature: string;
     details: Record<string, unknown>;
   },
-): Promise<void> {
+): Promise<boolean> {
   const { action, repeatedAction, signatureKey, signature, details } = cap;
   let priorRefusals = 0;
   let priorEscalations = 0;
@@ -791,7 +808,7 @@ async function writeRepeatCappedAuditLog(
   }
   if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
     await writeAuditLog(db, issue, action, details);
-    return;
+    return false;
   }
   if (priorEscalations === 0) {
     await writeAuditLog(db, issue, repeatedAction, {
@@ -801,6 +818,7 @@ async function writeRepeatCappedAuditLog(
       windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
     });
   }
+  return true;
 }
 
 async function writeLadderRefusalAuditLog(
@@ -808,13 +826,36 @@ async function writeLadderRefusalAuditLog(
   issue: { id: string; companyId: string; identifier: string | null },
   details: Record<string, unknown> & { reason: string },
 ): Promise<void> {
-  await writeRepeatCappedAuditLog(db, issue, {
+  const capped = await writeRepeatCappedAuditLog(db, issue, {
     action: LADDER_REFUSED_ACTION,
     repeatedAction: LADDER_REFUSAL_REPEATED_ACTION,
     signatureKey: "reason",
     signature: details.reason,
     details,
   });
+  if (!capped || typeof details.ladderStateKey !== "string") return;
+  // The audit cap limits INSERTs, not cache convergence. Keep original audit
+  // evidence and its DB timestamp intact; refresh only the independent cursor
+  // on the latest refusal, including when all rows predate keyed refusals.
+  const latestRefusal = db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issue.id),
+      eq(activityLog.action, LADDER_REFUSED_ACTION),
+    ))
+    .orderBy(sql`${activityLog.createdAt} desc`, sql`${activityLog.id} desc`)
+    .limit(1);
+  await db.update(activityLog).set({
+    details: sql`jsonb_set(coalesce(${activityLog.details}, '{}'::jsonb),
+      '{lastEvaluatedLadderStateKey}', to_jsonb(${details.ladderStateKey}::text))`,
+  }).where(and(
+    eq(activityLog.id, latestRefusal),
+    sql`coalesce(${activityLog.details} ->> 'lastEvaluatedLadderStateKey',
+      ${activityLog.details} ->> 'ladderStateKey') is distinct from ${details.ladderStateKey}`,
+  ));
 }
 
 /**
@@ -3849,9 +3890,10 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     }
 > {
   const { db, issue, actorId = "done-transition-guard", runId = null, closeComment, structuredDoneTier, listComments } = input;
+  const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
   const guardIssue = {
     ...issue,
-    doneTransitionAuditProvenance: { actorId, runId },
+    doneTransitionAuditProvenance: { actorId, runId, closeRowAudits },
   };
   const guardResult = await evaluateDoneTransitionGuard(db, guardIssue, null, false);
   if (!guardResult.allowed) {
@@ -3881,7 +3923,6 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     // transaction (they used to be fire-and-forget writes here, before and
     // outside it, so a caller whose close later refused or lost the race left
     // an orphan close row on a card that never wrote status→done).
-    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
       closeRowAudits.push({
         companyId: issue.companyId,
@@ -3944,7 +3985,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         systemBackstopActor: actorId,
       },
     },
-    closeRowAudits: [],
+    closeRowAudits,
   };
 }
 
@@ -4259,6 +4300,9 @@ type ReviewLadderEvaluation = NonNullable<ReturnType<typeof evaluateReviewLadder
 export function reviewLadderStateKey(evaluation: ReviewLadderEvaluation): string {
   const sorted = (values: string[]) => [...new Set(values)].sort();
   return JSON.stringify({
+    totalStages: evaluation.totalStages,
+    firstUnsatisfiedIndex: evaluation.firstUnsatisfiedIndex,
+    firstUnsatisfiedStage: evaluation.firstUnsatisfiedStage,
     stages: sorted([
       ...evaluation.completedStageIds,
       ...evaluation.skippedStageIds,
@@ -4896,7 +4940,7 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
-    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
+    doneTransitionAuditProvenance?: DoneTransitionAuditProvenance;
     // The status version before this close; it binds a requirement-change
     // marker to the close (SUP-24429).
     statusVersion?: number;
