@@ -1023,4 +1023,62 @@ describePg("child carrier attribution", () => {
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
     expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
   });
+
+  it("does not count an old attached approval after the current child review proof is cleared", async () => {
+    const { childId, ownerId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    await db.update(issues).set({
+      status: "in_progress",
+      executionState: { status: "active", childCarrierClaim: child!.executionState!.childCarrierClaim },
+    }).where(eq(issues.id, childId));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it("requires the new final child decision to attach before an older approval can be superseded", async () => {
+    const { childId, ownerId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const newDecision = await approveChild(childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row!.childDecisionId).toBe(newDecision);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+  });
+
+  it("does not revive a revoked final child approval after only an intermediate stage approves", async () => {
+    const { childId, ownerId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    const oldDecisionId = await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [oldDecision] = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, oldDecisionId));
+    const [rejected] = await db.insert(issueExecutionDecisions).values({
+      companyId, issueId: childId, stageId: oldDecision!.stageId, stageType: "approval",
+      outcome: "changes_requested", body: "Final approval revoked for review",
+    }).returning();
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    const claim = child!.executionState!.childCarrierClaim;
+    await db.update(issues).set({ status: "in_progress", executionState: {
+      status: "active", currentStageId: oldDecision!.stageId,
+      lastDecisionId: rejected!.id, lastDecisionOutcome: "changes_requested", childCarrierClaim: claim,
+    } }).where(eq(issues.id, childId));
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    const [intermediate] = await db.insert(issueExecutionDecisions).values({
+      companyId, issueId: childId, stageId: randomUUID(), stageType: "approval",
+      outcome: "approved", body: "Intermediate stage approved; final review remains pending",
+    }).returning();
+    await db.update(issues).set({ executionState: {
+      status: "active", currentStageId: oldDecision!.stageId,
+      lastDecisionId: intermediate!.id, lastDecisionOutcome: "approved", childCarrierClaim: claim,
+    } }).where(eq(issues.id, childId));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
 });
