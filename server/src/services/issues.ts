@@ -1,4 +1,4 @@
-import { listRecoveryCarrierParks } from "./recovery-carrier-park-state.js";
+import { listRecoveryCarrierParks, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -80,6 +80,7 @@ import {
   projects,
   toolConnections,
   workspaceOperations,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
@@ -13125,6 +13126,37 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        const [carrier] = await tx.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+        if (!carrier) return null;
+        // Match park admission's source-before-carrier lock order, including released fences.
+        const actionSources = await tx.select({ sourceId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          or(eq(issueRecoveryActions.recoveryIssueId, id), sql`exists (
+            select 1 from ${issueTreeHolds}
+            where ${issueTreeHolds.companyId} = ${carrier.companyId} and ${issueTreeHolds.rootIssueId} = ${id}
+              and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.status} in ('active', 'released')
+              and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`)}
+          )`),
+        ));
+        const sourceIds = [...new Set(actionSources.map(row => row.sourceId))].sort();
+        if (sourceIds.length) await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, carrier.companyId), inArray(issues.id, sourceIds),
+        )).orderBy(asc(issues.id)).for("update");
+        const [lockedCarrier] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, id), eq(issues.companyId, carrier.companyId),
+        )).for("update");
+        if (!lockedCarrier) return null;
+        const parks = await tx.select({ status: issueTreeHolds.status, actionStatus: issueRecoveryActions.status,
+          actionSourceId: issueRecoveryActions.sourceIssueId }).from(issueTreeHolds).leftJoin(issueRecoveryActions, and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`),
+        )).where(and(eq(issueTreeHolds.companyId, carrier.companyId), eq(issueTreeHolds.rootIssueId, id),
+          eq(issueTreeHolds.mode, "pause"), inArray(issueTreeHolds.status, ["active", "released"]),
+          sql`${issueTreeHolds.recoveryCarrierPark} is not null`));
+        if (parks.some(hold => hold.status === "active" || !hold.actionSourceId || !sourceIds.includes(hold.actionSourceId) ||
+            !hold.actionStatus || !["resolved", "cancelled"].includes(hold.actionStatus))) {
+          throw conflict("Recovery carrier cannot be deleted while its board park has pending effects.");
+        }
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)

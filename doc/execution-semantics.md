@@ -660,6 +660,10 @@ settle that schedule before parking; this operation never clears it.
 Deferred issue-execution receipts count as queued work, including verified
 interaction input and persisted issue/task identities in wake context or deferred
 skip metadata; park admission must not silently abandon that input.
+Unfinished `skipped` receipts with a deferrable reason also count as pending
+execution on the carrier tree or exact action. Acceptance rejects them atomically
+rather than retiring or discarding them. Finished skips, terminal skip reasons
+and unrelated bare-source receipts do not create a carrier execution conflict.
 
 The acceptance binding, ordinary manual pause hold and audit event commit
 together. Source and recovery-action rows are read-only: no resolution,
@@ -671,7 +675,9 @@ new source repair authority. Independent authorized board resolution remains
 separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
-New bindings store the database's canonical source, action, decision and blocker UUIDs.
+New bindings store the database's canonical source, action, decision, assignee
+and blocker UUIDs. Equivalent blocker ordering and UUID letter case do not make
+an otherwise identical acceptance stale; persisted consent is not rewritten.
 Source and admission gates compare uppercase, compact and braced UUID spellings
 consistently, including older bindings, without casting untrusted saved JSON,
 rewriting stored consent or touching the action row. Malformed aliases sharing
@@ -730,6 +736,11 @@ stage or authorize repair.
 Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
 sentinel blocker or consent backfill exists. Rollback retains the pause and audit
 evidence; it must not release holds or revive source recovery as cleanup.
+Deleting a carrier is refused while its typed park is active, or while a
+released binding still protects unresolved source effects. The shared removal
+service takes source locks before the carrier lock and rechecks the fence.
+Deletion cannot cascade away that fence or clear the bound unresolved action's
+carrier pointer; an unrelated ordinary card remains deletable.
 
 #### Recovery action freshness
 

@@ -6,6 +6,7 @@ import { conflict, forbidden, notFound } from "../errors.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
 import { listRecoveryCarrierParks, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
+import { DEFERRABLE_WAKE_SKIP_REASONS } from "./wake-skip-classification.js";
 
 type BoardParkActor = Pick<LogActivityInput, "actorType" | "actorId" | "boardApiKeyId" | "runId">;
 
@@ -57,7 +58,7 @@ export function recoveryCarrierParkService(db: Db) {
         throw conflict("The historical board decision changed");
       }
       if (carrier.hiddenAt || ["done", "cancelled"].includes(carrier.status) || carrier.status !== input.expectedStatus ||
-          carrier.statusVersion !== input.expectedStatusVersion || carrier.assigneeAgentId !== input.expectedAssigneeAgentId ||
+          carrier.statusVersion !== input.expectedStatusVersion || carrier.assigneeAgentId !== (input.expectedAssigneeAgentId?.toLowerCase() ?? null) ||
           carrier.assigneeUserId !== input.expectedAssigneeUserId) throw conflict("Carrier status or ownership changed");
 
       const relationRows = await tx.select().from(issueRelations).where(and(eq(issueRelations.companyId, companyId),
@@ -95,7 +96,11 @@ export function recoveryCarrierParkService(db: Db) {
         ),
       )).limit(1);
       const [wake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["pending", "queued", "claimed", "deferred_issue_execution"]), or(
+        eq(agentWakeupRequests.companyId, companyId), or(
+          inArray(agentWakeupRequests.status, ["pending", "queued", "claimed", "deferred_issue_execution"]),
+          and(eq(agentWakeupRequests.status, "skipped"), sql`${agentWakeupRequests.finishedAt} is null`,
+            inArray(agentWakeupRequests.reason, [...DEFERRABLE_WAKE_SKIP_REASONS])),
+        ), or(
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'taskId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,issueId}'`, treeIds),
@@ -112,13 +117,17 @@ export function recoveryCarrierParkService(db: Db) {
       }
       const existing = await treeControl.getActivePauseHoldGate(companyId, carrier.id);
       const binding: RecoveryCarrierParkBinding = { version: 1, ...input, recoveryActionId: action.id,
-        sourceIssueId: source.id, decisionInteractionId: decision.id,
-        expectedBlockers: input.expectedBlockers.map(row => ({ ...row, id: row.id.toLowerCase() })) };
+        sourceIssueId: source.id, decisionInteractionId: decision.id, expectedAssigneeAgentId: carrier.assigneeAgentId,
+        expectedBlockers: input.expectedBlockers.map(row => ({ ...row, id: row.id.toLowerCase() }))
+          .sort((left, right) => left.id.localeCompare(right.id)) };
       if (existing) {
         const hold = await treeControl.getHold(companyId, existing.holdId);
         const summary = (await listRecoveryCarrierParks(runner, companyId, [carrierId])).get(carrierId);
         if (hold?.recoveryCarrierPark && summary?.state === "accepted" &&
-            isDeepStrictEqual(hold.recoveryCarrierPark, binding)) return { hold, created: false };
+            isDeepStrictEqual({ ...hold.recoveryCarrierPark,
+              expectedBlockers: hold.recoveryCarrierPark.expectedBlockers.map(row => ({ ...row, id: row.id.toLowerCase() }))
+                .sort((left, right) => left.id.localeCompare(right.id)),
+            }, binding)) return { hold, created: false };
         throw conflict("Release the existing pause before choosing a new carrier disposition");
       }
       const created = await treeControl.createHold(companyId, carrier.id, { mode: "pause", reason: input.reason,
