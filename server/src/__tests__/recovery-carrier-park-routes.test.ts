@@ -82,9 +82,9 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
   }
 
   async function fixture(existingCompanyId?: string): Promise<Fixture> {
-    const companyId = existingCompanyId ?? randomUUID(), sourceId = randomUUID(), carrierId = randomUUID();
+    const companyId = existingCompanyId ?? randomUUID(), sourceId = `c${randomUUID().slice(1)}`, carrierId = randomUUID();
     // Casing coverage must always have a hexadecimal letter, not a random chance of one.
-    const blockerId = randomUUID(), actionId = `a${randomUUID().slice(1)}`, decisionId = randomUUID(), agentId = randomUUID();
+    const blockerId = `b${randomUUID().slice(1)}`, actionId = `a${randomUUID().slice(1)}`, decisionId = `d${randomUUID().slice(1)}`, agentId = randomUUID();
     if (!existingCompanyId) {
       await db.insert(companies).values({ id: companyId, name: "Park fixture", issuePrefix: `P${companyId.slice(0, 6)}` });
       await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "park-operator", status: "active", membershipRole: "operator" });
@@ -440,7 +440,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(f)).toEqual(before);
     await assertNoProtectedWrites();
     const receipts = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
-    expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toHaveLength(1);
+    expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toEqual([
+      expect.objectContaining({
+        companyId: f.companyId, actorType: "user", actorId: "park-operator", entityType: "issue", entityId: f.carrierId,
+        details: expect.objectContaining({ holdId: response.body.hold.id, sourceIssueId: f.sourceId,
+          recoveryActionId: f.actionId, decisionInteractionId: f.decisionId }),
+      }),
+    ]);
   });
 
   it("does not infer acceptance from exhaustion or a rejected decision", async () => {
@@ -1019,6 +1025,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
         ...parked.body.hold.recoveryCarrierPark, recoveryActionId: storedId,
       } }).where(eq(issueTreeHolds.id, parked.body.hold.id));
     }
+    const [storedHold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, parked.body.hold.id));
+    expect(storedHold.recoveryCarrierPark?.recoveryActionId).toBe(storedId);
     const before = await snapshot(f), records = await parkRecords(f);
     const assertNoProtectedWrites = await protectSourceRows(f), assertNoAdmission = await protectWakeAdmission(f);
     const release = (recoveryActionId: string) => request(app(f.companyId))
@@ -1037,6 +1045,52 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await parkRecords(f)).toEqual(retired);
     expect(await snapshot(f)).toEqual(before);
     await assertNoAdmission();
+    await assertNoProtectedWrites();
+  });
+
+  it("accepts equivalent blocker UUID spelling and retains a canonical idempotent binding", async () => {
+    const f = await fixture(), before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const input = { ...f.body, expectedBlockers: f.body.expectedBlockers.map(row => ({ ...row, id: row.id.toUpperCase() })) };
+    const accepted = await park(f, input);
+    expect(accepted.status).toBe(201);
+    expect(accepted.body.hold.recoveryCarrierPark.expectedBlockers).toEqual(f.body.expectedBlockers);
+    expect((await park(f, input)).status).toBe(200);
+    expect((await attention(f)).carrierPark.state).toBe("accepted");
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["context issue", "context task", "deferred skip"])("rejects a persisted issue-only wake in %s atomically", async shape => {
+    const f = await fixture();
+    const payload = shape === "context issue" ? { _paperclipWakeContext: { issueId: f.carrierId } }
+      : shape === "context task" ? { _paperclipWakeContext: { taskId: f.carrierId } }
+      : { heartbeatSkip: { issueId: f.carrierId } };
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "recovery", status: "deferred_issue_execution", payload });
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await park(f)).status).toBe(409);
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["action", "decision", "source", "blocker"])("projects case-equivalent legacy %s identity without rewriting consent", async shape => {
+    const f = await fixture();
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    const binding = accepted.body.hold.recoveryCarrierPark;
+    if (shape === "action") binding.recoveryActionId = f.actionId.toUpperCase();
+    if (shape === "decision") binding.decisionInteractionId = f.decisionId.toUpperCase();
+    if (shape === "source") binding.sourceIssueId = f.sourceId.toUpperCase();
+    if (shape === "blocker") binding.expectedBlockers = binding.expectedBlockers.map((row: { id: string }) => ({ ...row, id: row.id.toUpperCase() }));
+    await db.update(issueTreeHolds).set({ recoveryCarrierPark: binding }).where(eq(issueTreeHolds.id, accepted.body.hold.id));
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    expect((await attention(f)).carrierPark.state).toBe("accepted");
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
     await assertNoProtectedWrites();
   });
 
