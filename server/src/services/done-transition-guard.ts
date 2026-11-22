@@ -277,12 +277,25 @@ export interface DoneTransitionGuardResult {
   skipReason: string | null;
 }
 
-/** Durable audit-row debt: no status-version or time-window exemption. */
+/**
+ * Durable audit-row debt: no status-version or time-window exemption. A row
+ * older than the issue's latest accepted done transition is settled legacy
+ * history (read-side cutoff, never rewritten) and is ignored.
+ */
 export function unpaidLandingDebt() {
   return and(
     eq(activityLog.action, "issue.delivery_requirement_reclassified"),
     sql`${activityLog.details}->>'landingCheckOwed' = 'true'`,
     sql`${activityLog.details}->>'landingDebtDisposition' IS DISTINCT FROM 'discharged'`,
+    sql`NOT EXISTS (
+      SELECT 1 FROM activity_log AS done_close
+      WHERE done_close.company_id = ${activityLog.companyId}
+        AND done_close.entity_type = 'issue'
+        AND done_close.entity_id = ${activityLog.entityId}
+        AND done_close.action = 'issue.updated'
+        AND done_close.details->>'status' = 'done'
+        AND done_close.created_at > ${activityLog.createdAt}
+    )`,
   );
 }
 
@@ -6017,7 +6030,8 @@ export async function evaluateDoneTransitionGuard(
     return {
       ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",
       reason: "Repository landing debt remains: no successful repository landing proof was obtained.",
-      remedy: "Land the repository work and retry the close; reclassification and board tier-form bypass do not waive landing debt.",
+      remedy:
+        "Verify landing via a probe-able repository and branch or a merged PR, then retry the close; reclassification and board tier-form bypass do not waive landing debt. If landing cannot be verified, cancel the issue instead.",
     };
   }
   const census = observer.census;

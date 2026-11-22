@@ -2021,6 +2021,46 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
+    it("ignores settled legacy debt rows older than the latest done close, but a fresh flip still owes", async () => {
+      const { issueId, companyId } = await seedIssue("LEGACY");
+      board();
+      await flip(issueId);
+      // Pre-change row shape: owed, no disposition, followed by an accepted done close, then reopened.
+      await db.update(activityLog).set({
+        createdAt: new Date("2020-01-01"),
+        details: sql`${activityLog.details} - 'landingDebtDisposition'`,
+      }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      await db.insert(activityLog).values({
+        companyId, actorType: "user", actorId: "local-board", action: "issue.updated", entityType: "issue",
+        entityId: issueId, details: { status: "done" }, createdAt: new Date("2020-02-01"),
+      });
+      await db.update(issues).set({ status: "done", statusVersion: 41 }).where(eq(issues.id, issueId));
+      const now = new Date();
+      const rows = await buildDiscoveryQuery(db, new Date(now.getTime() - 86_400_000), now);
+      expect(selectLandingCandidates(rows, now, now).map((row) => row.issue.id)).not.toContain(issueId);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      landing();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBeUndefined();
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      // A fresh post-deploy flip on the open card owes debt again.
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      await flip(issueId);
+      mockGetByName.mockResolvedValue(null);
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+    });
+
+    it("names the exit when landing cannot be verified", async () => {
+      const { issueId } = await seedIssue("EXIT");
+      board();
+      await flip(issueId);
+      mockGetByName.mockResolvedValue(null);
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(JSON.stringify(refused.body)).toMatch(/probe-able repository[\s\S]*cancel/);
+    });
+
     it("rolls debt discharge back with a failed close and discharges only on verified commit", async () => {
       const { issueId } = await seedIssue("ATOMIC");
       board();
