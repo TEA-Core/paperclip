@@ -872,6 +872,16 @@ repair and does not acquire an assignee through this path. An explicit
 non-canonical assignee or a status-only write is not this repair either.
 A paused Maintainer is not available for adoption; the repair returns 422
 without assigning it.
+The stored card must have a handoff title and no user creator, and its
+`createdByAgentId` must resolve within the company to the `writer-Reporter`
+PM (normalized agent URL key `writer-reporter`). Legacy genuine report
+handoffs have `originKind: manual`, so origin alone cannot identify them.
+A board-created card, an unrelated agent's card (including another PM), or a
+title supplied by this PATCH cannot acquire an assignee through this path.
+The service rechecks the persisted creator and holds its row lock through
+the issue UPDATE. Renaming the emitter or changing its role removes repair
+eligibility; no instance-specific agent UUID is hardcoded.
+
 
 The route's lookup is preliminary. The service repeats the canonical check
 inside the issue-update transaction and holds shared locks on existing

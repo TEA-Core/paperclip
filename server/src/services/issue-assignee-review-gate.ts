@@ -1,4 +1,4 @@
-import type { IssueExecutionStage } from "@paperclipai/shared";
+import { normalizeAgentUrlKey, type IssueExecutionStage } from "@paperclipai/shared";
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, pluginEntities, pluginManagedResources, plugins } from "@paperclipai/db";
@@ -281,15 +281,45 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   return candidateIds.length > 0 ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null;
 }
 
+type WikiHandoffSource = {
+  title?: string | null;
+  description?: string | null;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+};
+
+async function isReporterHandoffSource(
+  db: Db,
+  companyId: string,
+  issue: WikiHandoffSource | null | undefined,
+  lockRows = false,
+): Promise<boolean> {
+  if (
+    !issue?.createdByAgentId ||
+    issue.createdByUserId != null ||
+    !isWikiHandoffTitle(issue.title)
+  ) return false;
+  // Legacy Reporter handoffs have manual origins. Resolve the stored creator,
+  // not a caller's title or a hardcoded instance-specific agent id.
+  const query = db.select({ name: agents.name }).from(agents).where(and(
+    eq(agents.companyId, companyId),
+    eq(agents.id, issue.createdByAgentId),
+    eq(agents.role, "pm"),
+  )).limit(1);
+  const [creator] = await (lockRows ? query.for("share") : query);
+  return normalizeAgentUrlKey(creator?.name) === "writer-reporter";
+}
+
 /**
- * Adoption requires a marked, non-paused live agent. Sentinel results can
- * enforce a refusal but must never become an assignee id.
+ * Adoption requires a recognized Reporter-created handoff and a marked,
+ * non-paused live Maintainer. Sentinels must never become an assignee id.
  */
 export async function resolveLiveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
-  issue: { title?: string | null; description?: string | null } | null | undefined,
+  issue: WikiHandoffSource | null | undefined,
 ): Promise<string | null> {
+  if (!await isReporterHandoffSource(db, companyId, issue)) return null;
   const resolved = await resolveCanonicalWikiMaintainerAgentId(db, companyId, issue, { requireAvailable: true });
   if (
     !resolved ||
@@ -445,6 +475,8 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   /** Only set on the transaction that will persist the guarded issue write. */
   lockCanonicalResolution?: boolean;
   requireAvailableCanonical?: boolean;
+  /** Persisted pre-write identity, never the caller's proposed fields. */
+  autoAdoptionSource?: WikiHandoffSource;
   /**
    * SUP-24280: the persisted status and assignee shape of this write, so the
    * guard can admit an unassigned-stub cancellation. Omit it at doors that
@@ -469,16 +501,24 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   // An auto-adopted assignee was chosen from a Maintainer that the route saw
   // earlier. If the locked resolution no longer finds one, the adopted id is
   // stale: fail closed. Ordinary writes keep the no-canonical exception.
-  const canonicalMaintainerAgentId =
-    (await resolveCanonicalWikiMaintainerAgentId(
+  const adoptionSourceValid = !input.requireAvailableCanonical ||
+    await isReporterHandoffSource(
       input.db as Db,
       input.companyId,
-      input.issue,
-      {
-        lockRows: input.lockCanonicalResolution,
-        requireAvailable: input.requireAvailableCanonical,
-      },
-    )) ?? (input.requireAvailableCanonical ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null);
+      input.autoAdoptionSource,
+      input.lockCanonicalResolution,
+    );
+  const canonicalMaintainerAgentId = adoptionSourceValid
+    ? (await resolveCanonicalWikiMaintainerAgentId(
+        input.db as Db,
+        input.companyId,
+        input.issue,
+        {
+          lockRows: input.lockCanonicalResolution,
+          requireAvailable: input.requireAvailableCanonical,
+        },
+      )) ?? (input.requireAvailableCanonical ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null)
+    : UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
   if (!canonicalMaintainerAgentId) return;
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId

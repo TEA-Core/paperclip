@@ -12510,6 +12510,7 @@ export function issueService(db: Db) {
             db: tx as Db,
             lockCanonicalResolution: true,
             requireAvailableCanonical: wikiHandoffAutoAdoption === true,
+            autoAdoptionSource: wikiHandoffAutoAdoption === true ? receiptExisting : undefined,
             companyId: receiptExisting.companyId,
             issue: {
               title:

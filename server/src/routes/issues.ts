@@ -20378,13 +20378,7 @@ export function issueRoutes(
       const adoptedMaintainerId = await resolveLiveCanonicalWikiMaintainerAgentId(
         db,
         existing.companyId,
-        {
-          title: fieldRepairTitle,
-          description:
-            updateFields.description !== undefined
-              ? updateFields.description
-              : existing.description,
-        },
+        existing,
       );
       if (adoptedMaintainerId) {
         // The self-assignment check above ran before adoption chose this

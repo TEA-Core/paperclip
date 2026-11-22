@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -139,7 +139,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       runtimeConfig: {},
       permissions: { pluginTools: [PLUGIN_KEY] },
     };
-    const [maintainer, intruder, stale] = await db.insert(agents).values([
+    const [maintainer, intruder, stale, emitter] = await db.insert(agents).values([
       {
         ...agentBase,
         name: "Wiki Maintainer",
@@ -147,6 +147,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       },
       { ...agentBase, name: "coder-LE", metadata: {} },
       { ...agentBase, name: "Stale Maintainer", metadata: {} },
+      { ...agentBase, name: "writer-Reporter", role: "pm", metadata: {} },
     ]).returning();
     await db.insert(plugins).values({
       id: pluginId,
@@ -191,16 +192,26 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       status: "active",
       membershipRole: "operator",
     });
-    return { company: company!, maintainer: maintainer!, intruder: intruder!, stale: stale! };
+    return { company: company!, maintainer: maintainer!, intruder: intruder!, stale: stale!, emitter: emitter! };
   }
 
   let issueCounter = 0;
   async function seedUnassignedHandoff(companyId: string) {
     issueCounter += 1;
+    const [emitter] = await db.select({ id: agents.id }).from(agents).where(and(
+      eq(agents.companyId, companyId),
+      eq(agents.name, "writer-Reporter"),
+      eq(agents.role, "pm"),
+    )).limit(1);
     const [issue] = await db.insert(issues).values({
       companyId,
       title: HANDOFF_TITLE,
       description: "interrupted create stub",
+      originKind: "manual",
+      originId: null,
+      originRunId: randomUUID(),
+      createdByAgentId: emitter!.id,
+      createdByUserId: null,
       status: "backlog",
       priority: "medium",
       assigneeAgentId: null,
@@ -235,6 +246,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       description: "Ordinary manually created work",
       originKind: "manual",
       originId: null,
+      createdByUserId: REVIEWER_USER_ID,
       status: "todo",
       priority: "medium",
       assigneeAgentId: null,
@@ -492,7 +504,7 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     }).returning();
     const stub = await seedUnassignedHandoff(company.id);
 
-    const res = await request(createApp(db, boardActor(company.id)))
+    const res = await request(createApp(db, { ...boardActor(company.id), isInstanceAdmin: false }))
       .patch(`/api/issues/${stub.id}`)
       .send({
         description: "Weekly report handoff pointer",
@@ -701,9 +713,14 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
   }
 
   it("refuses record_only when the adopted maintainer is the calling creator agent", async () => {
-    const { company, maintainer } = await seedWikiCompany("maintainer");
+    const { company, maintainer: previousMaintainer, emitter: maintainer } = await seedWikiCompany("maintainer");
     const stub = await seedUnassignedHandoff(company.id);
-    await db.update(issues).set({ createdByAgentId: maintainer.id }).where(eq(issues.id, stub.id));
+    await db.update(agents).set({ metadata: previousMaintainer.metadata }).where(eq(agents.id, maintainer.id));
+    await db.update(pluginManagedResources).set({ resourceId: maintainer.id })
+      .where(eq(pluginManagedResources.companyId, company.id));
+    await db.update(pluginEntities).set({ data: {
+      pluginKey: PLUGIN_KEY, resourceKind: "agent", resourceKey: AGENT_KEY, agentId: maintainer.id,
+    } }).where(eq(pluginEntities.companyId, company.id));
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
