@@ -28,7 +28,7 @@ import {
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
-import { loadOwnDraftPredicate } from "./done-transition-guard.js";
+import { loadOwnDraftPredicate, unpaidLandingDebt } from "./done-transition-guard.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
 import {
   isSharedCarrierRefusal,
@@ -188,6 +188,7 @@ interface CandidateIssue {
 
 interface CandidateRow {
   details: Record<string, unknown> | null;
+  landingDebtOwed?: boolean;
   createdAt: Date;
   issue: CandidateIssue;
 }
@@ -294,6 +295,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
   return db
     .select({
       details: activityLog.details,
+      landingDebtOwed: sql<boolean>`coalesce(${unpaidLandingDebt()}, false)`,
       createdAt: activityLog.createdAt,
       issue: {
         id: issues.id,
@@ -317,13 +319,12 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
     .where(
       and(
         eq(activityLog.entityType, "issue"),
-        // SUP-24429: the live record_only label excludes a card unless this row
-        // is the marker of its LATEST done close: a stored repository_delivery
-        // requirement relabelled in that close request, bound to the status
-        // version the close produced. A reopen and a later close advance the
-        // status version, so an older marker no longer counts.
+        // Unpaid reclassification debt survives both the mutable label and
+        // every reopen. Legacy close markers remain additional candidates;
+        // they never discharge the debt row.
         or(
           ne(issues.deliveryRequirement, "record_only"),
+          unpaidLandingDebt(),
           and(
             sql`${activityLog.details}->>'storedDeliveryRequirement' = 'repository_delivery'`,
             sql`${activityLog.details}->>'closeStatusVersion' = ${issues.statusVersion}::text`,
@@ -335,10 +336,11 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
             sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
           ),
           eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
+          unpaidLandingDebt(),
         ),
         lte(activityLog.createdAt, discoveryCutoff),
         or(
-          and(eq(issues.status, "done"), gte(activityLog.createdAt, windowStart)),
+          and(eq(issues.status, "done"), or(gte(activityLog.createdAt, windowStart), unpaidLandingDebt())),
           and(
             eq(issues.status, "blocked"),
             sql`${issues.unblockDescriptor}->>'owner' = 'board'`,
@@ -377,12 +379,12 @@ export function selectLandingCandidates(
     const parkedDraft = isBackstopDraftPark(row.issue);
     if (row.issue.status !== "done" && !parkedDraft) return false;
     const createdAt = row.createdAt.getTime();
-    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft)) return false;
+    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft && !row.landingDebtOwed)) return false;
     const details = readRecord(row.details);
     const isDecisionCarried =
       readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
     const isArmingRefused = readString(details?.refusalReason) !== null;
-    return isDecisionCarried || isArmingRefused;
+    return isDecisionCarried || isArmingRefused || row.landingDebtOwed === true;
   });
 }
 
@@ -489,6 +491,7 @@ export function createDoneCloseLandingBackstopService(
     const details = readRecord(row.details);
     if (
       issue.deliveryRequirement === "record_only" &&
+      !row.landingDebtOwed &&
       !(
         readString(details?.storedDeliveryRequirement) === "repository_delivery" &&
         details?.closeStatusVersion === issue.statusVersion

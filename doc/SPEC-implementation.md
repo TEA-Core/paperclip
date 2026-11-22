@@ -277,6 +277,16 @@ retain their titles and default to no generation request.
 - `cancelled_at` timestamptz null
 - `hidden_at` timestamptz null
 
+Repository landing debt survives a change from `repository_delivery` to
+`record_only` while an issue is open. The reclassification activity row records
+`landingCheckOwed` and an outstanding/discharged disposition. Every existing-issue
+done door rechecks that debt under the issue-row lock and discharges it only in
+the transaction that accepts a close with positive repository landing evidence.
+Reopening and status-version changes never waive unpaid debt. The landing backstop
+includes debt-bearing record-only cards without expiring the obligation.
+Board tier-form bypass and delivery overrides cannot discharge this debt;
+genuine record-only cards without debt retain their existing close behavior.
+
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
 the approving decision to its certified pull request and head, including when
 the decision comes from a final-stage escalation. Publish outcomes retain this

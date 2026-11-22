@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -29,6 +29,8 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1886,6 +1888,205 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
       expect(audit).toHaveLength(1);
+    });
+  });
+  describe("durable repository landing debt", () => {
+    const board = () => {
+      currentActor = { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" } as Express.Request["actor"];
+    };
+    const landing = (aheadBy = 0) => {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => new Response(
+        JSON.stringify(url.includes("/compare/") ? { ahead_by: aheadBy } : []), { status: 200 },
+      ));
+    };
+    const debtRows = (id: string) => db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, id), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+    ));
+    const patch = (id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
+    async function flip(id: string) {
+      const response = await patch(id, { deliveryRequirement: "record_only" });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    }
+
+    it.each(["recovery", "approval-comment", "escalation"] as const)(
+      "%s refuses unpaid debt before board bypass and preserves its pending state",
+      async (door) => {
+        const fixture = await seedIssue("DOOR");
+        const { companyId, issueId, agentId } = fixture;
+        board();
+        await flip(issueId);
+        let close: () => PromiseLike<request.Response>;
+        if (door === "recovery") {
+          await db.insert(issueRecoveryActions).values({
+            companyId, sourceIssueId: issueId, kind: "missing_disposition", status: "active",
+            ownerType: "agent", ownerAgentId: agentId, cause: "successful_run_missing_issue_disposition",
+            fingerprint: `debt:${issueId}`, evidence: {}, nextAction: "Close after landing.",
+          });
+          close = () => request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+            .send({ outcome: "restored", sourceIssueStatus: "done" });
+        } else {
+          const stageId = randomUUID();
+          const participant = { type: "user" as const, userId: "local-board", agentId: null };
+          await db.update(issues).set({
+            status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board",
+            executionPolicy: { stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [participant] }] },
+            executionState: {
+              status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+              currentParticipant: participant, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+              returnAssignee: { type: "agent", agentId, userId: null },
+            },
+          }).where(eq(issues.id, issueId));
+          if (door === "approval-comment") {
+            close = () => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "kind: review\ndecision: approved\nLooks good." });
+          } else {
+            const interaction = await issueThreadInteractionService(db).create(
+              { id: issueId, companyId },
+              {
+                kind: "request_confirmation", title: "Review round cap", resolverPolicy: "human_only",
+                continuationPolicy: "wake_assignee", idempotencyKey: `review-escalation:${issueId}:${stageId}:1`,
+                payload: { version: 1, prompt: "Approve review?", acceptLabel: "Approve", rejectLabel: "Reject" },
+              },
+              { userId: "local-board" },
+            );
+            close = () => request(app).post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`).send({});
+          }
+        }
+        const refused = await close();
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(stored?.status).not.toBe("done");
+        // The same door succeeds once real repository compare evidence exists.
+        landing();
+        const accepted = await close();
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(door === "approval-comment" ? 201 : 200);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("done");
+      },
+    );
+
+    it.each(["flip-first", "close-first"] as const)("serializes %s on the issue row", async (order) => {
+      const { issueId } = await seedIssue("RACE");
+      board();
+      landing();
+      // This package targets pre-ES2024 Promise typings.
+      let entered!: () => void;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { entered = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      mockAddComment.mockImplementationOnce(async (...args: unknown[]) => {
+        entered();
+        await released;
+        return realAddCommentRef.current!(...args);
+      });
+      const flipBody = { deliveryRequirement: "record_only" };
+      const closeBody = { status: "done", comment: "Close with verified landing." };
+      const first = patch(issueId, order === "flip-first" ? flipBody : closeBody).then((response) => response);
+      await held;
+      const second = patch(issueId, order === "flip-first" ? closeBody : flipBody).then((response) => response);
+      try {
+        await vi.waitFor(async () => {
+          const waiting = await db.execute(sql`select 1 from pg_stat_activity
+            where datname = current_database() and cardinality(pg_blocking_pids(pid)) > 0`);
+          expect(waiting.length).toBeGreaterThan(0);
+        });
+      } finally { release(); }
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status, JSON.stringify(a.body)).toBe(200);
+      expect(b.status, JSON.stringify(b.body)).toBe(order === "flip-first" ? 409 : 200);
+      const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(stored?.status).toBe(order === "flip-first" ? "todo" : "done");
+      expect((await debtRows(issueId))[0]?.details?.landingCheckOwed).toBe(order === "flip-first");
+    });
+
+    it("retains old unpaid debt across reopen and status-version changes, including backstop discovery", async () => {
+      const { issueId } = await seedIssue("REOPEN");
+      board();
+      await flip(issueId);
+      await db.update(activityLog).set({
+        createdAt: new Date("2020-01-01"),
+        details: sql`${activityLog.details} || '{"closeStatusVersion":1}'::jsonb`,
+      })
+        .where(eq(activityLog.entityId, issueId));
+      // Legacy done state with unpaid debt is fixture data, not a lawful close.
+      await db.update(issues).set({ status: "done", statusVersion: 41 }).where(eq(issues.id, issueId));
+      const now = new Date();
+      const rows = await buildDiscoveryQuery(db, new Date(now.getTime() - 86_400_000), now);
+      expect(selectLandingCandidates(rows, now, now).map((row) => row.issue.id)).toContain(issueId);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it("rolls debt discharge back with a failed close and discharges only on verified commit", async () => {
+      const { issueId } = await seedIssue("ATOMIC");
+      board();
+      await flip(issueId);
+      landing();
+      // Refuse at COMMIT, after the discharge UPDATE actually ran.
+      await db.execute(sql`create function test_reject_debt_close() returns trigger language plpgsql as $$
+        begin
+          if exists (select 1 from activity_log where entity_id = NEW.id::text
+            and action = 'issue.delivery_requirement_reclassified'
+            and details->>'landingDebtDisposition' = 'discharged') then
+            raise exception 'injected post-discharge rollback';
+          end if;
+          return NEW;
+        end $$`);
+      await db.execute(sql`create constraint trigger test_reject_debt_close after update on issues
+        deferrable initially deferred for each row when (NEW.status = 'done')
+        execute function test_reject_debt_close()`);
+      try {
+        const failed = await patch(issueId, { status: "done" });
+        expect(failed.status, JSON.stringify(failed.body)).toBe(500);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+      } finally {
+        await db.execute(sql`drop trigger test_reject_debt_close on issues`);
+        await db.execute(sql`drop function test_reject_debt_close()`);
+      }
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details).toMatchObject({
+        landingCheckOwed: true, landingDebtDisposition: "discharged", closeStatusVersion: 1,
+      });
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      await flip(issueId);
+      mockGetByName.mockResolvedValue(null);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await debtRows(issueId)).filter((row) => row.details?.landingDebtDisposition === "outstanding")).toHaveLength(1);
+    });
+
+    it("preserves genuine record-only board close and its audited tier bypass", async () => {
+      const { issueId } = await seedIssue("RECORD");
+      await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, issueId));
+      board();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect(await debtRows(issueId)).toEqual([]);
+      await vi.waitFor(async () => {
+        const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+        expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(true);
+        expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
+      });
+    });
+    it("refuses a board close after a separate record-only reclassification", async () => {
+      const { issueId } = await seedIssue("DEBT");
+      currentActor = { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" } as Express.Request["actor"];
+      const flip = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryRequirement: "record_only" });
+      expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+      const close = await request(app).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      expect(close.status, JSON.stringify(close.body)).toBe(409);
+      expect(close.body.code).toBe("done_transition_missing_delivery");
+      const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(stored?.status).toBe("todo");
+      const audit = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+      ));
+      expect(audit[0]?.details).toMatchObject({ landingCheckOwed: true });
+      expect(audit[0]?.details?.landingDebtDisposition).not.toBe("discharged");
     });
   });
 });

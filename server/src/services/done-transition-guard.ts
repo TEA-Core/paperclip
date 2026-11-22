@@ -230,6 +230,8 @@ export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
 
 export interface DoneTransitionGuardResult {
   allowed: boolean;
+  /** Positive repository evidence, never a waiver or an unmeasured fail-open. */
+  landingVerified?: boolean;
   reason: string;
   aheadBy: number | null;
   branch: string | null;
@@ -273,6 +275,15 @@ export interface DoneTransitionGuardResult {
   ladderedChildCount?: number;
   skipped: boolean;
   skipReason: string | null;
+}
+
+/** Durable audit-row debt: no status-version or time-window exemption. */
+export function unpaidLandingDebt() {
+  return and(
+    eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+    sql`${activityLog.details}->>'landingCheckOwed' = 'true'`,
+    sql`${activityLog.details}->>'landingDebtDisposition' IS DISTINCT FROM 'discharged'`,
+  );
 }
 
 /**
@@ -4918,6 +4929,7 @@ async function evaluateDoneTransitionGuardCore(
   // SUP-24429: the requirement stored before the close request; undefined when
   // the caller's request does not change it.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
+  landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -5179,6 +5191,7 @@ async function evaluateDoneTransitionGuardCore(
   // falls through to the repository landing check below. A caller that passes
   // no stored requirement changes nothing in that request.
   if (
+    !landingDebtOwed &&
     issue.deliveryRequirement === "record_only" &&
     (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
   ) {
@@ -5193,6 +5206,11 @@ async function evaluateDoneTransitionGuardCore(
       skipped: true,
       skipReason: "record_only_delivery_skipped",
     };
+  }
+  // An approval or no-deliverable override cannot discharge already-owed landing.
+  if (landingDebtOwed) {
+    override = null;
+    decisionCarried = false;
   }
 
   // SUP-14878: head-check waiver. A card that passed all three review gates
@@ -5611,11 +5629,14 @@ async function evaluateDoneTransitionGuardCore(
           );
         }
         if (mergedPrCount > 0) {
-          return fallback(
-            `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
-            true,
-            `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
-          );
+          return {
+            ...fallback(
+              `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
+              true,
+              `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
+            ),
+            landingVerified: true,
+          };
         }
         if (decisionCarried) {
           // Defense-in-depth (SUP-13691): a 404 here means the branch was not
@@ -5704,6 +5725,7 @@ async function evaluateDoneTransitionGuardCore(
   if (aheadBy === 0) {
     return {
       allowed: true,
+      landingVerified: true,
       reason: `Branch ${branch} is not ahead of ${ctx.defaultRef}`,
       aheadBy: 0,
       branch,
@@ -5791,6 +5813,7 @@ async function evaluateDoneTransitionGuardCore(
     if (mergedPrCount !== null && mergedPrCount > 0) {
       return {
         allowed: true,
+        landingVerified: true,
         reason:
           `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch), ` +
           `but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference${mergedPrCount === 1 ? "s" : ""} ${identifier} (carrier delivery); transition allowed`,
@@ -5907,6 +5930,7 @@ async function evaluateDoneTransitionGuardCore(
   if (hasMergedPr) {
     return {
       allowed: true,
+      landingVerified: true,
       reason: `Branch ${branch} has a merged PR; transition allowed`,
       aheadBy,
       branch,
@@ -5977,6 +6001,7 @@ export async function evaluateDoneTransitionGuard(
   // lets the close request change it. The record-only skip applies only when this
   // is record_only too; omitted means the request did not change the requirement.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
+  landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus } = {};
   const result = await evaluateDoneTransitionGuardCore(
@@ -5986,7 +6011,15 @@ export async function evaluateDoneTransitionGuard(
     decisionCarried,
     observer,
     storedDeliveryRequirement,
+    landingDebtOwed,
   );
+  if (landingDebtOwed && result.allowed && !result.landingVerified) {
+    return {
+      ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",
+      reason: "Repository landing debt remains: no successful repository landing proof was obtained.",
+      remedy: "Land the repository work and retry the close; reclassification and board tier-form bypass do not waive landing debt.",
+    };
+  }
   const census = observer.census;
   if (
     result.allowed
