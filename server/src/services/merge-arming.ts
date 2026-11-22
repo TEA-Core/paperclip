@@ -1676,6 +1676,8 @@ export interface MergePullRequestOptions {
   maxAttempts?: number;
   retryDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Revalidate caller authority before every mutation, including retries. */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 /**
@@ -1696,6 +1698,13 @@ export async function mergePullRequest(
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   const attempt = async (): Promise<{ success: boolean; error: string | null; status: number }> => {
+    let refusal: string | null;
+    try {
+      refusal = await options.beforeAttempt?.() ?? null;
+    } catch {
+      refusal = "authority could not be verified";
+    }
+    if (refusal) return { success: false, error: `authority_changed:${refusal}`, status: 0 };
     const query = `mutation { mergePullRequest(input: { pullRequestId: "${nodeId}", expectedHeadOid: "${expectedHeadOid}", mergeMethod: ${mergeMethod} }) { clientMutationId pullRequest { merged } } }`;
 
     try {
@@ -3064,6 +3073,38 @@ async function refuseChildCarrierPublication(
   return null;
 }
 
+async function writeAttributionGuardedApprovalStatus(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number; headRefName?: string | null },
+  headSha: string,
+  issueIdentifier: string,
+  token: string,
+): Promise<WriteCommitStatusResult> {
+  const authority = () => childCarrierStampBlock(db, companyId, {
+    owner: pr.owner, repo: pr.repo, number: pr.number, headSha, headRef: pr.headRefName ?? null,
+  }, issueId);
+  const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, { beforeAttempt: authority });
+  if (!result.success) return result;
+  let changed: string | null;
+  try {
+    changed = await authority();
+  } catch {
+    changed = "child attribution could not be verified after publication";
+  }
+  if (!changed) return result;
+  // PostgreSQL and GitHub cannot commit atomically. Void a success observed
+  // after revocation, and explicitly report an unconfirmed compensation.
+  const voided = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, {
+    state: "failure", description: `approval voided: ${changed}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX),
+  });
+  return {
+    ...result, success: false, transient: false,
+    error: `child_authority_changed:${voided.success ? "status-voided" : `void-unconfirmed:${voided.error ?? "unknown"}`}:${changed}`,
+  };
+}
+
 export async function publishApprovalStatus(
   db: Db,
   companyId: string,
@@ -3295,13 +3336,7 @@ export async function publishApprovalStatus(
       if (receipt && "kind" in receipt) return receipt;
       // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
       // recording a failure; a deterministic refusal returns after one attempt.
-      const result = await writeCommitStatusWithRetry(
-        pr.candidate.token,
-        pr.owner,
-        pr.repo,
-        headSha,
-        issueIdentifier,
-      );
+      const result = await writeAttributionGuardedApprovalStatus(db, companyId, issueId, pr, headSha, issueIdentifier, pr.candidate.token);
       if (result.success) {
         if (receipt) {
           const consumed = await consumeDeliveryReceipt(db, receipt.claim);
@@ -3463,7 +3498,7 @@ export async function publishApprovalStatus(
     if (receipt && "kind" in receipt) return receipt;
     // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
     // recording a failure; a deterministic refusal returns after one attempt.
-    const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier);
+    const result = await writeAttributionGuardedApprovalStatus(db, companyId, issueId, pr, headSha, issueIdentifier, token);
     if (result.success) {
       if (receipt) {
         const consumed = await consumeDeliveryReceipt(db, receipt.claim);
@@ -5198,6 +5233,8 @@ export interface WriteCommitStatusRetryOptions {
   signal?: AbortSignal;
   /** The status context to write (default `paperclip/approved`). */
   context?: string;
+  /** Fail closed before each external write; a refusal is not retried. */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 export interface WriteCommitStatusResult {
@@ -5207,7 +5244,7 @@ export interface WriteCommitStatusResult {
   status: number;
   /** Whether the last attempt's failure was transient. */
   transient: boolean;
-  /** How many attempts were actually made (1 for a deterministic refusal). */
+  /** HTTP attempts actually made; zero when authority refuses before the first write. */
   attempts: number;
   /** GitHub's id for the status it accepted, when the answer carried one. */
   statusId?: string | null;
@@ -5233,13 +5270,23 @@ export async function writeCommitStatusWithRetry(
   const delayMs = options.delayMs ?? 1000;
   const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
-  let made = 1;
+  let made = 0;
+  const attempt = async () => {
+    let refusal: string | null;
+    try {
+      refusal = await options.beforeAttempt?.() ?? null;
+    } catch {
+      refusal = "authority could not be verified";
+    }
+    if (refusal) return { success: false, error: `authority_changed:${refusal}`, status: 0, transient: false };
+    made += 1;
+    return writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
+  };
+  let result = await attempt();
   while (!result.success && result.transient && made < attempts && !options.signal?.aborted) {
     await delay(delayMs);
     if (options.signal?.aborted) break;
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
-    made += 1;
+    result = await attempt();
   }
   return { ...result, attempts: made };
 }
@@ -5752,6 +5799,11 @@ export async function publishHeadBoundRelease(
                 ? `the status written to ${input.headSha} was followed by a failure status`
                 : `a failure status on ${input.headSha} could NOT be written (${marked.error ?? `HTTP ${marked.status}`})`),
           };
+        }
+        const childBlock = await childCarrierStampBlock(conn, companyId, { owner, repo, number, headSha: input.headSha }, input.issueId);
+        if (childBlock) {
+          const outcome = await voidSuccess("child attribution changed while the release was written");
+          return { kind: "stale", headSha: input.headSha, message: `status:stale:child-authority-changed-after-write: ${childBlock}; ${outcome}` };
         }
         // The head is still live, but the card's authority is read once more: a decision reversed, a card
         // cancelled or a delivery retargeted while the write was in flight must not stay released.
@@ -6606,7 +6658,7 @@ export async function armMergeOnApproval(
       if (changedBeforeMerge) {
         return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeMerge}; no direct merge` };
       }
-      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod);
+      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod, { beforeAttempt: authorityChanged });
 
       if (mergeResult.success) {
         return {

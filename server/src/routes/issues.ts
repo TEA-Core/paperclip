@@ -20891,6 +20891,9 @@ export function issueRoutes(
               headSha: requestedDeliveryIdentity.headSha,
               claimedAt: new Date().toISOString(),
             },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
           };
         } else {
           const withoutClaim = { ...(currentExecState as Record<string, unknown>) };

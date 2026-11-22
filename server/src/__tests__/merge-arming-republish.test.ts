@@ -4356,10 +4356,10 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         });
         const operation = await hold({ companyId });
         try {
-          const started = Date.now();
+          const started = performance.now();
           const res = await request(app({ totalMs: 500, compensationMs: 300, fetchMs: 1000 })).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
-          expect(Date.now() - started).toBeLessThan(5000);
+          expect(performance.now() - started).toBeLessThan(5000);
           expect(res.body.outcome).toBe(outcome);
           if (outcome === "failed") expect(res.body.message).toMatch(/deadline|nothing was published|status_read: HTTP 0 timeout/);
           if (name === "the outcome audit insert") expect(res.body.auditRecorded).toBe(false);

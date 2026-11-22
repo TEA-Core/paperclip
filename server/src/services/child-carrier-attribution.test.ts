@@ -476,6 +476,7 @@ describePg("child carrier attribution", () => {
       executionState: {
         lastDecisionId: decision!.id,
         lastDecisionOutcome: "approved",
+        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
         delivery: { prNumber: 77, branch: CHILD_BRANCH },
       },
     }).where(eq(issues.id, childId));
@@ -510,6 +511,7 @@ describePg("child carrier attribution", () => {
       executionState: {
         lastDecisionId: decision!.id,
         lastDecisionOutcome: "approved",
+        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
         childCarrierClaim: { prNumber: 653, headSha: "d".repeat(40) },
       },
     }).where(eq(issues.id, childId));
@@ -807,7 +809,7 @@ describePg("child carrier attribution", () => {
     })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
-  it.each(["retry", "accepted write"])("does not retain an owner stamp when child approval changes during %s", async (moment) => {
+  it.each(["retry", "accepted write", "unconfirmed void"])("does not retain an owner stamp when child approval changes during %s", async (moment) => {
     const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     const decisionId = await approveChild(childId);
@@ -822,6 +824,7 @@ describePg("child carrier attribution", () => {
           await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.id, decisionId));
           if (moment === "retry") return { ok: false, status: 502, json: async () => ({}) };
         }
+        if (state === "failure" && moment === "unconfirmed void") return { ok: false, status: 403, json: async () => ({}) };
         return { ok: true, status: 201, json: async () => ({ id: 1 }) };
       }
       return { ok: true, status: 200, json: async () => livePr() };
@@ -831,6 +834,7 @@ describePg("child carrier attribution", () => {
     });
     expect(result.kind).not.toBe("armed");
     expect(states).toEqual(moment === "retry" ? ["success"] : ["success", "failure"]);
+    if (moment === "unconfirmed void") expect(result.message).toContain("void-unconfirmed");
   });
 
   it.each([1, 251])("verifies a 251-commit carrier with a complete %i-commit child source and rejects a truncated comparison", async (childCount) => {
@@ -839,6 +843,7 @@ describePg("child carrier attribution", () => {
     const all = [...commits, HEAD];
     const base = "f".repeat(40);
     let truncate = false;
+    let changedBase = false;
     github.mockImplementation(async (url: unknown) => {
       const target = new URL(String(url));
       let body: unknown;
@@ -852,7 +857,7 @@ describePg("child carrier attribution", () => {
       else {
         const slice = all.slice((page - 1) * 100, page * 100);
         if (truncate && page === 3) slice.pop();
-        body = { total_commits: 251, base_commit: { sha: base }, commits: slice.map((sha) => ({ sha })) };
+        body = { total_commits: 251, base_commit: { sha: changedBase && page === 2 ? HEAD : base }, commits: slice.map((sha) => ({ sha })) };
         next = page < 3;
       }
       return { ok: true, status: 200, headers: { get: () => next ? '<https://api.github.com/next>; rel="next"' : null }, json: async () => body };
@@ -860,6 +865,9 @@ describePg("child carrier attribution", () => {
     const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
     expect(await realEnumerate(input)).toEqual({ ok: true, shas: childCount === 1 ? [COMMIT] : [...all].sort() });
     truncate = true;
+    expect((await realEnumerate(input)).ok).toBe(false);
+    truncate = false;
+    changedBase = true;
     expect((await realEnumerate(input)).ok).toBe(false);
   });
 });

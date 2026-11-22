@@ -72,20 +72,33 @@ host. The attribution record is not a delivery receipt or publication authority.
 
 The child's decision attaches only to the proof it read: a concurrent change to
 the PR, branch, head, ancestor or commit set leaves the replacement proof pending.
-Both a carrier claim and a delivery-only binding must name the same immutable head
-when that decision attaches. Child approval never publishes `paperclip/approved`
-or arms the carrier.
+Refresh and reactivation compare-and-set the complete stored proof before
+preserving its decision. The control-plane final-delivery certificate must bind
+that decision to the same repository, PR and head; moving a claim and attribution
+row cannot move an older approval with them. A delivery-only binding must also
+match the live carrier branch. Child approval never publishes
+`paperclip/approved` or arms the carrier.
 
 The carrier owner's separate gate requires every contributing child to have a
 current, complete approved proof. A completely enumerated, disjoint child branch
 does not contribute; partial or unreadable contribution still refuses. The live
 carrier branch must match even when a caller does not provide a branch.
+Required attribution rows are read after remote enumeration. The PR-commits API's
+250-commit cap does not become an ownership limit: larger carrier/child comparisons
+are paged between immutable base/head SHAs and must prove their complete count,
+unique commits and pinned tip. Truncated or inconsistent comparisons still refuse.
 
+Status publication checks attribution before each write attempt and after an
+accepted write. A changed child decision voids the success with a failure status;
+an unconfirmed void is reported as a failure, never as publication. Head-bound
+release applies the same post-write gate before recording its confirmation.
 The approval actuator and landing backstop check attribution before each enable
-attempt and after an accepted enable. A new block takes the arm back through the
-existing disarm/fence recovery path. GitHub has no atomic comparison with the
-instance database: a merge inside the in-flight window cannot be undone, and a
-failed take-back retains the pending disarm record rather than claiming success.
+attempt and after an accepted enable. Direct-merge retries recheck authority too.
+A new block takes an arm back through the existing disarm/fence recovery path.
+GitHub has no atomic comparison with the instance database: a merge inside the
+in-flight window cannot be undone, and a failed take-back retains the pending
+disarm record rather than claiming success. These are bounded fresh checks and
+compensation, not a shared database/provider lock or atomic transaction.
 
 
 ## Override label and the reconciler
