@@ -70,6 +70,55 @@ function livePr(overrides: Record<string, unknown> = {}) {
   };
 }
 
+type CompareFault = "truncate" | "base" | "next" | null;
+
+function mockCommitSources(carrierShas = [COMMIT, HEAD], childShas = [COMMIT]) {
+  const baseSha = "f".repeat(40);
+  const controls = {
+    carrierShas, childShas,
+    carrierFault: null as CompareFault,
+    childFault: null as CompareFault,
+    namedBaseMoved: false,
+    comparisons: [] as Array<{ base: string; head: string; page: number }>,
+  };
+  github.mockImplementation(async (url: unknown) => {
+    const target = new URL(String(url));
+    const page = Number(target.searchParams.get("page") ?? 1);
+    let body: unknown;
+    let next = false;
+    if (target.pathname.endsWith("/pulls/653/commits")) {
+      body = controls.carrierShas.slice(0, 250).slice((page - 1) * 100, page * 100).map((sha) => ({ sha }));
+    } else if (target.pathname.includes("/commits/")) {
+      const ref = decodeURIComponent(target.pathname.split("/commits/")[1]!);
+      body = { sha: ref === CHILD_BRANCH ? controls.childShas.at(-1) ?? baseSha : baseSha };
+    } else if (target.pathname.includes("/compare/")) {
+      const [base, head] = decodeURIComponent(target.pathname.split("/compare/")[1]!).split("...");
+      const carrier = head === HEAD;
+      const source = carrier ? controls.carrierShas : controls.childShas;
+      const fault = carrier ? controls.carrierFault : controls.childFault;
+      controls.comparisons.push({ base: base!, head: head!, page });
+      const paged = target.searchParams.has("per_page");
+      const rows = paged ? source.slice((page - 1) * 100, page * 100) : source.slice(0, 250);
+      if (fault === "truncate" && page === Math.ceil(source.length / 100)) rows.pop();
+      const moved = !carrier && controls.namedBaseMoved && base !== baseSha;
+      body = {
+        base_commit: { sha: moved || (fault === "base" && page === Math.min(2, Math.ceil(source.length / 100))) ? "d".repeat(40) : baseSha },
+        total_commits: moved ? 0 : source.length,
+        commits: moved ? [] : rows.map((sha) => ({ sha })),
+      };
+      next = fault === "next" || (paged && page * 100 < source.length);
+    } else {
+      body = livePr();
+    }
+    return {
+      ok: true, status: 200,
+      headers: { get: () => next ? '<https://api.github.com/next>; rel="next"' : null },
+      json: async () => body,
+    };
+  });
+  return controls;
+}
+
 describePg("child carrier attribution", () => {
   let db: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -356,89 +405,23 @@ describePg("child carrier attribution", () => {
     expect(none).toBeNull();
   });
 
-  it("refuses a missing child commit, a short compare page, and a list past the pinned head", async () => {
-    const headers = { get: () => null };
-    github.mockImplementation(async (url: unknown) => {
-      const target = String(url);
-      if (target.includes("/commits")) {
-        return { ok: true, status: 200, headers, json: async () => [{ sha: COMMIT }, { sha: HEAD }] };
-      }
-      if (target.includes("/compare/")) {
-        return {
-          ok: true,
-          status: 200,
-          headers,
-          json: async () => ({ total_commits: 2, commits: [{ sha: COMMIT }, { sha: "b".repeat(40) }] }),
-        };
-      }
-      return { ok: true, status: 200, headers, json: async () => livePr() };
-    });
-    const missing = await realEnumerate({
-      token: "sandbox-token",
-      owner: OWNER,
-      repo: REPO,
-      pullRequestNumber: 653,
-      headSha: HEAD,
-      baseRef: "fold/tea-patches-v2026.722.0",
-      childBranch: CHILD_BRANCH,
-    });
-    expect(missing.ok).toBe(false);
-
-    github.mockImplementation(async (url: unknown) => {
-      const target = String(url);
-      if (target.includes("/compare/")) {
-        return { ok: true, status: 200, headers, json: async () => ({ total_commits: 300, commits: [{ sha: COMMIT }] }) };
-      }
-      return { ok: true, status: 200, headers, json: async () => [{ sha: HEAD }] };
-    });
-    const truncated = await realEnumerate({
-      token: "sandbox-token",
-      owner: OWNER,
-      repo: REPO,
-      pullRequestNumber: 653,
-      headSha: HEAD,
-      baseRef: "main",
-      childBranch: CHILD_BRANCH,
-    });
-    expect(truncated.ok).toBe(false);
-
-    github.mockImplementation(async () => ({
-      ok: true,
-      status: 200,
-      headers,
-      json: async () => [{ sha: HEAD }, { sha: "c".repeat(40) }],
-    }));
-    const advanced = await realEnumerate({
-      token: "sandbox-token",
-      owner: OWNER,
-      repo: REPO,
-      pullRequestNumber: 653,
-      headSha: HEAD,
-      baseRef: "main",
-      childBranch: CHILD_BRANCH,
-    });
-    expect(advanced.ok).toBe(false);
+  it("refuses a missing child commit, a short comparison page, and a list past the pinned head", async () => {
+    const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
+    mockCommitSources([COMMIT, HEAD], [COMMIT, "b".repeat(40)]);
+    expect((await realEnumerate(input)).ok).toBe(false);
+    const short = mockCommitSources();
+    short.childFault = "truncate";
+    expect((await realEnumerate(input)).ok).toBe(false);
+    mockCommitSources([COMMIT, HEAD, "c".repeat(40)]);
+    expect((await realEnumerate(input)).ok).toBe(false);
   });
 
   it("refuses a compare page that names a next link even when the visible commits are on the pull request", async () => {
-    const headers = { get: (name: string) => name.toLowerCase() === "link" ? '<https://api.github.com/next>; rel="next"' : null };
-    github.mockImplementation(async (url: unknown) => {
-      const target = String(url);
-      if (target.includes("/compare/")) {
-        return { ok: true, status: 200, headers, json: async () => ({ total_commits: 1, commits: [{ sha: COMMIT }] }) };
-      }
-      return { ok: true, status: 200, headers: { get: () => null }, json: async () => [{ sha: COMMIT }, { sha: HEAD }] };
-    });
-    const truncated = await realEnumerate({
-      token: "sandbox-token",
-      owner: OWNER,
-      repo: REPO,
-      pullRequestNumber: 653,
-      headSha: HEAD,
-      baseRef: "main",
-      childBranch: CHILD_BRANCH,
-    });
-    expect(truncated.ok).toBe(false);
+    const controls = mockCommitSources();
+    controls.childFault = "next";
+    expect((await realEnumerate({
+      token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH,
+    })).ok).toBe(false);
   });
 
   it("still blocks the owner when the live head ref differs only by case", async () => {
@@ -611,13 +594,18 @@ describePg("child carrier attribution", () => {
   });
 
   async function approveChild(childId: string) {
+    const [proof] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.childIssueId, childId)).limit(1);
+    if (!proof) throw new Error("Approval fixture requires a verified attribution");
     const [decision] = await db.insert(issueExecutionDecisions).values({
       companyId, issueId: childId, stageId: randomUUID(), stageType: "approval", outcome: "approved", body: "approved",
     }).returning();
     await db.update(issues).set({
       executionState: {
         lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, headSha: HEAD },
-        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
+        approvalStatus: { finalDelivery: {
+          decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD,
+          childCarrierProof: { attributionId: proof.id, ancestorIssueId: proof.ancestorIssueId, branchName: proof.branchName, commitShas: proof.commitShas },
+        } },
       },
     }).where(eq(issues.id, childId));
     return decision!.id;
@@ -664,19 +652,11 @@ describePg("child carrier attribution", () => {
   it("ignores a verified noncontributing branch but refuses its empty child claim and a partial contribution", async () => {
     const { ownerId, childId } = await seedPair();
     childCarrierCommits.enumerate = realEnumerate;
-    let childCommits = ["b".repeat(40)];
-    github.mockImplementation(async (url: unknown) => ({
-      ok: true, status: 200, headers: { get: () => null },
-      json: async () => String(url).includes("/commits?")
-        ? [{ sha: COMMIT }, { sha: HEAD }]
-        : String(url).includes("/compare/")
-          ? { total_commits: childCommits.length, commits: childCommits.map((sha) => ({ sha })) }
-          : livePr(),
-    }));
+    const controls = mockCommitSources([COMMIT, HEAD], ["b".repeat(40)]);
     const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
-    childCommits = [COMMIT, "b".repeat(40)];
+    controls.childShas = [COMMIT, "b".repeat(40)];
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
@@ -711,12 +691,15 @@ describePg("child carrier attribution", () => {
   });
   it("attaches and honors the same immutable delivery-only proof accepted by the child resolver", async () => {
     const { ownerId, childId } = await seedPair();
+    await db.update(issues).set({ executionState: { delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD } } }).where(eq(issues.id, childId));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
     const decisionId = await approveChild(childId);
+    const [approved] = await db.select().from(issues).where(eq(issues.id, childId));
     await db.update(issues).set({
       executionState: {
         lastDecisionId: decisionId, lastDecisionOutcome: "approved",
         delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD },
-        approvalStatus: { finalDelivery: { decisionId, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
+        approvalStatus: approved!.executionState?.approvalStatus,
       },
     }).where(eq(issues.id, childId));
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
@@ -809,7 +792,7 @@ describePg("child carrier attribution", () => {
     })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
-  it.each(["retry", "accepted write", "unconfirmed void"])("does not retain an owner stamp when child approval changes during %s", async (moment) => {
+  it.each(["retry", "accepted write", "unconfirmed void", "lost response", "lost response unconfirmed void"])("does not retain an owner stamp when child approval changes during %s", async (moment) => {
     const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     const decisionId = await approveChild(childId);
@@ -823,8 +806,9 @@ describePg("child carrier attribution", () => {
         if (states.length === 1) {
           await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.id, decisionId));
           if (moment === "retry") return { ok: false, status: 502, json: async () => ({}) };
+          if (moment.startsWith("lost response")) throw new TypeError("response lost after accepting success");
         }
-        if (state === "failure" && moment === "unconfirmed void") return { ok: false, status: 403, json: async () => ({}) };
+        if (state === "failure" && moment.includes("unconfirmed void")) return { ok: false, status: 403, json: async () => ({}) };
         return { ok: true, status: 201, json: async () => ({ id: 1 }) };
       }
       return { ok: true, status: 200, json: async () => livePr() };
@@ -833,41 +817,75 @@ describePg("child carrier attribution", () => {
       enforceDeliveryIdentity: true, expectedHeadSha: HEAD,
     });
     expect(result.kind).not.toBe("armed");
-    expect(states).toEqual(moment === "retry" ? ["success"] : ["success", "failure"]);
-    if (moment === "unconfirmed void") expect(result.message).toContain("void-unconfirmed");
+    expect(states).toEqual(["success", "failure"]);
+    if (moment.includes("unconfirmed void")) expect(result.message).toContain("void-unconfirmed");
   });
 
-  it.each([1, 251])("verifies a 251-commit carrier with a complete %i-commit child source and rejects a truncated comparison", async (childCount) => {
-    const commits = Array.from({ length: 250 }, (_, index) => (index + 1).toString(16).padStart(40, "0"));
-    commits[0] = COMMIT;
-    const all = [...commits, HEAD];
-    const base = "f".repeat(40);
-    let truncate = false;
-    let changedBase = false;
-    github.mockImplementation(async (url: unknown) => {
-      const target = new URL(String(url));
-      let body: unknown;
-      let next = false;
-      const page = Number(target.searchParams.get("page") ?? 1);
-      if (target.pathname.includes("/pulls/")) body = commits.slice((page - 1) * 100, page * 100).map((sha) => ({ sha }));
-      else if (target.pathname.includes("/commits/")) body = { sha: target.pathname.endsWith(CHILD_BRANCH) ? HEAD : base };
-      else if (!target.searchParams.has("per_page")) body = {
-        total_commits: childCount, commits: all.slice(0, Math.min(childCount, 250)).map((sha) => ({ sha })),
-      };
-      else {
-        const slice = all.slice((page - 1) * 100, page * 100);
-        if (truncate && page === 3) slice.pop();
-        body = { total_commits: 251, base_commit: { sha: changedBase && page === 2 ? HEAD : base }, commits: slice.map((sha) => ({ sha })) };
-        next = page < 3;
-      }
-      return { ok: true, status: 200, headers: { get: () => next ? '<https://api.github.com/next>; rel="next"' : null }, json: async () => body };
-    });
+  it.each([1, 251])("verifies a complete large carrier with a %i-commit child and isolates each comparison refusal", async (childCount) => {
+    const childTip = "c".repeat(40);
+    const child = childCount === 1 ? [COMMIT] : [
+      COMMIT, ...Array.from({ length: 249 }, (_, i) => (i + 1).toString(16).padStart(40, "0")), childTip,
+    ];
+    const carrier = childCount === 1
+      ? [COMMIT, ...Array.from({ length: 249 }, (_, i) => (i + 1).toString(16).padStart(40, "0")), HEAD]
+      : [...child, HEAD];
+    const controls = mockCommitSources(carrier, child);
     const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
-    expect(await realEnumerate(input)).toEqual({ ok: true, shas: childCount === 1 ? [COMMIT] : [...all].sort() });
-    truncate = true;
-    expect((await realEnumerate(input)).ok).toBe(false);
-    truncate = false;
-    changedBase = true;
-    expect((await realEnumerate(input)).ok).toBe(false);
+    expect(await realEnumerate(input)).toEqual({ ok: true, shas: [...child].sort() });
+    for (const fault of ["truncate", "base"] as const) {
+      controls.carrierFault = fault;
+      expect((await realEnumerate(input)).ok).toBe(false);
+      expect(controls.comparisons.at(-1)?.head).toBe(HEAD);
+    }
+    controls.carrierFault = null;
+    if (childCount > 250) {
+      for (const fault of ["truncate", "base"] as const) {
+        controls.childFault = fault;
+        expect((await realEnumerate(input)).ok).toBe(false);
+        expect(controls.comparisons.at(-1)?.head).toBe(childTip);
+      }
+    }
+  });
+
+  it("keeps the contribution on one pinned base when the named base moves after the carrier read", async () => {
+    const carrier = [COMMIT, ...Array.from({ length: 249 }, (_, i) => (i + 1).toString(16).padStart(40, "0")), HEAD];
+    const controls = mockCommitSources(carrier);
+    controls.namedBaseMoved = true;
+    expect(await realEnumerate({
+      token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH,
+    })).toEqual({ ok: true, shas: [COMMIT] });
+  });
+
+  it("refuses a small child comparison whose returned base differs from the pinned base", async () => {
+    const controls = mockCommitSources();
+    controls.childFault = "base";
+    expect((await realEnumerate({
+      token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH,
+    })).ok).toBe(false);
+  });
+
+  it("does not attach an older decision to a restored larger commit set at the same carrier head", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    childCarrierCommits.enumerate = async () => ({ ok: true, shas: [COMMIT, "b".repeat(40)] });
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row).toMatchObject({ state: "current", headSha: HEAD, commitShas: [COMMIT, "b".repeat(40)], childDecisionId: null });
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it("ignores a different-repository attribution for a disjoint child on the target PR", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await db.update(issueChildCarrierAttributions).set({ repo: "old-repository" });
+    childCarrierCommits.enumerate = async () => ({ ok: true, shas: [] });
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
   });
 });

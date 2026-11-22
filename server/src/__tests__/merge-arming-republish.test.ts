@@ -5244,7 +5244,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
   });
 
-  it.each([true, false])("preserves the forked child's delivered head only when stall escalation is %s", async (stallPolicy) => {
+  it.each([[true, false], [false, false], [true, true]])("preserves delivery state and heads (stall %s, self-owned refresh %s)", async (stallPolicy, withReviewRequest) => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, stallPolicy });
     const [child] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -5262,22 +5262,47 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, ownerId));
     await db.update(issues).set({ parentId: ownerId }).where(eq(issues.id, issueId));
     await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, child!.executionWorkspaceId!));
-    currentActor = agentActor(companyId, agentId, runId);
+    if (withReviewRequest) {
+      const policy = child!.executionPolicy as { stages: Array<{ id: string }> };
+      await db.update(issues).set({
+        status: "in_review", assigneeUserId: "stall-reviewer-user",
+        executionState: {
+          status: "pending", currentStageId: policy.stages[0]!.id, currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "user", userId: "stall-reviewer-user" },
+          returnAssignee: { type: "agent", agentId }, completedStageIds: [],
+          lastDecisionId: null, lastDecisionOutcome: null, reviewRequest: null,
+        },
+      }).where(eq(issues.id, issueId));
+    }
+    const deliveryBranch = withReviewRequest
+      ? (await db.select({ branch: executionWorkspaces.branchName }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, child!.executionWorkspaceId!)))[0]!.branch!
+      : branch;
+    currentActor = withReviewRequest ? boardActor(companyId) : agentActor(companyId, agentId, runId);
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
     mockGhFetch.mockImplementation(async () => createMockResponse({
       state: "open", draft: false, merged: false,
-      head: { ref: branch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } }, base: { ref: "main" },
+      head: { ref: deliveryBranch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } }, base: { ref: "main" },
     }));
     const response = await request(app).patch(`/api/issues/${issueId}`).send({
-      status: "in_review", deliveryIdentity: {
-        repo: { owner: OWNER, repo: REPO }, branch, headSha: HEAD_SHA,
+      ...(withReviewRequest ? { reviewRequest: { instructions: "Review the exact delivery." } } : { status: "in_review" }),
+      deliveryIdentity: {
+        repo: { owner: OWNER, repo: REPO }, branch: deliveryBranch, headSha: HEAD_SHA,
         prNumber: PR_NUMBER, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
       },
     });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+    if (withReviewRequest) {
+      expect(row!.executionState).toMatchObject({
+        delivery: { branch: deliveryBranch, headSha: HEAD_SHA, prNumber: PR_NUMBER },
+        reviewRequest: { instructions: "Review the exact delivery." },
+      });
+      expect(row!.executionState?.childCarrierClaim).toBeUndefined();
+    } else {
+      expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+    }
     expect(row!.executionState?.deliveredHeadSha).toBe(stallPolicy ? HEAD_SHA : undefined);
     expect(row!.executionWorkspaceId).toBe(child!.executionWorkspaceId);
   });

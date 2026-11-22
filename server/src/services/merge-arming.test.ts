@@ -4871,9 +4871,16 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         const outcome = await armMergeOnApproval(db, companyId, issueId, decide,
           { ...certifiedPr, ...(moment === "node lookup" ? { nodeId: null } : {}) },
           { expectedHeadOid: AUTH_HEAD });
-        expect(outcome.kind).toBe(moment === "accepted enable" ? "failed" : "skipped");
+        expect(outcome.kind).toBe(moment === "node lookup" ? "skipped" : "failed");
         expect(enables()).toHaveLength(moment === "node lookup" ? 0 : 1);
         expect(disables()).toHaveLength(moment === "accepted enable" ? 1 : 0);
+        if (moment === "retry") {
+          const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const state = stored!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+          expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight" });
+          expect(outcome.message).toContain("unconfirmed");
+          expect(outcome.message).not.toContain("nothing was armed");
+        }
       });
       it("refuses a direct-merge retry when a child-only attribution appears after a transient merge failure", async () => {
         const { issueId } = await seedAuthorityCard();

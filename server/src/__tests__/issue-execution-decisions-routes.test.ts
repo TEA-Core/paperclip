@@ -12,6 +12,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issueWorkProducts,
   issues,
@@ -42,6 +43,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type * as GitHubFetch from "../services/github-fetch.js";
 import type * as GitHubCredential from "../services/github-credential.js";
+import { carrierOwnerChildAttributionBlock, childCarrierCommits } from "../services/child-carrier-attribution.js";
 
 const github = vi.hoisted(() => vi.fn<typeof fetch>());
 vi.mock("../services/github-fetch.js", async (original) => ({
@@ -2180,6 +2182,69 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const fixture = await pendingDelivery({ adr072: true, draft: true, atStage: 2 });
       const before = await fixture.read();
       await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "head_draft");
+    });
+
+    it.each([false, true])("certifies only an open forked child contribution without carrier publication (merged during preflight %s)", async (mergeDuringPreflight) => {
+      const fixture = await pendingDelivery({ adr072: true, atStage: 2, mergeArmingEnabled: true, missing: true });
+      const child = await fixture.read();
+      const ownerId = randomUUID();
+      const carrierBranch = `${fixture.company.issuePrefix}-2-carrier`;
+      await db.insert(issues).values({
+        id: ownerId, companyId: fixture.company.id, projectId: child.projectId,
+        identifier: `${fixture.company.issuePrefix}-2`, issueNumber: 2, title: "Carrier owner", status: "in_progress", priority: "medium",
+      });
+      const [workspace] = await db.insert(executionWorkspaces).values({
+        companyId: fixture.company.id, projectId: child.projectId!, sourceIssueId: ownerId,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: carrierBranch, status: "active",
+        cwd: "/tmp/as02-no-local-repo", repoUrl: "https://github.com/TEA-Core/paperclip", baseRef: "main", branchName: carrierBranch,
+      }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, ownerId));
+      await db.update(issues).set({
+        parentId: ownerId,
+        executionState: { ...child.executionState, childCarrierClaim: { prNumber: 42, headSha: fixture.pr.head.sha } },
+      }).where(eq(issues.id, child.id));
+      fixture.pr.head.ref = carrierBranch;
+      const before = await fixture.read();
+      const originalEnumeration = childCarrierCommits.enumerate;
+      const transport = github.getMockImplementation()!;
+      github.mockImplementation(async (input, init) => {
+        if (mergeDuringPreflight && String(input).includes("/compare/")) {
+          return Response.json({ status: "identical", ahead_by: 0, behind_by: 0 });
+        }
+        return transport(input, init);
+      });
+      try {
+        childCarrierCommits.enumerate = async () => {
+          if (mergeDuringPreflight) Object.assign(fixture.pr, {
+            state: "closed", merged: true, merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19", base: { ref: "main" },
+          });
+          return { ok: true, shas: ["c".repeat(40)] };
+        };
+        const response = await fixture.approve();
+        if (mergeDuringPreflight) {
+          await expectRefusedUnchanged(fixture, response, before, "approval_final_delivery_preflight", "head_not_open");
+        } else {
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+          const stored = await fixture.read();
+          const [proof] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.childIssueId, child.id));
+          expect(stored.status).toBe("done");
+          expect(stored.executionWorkspaceId).toBe(child.executionWorkspaceId);
+          expect(approvalStatusOf(stored).finalDelivery).toMatchObject({
+            decisionId: stored.executionState?.lastDecisionId, headSha: fixture.pr.head.sha,
+            childCarrierProof: {
+              attributionId: proof!.id, ancestorIssueId: ownerId, branchName: carrierBranch, commitShas: ["c".repeat(40)],
+            },
+          });
+          expect(proof?.childDecisionId).toBe(stored.executionState?.lastDecisionId);
+          expect(await carrierOwnerChildAttributionBlock(db, fixture.company.id, ownerId, {
+            owner: "TEA-Core", repo: "paperclip", number: 42, headSha: fixture.pr.head.sha, headRef: carrierBranch,
+          })).toBeNull();
+        }
+        expect(fixture.writes).toEqual([]);
+        expect(fixture.armCalls).toEqual([]);
+      } finally {
+        childCarrierCommits.enumerate = originalEnumeration;
+      }
     });
 
     it.each(stageDoors)("%s: certifies and stamps the exact delivery head on the final-stage approve", async (door) => {
