@@ -6294,7 +6294,7 @@ describe("evaluateDoneTierDeclaration", () => {
         ["failed_positive", "failed=1"],
         ["scanned_zero", "scanned=0"],
         ["non_clean", "non-clean"],
-        ["failed_closed", "failed closed"],
+        ["failed_closed", "failed closed. All four configured repos shape"],
         ["refused", "REFUSED"],
         ["partial_failure", "partial failure"],
       ])("refuses %s in a pass predicate", async (marker, prose) => {
@@ -6310,7 +6310,7 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.remedy).toContain("Report the non-clean cycle and do not close");
       });
 
-      it.each(["exit -2", "exited +02", "failed=001", "scanned=00", "NON-CLEAN", "refused"])(
+      it.each(["exit -2", "exited +02", "failed=001", "scanned=00", "NON-CLEAN", "FAILED CLOSED. ALL four repos"])(
         "refuses integer and case variants: %s",
         async (prose) => {
           const result = await evaluateDoneTierDeclaration(
@@ -6352,6 +6352,8 @@ describe("evaluateDoneTierDeclaration", () => {
 
       it.each([
         "exit criteria met",
+        "anon request refused 401",
+        "failed closed on anon request, expected negative path confirmed",
         "exit 0; exited 0; exit -0; exited +00; failed=0; scanned=12",
         "preexit 2; failed=0; scanned=01; unREFUSED; non-cleanliness",
       ])("accepts harmless trailing prose: %s", async (prose) => {

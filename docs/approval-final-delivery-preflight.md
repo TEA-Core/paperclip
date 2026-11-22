@@ -49,7 +49,7 @@ The query reads one page of 100 check contexts. When GitHub reports a next page,
 
 A `record_only` live close uses `Closed at Tier 2 (live): record-only probe ` followed by a backticked command, `target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>` (or the existing UTC observation range). The structured `doneTier.probeEvidence` carries the same evidence without the close prefix. No merge head is required.
 
-The guard refuses a `result: pass` declaration with `done_transition_record_only_probe_contradiction` when its trailing predicate/result contains one of these eight token-anchored markers, case-insensitively:
+The guard refuses a `result: pass` declaration with `done_transition_record_only_probe_contradiction` when its trailing predicate/result contains one of these eight token-anchored markers (case-insensitive except `REFUSED`, which matches uppercase only):
 
 | Marker name | Recognized form |
 | --- | --- |
@@ -58,11 +58,11 @@ The guard refuses a `result: pass` declaration with `done_transition_record_only
 | `failed_positive` | `failed=<integer>` with a positive value |
 | `scanned_zero` | `scanned=0` |
 | `non_clean` | `non-clean` |
-| `failed_closed` | `failed closed` |
+| `failed_closed` | `failed closed. All` (literal context) |
 | `refused` | `REFUSED` |
 | `partial_failure` | `partial failure` |
 
-Numbers may have leading zeroes; exit codes may have a sign. Words have word-boundary anchors; phrase separators accept spaces or tabs. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
+Numbers may have leading zeroes; exit codes may have a sign. Words have word-boundary anchors; phrase separators accept spaces or tabs. Lowercase `refused` (for example `anon request refused 401`) and a bare `failed closed` (for example a predicate confirming an expected negative path) do not contradict a pass; a failed-closed outcome with an explicit failing exit is caught by the `exit`/`exited` markers. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
 
 The refusal names the marker, repeats the accepted form verbatim, and states the honest alternative: **Report the non-clean cycle and do not close.** Re-probe before claiming a genuine pass; do not relabel a failed probe to force a close.
 

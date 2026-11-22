@@ -1971,8 +1971,8 @@ const RECORD_ONLY_PASS_CONTRADICTIONS = [
   { name: "failed_positive", pattern: /\bfailed=0*[1-9]\d*\b/i },
   { name: "scanned_zero", pattern: /\bscanned=0+\b/i },
   { name: "non_clean", pattern: /\bnon-clean\b/i },
-  { name: "failed_closed", pattern: /\bfailed[ \t]+closed\b/i },
-  { name: "refused", pattern: /\bREFUSED\b/i },
+  { name: "failed_closed", pattern: /\bfailed[ \t]+closed\.[ \t]+All\b/i },
+  { name: "refused", pattern: /\bREFUSED\b/ },
   { name: "partial_failure", pattern: /\bpartial[ \t]+failure\b/i },
 ] as const;
 
