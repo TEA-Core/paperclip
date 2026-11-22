@@ -1352,6 +1352,58 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await issueTreeControlService(db).getActivePauseHoldGate(local.companyId, childId)).toBeNull();
   });
 
+  it("does not combine a reopened blocker graph with obsolete accepted park consent", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    let reopened = false;
+    // Keep the real SQL builder/results. Commit the competing transition just
+    // before the relational blocker graph executes, not before admission reads.
+    const select = new Proxy(db.select, { apply(target, receiver, args) {
+      const builder = Reflect.apply(target, receiver, args);
+      const fields = args[0];
+      if (fields?.issueId === issueRelations.relatedIssueId && fields?.blockerIssueId === issues.id &&
+          fields?.parentId === issues.parentId && fields?.executionRunId === issues.executionRunId) {
+        builder.from = new Proxy(builder.from, { apply(from, fromReceiver, fromArgs) {
+          const query = Reflect.apply(from, fromReceiver, fromArgs);
+          if (!query || typeof query !== "object") throw new Error("Expected the real Drizzle query object");
+          const then = Reflect.get(query, "then");
+          if (typeof then !== "function") throw new Error("Expected the real Drizzle query promise");
+          const execute = then.bind(query);
+          Object.defineProperty(query, "then", { value: (
+            fulfilled?: (value: unknown) => unknown, rejected?: (reason: unknown) => unknown,
+          ) => {
+            const read = async () => {
+              if (!reopened) {
+                reopened = true;
+                await db.update(issues).set({ status: "in_progress", assigneeUserId: "park-operator" })
+                  .where(eq(issues.id, f.blockerId));
+              }
+              return new Promise<unknown>((resolve, reject) => { execute(resolve, reject); });
+            };
+            return read().then(fulfilled, rejected);
+          } });
+          return query;
+        } });
+      }
+      return builder;
+    } });
+    const spy = vi.spyOn(db, "select").mockImplementation(select);
+    try {
+      expect(await attention(f)).toMatchObject({ state: "needs_attention", reason: "attention_required",
+        unresolvedBlockerCount: 1, coveredBlockerCount: 1, carrierPark: { state: "stale" } });
+    } finally {
+      spy.mockRestore();
+    }
+    const after = await snapshot(f);
+    expect(after.source).toEqual(before.source);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.wakes).toEqual(before.wakes);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
