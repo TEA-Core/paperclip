@@ -55,6 +55,12 @@ A child card with its own self-sourced execution workspace may have its delivery
 
 Child approval records only the child's decision. It does not publish `paperclip/approved` and does not arm the carrier pull request. The self-sourced carrier owner stamps or arms only when every required child attribution is approved, current and complete. The child resolver and the owner publication predicate are separate (`server/src/services/child-carrier-attribution.ts`, `server/src/services/merge-arming.ts`).
 
+The untrusted child claim must retain the canonical PR URL for its current
+repository and exact PR number. Preflight, decision attachment and owner
+publication each check that anchor. A missing or mismatched URL refuses;
+record delivery again through the control plane. Recording a new child-carrier
+claim removes an obsolete ordinary delivery binding.
+
 ## Authoritative flow
 
 `resolveDeliveryIdentity` reads the recorded identity. `resolveExactBoundPullRequest` verifies the exact live PR and head. `narrowToDelivered` restricts candidates to that verified PR, while `publishApprovalStatus` and `armMergeOnApproval` reject any mismatch before writing approval status or arming merge. The decision-time head resolver uses the same exact binding so the approving card and the actuator target cannot diverge.

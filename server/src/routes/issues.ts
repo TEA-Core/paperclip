@@ -20898,6 +20898,7 @@ export function issueRoutes(
               ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
               : {}),
           };
+          delete updateFields.executionState.delivery;
         } else {
           const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
           delete withoutClaim.childCarrierClaim;

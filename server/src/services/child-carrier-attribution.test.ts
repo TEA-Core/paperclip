@@ -479,7 +479,7 @@ describePg("child carrier attribution", () => {
   it("refuses a mismatched claim head and clears approval when the commit proof changes", async () => {
     const { childId } = await seedPair();
     await db.update(issues).set({
-      executionState: { childCarrierClaim: { prNumber: 653, headSha: HEAD } },
+      executionState: { childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD } },
     }).where(eq(issues.id, childId));
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     const [decision] = await db.insert(issueExecutionDecisions).values({
@@ -496,7 +496,7 @@ describePg("child carrier attribution", () => {
         lastDecisionId: decision!.id,
         lastDecisionOutcome: "approved",
         approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
-        childCarrierClaim: { prNumber: 653, headSha: "d".repeat(40) },
+        childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "d".repeat(40) },
       },
     }).where(eq(issues.id, childId));
     await recordChildCarrierDecision(db, companyId, childId);
@@ -507,7 +507,7 @@ describePg("child carrier attribution", () => {
     childCarrierCommits.enumerate = async () => ({ ok: true, shas: [COMMIT, "e".repeat(40)] });
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     await db.update(issues).set({
-      executionState: { childCarrierClaim: { prNumber: 653, headSha: HEAD } },
+      executionState: { childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD } },
     }).where(eq(issues.id, childId));
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     const [refreshed] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.state, "current"));
@@ -602,7 +602,7 @@ describePg("child carrier attribution", () => {
     }).returning();
     await db.update(issues).set({
       executionState: {
-        lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, headSha: HEAD },
+        lastDecisionId: decision!.id, lastDecisionOutcome: "approved", childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD },
         approvalStatus: { finalDelivery: {
           decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD,
           childCarrierProof: { attributionId: proof.id, ancestorIssueId: proof.ancestorIssueId, branchName: proof.branchName, commitShas: proof.commitShas },
@@ -718,7 +718,7 @@ describePg("child carrier attribution", () => {
     const moved = "d".repeat(40);
     const [issue] = await db.select().from(issues).where(eq(issues.id, childId));
     await db.update(issues).set({ executionState: {
-      ...issue!.executionState, childCarrierClaim: { prNumber: 653, headSha: moved },
+      ...issue!.executionState, childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: moved },
     } }).where(eq(issues.id, childId));
     await db.update(issueChildCarrierAttributions).set({ headSha: moved, childDecisionId: null });
     await recordChildCarrierDecision(db, companyId, childId);
@@ -983,5 +983,26 @@ describePg("child carrier attribution", () => {
     expect((await resolveChildCarrierDecisionHead(racingDb, companyId, childId)).kind).toBe("unresolvable");
     const [row] = await db.select().from(issueChildCarrierAttributions);
     expect(row).toMatchObject({ state: "current", commitShas: replacement, childDecisionId: replacementDecision });
+  });
+
+  it.each(["attachment", "owner gate"])("rejects claim repository drift at the %s after preflight", async (site) => {
+    const { childId, ownerId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    if (site === "owner gate") {
+      await recordChildCarrierDecision(db, companyId, childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+    }
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    await db.update(issues).set({ executionState: {
+      ...child!.executionState,
+      childCarrierClaim: { prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${OWNER}/old-repository/pull/653` },
+    } }).where(eq(issues.id, childId));
+    if (site === "attachment") {
+      await recordChildCarrierDecision(db, companyId, childId);
+      const [row] = await db.select().from(issueChildCarrierAttributions);
+      expect(row!.childDecisionId).toBeNull();
+    } else expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 });

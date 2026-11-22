@@ -5777,9 +5777,18 @@ export async function publishHeadBoundRelease(
     const attempts = 3;
     for (let attempt = 1; ; attempt += 1) {
       const refusal = await recheck(conn);
-      if (refusal) return refusal;
+      if (refusal) {
+        if (!statusMayExist) return refusal;
+        const outcome = await voidSuccess("the release's authority changed before a retry");
+        return {
+          kind: refusal.kind === "refused" ? "stale" : "failed",
+          headSha: input.headSha,
+          message: `${refusal.message}; the status may have been written; ${outcome}`,
+        };
+      }
       // Nothing is written once the release's clock has run out.
       if (envelope.aborted) return deadlineOutcome();
+      const previouslyMayExist = statusMayExist;
       statusMayExist = true;
       let inFlight: ReturnType<typeof writeCommitStatusWithRetry> | undefined;
       const write = await bounded(
@@ -5790,6 +5799,7 @@ export async function publishHeadBoundRelease(
         })),
         { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       );
+      statusMayExist = previouslyMayExist || write.mayHaveApplied;
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal(true);
@@ -5867,13 +5877,13 @@ export async function publishHeadBoundRelease(
             compensateLateSuccess(inFlight);
             recheckAfterNoAnswer();
           }
-          const outcome = await voidSuccess("the release's status write did not answer");
-          return { kind: "failed", message: `status:failed:status_write: ${write.error ?? "no answer"}; the status may have been written; ${outcome}` };
         }
-        statusMayExist = false;
+        if (statusMayExist) {
+          const outcome = await voidSuccess("the release's status write could not be confirmed");
+          return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}; the status may have been written; ${outcome}` };
+        }
         return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
       }
-      statusMayExist = false;
       await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
     }
   };

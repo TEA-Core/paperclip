@@ -2201,7 +2201,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, ownerId));
       await db.update(issues).set({
         parentId: ownerId,
-        executionState: { ...child.executionState, childCarrierClaim: { prNumber: 42, headSha: fixture.pr.head.sha } },
+        executionState: { ...child.executionState, childCarrierClaim: { prNumber: 42, prUrl: "https://github.com/TEA-Core/paperclip/pull/42", headSha: fixture.pr.head.sha } },
       }).where(eq(issues.id, child.id));
       fixture.pr.head.ref = carrierBranch;
       const before = await fixture.read();
