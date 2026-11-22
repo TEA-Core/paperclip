@@ -1404,6 +1404,84 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
+  it("keeps healthy-child repair exact to the parked action while repairing an ordinary same-company source", async () => {
+    const f = await fixture(), ordinary = await fixture(f.companyId);
+    expect((await park(f)).status).toBe(201);
+    const protectedChild = randomUUID(), ordinaryChild = randomUUID();
+    await db.insert(issues).values([
+      { id: protectedChild, companyId: f.companyId, title: "Human-owned parked source child",
+        status: "in_progress", assigneeUserId: "park-operator", parentId: f.sourceId },
+      { id: ordinaryChild, companyId: f.companyId, title: "Human-owned ordinary source child",
+        status: "in_progress", assigneeUserId: "park-operator", parentId: ordinary.sourceId },
+    ]);
+    const before = await snapshot(f), holds = (await parkRecords(f)).holds;
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Child repair must not dispatch"); } }).reconcileActiveRecoveryActions();
+    const after = await snapshot(f);
+    expect(after.source).toEqual(before.source);
+    expect(after.actions.find(row => row.id === f.actionId)).toEqual(before.actions.find(row => row.id === f.actionId));
+    expect((await parkRecords(f)).holds).toEqual(holds);
+    expect(await db.select({ id: issueRelations.issueId }).from(issueRelations).where(and(
+      eq(issueRelations.relatedIssueId, f.sourceId), eq(issueRelations.type, "blocks"),
+    ))).toEqual([]);
+    expect(await db.select({ id: issueRelations.issueId }).from(issueRelations).where(and(
+      eq(issueRelations.relatedIssueId, ordinary.sourceId), eq(issueRelations.type, "blocks"),
+    ))).toEqual([{ id: ordinaryChild }]);
+    // Ordinary blocker repair does not independently resolve terminal exhaustion.
+    expect(after.actions.find(row => row.id === ordinary.actionId))
+      .toEqual(before.actions.find(row => row.id === ordinary.actionId));
+    await assertNoProtectedWrites();
+  });
+
+  it("rechecks exact action consent under the source lock before healthy-child blocker repair", async () => {
+    const f = await fixture();
+    await db.insert(issues).values({ companyId: f.companyId, title: "Human-owned child",
+      status: "in_progress", assigneeUserId: "park-operator", parentId: f.sourceId });
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    const repair = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Child repair must not dispatch"); } }).reconcileActiveRecoveryActions();
+    try {
+      await waitForBlockedPid(parkPid);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, repair]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("locks the bound action source before admitting a wake scoped to an unrelated target", async () => {
+    const f = await fixture(), targetId = randomUUID();
+    await db.update(companies).set({ defaultResponsibleUserId: "park-operator" }).where(eq(companies.id, f.companyId));
+    await db.update(agents).set({ adapterType: "codex_local", status: "active" }).where(eq(agents.id, f.agentId));
+    await db.insert(issues).values({ id: targetId, companyId: f.companyId, title: "Unrelated wake target",
+      status: "todo", assigneeAgentId: f.agentId });
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    let settled = false;
+    const wake = heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { issueId: targetId, recoveryActionId: f.actionId },
+      contextSnapshot: { issueId: targetId, recoveryActionId: f.actionId },
+    }).then(run => { settled = true; return { run, error: null }; },
+      error => { settled = true; return { run: null, error }; });
+    try {
+      await expect.poll(async () => settled || (await db.execute(sql`select exists (
+        select 1 from pg_stat_activity where datname = current_database()
+        and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked,
+      { timeout: 10_000 }).toBe(true);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, wake]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await wake).toEqual({ run: null, error: null });
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  }, 30_000);
+
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
     const f = await fixture();
     const response = await request(app(f.companyId)).patch(`/api/issues/${f.carrierId}`).send({ status: "blocked", blockedByIssueIds: [f.blockerId], unblockDescriptor: { owner: "board", action: "Review" } });
