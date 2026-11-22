@@ -680,6 +680,11 @@ server-derived action identity in queued wake context.
 Exhaustion drain excludes the exact parked action before its bounded candidate
 page, so parked rows cannot hide later eligible work. Carrier eligibility and
 wake preflight use the lock-holding transaction; wake publication follows commit.
+Locked preflight distinguishes a board park, an existing live monitor and ordinary
+unavailability. Park refusal posts no missing-owner notice or fallback audit.
+An existing monitor keeps its schedule and metadata without creating a carrier.
+Recovery notices recheck the exact source/action under the source lock, including
+the comment's source-recency update.
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.
