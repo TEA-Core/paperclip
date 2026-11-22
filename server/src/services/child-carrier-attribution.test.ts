@@ -1173,6 +1173,47 @@ describePg("child carrier attribution", () => {
       return childId;
     }
 
+    function afterProofRead(afterRead: () => void, refuseLaterReads = false): Db {
+      let read = false;
+      return new Proxy(db, { get(base, key, receiver) {
+        if (key !== "select") return Reflect.get(base, key, receiver);
+        return (...args: Parameters<Db["select"]>) => {
+          if (read && refuseLaterReads) throw new Error("Issue reader became unavailable after proof fetch");
+          const selected = base.select(...args);
+          return new Proxy(selected, { get(selection, member, selectionReceiver) {
+            if (member !== "from") return Reflect.get(selection, member, selectionReceiver);
+            return (...tables: Parameters<typeof selected.from>) => {
+              const query = selection.from(...tables);
+              if (tables[0] !== issueChildCarrierAttributions) return query;
+              return new Proxy(query, { get(builder, method, builderReceiver) {
+                if (method !== "then") return Reflect.get(builder, method, builderReceiver);
+                return (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+                  query.then((rows) => {
+                    read = true;
+                    afterRead();
+                    return rows;
+                  }).then(resolve, reject);
+              } });
+            };
+          } });
+        };
+      } });
+    }
+
+    it.each(["owner", "repo"] as const)("refuses caller %s drift after the scoped attribution query completes", async (field) => {
+      const { ownerId } = await approvedPair();
+      const requested = { ...target };
+      const racingDb = afterProofRead(() => { requested[field] = `other-${field}`; });
+      expect(await carrierOwnerChildAttributionBlock(racingDb, companyId, ownerId, requested)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses pending child approval without depending on a later issue-state read", async () => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      const unavailableAfterProof = afterProofRead(() => {}, true);
+      expect(await carrierOwnerChildAttributionBlock(unavailableAfterProof, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
     it.each(["owner", "child"] as const)("does not constrain an unrelated PR through an unreadable %s workspace", async (which) => {
       const { ownerId, childId } = await seedPair();
       await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, which === "owner" ? ownerId : childId));
