@@ -574,6 +574,33 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect(stored?.status).toBe("backlog");
   });
 
+  it.each(["bound", "metadata-fallback"] as const)(
+    "adopts the live replacement when a terminated maintainer remains in the %s lookup",
+    async (lookup) => {
+      const { company, maintainer } = await seedWikiCompany(lookup === "bound" ? "maintainer" : "unresolvable");
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, maintainer.id));
+      if (lookup === "metadata-fallback") await db.delete(pluginEntities);
+      const [replacement] = await db.insert(agents).values({
+        companyId: company.id,
+        name: "Replacement Wiki Maintainer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        metadata: maintainer.metadata,
+      }).returning();
+      const stub = await seedUnassignedHandoff(company.id);
+      const res = await request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${stub.id}`).send({ description: "Repair after replacing the terminated Maintainer" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await readAssignee(stub.id)).toMatchObject({
+        assigneeAgentId: replacement!.id,
+        assigneeUserId: null,
+        status: "backlog",
+      });
+    },
+  );
+
   it("admits an assignee write of the metadata-marked Wiki Maintainer when the resource row is unresolvable", async () => {
     const { company, maintainer } = await seedWikiCompany("unresolvable");
     const stub = await seedUnassignedHandoff(company.id);
