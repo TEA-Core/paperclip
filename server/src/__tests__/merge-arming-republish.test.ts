@@ -1992,7 +1992,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const requestRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_requested");
     const outcomeRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_outcome");
 
-    it("voids a success instead of confirming release when child-only authority appears during the write", async () => {
+    it.each([201, 502])("voids a possible success instead of confirming release when child-only authority appears during the write (HTTP %s)", async (firstStatus) => {
       const { issueId, companyId } = await seedReleasable();
       const ancestorId = randomUUID();
       await db.insert(issues).values({
@@ -2005,7 +2005,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA], state: "invalidated",
         writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
       }).returning();
-      installReleaseTransport();
+      installReleaseTransport({ postStatus: (call) => ({ ok: call !== 1 || firstStatus === 201, status: call === 1 ? firstStatus : 201 }) });
       const transport = mockGhFetch.getMockImplementation()!;
       mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.includes("/statuses/") && init?.method === "POST") {
@@ -2385,14 +2385,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       let head = HEAD_SHA;
       installReleaseTransport({
         liveHeadNow: () => head,
-        postStatus: () => { head = OTHER_HEAD; return { ok: false, status: 502 }; },
+        postStatus: (call) => { if (call === 1) { head = OTHER_HEAD; return { ok: false, status: 502 }; } return { ok: true, status: 201 }; },
       });
 
       const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(res.status).toBe(409);
       expect(res.body.message).toContain("head-mismatch");
-      expect(statusWrites()).toHaveLength(1);
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
     });
 
     it("retries a transient write failure while the head is unchanged", async () => {
@@ -2404,6 +2405,18 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("released");
       expect(statusWrites()).toHaveLength(2);
+    });
+
+    it.each([false, true])("voids a possibly accepted terminal release failure (void rejected %s)", async (voidRejected) => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postStatus: (call) => call <= 3
+        ? { ok: false, status: 502 }
+        : { ok: !voidRejected, status: voidRejected ? 403 : 201 } });
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(response.body.outcome).toBe("failed");
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state).at(-1)).toBe("failure");
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      if (voidRejected) expect(response.body.message).toMatch(/could NOT|unconfirmed/i);
     });
 
     // The card's review certified one PR for delivery (executionState.approvalStatus.finalDelivery).
@@ -5244,7 +5257,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
   });
 
-  it.each([[true, false], [false, false], [true, true]])("preserves delivery state and heads (stall %s, self-owned refresh %s)", async (stallPolicy, withReviewRequest) => {
+  it.each([[true, false, false], [false, false, false], [true, true, false], [false, false, true]])("preserves delivery state and heads (stall %s, self-owned refresh %s, stale binding %s)", async (stallPolicy, withReviewRequest, withStaleDelivery) => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, stallPolicy });
     const [child] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -5262,6 +5275,14 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, ownerId));
     await db.update(issues).set({ parentId: ownerId }).where(eq(issues.id, issueId));
     await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, child!.executionWorkspaceId!));
+    if (withStaleDelivery) {
+      await db.update(issues).set({ executionPolicy: null, executionState: { ...child!.executionState, delivery: {
+        kind: "as05_bound_pr", branch: "previous-carrier", headSha: "a".repeat(40),
+        repo: { owner: OWNER, repo: REPO }, prNumber: PR_NUMBER + 1,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER + 1}`,
+        cardBranch: "SUP-14824-branch", sourceIssueId: issueId,
+      } } }).where(eq(issues.id, issueId));
+    }
     if (withReviewRequest) {
       const policy = child!.executionPolicy as { stages: Array<{ id: string }> };
       await db.update(issues).set({
@@ -5302,6 +5323,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       expect(row!.executionState?.childCarrierClaim).toBeUndefined();
     } else {
       expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+      expect(row!.executionState?.delivery).toBeUndefined();
     }
     expect(row!.executionState?.deliveredHeadSha).toBe(stallPolicy ? HEAD_SHA : undefined);
     expect(row!.executionWorkspaceId).toBe(child!.executionWorkspaceId);

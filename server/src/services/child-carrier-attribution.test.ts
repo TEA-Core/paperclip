@@ -90,7 +90,8 @@ function mockCommitSources(carrierShas = [COMMIT, HEAD], childShas = [COMMIT]) {
       body = controls.carrierShas.slice(0, 250).slice((page - 1) * 100, page * 100).map((sha) => ({ sha }));
     } else if (target.pathname.includes("/commits/")) {
       const ref = decodeURIComponent(target.pathname.split("/commits/")[1]!);
-      body = { sha: ref === CHILD_BRANCH ? controls.childShas.at(-1) ?? baseSha : baseSha };
+      const moved = controls.namedBaseMoved && controls.comparisons.some(({ head }) => head === HEAD);
+      body = { sha: ref === CHILD_BRANCH ? controls.childShas.at(-1) ?? baseSha : moved ? "d".repeat(40) : baseSha };
     } else if (target.pathname.includes("/compare/")) {
       const [base, head] = decodeURIComponent(target.pathname.split("/compare/")[1]!).split("...");
       const carrier = head === HEAD;
@@ -854,6 +855,8 @@ describePg("child carrier attribution", () => {
     expect(await realEnumerate({
       token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH,
     })).toEqual({ ok: true, shas: [COMMIT] });
+    expect(new Set(controls.comparisons.map(({ base }) => base))).toEqual(new Set(["f".repeat(40)]));
+    expect(new Set(controls.comparisons.map(({ head }) => head))).toEqual(new Set([HEAD, COMMIT]));
   });
 
   it("refuses a small child comparison whose returned base differs from the pinned base", async () => {
@@ -887,5 +890,98 @@ describePg("child carrier attribution", () => {
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
       owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
     })).toBeNull();
+  });
+
+  it("does not combine disjoint child results from different carrier bases", async () => {
+    const { ownerId } = await seedPair();
+    const [owner] = await db.select().from(issues).where(eq(issues.id, ownerId));
+    const secondId = randomUUID();
+    const secondBranch = "second-child";
+    const secondCommit = "b".repeat(40);
+    await db.insert(issues).values({
+      id: secondId, companyId, projectId: owner!.projectId, parentId: ownerId,
+      title: "Second child", status: "in_review", identifier: "SUP-22879",
+    });
+    const [workspace] = await db.insert(executionWorkspaces).values({
+      companyId, projectId: owner!.projectId!, sourceIssueId: secondId,
+      mode: "isolated_workspace", strategyType: "git_worktree", name: "second",
+      status: "active", branchName: secondBranch, repoUrl: `https://github.com/${OWNER}/${REPO}`,
+    }).returning();
+    await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, secondId));
+    let currentChildBranch = "";
+    childCarrierCommits.enumerate = (input) => { currentChildBranch = input.childBranch; return realEnumerate(input); };
+    github.mockImplementation(async (url: string) => {
+      const pathname = decodeURIComponent(new URL(url).pathname);
+      let body: unknown;
+      if (pathname.includes("/commits/")) {
+        const ref = pathname.split("/commits/")[1];
+        body = { sha: ref === CHILD_BRANCH ? COMMIT : ref === secondBranch ? secondCommit : currentChildBranch === CHILD_BRANCH ? COMMIT : secondCommit };
+      } else if (pathname.includes("/compare/")) {
+        const [base, head] = pathname.split("/compare/")[1]!.split("...");
+        const shas = head === HEAD ? [base === COMMIT ? secondCommit : COMMIT, HEAD] : head === base ? [] : [head!];
+        body = { base_commit: { sha: base }, total_commits: shas.length, commits: shas.map((sha) => ({ sha })) };
+      } else body = livePr();
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => body };
+    });
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it.each([
+    `https://github.com/${OWNER}/old-repository/pull/653`,
+    `https://github.com/${OWNER}/${REPO}/pull/654`,
+    `https://github.com.evil/${OWNER}/${REPO}/pull/653`,
+    null,
+  ])("does not certify a child claim with unproven recorded PR URL %s", async (prUrl) => {
+    const { childId } = await seedPair();
+    await db.update(issues).set({ executionState: { childCarrierClaim: { prNumber: 653, headSha: HEAD, prUrl } } })
+      .where(eq(issues.id, childId));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
+  });
+
+  it.each(["claim head", "stored head", "commits"])("does not invalidate newer approved proof after a stale %s read", async (reason) => {
+    const { childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    if (reason === "claim head") {
+      await db.update(issues).set({ executionState: { childCarrierClaim: {
+        prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "d".repeat(40),
+      } } }).where(eq(issues.id, childId));
+    }
+    if (reason === "stored head") {
+      github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr({
+        head: { ref: CARRIER_BRANCH, sha: "d".repeat(40), repo: { full_name: `${OWNER}/${REPO}` } },
+      }) }));
+    }
+    const replacement = [COMMIT, "b".repeat(40)];
+    if (reason === "commits") childCarrierCommits.enumerate = async () => ({ ok: true, shas: replacement });
+    let replacementDecision: string | undefined;
+    const racingDb = new Proxy(db, { get(target, key, receiver) {
+      if (key !== "update") return Reflect.get(target, key, receiver);
+      return (...args: Parameters<Db["update"]>) => {
+        const query = target.update(...args);
+        return new Proxy(query, { get(builder, property, builderReceiver) {
+          if (property !== "set") return Reflect.get(builder, property, builderReceiver);
+          return (values: Parameters<typeof query.set>[0]) => {
+            const filtered = query.set(values);
+            return new Proxy(filtered, { get(setter, clause, setterReceiver) {
+              if (clause !== "where") return Reflect.get(setter, clause, setterReceiver);
+              return async (...conditions: Parameters<typeof filtered.where>) => {
+                if ("state" in values && values.state === "invalidated") {
+                  await db.update(issueChildCarrierAttributions).set({ commitShas: replacement });
+                  replacementDecision = await approveChild(childId);
+                  await recordChildCarrierDecision(db, companyId, childId);
+                }
+                return filtered.where(...conditions);
+              };
+            } });
+          };
+        } });
+      };
+    } });
+    expect((await resolveChildCarrierDecisionHead(racingDb, companyId, childId)).kind).toBe("unresolvable");
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row).toMatchObject({ state: "current", commitShas: replacement, childDecisionId: replacementDecision });
   });
 });
