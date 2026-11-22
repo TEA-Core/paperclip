@@ -12,6 +12,7 @@ import {
   issueComments,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issues,
   projects,
@@ -3339,6 +3340,42 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.body).toContain("[Merge-arming]");
       expect(comments[0]!.body).toContain("armed:");
       expect(comments[0]!.authorType).toBe("system");
+    });
+
+    it("returns each re-arm slot refused by a current child-only attribution", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      const ancestorId = await insertIssue({ identifier: "SUP-900", status: "backlog", executionState: {} });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: "tea-core", repo: "paperclip", pullRequestNumber: 42,
+        branchName: "SUP-42-branch", headSha: NEW_HEAD, commitShas: [NEW_HEAD],
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      for (let tick = 0; tick < 4; tick += 1) {
+        const summary = await runApprovalStatusReconcilerTick(db);
+        expect(summary.rearmDetails).toHaveLength(1);
+        expect(summary.rearmDetails[0]).toContain("child-carrier-attribution");
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(row!.executionState?.approvalStatus).toMatchObject({
+          armReattempt: { headSha: NEW_HEAD, attempts: 0 },
+          armOutcome: { kind: "skipped" },
+        });
+      }
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toEqual([]);
+      await db.delete(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.id, proof!.id));
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.rearmDetails[0]).toContain("armed:");
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toHaveLength(1);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState?.approvalStatus).toMatchObject({ armReattempt: { headSha: NEW_HEAD, attempts: 1 } });
     });
 
     const RELEASE_STATUS = {

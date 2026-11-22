@@ -109,6 +109,12 @@ unsupported and refuses, just as truncated or inconsistent data refuses.
 Every supported comparison must prove its complete count, unique commits and
 pinned tip; the PR-commits API's capped list is not used as complete proof.
 
+Removing a child's parent does not invalidate its stored attribution. The owner
+gate checks current descendants and ignores a historical attribution whose child
+is no longer its descendant, even if that row still says `current`. The stored
+state alone does not prove current ancestry. Automatic cleanup or reparenting
+recovery is not part of this change.
+
 Status publication checks attribution before each write attempt and after a
 confirmed or possibly accepted write. A changed child decision voids the possible
 success with a failure status; an unconfirmed void is reported as a failure,

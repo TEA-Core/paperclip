@@ -1992,6 +1992,35 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const requestRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_requested");
     const outcomeRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_outcome");
 
+    it.each(["release", "release-override"] as const)("refuses %s before a status write when child-only attribution already exists", async (route) => {
+      const { issueId, companyId } = await seedReleasable();
+      const ancestorId = randomUUID();
+      await db.insert(issues).values({
+        id: ancestorId, companyId, identifier: "SUP-900", issueNumber: 900,
+        title: "Carrier", status: "in_progress", priority: "medium",
+      });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER,
+        branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA],
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      installReleaseTransport();
+      const body = route === "release" ? { headSha: HEAD_SHA, reason: RELEASE_REASON }
+        : { headSha: HEAD_SHA, overrideReason: RELEASE_REASON };
+      const refused = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(refused.status).toBe(409);
+      expect(refused.body.message).toContain("child-carrier-attribution");
+      expect(statusWrites()).toEqual([]);
+      expect(markerWrites()).toEqual([]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+
+      await db.delete(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.id, proof!.id));
+      const released = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(released.status).toBe(200);
+      expect(released.body.outcome).toBe("released");
+    });
+
     it.each([201, 502])("voids a possible success instead of confirming release when child-only authority appears during the write (HTTP %s)", async (firstStatus) => {
       const { issueId, companyId } = await seedReleasable();
       const ancestorId = randomUUID();

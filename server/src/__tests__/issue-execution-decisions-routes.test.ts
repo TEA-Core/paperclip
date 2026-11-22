@@ -43,6 +43,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type * as GitHubFetch from "../services/github-fetch.js";
 import type * as GitHubCredential from "../services/github-credential.js";
+import * as childCarrierAttribution from "../services/child-carrier-attribution.js";
 import { carrierOwnerChildAttributionBlock, childCarrierCommits } from "../services/child-carrier-attribution.js";
 
 const github = vi.hoisted(() => vi.fn<typeof fetch>());
@@ -2184,7 +2185,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "head_draft");
     });
 
-    it.each([false, true])("certifies only an open forked child contribution without carrier publication (merged during preflight %s)", async (mergeDuringPreflight) => {
+    it.each(["open", "merged during preflight", "attachment exception"] as const)("certifies only an open forked child contribution without carrier publication (%s)", async (scenario) => {
+      const mergeDuringPreflight = scenario === "merged during preflight";
       const fixture = await pendingDelivery({ adr072: true, atStage: 2, mergeArmingEnabled: true, missing: true });
       const child = await fixture.read();
       const ownerId = randomUUID();
@@ -2213,6 +2215,10 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         }
         return transport(input, init);
       });
+      const attachmentFault = scenario === "attachment exception"
+        ? vi.spyOn(childCarrierAttribution, "recordChildCarrierDecision")
+          .mockRejectedValueOnce(new Error("Injected post-commit attachment failure"))
+        : null;
       try {
         childCarrierCommits.enumerate = async () => {
           if (mergeDuringPreflight) Object.assign(fixture.pr, {
@@ -2235,14 +2241,21 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
               attributionId: proof!.id, ancestorIssueId: ownerId, branchName: carrierBranch, commitShas: ["c".repeat(40)],
             },
           });
-          expect(proof?.childDecisionId).toBe(stored.executionState?.lastDecisionId);
-          expect(await carrierOwnerChildAttributionBlock(db, fixture.company.id, ownerId, {
+          const block = await carrierOwnerChildAttributionBlock(db, fixture.company.id, ownerId, {
             owner: "TEA-Core", repo: "paperclip", number: 42, headSha: fixture.pr.head.sha, headRef: carrierBranch,
-          })).toBeNull();
+          });
+          if (scenario === "attachment exception") {
+            expect(proof?.childDecisionId).toBeNull();
+            expect(block).toContain("child-carrier-owner-gate");
+          } else {
+            expect(proof?.childDecisionId).toBe(stored.executionState?.lastDecisionId);
+            expect(block).toBeNull();
+          }
         }
         expect(fixture.writes).toEqual([]);
         expect(fixture.armCalls).toEqual([]);
       } finally {
+        attachmentFault?.mockRestore();
         childCarrierCommits.enumerate = originalEnumeration;
       }
     });

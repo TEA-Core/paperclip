@@ -417,9 +417,74 @@ describePg("child carrier attribution", () => {
     })).ok).toBe(false);
   });
 
+  it("refuses an empty comparison while the contributing child's approved system attribution is still current", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+
+    childCarrierCommits.enumerate = realEnumerate;
+    mockCommitSources([COMMIT, HEAD], []);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row).toMatchObject({ state: "current", writtenByActorType: "system", commitShas: [COMMIT] });
+  });
+
+  it("refuses a case-only caller carrier reference with a valid final child approval", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      ...pr, headRef: CARRIER_BRANCH.toLowerCase(),
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it.each(["head SHA", "carrier branch", "commit set"] as const)("refuses a changed stored %s after valid child approval", async (field) => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    await db.update(issues).set({ executionState: {
+      ...child!.executionState,
+      childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653` },
+    } }).where(eq(issues.id, childId));
+    const pr = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
+
+    await db.update(issueChildCarrierAttributions).set(
+      field === "head SHA" ? { headSha: "b".repeat(40) }
+        : field === "carrier branch" ? { branchName: "other-carrier" } : { commitShas: ["b".repeat(40)] },
+    ).where(eq(issueChildCarrierAttributions.childIssueId, childId));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it("ignores a removed descendant without invalidating its historical approved attribution", async () => {
+    const { ownerId, childId } = await seedPair();
+    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    const decisionId = await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    await db.update(issues).set({ parentId: null }).where(eq(issues.id, childId));
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row).toMatchObject({ state: "current", childDecisionId: decisionId, ancestorIssueId: ownerId });
+  });
+
   it("still blocks the owner when the live head ref differs only by case", async () => {
     const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
     github.mockImplementation(async () => ({
       ok: true,
       status: 200,
