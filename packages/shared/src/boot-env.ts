@@ -4,16 +4,19 @@ import path from "node:path";
 import { parse as parseDotenv } from "dotenv";
 import { vetEnvFileContents } from "./env-file.js";
 import { expandHomePrefix } from "./home-paths.js";
+import { readWorktreePortRegistry } from "./worktree-port-registry.js";
 
 export type EnvSourceKind = "own" | "cwd";
 export type EnvOrigin = "operator" | "own" | "cwd" | "boot";
-export type RefusalKind = "unreadable" | "not-a-file" | "content" | "persist";
+export type RefusalKind = "unreadable" | "not-a-file" | "content" | "persist" | "undeclared" | "identity";
 
 export type BootEnvPlan = {
   mode: "instance" | "worktree";
   configPath: string;
   stateDir: string;
-  sources: Array<{ kind: EnvSourceKind; path: string }>;
+  sources: ReadonlyArray<Readonly<{ kind: EnvSourceKind; path: string }>>;
+  evidence: readonly string[];
+  undeclared: boolean;
 };
 
 export type BootEnvRefusal = {
@@ -34,16 +37,13 @@ type StagedSource = {
 type BootEnvState = {
   captured: boolean;
   snapshot: Record<string, string | undefined>;
-  plan: BootEnvPlan | null;
+  plan: Readonly<BootEnvPlan> | null;
   staged: Map<string, StagedSource>;
   origins: Record<string, EnvOrigin>;
   fileSuppliedKeys: Set<string>;
   refused: boolean;
   refusals: BootEnvRefusal[];
   committed: boolean;
-  instanceDespiteWorktreeFlag: boolean;
-  boundCwd: string;
-  boundConfig: string;
 };
 
 const STATE_KEY = Symbol.for("paperclip.boot-env.v1");
@@ -51,17 +51,14 @@ const STATE_KEY = Symbol.for("paperclip.boot-env.v1");
 function freshState(): BootEnvState {
   return {
     captured: false,
-    snapshot: {},
+    snapshot: Object.create(null),
     plan: null,
     staged: new Map(),
-    origins: {},
+    origins: Object.create(null),
     fileSuppliedKeys: new Set(),
     refused: false,
     refusals: [],
     committed: false,
-    instanceDespiteWorktreeFlag: false,
-    boundCwd: "",
-    boundConfig: "",
   };
 }
 
@@ -72,42 +69,40 @@ function state(): BootEnvState {
 }
 
 function copyEnv(env: NodeJS.ProcessEnv): Record<string, string | undefined> {
-  const snapshot: Record<string, string | undefined> = {};
+  const snapshot: Record<string, string | undefined> = Object.create(null);
   for (const key of Object.keys(env)) snapshot[key] = env[key];
   return snapshot;
 }
+function requireCapture(): BootEnvState {
+  const current = state();
+  if (!current.captured) throw new Error("boot env was not captured");
+  return current;
+}
+
+function setOrigin(key: string, next: EnvOrigin | null): void {
+  const current = state();
+  const previous = current.origins[key];
+  if (next === "operator" && previous && previous !== "operator") {
+    throw new Error(`Cannot promote file or boot origin for ${key}`);
+  }
+  if (next === null) delete current.origins[key];
+  else current.origins[key] = next;
+}
+
 
 export function captureOperatorEnv(env: NodeJS.ProcessEnv = process.env): void {
   const current = state();
   if (current.captured) return;
   current.snapshot = copyEnv(env);
   current.captured = true;
-  for (const key of Object.keys(current.snapshot)) current.origins[key] = "operator";
-}
-export function adoptCurrentProcessEnv(cwd: string): void {
-  const current = state();
-  const resolved = path.resolve(cwd);
-  const config = process.env.PAPERCLIP_CONFIG ?? "";
-  if (current.captured && current.boundCwd === resolved && current.boundConfig === config) {
-    current.staged = new Map();
-    current.committed = false;
-    current.refused = false;
-    current.refusals = [];
-    current.fileSuppliedKeys = new Set();
-    return;
-  }
-  const holder = globalThis as typeof globalThis & { [STATE_KEY]?: BootEnvState };
-  holder[STATE_KEY] = freshState();
-  captureOperatorEnv();
-  state().boundCwd = resolved;
-  state().boundConfig = config;
+  for (const key of Object.keys(current.snapshot)) setOrigin(key, "operator");
 }
 
-export function noteOperatorEnv(key: string, value: string): void {
-  captureOperatorEnv();
-  const current = state();
+export function noteOperatorFlag(key: string, value: string): void {
+  const current = requireCapture();
+  if (current.plan) throw new Error("operator flags must precede the boot env plan");
+  setOrigin(key, "operator");
   current.snapshot[key] = value;
-  current.origins[key] = "operator";
   process.env[key] = value;
 }
 
@@ -120,7 +115,7 @@ export function bootEnvOrigin(key: string): EnvOrigin | null {
   return state().origins[key] ?? null;
 }
 
-export function currentBootEnvPlan(): BootEnvPlan | null {
+export function currentBootEnvPlan(): Readonly<BootEnvPlan> | null {
   return state().plan;
 }
 
@@ -213,11 +208,13 @@ function findStateDir(cwd: string, home: string, operatorInWorktree: boolean): s
   }
 }
 
-function findAncestorConfig(start: string): string | null {
+export function findAncestorConfig(start: string): string | null {
+  const bound = checkoutBound(start);
   let current = path.resolve(start);
   while (true) {
     const candidate = path.join(current, ".paperclip", "config.json");
     if (isRegularFile(candidate)) return candidate;
+    if (current === bound) return null;
     const next = path.resolve(current, "..");
     if (next === current) return null;
     current = next;
@@ -233,182 +230,163 @@ function peekEntries(filePath: string): Record<string, string> | null {
   }
 }
 
-export function resolveBootEnvPlan(input: { cwd: string; configOverride?: string }): BootEnvPlan {
-  const current = state();
+export function resolveBootEnvPlan(input: { cwd: string }): Readonly<BootEnvPlan> {
+  const current = requireCapture();
   if (current.plan) return current.plan;
-  captureOperatorEnv();
-  const snapshot = current.snapshot;
+  const snapshot = Object.freeze(current.snapshot);
   const cwd = path.resolve(input.cwd);
-  const home = operatorHome(snapshot);
-  const override = input.configOverride?.trim() || snapshot.PAPERCLIP_CONFIG?.trim() || "";
+  const bound = checkoutBound(cwd);
   const operatorInWorktree = snapshot.PAPERCLIP_IN_WORKTREE === "true";
+  const localState = findStateDir(cwd, operatorHome(snapshot), operatorInWorktree) ?? path.join(bound, ".paperclip");
+  const localEntries = peekEntries(path.join(localState, ".env"));
+  const worktreesHome = path.resolve(expandHomePrefix(snapshot.PAPERCLIP_WORKTREES_DIR?.trim() || "~/.paperclip-worktrees"));
+  const evidence: string[] = [];
+  if (operatorInWorktree) evidence.push("operator-flag");
+  if (localEntries?.PAPERCLIP_IN_WORKTREE === "true") evidence.push("own-declaration");
+  if (bound.includes(`${path.sep}.paperclip${path.sep}worktrees${path.sep}`) ||
+      (snapshot.PAPERCLIP_WORKTREES_DIR && isInside(bound, worktreesHome))) evidence.push("worktree-layout");
+  if (readWorktreePortRegistry(worktreesHome).has(path.join(localState, "config.json"))) evidence.push("port-registry");
 
-  let stateDir = "";
-  let configPath = "";
-  let fromOverride = false;
-  if (override) {
-    configPath = path.resolve(expandHomePrefix(override));
-    stateDir = path.dirname(configPath);
-    fromOverride = true;
-  } else {
-    stateDir = findStateDir(cwd, home, operatorInWorktree) ?? "";
-    configPath = stateDir ? path.join(stateDir, "config.json") : "";
-  }
-
-  const peeked = stateDir ? peekEntries(path.join(stateDir, ".env")) : null;
-  const ownSaysWorktree = peeked?.PAPERCLIP_IN_WORKTREE === "true";
-  const ownDisablesCwd = snapshot.PAPERCLIP_DISABLE_CWD_ENV_FILE === "true" || peeked?.PAPERCLIP_DISABLE_CWD_ENV_FILE === "true";
-  const canonical = stateDir !== "" && isCanonicalStateDir(stateDir);
-  const readableOwnDeclines = peeked !== null && !ownSaysWorktree;
-  // A leaked operator flag must not adopt a readable .paperclip whose own
-  // env does not declare a worktree. The flag still selects a directory
-  // that has no readable declaration, which is the missing-config case.
-  const mode: BootEnvPlan["mode"] =
-    canonical && (ownSaysWorktree || (operatorInWorktree && !readableOwnDeclines))
-      ? "worktree"
-      : "instance";
-  current.instanceDespiteWorktreeFlag = operatorInWorktree && mode === "instance";
-
-  if (mode !== "worktree" && !fromOverride && !isRegularFile(configPath)) {
+  const override = snapshot.PAPERCLIP_CONFIG?.trim();
+  let configPath = override
+    ? path.resolve(expandHomePrefix(override))
+    : path.join(localState, "config.json");
+  let stateDir = path.dirname(configPath);
+  const own = stateDir === localState ? localEntries : peekEntries(path.join(stateDir, ".env"));
+  const declared = own?.PAPERCLIP_IN_WORKTREE === "true";
+  const mode: BootEnvPlan["mode"] = override
+    ? (isCanonicalStateDir(stateDir) && (declared || operatorInWorktree) ? "worktree" : "instance")
+    : (evidence.length > 0 ? "worktree" : "instance");
+  const undeclared = mode === "worktree" && own !== null && !declared;
+  if (!override && mode === "instance") {
     configPath = findAncestorConfig(cwd) ?? defaultInstanceConfig(snapshot);
     stateDir = path.dirname(configPath);
-  } else if (!configPath) {
-    configPath = defaultInstanceConfig(snapshot);
-    stateDir = path.dirname(configPath);
   }
-
-  const sources: BootEnvPlan["sources"] = [{ kind: "own", path: path.join(stateDir, ".env") }];
-  if (mode === "instance" && !ownDisablesCwd) {
-    const cwdEnv = path.resolve(cwd, ".env");
-    if (!sameFile(cwdEnv, sources[0].path)) sources.push({ kind: "cwd", path: cwdEnv });
+  const sources: Array<{ kind: EnvSourceKind; path: string }> = [{ kind: "own", path: path.join(stateDir, ".env") }];
+  const cwdEnv = path.join(cwd, ".env");
+  if (mode === "instance" && evidence.length > 0) {
+    console.warn(`Skipping cwd env file ${cwdEnv}: worktree evidence is present`);
+  } else if (mode === "instance" && snapshot.PAPERCLIP_DISABLE_CWD_ENV_FILE !== "true" && !sameFile(cwdEnv, sources[0].path)) {
+    sources.push({ kind: "cwd", path: cwdEnv });
   }
-
-  current.plan = { mode, configPath, stateDir, sources };
-  if (current.instanceDespiteWorktreeFlag) {
-    console.warn(
-      "PAPERCLIP_IN_WORKTREE was set but this boot stayed in instance mode; the worktree layout was not adopted",
-    );
-  }
+  current.plan = Object.freeze({
+    mode, configPath, stateDir, undeclared,
+    sources: Object.freeze(sources.map((source) => Object.freeze(source))),
+    evidence: Object.freeze(evidence),
+  });
   return current.plan;
 }
 
-export function stageEnvSource(source: { kind: EnvSourceKind; path: string }): {
-  status: "staged" | "absent" | "refused";
+type EnvRead = {
+  status: "ok" | "absent" | "refused";
+  entries: Record<string, string>;
   refusal?: BootEnvRefusal;
-  keys: string[];
-} {
-  const current = state();
-  const resolved = path.resolve(source.path);
-  let realPath = resolved;
-  try {
-    realPath = fs.realpathSync(resolved);
-  } catch {
-    realPath = resolved;
-  }
-  const cached = current.staged.get(realPath) ?? current.staged.get(resolved);
-  if (cached && cached.status !== "absent") {
-    return { status: cached.status, refusal: cached.refusal, keys: Object.keys(cached.entries) };
-  }
+};
 
+function readEnvFile(filePath: string, vet: boolean): EnvRead {
+  const resolved = path.resolve(filePath);
+  const refuse = (kind: RefusalKind, message: string): EnvRead => ({
+    status: "refused", entries: {}, refusal: { kind, path: resolved, message },
+  });
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(resolved);
   } catch (error) {
-    const code = error instanceof Error && "code" in error ? error.code : null;
-    if (code === "ENOENT") {
-      const absent: StagedSource = { kind: source.kind, path: resolved, realPath, status: "absent", entries: {} };
-      current.staged.set(resolved, absent);
-      return { status: "absent", keys: [] };
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { status: "absent", entries: {} };
     }
-    const refusal: BootEnvRefusal = {
-      kind: "unreadable",
-      path: resolved,
-      message: `Could not read env file ${resolved}`,
-    };
-    const refused: StagedSource = { kind: source.kind, path: resolved, realPath, status: "refused", entries: {}, refusal };
-    current.staged.set(resolved, refused);
-    return { status: "refused", refusal, keys: [] };
+    return refuse("unreadable", `Could not read env file ${resolved}`);
   }
-
-  if (!stat.isFile()) {
-    const refusal: BootEnvRefusal = {
-      kind: "not-a-file",
-      path: resolved,
-      message: `Env file is not a regular file: ${resolved}`,
-    };
-    const refused: StagedSource = { kind: source.kind, path: resolved, realPath, status: "refused", entries: {}, refusal };
-    current.staged.set(resolved, refused);
-    return { status: "refused", refusal, keys: [] };
-  }
-
+  if (!stat.isFile()) return refuse("not-a-file", `Env file is not a regular file: ${resolved}`);
   let contents: string;
   try {
     contents = fs.readFileSync(resolved, "utf8");
   } catch {
-    const refusal: BootEnvRefusal = {
-      kind: "unreadable",
-      path: resolved,
-      message: `Could not read env file ${resolved}`,
-    };
-    const refused: StagedSource = { kind: source.kind, path: resolved, realPath, status: "refused", entries: {}, refusal };
-    current.staged.set(resolved, refused);
-    return { status: "refused", refusal, keys: [] };
+    return refuse("unreadable", `Could not read env file ${resolved}`);
   }
-
-  const vetInWorktree = current.plan?.mode === "worktree";
-  if (vetInWorktree) {
-    try {
-      vetEnvFileContents(contents);
-    } catch (error) {
-      const refusal: BootEnvRefusal = {
-        kind: "content",
-        path: resolved,
-        message: error instanceof Error ? error.message : String(error),
-      };
-      const refused: StagedSource = { kind: source.kind, path: resolved, realPath, status: "refused", entries: {}, refusal };
-      current.staged.set(resolved, refused);
-      current.staged.set(realPath, refused);
-      return { status: "refused", refusal, keys: [] };
-    }
-  }
-
-  let entries: Record<string, string> = {};
   try {
-    entries = parseDotenv(contents);
+    if (vet) vetEnvFileContents(contents);
+    return { status: "ok", entries: parseDotenv(contents) };
   } catch (error) {
-    const refusal: BootEnvRefusal = {
-      kind: "content",
-      path: resolved,
-      message: error instanceof Error ? error.message : String(error),
-    };
-    const refused: StagedSource = { kind: source.kind, path: resolved, realPath, status: "refused", entries: {}, refusal };
-    current.staged.set(resolved, refused);
-    return { status: "refused", refusal, keys: [] };
+    return refuse("content", error instanceof Error ? error.message : String(error));
   }
-
-  const staged: StagedSource = { kind: source.kind, path: resolved, realPath, status: "staged", entries };
-  current.staged.set(resolved, staged);
-  current.staged.set(realPath, staged);
-  for (const key of Object.keys(entries)) current.fileSuppliedKeys.add(key);
-  return { status: "staged", keys: Object.keys(entries) };
 }
 
-const WORKTREE_FILE_BLOCKED = new Set(["DATABASE_URL", "DATABASE_MIGRATION_URL"]);
+export function readEnvFileVetted(filePath: string): EnvRead {
+  return readEnvFile(filePath, true);
+}
+
+function stageEnvSource(source: { kind: EnvSourceKind; path: string }): void {
+  const current = requireCapture();
+  const resolved = path.resolve(source.path);
+  if (!current.plan?.sources.some((entry) => entry.kind === source.kind && entry.path === resolved)) {
+    throw new Error("Cannot stage an undeclared boot env source");
+  }
+  const read = source.kind === "own" && current.plan.undeclared
+    ? { status: "refused" as const, entries: {}, refusal: {
+      kind: "undeclared" as const, path: resolved, message: "Worktree evidence exists but PAPERCLIP_IN_WORKTREE is not declared",
+    } }
+    : readEnvFile(resolved, current.plan.mode === "worktree");
+  const staged: StagedSource = {
+    ...source, path: resolved, realPath: resolved, entries: read.entries,
+    status: read.status === "ok" ? "staged" : read.status, refusal: read.refusal,
+  };
+  current.staged.set(resolved, staged);
+  for (const key of Object.keys(read.entries)) current.fileSuppliedKeys.add(key);
+  if (read.refusal) {
+    if (current.plan.mode === "worktree") refuseBootEnv(read.refusal);
+    else {
+      current.refusals.push(read.refusal);
+      console.warn(`Could not use env file ${resolved} (${read.refusal.kind}): ${read.refusal.message}`);
+    }
+  }
+}
+
+export function loadBootEnv(input: { cwd: string }): {
+  plan: Readonly<BootEnvPlan>; refusals: BootEnvRefusal[];
+} {
+  const plan = resolveBootEnvPlan(input);
+  const current = requireCapture();
+  if (!current.committed) {
+    for (const source of plan.sources) stageEnvSource(source);
+    commitBootEnv();
+    current.committed = true;
+  }
+  return { plan, refusals: [...current.refusals] };
+}
+
+const IDENTITY_KEYS: Record<string, true> = {
+  PAPERCLIP_HOME: true, PAPERCLIP_INSTANCE_ID: true, PAPERCLIP_WORKTREE_NAME: true,
+  PAPERCLIP_WORKTREES_DIR: true,
+  PAPERCLIP_CONFIG: true, PAPERCLIP_CONTEXT: true, PAPERCLIP_IN_WORKTREE: true, PAPERCLIP_DB_BACKUP_ENABLED: true,
+};
+const WORKTREE_FILE_ALLOWED: Record<string, true> = {
+  PAPERCLIP_SECRETS_MASTER_KEY: true, PAPERCLIP_AGENT_JWT_SECRET: true, BETTER_AUTH_SECRET: true,
+  PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: true, PAPERCLIP_DECISION_SIGNING_SECRET: true, PAPERCLIP_WORKTREE_COLOR: true,
+};
+const PROTECTED_KEY = /^(?:PAPERCLIP_|DATABASE_|BETTER_AUTH_|DOTENV_|NODE_|GIT_|RUN_LOG_)|^(?:HOME|USERPROFILE|PATH|TMPDIR)$/;
+
+function isOperatorOnlyKey(key: string, mode: BootEnvPlan["mode"] | undefined): boolean {
+  return Object.hasOwn(IDENTITY_KEYS, key) ||
+    (mode === "worktree" && PROTECTED_KEY.test(key) && !Object.hasOwn(WORKTREE_FILE_ALLOWED, key));
+}
 
 function snapshotHas(key: string): boolean {
   return Object.hasOwn(state().snapshot, key) && typeof state().snapshot[key] === "string";
 }
 
-export function commitBootEnv(): { applied: string[]; shadowed: string[] } {
+function commitBootEnv(): { applied: string[]; shadowed: string[] } {
   const current = state();
   if (current.refused) return { applied: [], shadowed: [] };
   const applied: string[] = [];
   const shadowed: string[] = [];
+  const blocked = new Set<string>();
   const ordered = [...current.staged.values()].filter((staged) => staged.status === "staged");
   ordered.sort((left, right) => (left.kind === right.kind ? 0 : left.kind === "own" ? -1 : 1));
   for (const staged of ordered) {
     for (const [key, value] of Object.entries(staged.entries)) {
-      if (current.plan?.mode === "worktree" && WORKTREE_FILE_BLOCKED.has(key)) {
+      if (isOperatorOnlyKey(key, current.plan?.mode)) {
+        blocked.add(key);
         shadowed.push(key);
         continue;
       }
@@ -421,10 +399,11 @@ export function commitBootEnv(): { applied: string[]; shadowed: string[] } {
         continue;
       }
       process.env[key] = value;
-      current.origins[key] = staged.kind;
+      setOrigin(key, staged.kind);
       applied.push(key);
     }
   }
+  if (blocked.size > 0) console.warn(`Ignoring operator-only env keys from ${current.plan?.sources.map((source) => source.path).join(", ")}: ${[...blocked].join(", ")}`);
   current.committed = true;
   return { applied, shadowed };
 }
@@ -441,19 +420,18 @@ export function refuseBootEnv(refusal: BootEnvRefusal): void {
     const snapped = current.snapshot[key];
     if (typeof snapped === "string") {
       process.env[key] = snapped;
-      current.origins[key] = "operator";
     } else {
       delete process.env[key];
-      delete current.origins[key];
+      setOrigin(key, null);
     }
   }
   console.warn(`Could not use env file ${refusal.path} (${refusal.kind}): ${refusal.message}`);
 }
 
 export function setBootDerivedEnv(key: string, value: string): void {
-  captureOperatorEnv();
+  requireCapture();
   process.env[key] = value;
-  state().origins[key] = "boot";
+  setOrigin(key, "boot");
 }
 
 export function operatorEnvForChild(): NodeJS.ProcessEnv {
@@ -484,6 +462,7 @@ export function bootEnvReport(): {
 }
 
 export function resetBootEnvForTests(): void {
+  if (!process.env.VITEST && process.env.NODE_ENV !== "test") throw new Error("boot env reset is test-only");
   const holder = globalThis as typeof globalThis & { [STATE_KEY]?: BootEnvState };
   holder[STATE_KEY] = freshState();
 }

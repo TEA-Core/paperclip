@@ -7,9 +7,8 @@ import pc from "picocolors";
 import { bootstrapCeoInvite } from "./auth-bootstrap-ceo.js";
 import { onboard } from "./onboard.js";
 import { doctor } from "./doctor.js";
-import { loadPaperclipEnvFile } from "../config/env.js";
-import { noteOperatorEnv } from "@paperclipai/shared/boot-env";
-import { configExists, resolveConfigPath } from "../config/store.js";
+import { currentBootEnvPlan, setBootDerivedEnv } from "@paperclipai/shared/boot-env";
+import { configExists } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { readConfig } from "../config/store.js";
 import {
@@ -48,8 +47,10 @@ export interface StartedServer {
 }
 
 export async function runCommand(opts: RunOptions): Promise<void> {
+  const plan = currentBootEnvPlan();
+  if (!plan) throw new Error("CLI boot env plan is missing");
   const instanceId = resolvePaperclipInstanceId(opts.instance);
-  noteOperatorEnv("PAPERCLIP_INSTANCE_ID", instanceId);
+  if (plan.mode === "instance") setBootDerivedEnv("PAPERCLIP_INSTANCE_ID", instanceId);
   if (!opts.skipServiceManagerCheck) {
     await assertForegroundRunAllowed(instanceId, opts.force);
   }
@@ -60,9 +61,8 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   const paths = describeLocalInstancePaths(instanceId);
   fs.mkdirSync(paths.instanceRoot, { recursive: true });
 
-  const configPath = resolveConfigPath(opts.config);
-  noteOperatorEnv("PAPERCLIP_CONFIG", configPath);
-  loadPaperclipEnvFile(configPath);
+  const configPath = plan.configPath;
+  if (plan.mode === "instance") setBootDerivedEnv("PAPERCLIP_CONFIG", configPath);
   await printUpdateNotice(configPath);
 
   p.intro(pc.bgCyan(pc.black(` ${opts.introLabel ?? "paperclipai run"} `)));

@@ -11,11 +11,11 @@ import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
+import { captureOperatorEnv, loadBootEnv, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 import {
   applyRuntimePortSelectionToConfig,
-  maybePersistWorktreeRuntimePorts,
-  maybeRepairLegacyWorktreeConfigAndEnvFiles,
+  maybePersistWorktreeRuntimePorts as persistWorktreePorts,
+  maybeRepairLegacyWorktreeConfigAndEnvFiles as repairWorktree,
 } from "../worktree-config.js";
 import { parse as parseEnvFile } from "dotenv";
 import { updateEnvFileContents } from "@paperclipai/shared/env-file";
@@ -23,6 +23,17 @@ import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
+
+function maybeRepairLegacyWorktreeConfigAndEnvFiles() {
+  captureOperatorEnv();
+  return repairWorktree();
+}
+
+function maybePersistWorktreeRuntimePorts(input: Parameters<typeof persistWorktreePorts>[0]) {
+  captureOperatorEnv();
+  loadBootEnv({ cwd: process.cwd() });
+  return persistWorktreePorts(input);
+}
 
 // The ambient shell can carry real PAPERCLIP_* settings (agent shells export
 // PAPERCLIP_CONFIG pointing at the live default instance). Repair helpers
@@ -42,7 +53,7 @@ afterEach(() => {
   process.chdir(ORIGINAL_CWD);
 
   for (const key of Object.keys(process.env)) {
-    if (!(key in ORIGINAL_ENV)) {
+    if (!Object.hasOwn(ORIGINAL_ENV, key)) {
       delete process.env[key];
     }
   }
@@ -231,7 +242,7 @@ describe("worktree config repair", () => {
     );
 
     process.chdir(worktreeRoot);
-    process.env.PAPERCLIP_HOME = isolatedHome;
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
     process.env.PAPERCLIP_INSTANCE_ID = "disable-worktree-backups";
     process.env.PAPERCLIP_CONFIG = configPath;
     process.env.PAPERCLIP_DB_BACKUP_ENABLED = "true";
@@ -603,11 +614,12 @@ describe("worktree config repair", () => {
     };
 
     const activateWorktree = (worktreeRoot: string, name: string) => {
+      resetBootEnvForTests();
       process.chdir(worktreeRoot);
       process.env.PAPERCLIP_IN_WORKTREE = "true";
       process.env.PAPERCLIP_WORKTREE_NAME = name;
       process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
-      process.env.PAPERCLIP_HOME = isolatedHome;
+      delete process.env.PAPERCLIP_HOME;
       process.env.PAPERCLIP_INSTANCE_ID = name.toLowerCase();
       process.env.PAPERCLIP_CONFIG = path.join(worktreeRoot, ".paperclip", "config.json");
       delete process.env.PORT;
@@ -1008,7 +1020,7 @@ describe("worktree config repair", () => {
     process.chdir(worktreeRoot);
     process.env.PAPERCLIP_IN_WORKTREE = "true";
     process.env.PAPERCLIP_WORKTREE_NAME = "PAP-878-create-a-mine-tab-in-inbox";
-    process.env.PAPERCLIP_HOME = isolatedHome;
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
     process.env.PAPERCLIP_INSTANCE_ID = "pap-878-create-a-mine-tab-in-inbox";
     process.env.PAPERCLIP_CONFIG = configPath;
     delete process.env.PORT;
@@ -1098,7 +1110,7 @@ describe("worktree config repair", () => {
     process.chdir(worktreeRoot);
     process.env.PAPERCLIP_IN_WORKTREE = "true";
     process.env.PAPERCLIP_WORKTREE_NAME = "PAP-125-public-base-url";
-    process.env.PAPERCLIP_HOME = isolatedHome;
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
     process.env.PAPERCLIP_INSTANCE_ID = "pap-125-public-base-url";
     process.env.PAPERCLIP_CONFIG = configPath;
     delete process.env.PORT;
@@ -1158,7 +1170,7 @@ describe("worktree config repair", () => {
     process.chdir(worktreeRoot);
     process.env.PAPERCLIP_IN_WORKTREE = "true";
     process.env.PAPERCLIP_WORKTREE_NAME = "config-extensions";
-    process.env.PAPERCLIP_HOME = isolatedHome;
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
     process.env.PAPERCLIP_INSTANCE_ID = "config-extensions";
     process.env.PAPERCLIP_CONFIG = configPath;
     delete process.env.PORT;
@@ -1364,6 +1376,8 @@ describe("worktree config repair", () => {
     // Present in the worktree env: the worktree value wins over the inherited one.
     await fs.appendFile(envPath, `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=${worktreeCanary}\n`, "utf8");
     process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = inheritedCanary;
+    resetBootEnvForTests();
+    delete process.env.PAPERCLIP_HOME;
 
     maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
@@ -1887,7 +1901,7 @@ describe("worktree config repair", () => {
     expect(process.env.PAPERCLIP_HOME).toBe(isolatedHome);
     expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("sup-24365-refused-legacy");
     expect(process.env.PAPERCLIP_HOME).not.toBe(sharedHome);
-    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe("file-refused-secret");
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET === "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET").toBe(true);
 
     const repairedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
     const isolatedInstanceRoot = path.join(isolatedHome, "instances", "sup-24365-refused-legacy");
@@ -2059,6 +2073,7 @@ describe("worktree config repair", () => {
       const originalEnv = lines.join(newline);
       await fs.writeFile(envPath, originalEnv, "utf8");
 
+      resetBootEnvForTests();
       process.chdir(worktreeRoot);
       process.env.PAPERCLIP_IN_WORKTREE = "true";
       process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;

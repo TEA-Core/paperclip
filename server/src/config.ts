@@ -4,11 +4,8 @@ import { execFileSync } from "node:child_process";
 import {
   bootEnvOrigin,
   captureOperatorEnv,
-  commitBootEnv,
   currentBootEnvPlan,
-  refuseBootEnv,
-  resolveBootEnvPlan,
-  stageEnvSource,
+  loadBootEnv,
 } from "@paperclipai/shared/boot-env";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles, readWorktreeBootIsolation } from "./worktree-config.js";
 import {
@@ -36,16 +33,7 @@ import {
 } from "./home-paths.js";
 
 captureOperatorEnv(process.env);
-const bootPlan = resolveBootEnvPlan({ cwd: process.cwd() });
-for (const source of bootPlan.sources) {
-  const staged = stageEnvSource(source);
-  if (staged.status === "refused" && staged.refusal && bootPlan.mode === "worktree") {
-    refuseBootEnv(staged.refusal);
-  } else if (staged.status === "refused" && staged.refusal) {
-    console.warn(`Could not use env file ${source.path} (${staged.refusal.kind}): ${staged.refusal.message}`);
-  }
-}
-commitBootEnv();
+loadBootEnv({ cwd: process.cwd() });
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
@@ -469,7 +457,9 @@ export function loadConfig(): Config {
           ? undefined
           : process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE) ??
           fileSecrets?.localEncrypted.keyFilePath ??
-          resolveDefaultSecretsKeyFilePath(),
+          (currentBootEnvPlan()?.mode === "worktree"
+            ? `/etc/paperclip/worktrees/${process.env.PAPERCLIP_INSTANCE_ID}/master.key`
+            : resolveDefaultSecretsKeyFilePath()),
       ),
     secretsDirWatchIntervalMs: Math.max(
       30_000,

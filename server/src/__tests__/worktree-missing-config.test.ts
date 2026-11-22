@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "../worktree-config.js";
+import { captureOperatorEnv, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 
 const ORIGINAL_CWD = process.cwd();
 
@@ -32,6 +33,8 @@ describe("worktree with no config file", () => {
     delete process.env.PAPERCLIP_INSTANCE_ID;
 
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    resetBootEnvForTests();
+    captureOperatorEnv();
     maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
     expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("no-config-worktree");

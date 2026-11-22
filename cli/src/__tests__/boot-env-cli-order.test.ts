@@ -2,8 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
-import { loadPaperclipEnvFile, readAgentJwtSecretFromEnv } from "../config/env.js";
+import { captureOperatorEnv, loadBootEnv, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
+import { readAgentJwtSecretFromEnv } from "../config/env.js";
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
@@ -61,7 +61,9 @@ describe("cli preload order (SUP-24365)", () => {
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "operator-jwt";
 
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    loadPaperclipEnvFile(configPath);
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: process.cwd() });
 
     // The r9b door: the preload used to run before any capture, so the
     // refused file's values survived. The loader now refuses and restores.
@@ -83,7 +85,9 @@ describe("cli preload order (SUP-24365)", () => {
     const configPath = path.join(stateDir, "config.json");
     fs.writeFileSync(configPath, "{}\n", "utf8");
 
-    loadPaperclipEnvFile(configPath);
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: process.cwd() });
 
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("clean-file-jwt");
     expect(readAgentJwtSecretFromEnv(configPath)).toBe("clean-file-jwt");

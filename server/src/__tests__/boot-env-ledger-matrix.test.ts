@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
+import { bootEnvOrigin, bootEnvReport, currentBootEnvPlan, operatorEnvValue, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 import type { PaperclipConfig } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 
@@ -231,11 +231,8 @@ function expectNotSuppliedBy(entries: Record<string, string>, allowedPresent: st
   }
 }
 
-function expectIsolatedIdentity(fixture: WorktreeFixture, options: { marker?: boolean } = {}) {
-  // A refused boot restores the file-supplied marker away; every boot still
-  // derives the isolated identity.
-  if (options.marker !== false) expect(process.env.PAPERCLIP_IN_WORKTREE).toBe("true");
-  else expect(process.env.PAPERCLIP_IN_WORKTREE).toBeUndefined();
+function expectIsolatedIdentity(fixture: WorktreeFixture) {
+  expect(process.env.PAPERCLIP_IN_WORKTREE).toBe("true");
   expect(process.env.PAPERCLIP_INSTANCE_ID).toBe(fixture.worktreeName);
   expect(process.env.PAPERCLIP_INSTANCE_ID).not.toBe("steered-sibling");
   expect(path.resolve(process.env.PAPERCLIP_HOME!)).toBe(path.resolve(fixture.isolatedHome));
@@ -276,6 +273,127 @@ async function scanFilesFor(root: string, needle: string): Promise<string | null
 }
 
 describe("boot env source x key matrix (SUP-24365)", () => {
+  it("keeps clean own-file origins after repair and blocks protected names (X2/X3)", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: envFileContents({
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_AGENT_JWT_SECRET: "fixture-jwt",
+        PAPERCLIP_SECRETS_MASTER_KEY: "fixture-master",
+        PAPERCLIP_ZZ_UNLISTED: "fixture-protected",
+        PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/nonexistent/fixture-master",
+        PAPERCLIP_STORAGE_LOCAL_DIR: "/nonexistent/fixture-storage",
+        ZZ_PLAIN: "fixture-plain",
+      }),
+    });
+    operatorWorktreeLayout(fixture);
+    process.chdir(fixture.worktreeRoot);
+    const booted = await bootServerModules();
+    for (const key of ["PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_SECRETS_MASTER_KEY", "ZZ_PLAIN"]) {
+      expect(bootEnvOrigin(key), key).toBe("own");
+      expect(operatorEnvValue(key), key).toBeUndefined();
+    }
+    for (const key of ["PAPERCLIP_ZZ_UNLISTED", "PAPERCLIP_SECRETS_MASTER_KEY_FILE", "PAPERCLIP_STORAGE_LOCAL_DIR"]) {
+      expect(process.env[key] === undefined, key).toBe(true);
+      expect(booted.warnings.some((line) => line.includes(key)), key).toBe(true);
+    }
+    expect(booted.loadConfig().databaseUrl).toBeUndefined();
+  });
+
+  it("refuses main-home identity claims without rewriting the own file (X4)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    process.env.HOME = path.join(fixture.root, "home");
+    const contents = envFileContents({
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_HOME: path.join(process.env.HOME, ".paperclip"),
+      PAPERCLIP_INSTANCE_ID: "default",
+      PAPERCLIP_WORKTREE_NAME: "default",
+    });
+    fs.writeFileSync(fixture.ownEnvPath, contents);
+    operatorWorktreeLayout(fixture);
+    process.chdir(fixture.worktreeRoot);
+    const booted = await bootServerModules();
+    expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "identity")).toBe(true);
+    expectIsolatedIdentity(fixture);
+    expect(booted.loadConfig().embeddedPostgresDataDir).toBe(path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"));
+    expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+  });
+
+  it("never follows a clean own-file config redirect or rewrites its target (X5)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    const sibling = path.join(fixture.repoRoot, "sibling", ".paperclip");
+    fs.mkdirSync(sibling, { recursive: true });
+    const siblingConfig = JSON.stringify(buildLegacyConfig(path.join(fixture.root, "sibling-data")));
+    const siblingEnv = "PAPERCLIP_IN_WORKTREE=true\n";
+    fs.writeFileSync(path.join(sibling, "config.json"), siblingConfig);
+    fs.writeFileSync(path.join(sibling, ".env"), siblingEnv);
+    fs.writeFileSync(fixture.ownEnvPath, `PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_CONFIG=${path.join(sibling, "config.json")}\n`);
+    operatorWorktreeLayout(fixture);
+    process.chdir(fixture.worktreeRoot);
+    await bootServerModules();
+    expect(currentBootEnvPlan()?.configPath).toBe(fixture.configPath);
+    expect(fs.readFileSync(path.join(sibling, "config.json"), "utf8")).toBe(siblingConfig);
+    expect(fs.readFileSync(path.join(sibling, ".env"), "utf8")).toBe(siblingEnv);
+  });
+
+  it("keeps exported worktree evidence when the own file declines and persists nothing (X8)", async () => {
+    const contents = "ZZ_PLAIN=declined\n";
+    const fixture = await makeWorktreeFixture({ ownEnvContents: contents });
+    const originalConfig = fs.readFileSync(fixture.configPath, "utf8");
+    fs.writeFileSync(path.join(fixture.worktreeRoot, ".env"), envFileContents(steeringEntries()));
+    operatorWorktreeLayout(fixture);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.chdir(fixture.worktreeRoot);
+    const booted = await bootServerModules();
+    expect(currentBootEnvPlan()?.mode).toBe("worktree");
+    expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "undeclared")).toBe(true);
+    expect(booted.loadConfig().databaseUrl).toBeUndefined();
+    expectIsolatedIdentity(fixture);
+    expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+    expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(originalConfig);
+    expect(fs.existsSync(fixture.isolatedHome)).toBe(false);
+  });
+
+  it("skips worktree cwd env even with an explicit instance config (X10)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    const instance = path.join(fixture.root, "main");
+    fs.mkdirSync(instance);
+    fs.writeFileSync(path.join(instance, "config.json"), JSON.stringify(buildLegacyConfig(instance)));
+    fs.writeFileSync(path.join(fixture.worktreeRoot, ".env"), envFileContents(steeringEntries()));
+    process.env.PAPERCLIP_CONFIG = path.join(instance, "config.json");
+    process.chdir(fixture.worktreeRoot);
+    const booted = await bootServerModules();
+    expect(currentBootEnvPlan()?.mode).toBe("instance");
+    expect(currentBootEnvPlan()?.sources.map((source) => source.kind)).toEqual(["own"]);
+    expect(booted.loadConfig().databaseUrl).toBeUndefined();
+    expect(booted.warnings.some((line) => line.includes(path.join(fixture.worktreeRoot, ".env")))).toBe(true);
+  });
+
+  it("does not read an ancestor config above the checkout in instance mode (X14)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    const checkout = path.join(fixture.root, "nested");
+    fs.mkdirSync(path.join(checkout, ".git"), { recursive: true });
+    fs.mkdirSync(path.join(fixture.root, ".paperclip"));
+    fs.writeFileSync(path.join(fixture.root, ".paperclip", "config.json"), "{}");
+    fs.writeFileSync(path.join(fixture.root, ".paperclip", ".env"), "DATABASE_URL=postgresql://ancestor.invalid/db\n");
+    process.env.HOME = path.join(fixture.root, "home");
+    process.chdir(checkout);
+    const booted = await bootServerModules();
+    expect(currentBootEnvPlan()?.configPath).toBe(path.join(process.env.HOME, ".paperclip", "instances", "default", "config.json"));
+    expect(booted.loadConfig().databaseUrl).toBeUndefined();
+  });
+
+  it("never uses the signing secret from content-refused bytes (X18)", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: 'PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_TOOL_ACTION_SIGNING_SECRET=fixture-refused-secret\nBROKEN="unterminated\n',
+    });
+    operatorWorktreeLayout(fixture);
+    process.chdir(fixture.worktreeRoot);
+    await bootServerModules();
+    const secret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "";
+    expect(/^[0-9a-f]{64}$/.test(secret)).toBe(true);
+    expect(await scanFilesFor(fixture.root, secret)).toBeNull();
+  });
+
   it("worktree with a clean own file: own secrets load, cwd steering and file database URLs do not", async () => {
     const cwdSteering = steeringEntries();
     const fixture = await makeWorktreeFixture({
@@ -308,7 +426,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     // Own-file values the worktree owns do load; database URLs never do.
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("own-file-jwt");
     expect(process.env.PAPERCLIP_SECRETS_MASTER_KEY).toBe("own-file-master-key");
-    expect(process.env.PAPERCLIP_ZZ_UNLISTED).toBe("own-file-unlisted");
+    expect(process.env.PAPERCLIP_ZZ_UNLISTED).toBeUndefined();
     expect(process.env.DATABASE_URL).toBeUndefined();
     expect(process.env.DATABASE_MIGRATION_URL).toBeUndefined();
     expectIsolatedIdentity(fixture);
@@ -341,7 +459,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
 
     expectNotSuppliedBy(ownSteering);
     expectNotSuppliedBy(cwdSteering);
-    expectIsolatedIdentity(fixture, { marker: false });
+    expectIsolatedIdentity(fixture);
     const loaded = booted.loadConfig();
     expect(loaded.databaseUrl).toBeUndefined();
     expect(loaded.secretsMasterKeyFilePath).not.toContain("CANARY-STEER");
@@ -495,7 +613,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     process.chdir(fixture.worktreeRoot);
     const booted = await bootServerModules();
 
-    expect(process.env.DOTENV_KEY).toBe("dotenv:v1:canary-from-own-file");
+    expect(process.env.DOTENV_KEY).toBeUndefined();
     expect(process.env.DOTENV_VAULT_CWD_PROBE).toBeUndefined();
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("own-jwt");
     expectIsolatedIdentity(fixture);
@@ -527,6 +645,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
   it("instance mode keeps today's behaviour: own and cwd files both load", async () => {
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "paperclip-ledger-instance-"));
     const instanceState = path.join(root, "instance", ".paperclip");
+    await fs.promises.mkdir(path.join(root, "instance", ".git"), { recursive: true });
     await fs.promises.mkdir(instanceState, { recursive: true });
     await fs.promises.writeFile(
       path.join(instanceState, ".env"),
@@ -614,5 +733,60 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     const rebooted = await bootServerModules();
     expect(rebooted.readWorktreeBootIsolation()).toBeNull();
     expect(rebooted.loadConfig().databaseUrl).toBeUndefined();
+  });
+
+  it("honours valid custom identity claims but refuses a sibling instance root (X6/X7)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    process.env.HOME = path.join(fixture.root, "home");
+    const customHome = path.join(fixture.root, "custom-worktrees");
+    const claims = envFileContents({
+      PAPERCLIP_IN_WORKTREE: "true", PAPERCLIP_HOME: customHome,
+      PAPERCLIP_INSTANCE_ID: "custom-id", PAPERCLIP_WORKTREE_NAME: "Custom name",
+    });
+    fs.writeFileSync(fixture.ownEnvPath, claims);
+    operatorWorktreeLayout(fixture);
+    process.chdir(fixture.worktreeRoot);
+    const first = await bootServerModules();
+    expect(first.loadConfig().embeddedPostgresDataDir).toBe(path.join(customHome, "instances", "custom-id", "db"));
+    expect(bootEnvReport().refusals).toEqual([]);
+
+    const sibling = path.join(fixture.repoRoot, "sibling", ".paperclip");
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(sibling, "config.json"), JSON.stringify(buildLegacyConfig(path.join(customHome, "instances", "custom-id"))));
+    fs.writeFileSync(fixture.ownEnvPath, claims);
+    for (const key of Object.keys(process.env)) if (key.startsWith("PAPERCLIP_")) delete process.env[key];
+    resetBootEnvForTests();
+    operatorWorktreeLayout(fixture);
+    const second = await bootServerModules();
+    expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "identity")).toBe(true);
+    expect(second.loadConfig().embeddedPostgresDataDir).toBe(path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"));
+    expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(claims);
+  });
+
+  it.each(["layout", "registry"])("retains %s worktree evidence after the declaration is removed (X9)", async (evidence) => {
+    const fixture = await makeWorktreeFixture({});
+    process.env.HOME = path.join(fixture.root, "home");
+    let cwd = fixture.worktreeRoot;
+    if (evidence === "layout") {
+      cwd = path.join(fixture.root, "repo", ".paperclip", "worktrees", "isolated");
+      fs.mkdirSync(path.dirname(cwd), { recursive: true });
+      fs.renameSync(fixture.worktreeRoot, cwd);
+    } else {
+      fs.mkdirSync(fixture.isolatedHome, { recursive: true });
+      fs.writeFileSync(path.join(fixture.isolatedHome, "worktree-port-reservations.json"), JSON.stringify({
+        version: 1, configPaths: [fixture.configPath],
+      }));
+    }
+    fs.mkdirSync(path.join(cwd, ".git"));
+    const envPath = path.join(cwd, ".paperclip", ".env");
+    fs.writeFileSync(envPath, "ZZ_PLAIN=declined\n");
+    fs.writeFileSync(path.join(cwd, ".env"), "DATABASE_URL=postgresql://fixture.invalid/db\n");
+    operatorWorktreeLayout(fixture);
+    process.chdir(cwd);
+    const booted = await bootServerModules();
+    expect(currentBootEnvPlan()?.mode).toBe("worktree");
+    expect(currentBootEnvPlan()?.undeclared).toBe(true);
+    expect(booted.loadConfig().databaseUrl).toBeUndefined();
+    expect(fs.readFileSync(envPath, "utf8")).toBe("ZZ_PLAIN=declined\n");
   });
 });

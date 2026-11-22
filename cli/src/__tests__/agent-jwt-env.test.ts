@@ -62,7 +62,7 @@ describe("agent jwt env helpers", () => {
 
     const loaded = readAgentJwtSecretFromEnv(configPath);
     expect(loaded).toBe("test-secret");
-    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("test-secret");
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
   });
 
   it("doctor check passes when secret exists in adjacent .env", () => {

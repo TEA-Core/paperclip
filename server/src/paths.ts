@@ -1,38 +1,16 @@
-import fs from "node:fs";
 import path from "node:path";
 import { resolveDefaultConfigPath } from "./home-paths.js";
-import { currentBootEnvPlan } from "@paperclipai/shared/boot-env";
+import { currentBootEnvPlan, findAncestorConfig } from "@paperclipai/shared/boot-env";
 
-const PAPERCLIP_CONFIG_BASENAME = "config.json";
 const PAPERCLIP_ENV_FILENAME = ".env";
 
-function findConfigFileFromAncestors(startDir: string): string | null {
-  const absoluteStartDir = path.resolve(startDir);
-  let currentDir = absoluteStartDir;
-
-  while (true) {
-    const candidate = path.resolve(currentDir, ".paperclip", PAPERCLIP_CONFIG_BASENAME);
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-
-    const nextDir = path.resolve(currentDir, "..");
-    if (nextDir === currentDir) break;
-    currentDir = nextDir;
-  }
-
-  return null;
-}
 
 export function resolvePaperclipConfigPath(overridePath?: string): string {
   if (overridePath) return path.resolve(overridePath);
-  if (process.env.PAPERCLIP_CONFIG) return path.resolve(process.env.PAPERCLIP_CONFIG);
   const plan = currentBootEnvPlan();
-  const cwd = path.resolve(process.cwd());
-  if (plan && (cwd === path.resolve(plan.stateDir, "..") || cwd === path.resolve(plan.stateDir))) {
-    return plan.configPath;
-  }
-  return findConfigFileFromAncestors(cwd) ?? resolveDefaultConfigPath();
+  if (plan) return plan.configPath;
+  if (process.env.PAPERCLIP_CONFIG) return path.resolve(process.env.PAPERCLIP_CONFIG);
+  return findAncestorConfig(process.cwd()) ?? resolveDefaultConfigPath();
 }
 
 export function resolvePaperclipEnvPath(overrideConfigPath?: string): string {

@@ -69,7 +69,6 @@ describe("single env reader (SUP-24365)", () => {
         }
 
         if (
-          relative !== "packages/shared/src/boot-env.ts" &&
           (/import\s*\{[^}]*\bconfig\b[^}]*\}\s*from\s*["']dotenv["']/.test(contents) ||
             /dotenv\.config\s*\(/.test(contents))
         ) {

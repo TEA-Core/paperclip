@@ -17,7 +17,6 @@ import {
   storageCheck,
   type CheckResult,
 } from "../checks/index.js";
-import { loadPaperclipEnvFile } from "../config/env.js";
 import { printPaperclipCliBanner } from "../utils/banner.js";
 import { printUpdateNotice } from "../update-notice.js";
 
@@ -37,7 +36,6 @@ export async function doctor(opts: {
   p.intro(pc.bgCyan(pc.black(" paperclip doctor ")));
 
   const configPath = resolveConfigPath(opts.config);
-  loadPaperclipEnvFile(configPath);
   const results: CheckResult[] = [];
 
   // 1. Config check (must pass before others)
@@ -192,8 +190,6 @@ async function runRepairableCheck(input: {
   const repaired = await maybeRepair(result, input.opts);
   if (!repaired) return result;
 
-  // Repairs may create/update the adjacent .env file or other local resources.
-  loadPaperclipEnvFile(input.configPath);
   result = await input.run();
   printResult(result);
   return result;

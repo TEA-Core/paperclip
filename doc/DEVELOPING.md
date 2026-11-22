@@ -1000,7 +1000,69 @@ The server/UI use those values for worktree-specific branding such as the top ba
 Authenticated worktree servers also use the `PAPERCLIP_INSTANCE_ID` value to scope Better Auth cookie names.
 Browser cookies are shared by host rather than port, so this prevents logging into one `127.0.0.1:<port>` worktree from replacing another worktree server's session cookie.
 
-When the server repairs a worktree's `.paperclip/.env` at boot, it keeps the worktree's own `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` when that file sets one. If the file does not set it, an inherited value from the parent shell is used for that boot only and is never written into the worktree `.env`; with neither, the repair generates a new worktree-local secret. The repair reads the `.env` with the same dotenv parser the server loads it with, so quoted values, inline comments and `export` prefixes read back unchanged.
+When the server repairs a worktree's `.paperclip/.env` at boot, it keeps the worktree's own non-empty `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` only after the file and identity pass vetting. That key is omitted from the managed rewrite, preserving multiline and escaped values byte-for-byte. If the file does not supply an accepted value, an inherited value from the parent shell is used for that boot only and is never written into the worktree `.env`; with neither, the repair generates a new worktree-local secret. A refused file is never changed, and its replacement secret is kept in memory only. The repair uses the same dotenv decoding as the loader.
+
+#### Boot environment sources and identity
+
+The server, CLI and database command entrypoints capture the operator environment
+once, before loading any file. Explicit CLI flags are recorded before the source
+plan is frozen. Repair and later reads cannot recapture file-loaded values as
+operator values, change the plan, or stage additional files.
+
+Worktree evidence includes the exported worktree flag, the own-file declaration,
+the managed worktree layout, and an existing port-registry entry. With evidence
+and no explicit operator config, removing the own-file declaration does not
+downgrade the boot to an instance: it isolates in memory, warns, and writes
+neither the env file, config nor registry. Config discovery stops at the checkout.
+An explicit operator config is honoured, but a cwd `.env` in a worktree is still
+skipped with a warning.
+
+| Source/key class | Worktree mode | Instance mode without worktree evidence |
+| --- | --- | --- |
+| Operator env and explicit flags | Retained; file values cannot acquire this origin | Retained |
+| Own `.env`: identity | Validated claims only, never committed directly | Never committed |
+| Own `.env`: protected settings | Ignored with key-name warning, except the allowlist below | Loaded |
+| Own `.env`: other settings | Loaded with file origin | Loaded with file origin |
+| Cwd `.env` | Never loaded | Loaded after own `.env`, unless disabled by the operator |
+| Other paths or refused files | Never supply boot values | No additional sources; refused sources warn and are skipped |
+
+Protected names start with `PAPERCLIP_`, `DATABASE_`, `BETTER_AUTH_`, `DOTENV_`,
+`NODE_`, `GIT_` or `RUN_LOG_`, or equal `HOME`, `USERPROFILE`, `PATH` or `TMPDIR`.
+The worktree own-file allowlist is `PAPERCLIP_SECRETS_MASTER_KEY`,
+`PAPERCLIP_AGENT_JWT_SECRET`, `BETTER_AUTH_SECRET`,
+`PAPERCLIP_TOOL_ACTION_SIGNING_SECRET`, `PAPERCLIP_DECISION_SIGNING_SECRET`
+and `PAPERCLIP_WORKTREE_COLOR`. A refused file cannot supply the signing secret:
+repair keeps an exported value or mints one in memory without writing it.
+The existing one-key exception remains: a vetted own-file tool-action signing
+secret wins for that boot over an exported value.
+
+Identity claims for home, instance id and display name must stay outside the
+main home and cannot adopt a sibling's instance root. Valid custom worktree
+identities are preserved. A stale copied config claim is discarded; a file's
+`PAPERCLIP_CONFIG` never redirects the boot. Rejected claims leave the file
+unchanged and use layout-derived isolation. A colliding layout name receives a
+config-path-derived suffix; if no safe identity exists, boot refuses.
+
+Limits of this protection:
+
+- A never-booted checkout outside a managed layout with no surviving worktree
+  evidence is indistinguishable from an ordinary instance.
+- Operator env, the home directory and port registry are trusted; same-user
+  writes outside the checkout are not contained by the loader.
+- Explicit operator config paths and exported database/secret settings remain
+  authoritative, including accidentally inherited production settings.
+- Instance-mode files retain their existing non-identity settings; vetted
+  worktree files still supply allowlisted secrets and third-party settings.
+- Worktree `config.json` fields beyond repaired isolation paths are a separate
+  input, not an env-file sandbox.
+- The dev-runner parent's repair-side parser remains; its server child receives
+  the operator snapshot rather than file-loaded parent values.
+- There remains a read/repair race: boot uses staged values while a subsequent
+  repair read can see newer bytes.
+- Warnings are stderr-only. Symlinked state directories are not an ownership
+  boundary (env-file symlinks themselves are refused).
+- Dotenv's `PAPERCLIP_IN_WORKTREE=true#nospace` declaration remains accepted.
+
 
 When Paperclip closes a server-managed git worktree, it also reclaims the isolated instance referenced by that worktree's repo-local `.paperclip/.env`. New server-managed worktrees use a collision-resistant instance id derived from the resolved absolute worktree path, and Paperclip persists the resulting instance root as execution-workspace ownership metadata. Cleanup requires the env pointer to match that persisted root, stops a running embedded PostgreSQL process, and then removes the instance directory. The deletion guard only accepts canonical instance paths below `PAPERCLIP_WORKTREES_DIR/instances/`; legacy or mismatched ownership, pointers to the default/live Paperclip home, and all other locations are logged and left untouched.
 

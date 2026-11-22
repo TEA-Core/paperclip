@@ -1,20 +1,21 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bootEnvOrigin,
   bootEnvReport,
   captureOperatorEnv,
-  commitBootEnv,
   currentBootEnvPlan,
+  loadBootEnv,
+  noteOperatorFlag,
+  operatorEnvValue,
+  readEnvFileVetted,
   operatorEnvForChild,
   refuseBootEnv,
   resetBootEnvForTests,
   resolveBootEnvPlan,
   setBootDerivedEnv,
-  stageEnvSource,
 } from "./boot-env.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -59,6 +60,28 @@ function planWorktree(worktreeRoot: string) {
 }
 
 describe("boot env ledger", () => {
+  it("requires capture before planning or deriving boot values (L1/L4)", () => {
+    expect(() => resolveBootEnvPlan({ cwd: process.cwd() })).toThrow("boot env was not captured");
+    expect(() => loadBootEnv({ cwd: process.cwd() })).toThrow("boot env was not captured");
+    expect(() => noteOperatorFlag("PAPERCLIP_INSTANCE_ID", "fixture")).toThrow("boot env was not captured");
+    expect(() => setBootDerivedEnv("ZZ_DERIVED", "fixture")).toThrow("boot env was not captured");
+  });
+
+  it("restores a committed instance DATABASE_URL on refusal (L2)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-restore-db-"));
+    const own = path.join(root, ".paperclip");
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, "config.json"), "{}");
+    fs.writeFileSync(path.join(own, ".env"), "DATABASE_URL=postgresql://fixture.invalid/db\n");
+    process.env.PAPERCLIP_CONFIG = path.join(own, "config.json");
+    captureOperatorEnv();
+    const { plan } = loadBootEnv({ cwd: root });
+    expect(process.env.DATABASE_URL !== undefined).toBe(true);
+    refuseBootEnv({ kind: "content", path: plan.sources[0].path, message: "fixture refusal" });
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    expect(bootEnvOrigin("DATABASE_URL")).toBeNull();
+  });
+
   it("freezes the worktree plan to the nearest state dir and its single own file", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-boot-env-plan-"));
     fs.mkdirSync(path.join(root, "repo", ".git"), { recursive: true });
@@ -95,12 +118,12 @@ describe("boot env ledger", () => {
     const worktreeRoot = makeWorktree(root, "wt", "PAPERCLIP_IN_WORKTREE=true\n", true);
     planWorktree(worktreeRoot);
 
-    const absent = stageEnvSource({ kind: "own", path: path.join(root, "missing.env") });
+    const absent = readEnvFileVetted(path.join(root, "missing.env"));
     expect(absent.status).toBe("absent");
 
     const asDirectory = path.join(root, "dir.env");
     fs.mkdirSync(asDirectory, { recursive: true });
-    const refusedDirectory = stageEnvSource({ kind: "own", path: asDirectory });
+    const refusedDirectory = readEnvFileVetted(asDirectory);
     expect(refusedDirectory.status).toBe("refused");
     expect(refusedDirectory.refusal?.kind).toBe("not-a-file");
 
@@ -109,7 +132,7 @@ describe("boot env ledger", () => {
     fs.chmodSync(noAccess, 0o000);
     try {
       if (process.getuid?.() === 0) return; // mode 000 stays readable for root
-      const refusedUnreadable = stageEnvSource({ kind: "own", path: noAccess });
+      const refusedUnreadable = readEnvFileVetted(noAccess);
       expect(refusedUnreadable.status).toBe("refused");
       expect(refusedUnreadable.refusal?.kind).toBe("unreadable");
     } finally {
@@ -129,16 +152,8 @@ describe("boot env ledger", () => {
     const worktreeRoot = makeWorktree(root, "wt", poisoned, true);
     planWorktree(worktreeRoot);
 
-    const staged = stageEnvSource({
-      kind: "own",
-      path: path.join(worktreeRoot, ".paperclip", ".env"),
-    });
-    expect(staged.status).toBe("refused");
-    expect(staged.refusal?.kind).toBe("content");
-
-    refuseBootEnv(staged.refusal!);
-    const committed = commitBootEnv();
-    expect(committed.applied).toEqual([]);
+    const { refusals } = loadBootEnv({ cwd: worktreeRoot });
+    expect(refusals[0]?.kind).toBe("content");
     expect(process.env.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
     expect(process.env.DATABASE_URL).toBeUndefined();
   });
@@ -162,70 +177,37 @@ describe("boot env ledger", () => {
     const plan = planWorktree(worktreeRoot);
     expect(plan.mode).toBe("worktree");
 
-    const staged = stageEnvSource(plan.sources[0]);
-    expect(staged.status).toBe("staged");
-    const committed = commitBootEnv();
-
-    expect(committed.applied).toContain("PAPERCLIP_ZZ_UNLISTED");
-    expect(committed.applied).toContain("BETTER_AUTH_SECRET");
-    expect(committed.shadowed).toContain("DATABASE_URL");
-    expect(committed.shadowed).toContain("DATABASE_MIGRATION_URL");
-    expect(committed.shadowed).toContain("PAPERCLIP_AGENT_JWT_SECRET");
+    loadBootEnv({ cwd: worktreeRoot });
+    expect(process.env.BETTER_AUTH_SECRET).toBe("file-auth");
 
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("operator-jwt");
     expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBe("operator");
-    expect(process.env.PAPERCLIP_ZZ_UNLISTED).toBe("file-unlisted");
-    expect(bootEnvOrigin("PAPERCLIP_ZZ_UNLISTED")).toBe("own");
+    expect(process.env.PAPERCLIP_ZZ_UNLISTED).toBeUndefined();
+    expect(bootEnvOrigin("PAPERCLIP_ZZ_UNLISTED")).toBeNull();
     expect(process.env.DATABASE_URL).toBeUndefined();
     expect(process.env.DATABASE_MIGRATION_URL).toBeUndefined();
   });
 
-  it("restores every file-supplied key and the full snapshot on any refusal (I-5)", () => {
+  it("restores all committed own and cwd keys without promoting file origins (I-5)", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-boot-env-restore-"));
-    const randomKeys = Array.from({ length: 24 }, (_, index) => {
-      const prefix = index % 2 === 0 ? "PAPERCLIP_" : "";
-      return `${prefix}ZZ_${randomBytes(6).toString("hex").toUpperCase()}`;
-    });
-    const ownEntries = randomKeys.map((key) => `${key}=file-${key}`);
-    const ownFile = path.join(root, "own.env");
-    fs.writeFileSync(ownFile, [...ownEntries, 'POISON="unterminated'].join("\n") + "\n", "utf8");
-    const cwdFile = path.join(root, "cwd.env");
-    fs.writeFileSync(
-      cwdFile,
-      ["CWD_ZZ_KEY=cwd-value", "PAPERCLIP_SECRETS_MASTER_KEY=cwd-master-key"].join("\n") + "\n",
-      "utf8",
-    );
-
-    resetBootEnvForTests();
-    process.env.PAPERCLIP_OPERATOR_MARKER = "snapshot-marker";
-    captureOperatorEnv({ ...process.env });
-
-    // The clean cwd file is applied first; the poisoned own file is staged
-    // after it, so the refusal must undo an already-applied source too.
-    const cleanCwd = stageEnvSource({ kind: "cwd", path: cwdFile });
-    expect(cleanCwd.status).toBe("staged");
-    const committed = commitBootEnv();
-    expect(committed.applied).toContain("CWD_ZZ_KEY");
-    expect(process.env.CWD_ZZ_KEY).toBe("cwd-value");
-
-    const refusedOwn = stageEnvSource({ kind: "own", path: ownFile });
-    expect(refusedOwn.status).toBe("staged");
-    expect(refusedOwn.keys).toContain(randomKeys[0]);
-    commitBootEnv();
-    expect(process.env[randomKeys[0]]).toBe(`file-${randomKeys[0]}`);
-
-    vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    refuseBootEnv({ kind: "content", path: ownFile, message: "poisoned for test" });
-
-    for (const key of randomKeys) {
-      expect(process.env[key]).toBeUndefined();
+    const keys = Array.from({ length: 24 }, (_, index) => `ZZ_${index}`);
+    const wt = makeWorktree(root, "wt", keys.map((key) => `${key}=fixture`).join("\n") + "\n", true);
+    fs.writeFileSync(path.join(wt, ".env"), "CWD_ZZ_KEY=cwd\n");
+    process.env.PAPERCLIP_CONFIG = path.join(wt, ".paperclip", "config.json");
+    process.env.PAPERCLIP_OPERATOR_MARKER = "operator";
+    captureOperatorEnv();
+    const { plan } = loadBootEnv({ cwd: wt });
+    for (const key of keys) expect(bootEnvOrigin(key), key).toBe("own");
+    expect(bootEnvOrigin("CWD_ZZ_KEY")).toBe("cwd");
+    refuseBootEnv({ kind: "content", path: plan.sources[0].path, message: "fixture refusal" });
+    for (const key of [...keys, "CWD_ZZ_KEY"]) {
+      expect(process.env[key], key).toBeUndefined();
+      expect(bootEnvOrigin(key), key).toBeNull();
+      expect(operatorEnvValue(key), key).toBeUndefined();
     }
+    expect(process.env.PAPERCLIP_OPERATOR_MARKER).toBe("operator");
+    loadBootEnv({ cwd: wt });
     expect(process.env.CWD_ZZ_KEY).toBeUndefined();
-    expect(process.env.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
-    expect(process.env.PAPERCLIP_OPERATOR_MARKER).toBe("snapshot-marker");
-
-    const afterRefusal = commitBootEnv();
-    expect(afterRefusal.applied).toEqual([]);
   });
 
   it("strips every file-origin key for a child process but keeps operator and boot keys (I-12)", () => {
@@ -235,20 +217,19 @@ describe("boot env ledger", () => {
       "wt",
       [
         "PAPERCLIP_IN_WORKTREE=true",
-        "PAPERCLIP_ZZ_CHILD_FILE=file-value",
+        "ZZ_CHILD_FILE=file-value",
         "PAPERCLIP_AGENT_JWT_SECRET=file-jwt",
       ].join("\n") + "\n",
       true,
     );
     process.env.PAPERCLIP_ZZ_CHILD_OPERATOR = "operator-value";
     const plan = planWorktree(worktreeRoot);
-    stageEnvSource(plan.sources[0]);
-    commitBootEnv();
+    loadBootEnv({ cwd: worktreeRoot });
     setBootDerivedEnv("PAPERCLIP_ZZ_BOOT", "boot-value");
 
-    expect(process.env.PAPERCLIP_ZZ_CHILD_FILE).toBe("file-value");
+    expect(process.env.ZZ_CHILD_FILE).toBe("file-value");
     const child = operatorEnvForChild();
-    expect(child.PAPERCLIP_ZZ_CHILD_FILE).toBeUndefined();
+    expect(child.ZZ_CHILD_FILE).toBeUndefined();
     expect(child.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
     expect(child.PAPERCLIP_ZZ_CHILD_OPERATOR).toBe("operator-value");
     expect(child.PAPERCLIP_ZZ_BOOT).toBe("boot-value");
@@ -260,11 +241,12 @@ describe("boot env ledger", () => {
     fs.mkdirSync(instanceState, { recursive: true });
     fs.writeFileSync(
       path.join(instanceState, ".env"),
-      "PAPERCLIP_ZZ_INSTANCE_OWN=own-value\n",
+      "PAPERCLIP_ZZ_INSTANCE_OWN=own-value\nPAPERCLIP_WORKTREES_DIR=/file-steered/worktrees\n",
       "utf8",
     );
     fs.writeFileSync(path.join(instanceState, "config.json"), "{}\n", "utf8");
     const workdir = path.join(root, "instance", "work");
+    fs.mkdirSync(path.join(root, "instance", ".git"), { recursive: true });
     fs.mkdirSync(workdir, { recursive: true });
     fs.writeFileSync(path.join(workdir, ".env"), "PAPERCLIP_ZZ_CWD=cwd-value\n", "utf8");
 
@@ -274,11 +256,11 @@ describe("boot env ledger", () => {
     expect(plan.mode).toBe("instance");
     expect(plan.sources.map((source) => source.kind)).toEqual(["own", "cwd"]);
 
-    for (const source of plan.sources) stageEnvSource(source);
-    commitBootEnv();
+    loadBootEnv({ cwd: workdir });
     expect(process.env.PAPERCLIP_ZZ_INSTANCE_OWN).toBe("own-value");
     expect(process.env.PAPERCLIP_ZZ_CWD).toBe("cwd-value");
     expect(bootEnvOrigin("PAPERCLIP_ZZ_CWD")).toBe("cwd");
+    expect(process.env.PAPERCLIP_WORKTREES_DIR).toBeUndefined();
   });
 
   it("reports names and origins only, never values", () => {
@@ -290,13 +272,46 @@ describe("boot env ledger", () => {
       true,
     );
     const plan = planWorktree(worktreeRoot);
-    stageEnvSource(plan.sources[0]);
-    commitBootEnv();
+    loadBootEnv({ cwd: worktreeRoot });
 
     const report = bootEnvReport();
     expect(report.mode).toBe("worktree");
     expect(report.origins.PAPERCLIP_AGENT_JWT_SECRET).toBe("own");
     expect(JSON.stringify(report)).not.toContain("secret-value");
     expect(currentBootEnvPlan()?.mode).toBe("worktree");
+  });
+
+  it("captures once and rejects flags after the frozen plan", () => {
+    captureOperatorEnv();
+    process.env.ZZ_LATE = "fixture";
+    captureOperatorEnv();
+    expect(operatorEnvValue("ZZ_LATE")).toBeUndefined();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-capture-"));
+    const { plan } = loadBootEnv({ cwd: root });
+    expect(Object.isFrozen(plan)).toBe(true);
+    expect(Object.isFrozen(plan.sources)).toBe(true);
+    expect(() => noteOperatorFlag("ZZ_LATE", "promoted")).toThrow("operator flags must precede");
+    expect(operatorEnvValue("ZZ_LATE")).toBeUndefined();
+  });
+
+  it("does not re-read or re-apply a loaded source", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-idempotent-"));
+    const wt = makeWorktree(root, "wt", "PAPERCLIP_IN_WORKTREE=true\nZZ_PLAIN=fixture\n");
+    planWorktree(wt);
+    const { plan } = loadBootEnv({ cwd: wt });
+    fs.writeFileSync(plan.sources[0].path, "ZZ_PLAIN=changed\n");
+    delete process.env.ZZ_PLAIN;
+    expect(loadBootEnv({ cwd: root }).plan).toBe(plan);
+    expect(process.env.ZZ_PLAIN).toBeUndefined();
+  });
+
+  it("pure vetted reads do not add a boot source or modify the process", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-pure-read-"));
+    const file = path.join(root, ".env");
+    fs.writeFileSync(file, "ZZ_PLAIN=fixture\n");
+    const before = bootEnvReport();
+    expect(readEnvFileVetted(file).entries.ZZ_PLAIN).toBe("fixture");
+    expect(bootEnvReport()).toEqual(before);
+    expect(process.env.ZZ_PLAIN).toBeUndefined();
   });
 });

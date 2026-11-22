@@ -5,9 +5,12 @@ import { vettedEnvEntries } from "./runtime-config.js";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
-  resolvePaperclipConfigPathForInstance,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
+import { captureOperatorEnv, loadBootEnv } from "@paperclipai/shared/boot-env";
+
+captureOperatorEnv();
+const { plan } = loadBootEnv({ cwd: process.cwd() });
 
 type PartialConfig = {
   database?: {
@@ -71,7 +74,7 @@ function resolveRetentionDays(config: PartialConfig | null): number {
 }
 
 async function main() {
-  const configPath = resolvePaperclipConfigPathForInstance();
+  const configPath = plan.configPath;
   const config = readConfig(configPath);
   const connectionString = resolveConnectionString(configPath, config);
   const backupDir = resolveBackupDir(config);

@@ -516,4 +516,8 @@ describe("env file editor", () => {
     expect(updateEnvFileContents("KEY=a\\# note\n", { KEY: "new" })).toBe('KEY="new"# note\n');
     expect(updateEnvFileContents("KEY='a\\' # note\n", { KEY: "new" })).toBe('KEY="new" # note\n');
   });
+
+  it("refuses a single quote followed by a backslash that cannot round-trip (N21)", () => {
+    expect(() => updateEnvFileContents("KEY=\\\n", { KEY: "'\\" })).toThrow(/rewrite would change loader value/);
+  });
 });

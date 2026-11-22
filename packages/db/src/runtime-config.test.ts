@@ -2,11 +2,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resetBootEnvForTests } from "@paperclipai/shared/boot-env";
-import { resolveDatabaseTarget } from "./runtime-config.js";
+import { captureOperatorEnv, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
+import { resolveDatabaseTarget as resolveTarget } from "./runtime-config.js";
 
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_ENV = { ...process.env };
+
+function resolveDatabaseTarget() {
+  captureOperatorEnv();
+  return resolveTarget();
+}
 
 function writeJson(filePath: string, value: unknown) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -210,7 +215,7 @@ describe("resolveDatabaseTarget", () => {
     expect(target.source).toContain("embedded-postgres@");
   });
 
-  it("still uses a clean worktree env file's DATABASE_URL (SUP-24365)", () => {
+  it("does not use a clean worktree env file's DATABASE_URL (SUP-24365)", () => {
     const { worktreeRoot, configPath } = makeWorktreeFixture(
       ["PAPERCLIP_IN_WORKTREE=true", "DATABASE_URL=postgresql://clean-file.invalid/db", ""].join("\n"),
     );
@@ -220,9 +225,7 @@ describe("resolveDatabaseTarget", () => {
 
     const target = resolveDatabaseTarget();
     expect(target).toMatchObject({
-      mode: "postgres",
-      connectionString: "postgresql://clean-file.invalid/db",
-      source: "paperclip-env",
+      mode: "embedded-postgres",
     });
   });
 });

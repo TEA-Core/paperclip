@@ -328,20 +328,14 @@ function ownValue(record: Record<string, string>, key: string): string | undefin
 }
 
 function unclosedQuoteInLine(text: string): boolean {
-  let quote: EnvQuote | null = null;
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];
-    if (quote !== null) {
-      if (character === "\\" && text[index + 1] === quote) {
-        index += 1;
-        continue;
-      }
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (character === '"' || character === "'" || character === "`") quote = character;
+    if (character !== '"' && character !== "'" && character !== "`") continue;
+    const closing = closingQuoteIndex(text, character, index + 1);
+    if (closing === null) return true;
+    index = closing;
   }
-  return quote !== null;
+  return false;
 }
 
 // The loader (dotenv) is the oracle for what a file means. The writer's

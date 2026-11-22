@@ -1,15 +1,11 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import {
   expandHomePrefix,
   resolveDefaultEmbeddedPostgresDir,
-  resolvePaperclipConfigPathForInstance,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
-import { vetEnvFileContents } from "@paperclipai/shared/env-file";
-import { captureOperatorEnv, resolveBootEnvPlan, stageEnvSource, stagedOwnValue } from "@paperclipai/shared/boot-env";
-
-const CONFIG_BASENAME = "config.json";
+import { currentBootEnvPlan, readEnvFileVetted, resolveBootEnvPlan } from "@paperclipai/shared/boot-env";
 
 type PartialConfig = {
   database?: {
@@ -43,47 +39,24 @@ function resolveHomeAwarePath(value: string): string {
   return path.resolve(expandHomePrefix(value));
 }
 
-function findConfigFileFromAncestors(startDir: string): string | null {
-  let currentDir = path.resolve(startDir);
-
-  while (true) {
-    const candidate = path.resolve(currentDir, ".paperclip", CONFIG_BASENAME);
-    if (existsSync(candidate)) return candidate;
-
-    const nextDir = path.resolve(currentDir, "..");
-    if (nextDir === currentDir) return null;
-    currentDir = nextDir;
-  }
-}
-
 function resolvePaperclipConfigPath(): string {
-  if (process.env.PAPERCLIP_CONFIG?.trim()) {
-    return path.resolve(process.env.PAPERCLIP_CONFIG.trim());
-  }
-  return findConfigFileFromAncestors(process.cwd()) ?? resolvePaperclipConfigPathForInstance();
+  return (currentBootEnvPlan() ?? resolveBootEnvPlan({ cwd: process.cwd() })).configPath;
 }
 
 function resolvePaperclipEnvPath(configPath: string): string {
   return resolvePaperclipEnvPathForConfig(configPath);
 }
 
-// Reads DATABASE_URL from the instance env file only when the boot ledger
-// stages that file clean. A refused (unvetted, unreadable, not-a-file) env
-// file never supplies a database target.
+// Non-boot reads never stage another file into the boot ledger.
 export function vettedEnvEntries(envPath: string): Record<string, string> | null {
-  if (!existsSync(envPath)) return {};
-  try {
-    if (!statSync(envPath).isFile()) return null;
-    vetEnvFileContents(readFileSync(envPath, "utf8"));
-  } catch {
-    return null;
+  const read = readEnvFileVetted(envPath);
+  if (read.status === "refused") return null;
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree" && plan.sources.some((source) => source.path === path.resolve(envPath))) {
+    const { DATABASE_URL: _databaseUrl, DATABASE_MIGRATION_URL: _migrationUrl, ...entries } = read.entries;
+    return entries;
   }
-  captureOperatorEnv();
-  resolveBootEnvPlan({ cwd: process.cwd() });
-  const staged = stageEnvSource({ kind: "own", path: envPath });
-  if (staged.status !== "staged") return null;
-  const databaseUrl = stagedOwnValue("DATABASE_URL");
-  return databaseUrl ? { DATABASE_URL: databaseUrl } : {};
+  return read.entries;
 }
 
 
