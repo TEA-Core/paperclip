@@ -7433,6 +7433,35 @@ describe("enableAutoMerge deadline (SUP-20772 round 14)", () => {
     }
   });
 
+  it("expires the authority check before arm grace and never enables after the check returns late", async () => {
+    vi.useFakeTimers();
+    // The repository's ES2023 Promise API requires the executor form.
+    let finishCheck!: () => void;
+    const check = new Promise<void>((resolve) => { finishCheck = resolve; });
+    let providerEnabled = false;
+    mockGhFetch.mockImplementation(async () => {
+      providerEnabled = true;
+      return Response.json({ data: { enablePullRequestAutoMerge: {} } });
+    });
+    try {
+      const pending = enableAutoMerge("t", "PR_node_1", {
+        attemptTimeoutMs: 10, maxAttempts: 1,
+        beforeAttempt: async () => { await check; return null; },
+      });
+      await vi.advanceTimersByTimeAsync(disarmTiming.inFlightGraceMs + 1);
+      const beforeLateCheck = await Promise.race([pending, Promise.resolve(null)]);
+      finishCheck();
+      const result = await pending;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(beforeLateCheck).toMatchObject({ success: false, status: 0 });
+      expect(result).toMatchObject({ success: false, status: 0 });
+      expect(providerEnabled).toBe(false);
+    } finally {
+      finishCheck();
+      vi.useRealTimers();
+    }
+  });
+
   it("is over, in the worst case, well before the in-flight record is settled", () => {
     expect(ENABLE_WORST_CASE_MS).toBeLessThan(disarmTiming.inFlightGraceMs / 2);
   });

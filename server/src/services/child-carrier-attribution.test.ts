@@ -692,14 +692,14 @@ describePg("child carrier attribution", () => {
   });
   it("attaches and honors the same immutable delivery-only proof accepted by the child resolver", async () => {
     const { ownerId, childId } = await seedPair();
-    await db.update(issues).set({ executionState: { delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD } } }).where(eq(issues.id, childId));
+    await db.update(issues).set({ executionState: { delivery: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, branch: CARRIER_BRANCH, headSha: HEAD } } }).where(eq(issues.id, childId));
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
     const decisionId = await approveChild(childId);
     const [approved] = await db.select().from(issues).where(eq(issues.id, childId));
     await db.update(issues).set({
       executionState: {
         lastDecisionId: decisionId, lastDecisionOutcome: "approved",
-        delivery: { prNumber: 653, branch: CARRIER_BRANCH, headSha: HEAD },
+        delivery: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, branch: CARRIER_BRANCH, headSha: HEAD },
         approvalStatus: approved!.executionState?.approvalStatus,
       },
     }).where(eq(issues.id, childId));
@@ -985,7 +985,7 @@ describePg("child carrier attribution", () => {
     expect(row).toMatchObject({ state: "current", commitShas: replacement, childDecisionId: replacementDecision });
   });
 
-  it.each(["attachment", "owner gate"])("rejects claim repository drift at the %s after preflight", async (site) => {
+  it.each([["claim", "attachment"], ["claim", "owner gate"], ["binding", "attachment"], ["binding", "owner gate"]])("rejects %s repository drift at the %s after preflight", async (source, site) => {
     const { childId, ownerId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     await approveChild(childId);
@@ -995,14 +995,32 @@ describePg("child carrier attribution", () => {
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBeNull();
     }
     const [child] = await db.select().from(issues).where(eq(issues.id, childId));
-    await db.update(issues).set({ executionState: {
-      ...child!.executionState,
-      childCarrierClaim: { prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${OWNER}/old-repository/pull/653` },
-    } }).where(eq(issues.id, childId));
+    const state = { ...child!.executionState };
+    const identity = { prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${OWNER}/old-repository/pull/653` };
+    if (source === "claim") state.childCarrierClaim = identity;
+    else {
+      delete state.childCarrierClaim;
+      state.delivery = { ...identity, branch: CARRIER_BRANCH };
+    }
+    await db.update(issues).set({ executionState: state }).where(eq(issues.id, childId));
     if (site === "attachment") {
       await recordChildCarrierDecision(db, companyId, childId);
       const [row] = await db.select().from(issueChildCarrierAttributions);
       expect(row!.childDecisionId).toBeNull();
     } else expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  it.each([
+    `https://github.com/${OWNER}/old-repository/pull/653`,
+    `https://github.com/${OWNER}/${REPO}/pull/654`,
+    `https://github.com.evil/${OWNER}/${REPO}/pull/653`,
+    null,
+  ])("does not certify a delivery-only binding with unproven recorded PR URL %s", async (prUrl) => {
+    const { childId } = await seedPair();
+    await db.update(issues).set({ executionState: { delivery: {
+      prNumber: 653, headSha: HEAD, branch: CARRIER_BRANCH, prUrl,
+    } } }).where(eq(issues.id, childId));
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
   });
 });
