@@ -1394,6 +1394,12 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   it("never holds the issue row while the probe runs: every GitHub compare finds the row unlocked", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    // This case proves lock ordering, not the production recheck deadline.
+    // Keep the real Git/filesystem validation, but separate this proof from the
+    // shorter production deadline when neighboring suites add instrumentation.
+    // The timeout/remedy case above still exercises the real bounded refusal.
+    mockRecheckRecordedWorktree.mockImplementation((input: Parameters<typeof recheckRecordedWorktree>[0]) =>
+      realRecheckRecordedWorktreeRef.current!({ ...input, budgetMs: 60_000 }));
     const rowUnlockedDuringCompare: boolean[] = [];
     mockGhFetch.mockImplementation(async (url: string) => {
       rowUnlockedDuringCompare.push(await issueRowIsUnlocked(fixture.issueId));
@@ -1406,7 +1412,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     // The declaration check and the pre-write measurement each compare the tip.
     expect(rowUnlockedDuringCompare.length).toBeGreaterThanOrEqual(2);
     expect(rowUnlockedDuringCompare.every(Boolean), JSON.stringify(rowUnlockedDuringCompare)).toBe(true);
-  });
+  }, 120_000);
 
   it("completes twelve concurrent no-repository closes, more than the database pool holds", async () => {
     const fixtures: SeededIssue[] = [];

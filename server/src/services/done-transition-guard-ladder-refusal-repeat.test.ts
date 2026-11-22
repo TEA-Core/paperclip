@@ -10,7 +10,7 @@ import {
   reapStrandedSummaryGenerationIssues,
   SUMMARIZER_AGENT_ID,
 } from "./execution-control-reconciliation.js";
-import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
+import { evaluateDoneTransitionGuard, evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -136,9 +136,9 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
   it.each([false, true])("refreshes capped deferral state, including legacy rows (%s), without bypassing the guard", async (legacy) => {
     const { issueId, stageId } = await seedLadderCard();
     for (let call = 0; call < 5; call++) {
-      expect((await evaluateDoneTransitionGuardForBackstopClose({
-        db, issue: await readIssue(issueId), closeComment: null,
-      })).allowed).toBe(false);
+      // Seed through the core door so a backstop-bypass mutant must reach
+      // the real reaper outcome, not fail only on this setup assertion.
+      expect((await evaluateDoneTransitionGuard(db, await readIssue(issueId), null)).allowed).toBe(false);
     }
     if (legacy) {
       await db.update(activityLog).set({
@@ -152,14 +152,118 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
       stages.push({ id: randomUUID(), type: "review" });
       await db.update(issues).set({ executionPolicy: policy(stages) }).where(eq(issues.id, issueId));
       await ageActivity(issueId, 10);
+      const originalRefusals = await rows(issueId, REFUSED);
       expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 1, terminalized: 0 });
       expect(await statusOf(issueId)).toBe("in_progress");
+      const refreshedRefusals = await rows(issueId, REFUSED);
+      for (const original of originalRefusals) {
+        const refreshed = refreshedRefusals.find((row) => row.id === original.id)!;
+        const originalDetails = { ...original.details };
+        const refreshedDetails = { ...refreshed.details };
+        delete originalDetails.lastEvaluatedLadderStateKey;
+        delete refreshedDetails.lastEvaluatedLadderStateKey;
+        expect(refreshedDetails).toEqual(originalDetails);
+        expect(refreshed.createdAt).toEqual(original.createdAt);
+      }
       for (let tick = 0; tick < 3; tick++) {
         expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
       }
     }
     expect(await rows(issueId, REFUSED)).toHaveLength(3);
     expect(await rows(issueId, REPEATED)).toHaveLength(1);
+  });
+
+  it("preserves the computed refusal when a real cursor lock times out, then converges after release", async () => {
+    const { issueId, stageId } = await seedLadderCard();
+    for (let call = 0; call < 5; call++) {
+      expect((await evaluateDoneTransitionGuardForBackstopClose({
+        db, issue: await readIssue(issueId), closeComment: null,
+      })).allowed).toBe(false);
+    }
+    await db.update(issues).set({
+      executionPolicy: policy([{ id: stageId, type: "review" }, { id: randomUUID(), type: "review" }]),
+    }).where(eq(issues.id, issueId));
+    const [latest] = await db.select({ id: activityLog.id }).from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, REFUSED)))
+      .orderBy(sql`${activityLog.createdAt} desc`, sql`${activityLog.id} desc`).limit(1);
+    // This package's compiler library predates Promise.withResolvers.
+    let signalLocked!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    let releaseLock!: () => void;
+    const released = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const holding = db.transaction(async (tx) => {
+      await tx.select({ id: activityLog.id }).from(activityLog).where(eq(activityLog.id, latest!.id)).for("update");
+      signalLocked();
+      await released;
+    });
+    await locked;
+    // A separate single-connection pool makes the session timeout apply to
+    // the actual refresh UPDATE, never to the lock-holding connection.
+    const limitedDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    try {
+      await limitedDb.execute(sql`set lock_timeout = '50ms'`);
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: limitedDb, issue: await readIssue(issueId), closeComment: null,
+      });
+      expect(verdict).toMatchObject({
+        allowed: false,
+        code: "done_transition_missing_delivery",
+        reason: expect.stringContaining(`review, ${stageId}`),
+      });
+      expect(await statusOf(issueId)).toBe("in_progress");
+    } finally {
+      releaseLock();
+      await holding;
+    }
+    expect((await evaluateDoneTransitionGuardForBackstopClose({
+      db, issue: await readIssue(issueId), closeComment: null,
+    })).allowed).toBe(false);
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    expect(await rows(issueId, REFUSED)).toHaveLength(3);
+    expect(await rows(issueId, REPEATED)).toHaveLength(1);
+  });
+
+  it("refreshes only the changed card when another capped card owns the latest company refusal", async () => {
+    const first = await seedLadderCard();
+    for (let call = 0; call < 5; call++) {
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(first.issueId), closeComment: null });
+    }
+    await ageActivity(first.issueId, 1);
+    const second = await seedLadderCard();
+    for (let call = 0; call < 5; call++) {
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(second.issueId), closeComment: null });
+    }
+    const untouched = await rows(second.issueId, REFUSED);
+    await db.update(issues).set({
+      executionPolicy: policy([{ id: first.stageId, type: "review" }, { id: randomUUID(), type: "review" }]),
+    }).where(eq(issues.id, first.issueId));
+    expect((await evaluateDoneTransitionGuardForBackstopClose({
+      db, issue: await readIssue(first.issueId), closeComment: null,
+    })).allowed).toBe(false);
+    const after = await rows(second.issueId, REFUSED);
+    for (const original of untouched) {
+      expect(after.find((row) => row.id === original.id)).toEqual(original);
+    }
+    expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+    expect(await statusOf(first.issueId)).toBe("in_progress");
+    expect(await statusOf(second.issueId)).toBe("in_progress");
+  });
+
+  it("does not create new audit row versions for unchanged capped refusals", async () => {
+    const { issueId } = await seedLadderCard();
+    for (let call = 0; call < 5; call++) {
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(issueId), closeComment: null });
+    }
+    const before = await db.select({ id: activityLog.id, version: sql<string>`xmin::text` })
+      .from(activityLog).where(eq(activityLog.entityId, issueId)).orderBy(activityLog.id);
+    for (let call = 0; call < 2; call++) {
+      expect((await evaluateDoneTransitionGuardForBackstopClose({
+        db, issue: await readIssue(issueId), closeComment: null,
+      })).allowed).toBe(false);
+    }
+    expect(await db.select({ id: activityLog.id, version: sql<string>`xmin::text` })
+      .from(activityLog).where(eq(activityLog.entityId, issueId)).orderBy(activityLog.id)).toEqual(before);
+    expect(await statusOf(issueId)).toBe("in_progress");
   });
 
   it("uses the latest refusal rather than an older differently evaluated state", async () => {

@@ -848,14 +848,20 @@ async function writeLadderRefusalAuditLog(
     ))
     .orderBy(sql`${activityLog.createdAt} desc`, sql`${activityLog.id} desc`)
     .limit(1);
-  await db.update(activityLog).set({
-    details: sql`jsonb_set(coalesce(${activityLog.details}, '{}'::jsonb),
-      '{lastEvaluatedLadderStateKey}', to_jsonb(${details.ladderStateKey}::text))`,
-  }).where(and(
-    eq(activityLog.id, latestRefusal),
-    sql`coalesce(${activityLog.details} ->> 'lastEvaluatedLadderStateKey',
-      ${activityLog.details} ->> 'ladderStateKey') is distinct from ${details.ladderStateKey}`,
-  ));
+  try {
+    await db.update(activityLog).set({
+      details: sql`jsonb_set(coalesce(${activityLog.details}, '{}'::jsonb),
+        '{lastEvaluatedLadderStateKey}', to_jsonb(${details.ladderStateKey}::text))`,
+    }).where(and(
+      eq(activityLog.id, latestRefusal),
+      sql`coalesce(${activityLog.details} ->> 'lastEvaluatedLadderStateKey',
+        ${activityLog.details} ->> 'ladderStateKey') is distinct from ${details.ladderStateKey}`,
+    ));
+  } catch (err) {
+    // Cache availability cannot replace the already-computed refusal with a
+    // database error. A later evaluation can refresh the cursor after recovery.
+    logger.warn({ err, issueId: issue.id }, "failed to refresh ladder-refusal cursor; retaining computed refusal");
+  }
 }
 
 /**
