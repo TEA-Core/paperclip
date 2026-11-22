@@ -18,6 +18,7 @@ import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryCarrierParkService } from "../services/recovery-carrier-park.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
@@ -1303,6 +1304,52 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(f)).toEqual(before);
     expect(await parkRecords(f)).toEqual(records);
     expect((await park(f)).status).toBe(201);
+  });
+
+  it("retains the ordinary 100-node pause boundary while another branch has a typed park", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    const chain: Array<typeof issues.$inferInsert> = [];
+    let parentId: string | null = null;
+    for (let depth = 0; depth <= 100; depth++) {
+      const id = randomUUID();
+      chain.push({ id, companyId: f.companyId, title: "Ordinary pause depth control", status: "todo", parentId });
+      parentId = id;
+    }
+    await db.insert(issues).values(chain);
+    const tree = issueTreeControlService(db);
+    const ordinary = await tree.createHold(f.companyId, chain[0].id!, { mode: "pause", releasePolicy: { strategy: "manual" },
+      actor: { actorType: "user", actorId: "park-operator", userId: "park-operator" } });
+    expect(await tree.getActivePauseHoldGate(f.companyId, chain[99].id!)).toMatchObject({ holdId: ordinary.hold.id });
+    expect(await tree.getActivePauseHoldGate(f.companyId, chain[100].id!)).toBeNull();
+  });
+
+  it("terminates cyclic ancestry and still finds the exact typed stop when it lies in the cycle", async () => {
+    const f = await fixture(), parked = await park(f);
+    expect(parked.status).toBe(201);
+    const first = randomUUID(), second = randomUUID();
+    await db.insert(issues).values([
+      { id: first, companyId: f.companyId, title: "Legacy cyclic parent", status: "todo" },
+      { id: second, companyId: f.companyId, title: "Legacy cyclic child", status: "todo", parentId: first },
+    ]);
+    await db.update(issues).set({ parentId: second }).where(eq(issues.id, first));
+    const tree = issueTreeControlService(db);
+    expect(await tree.getActivePauseHoldGate(f.companyId, second)).toBeNull();
+    await db.update(issues).set({ parentId: f.carrierId }).where(eq(issues.id, first));
+    await db.update(issues).set({ parentId: second }).where(eq(issues.id, f.carrierId));
+    expect(await tree.getActivePauseHoldGate(f.companyId, second)).toMatchObject({
+      holdId: parked.body.hold.id, rootIssueId: f.carrierId, recoveryCarrierPark: { recoveryActionId: f.actionId },
+    });
+  });
+
+  it("does not follow a foreign-company parent when an unrelated same-company typed park exists", async () => {
+    const foreign = await fixture(), local = await fixture();
+    expect((await park(foreign)).status).toBe(201);
+    expect((await park(local)).status).toBe(201);
+    const childId = randomUUID();
+    await db.insert(issues).values({ id: childId, companyId: local.companyId, title: "Legacy foreign parent",
+      status: "todo", parentId: foreign.carrierId });
+    expect(await issueTreeControlService(db).getActivePauseHoldGate(local.companyId, childId)).toBeNull();
   });
 
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
