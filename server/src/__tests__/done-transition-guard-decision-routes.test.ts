@@ -1050,6 +1050,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ["exit_nonzero", "exit 2"],
       ["exited_nonzero", "exited 2"],
       ["failed_positive", "failed=1"],
+      ["failed_positive", "failed=1e-400"],
       ["scanned_zero", "scanned=0"],
       ["non_clean", "non-clean"],
       ["failed_closed", "failed closed. All four configured repos shape"],
@@ -1057,7 +1058,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ["partial_failure", "partial failure"],
     ])("PATCH refuses %s without a terminal write or green audit", async (marker, prose) => {
       const { companyId, reviewerAgentId, issueId, identifier } =
-        await seedIssueAwaitingReview(`D25007R${marker.replaceAll("_", "").toUpperCase()}`, { deliveryRequirement: "record_only" });
+        await seedIssueAwaitingReview(`D25007R${marker.replaceAll("_", "").toUpperCase()}${prose.length}`, { deliveryRequirement: "record_only" });
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
       mockNoOpenPulls();
@@ -1082,7 +1083,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
     });
 
-    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42", "scanned=0.5 failed=0.0", "anon request refused 401; failed closed on anon request"])(
+    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42", "scanned=0.5 failed=0.0", "scanned=1e-400", "anon request refused 401; failed closed on anon request"])(
       "PATCH closes honest evidence at Tier 2 and records its class: %s",
       async (prose) => {
         const { companyId, reviewerAgentId, issueId, identifier } =

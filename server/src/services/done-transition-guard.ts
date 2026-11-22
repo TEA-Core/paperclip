@@ -1970,24 +1970,32 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
 // `failed=0.0` / `exit -0` are zero. Keep these eight names and forms synchronized
 // with the done-close documentation.
 const DECIMAL = String.raw`([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w]|\.\d)`;
-const numericMarker = (name: string, label: string, test: (value: number) => boolean) => ({
-  name,
-  matches: (text: string) => {
-    for (const m of text.matchAll(new RegExp(String.raw`\b${label}${DECIMAL}`, "gi"))) {
-      if (test(Number(m[1]))) return true;
-    }
-    return false;
-  },
-});
+// Exact decimal zero test on the token text (no Number() coercion, which underflows
+// `1e-400` to 0): zero iff the mantissa has no nonzero digit, whatever the exponent.
+const DECIMAL_ZERO_RE = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?$/i;
+const isZeroDecimal = (token: string) => DECIMAL_ZERO_RE.test(token);
+const isPositiveDecimal = (token: string) => !token.startsWith("-") && !isZeroDecimal(token);
+const numericMarker = (name: string, label: string, test: (token: string) => boolean) => {
+  const re = new RegExp(String.raw`\b${label}${DECIMAL}`, "gi");
+  return {
+    name,
+    matches: (text: string) => {
+      for (const m of text.matchAll(re)) {
+        if (test(m[1])) return true;
+      }
+      return false;
+    },
+  };
+};
 const phraseMarker = (name: string, pattern: RegExp) => ({
   name,
   matches: (text: string) => pattern.test(text),
 });
 const RECORD_ONLY_PASS_CONTRADICTIONS = [
-  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (v) => v !== 0),
-  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (v) => v !== 0),
-  numericMarker("failed_positive", "failed=", (v) => v > 0),
-  numericMarker("scanned_zero", "scanned=", (v) => v === 0),
+  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("failed_positive", "failed=", isPositiveDecimal),
+  numericMarker("scanned_zero", "scanned=", isZeroDecimal),
   phraseMarker("non_clean", /\bnon-clean\b/i),
   // Literal scan-failure contexts only; bare expected-negative "failed closed" stays valid.
   phraseMarker("failed_closed", /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i),

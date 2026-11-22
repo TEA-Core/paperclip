@@ -6325,6 +6325,7 @@ describe("evaluateDoneTierDeclaration", () => {
       it.each([
         "scanned=0.0", "scanned=-0", "scanned=0e5", "scanned=.0", "scanned=0.", "failed=1.5", "failed=1e2",
         "failed=+.5e1", "exit 2.0", "exit -0.5", "exited 1e1", "exit 2.",
+        "failed=1e-400", "exit 1e-400", "exited -1e-400",
       ])("refuses complete decimal contradiction form: %s", async (prose) => {
         const result = await evaluateDoneTierDeclaration(
           mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
@@ -6336,7 +6337,7 @@ describe("evaluateDoneTierDeclaration", () => {
 
       it.each([
         "scanned=0.5", "scanned=+.5", "scanned=1e2", "scanned=0.001", "failed=0.0", "failed=-1", "failed=0e3",
-        "failed=.0", "exit 0.0", "exit -0", "exited 00.00", "exit 0e5",
+        "failed=.0", "exit 0.0", "exit -0", "exited 00.00", "exit 0e5", "scanned=1e-400",
       ])("does not refuse non-contradicting decimal form: %s", async (prose) => {
         const result = await evaluateDoneTierDeclaration(
           mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
