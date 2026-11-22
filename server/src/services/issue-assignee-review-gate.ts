@@ -502,7 +502,10 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   // An auto-adopted assignee was chosen from a Maintainer that the route saw
   // earlier. If the locked resolution no longer finds one, the adopted id is
   // stale: fail closed. Ordinary writes keep the no-canonical exception.
-  if (input.lockCanonicalResolution) await lockWikiMaintainerResolution(input.db as Db, input.companyId, "shared");
+  if (
+    input.lockCanonicalResolution &&
+    (input.requireAvailableCanonical || isWikiHandoffTitle(input.issue?.title))
+  ) await lockWikiMaintainerResolution(input.db as Db, input.companyId, "shared");
   const adoptionSourceValid = !input.requireAvailableCanonical ||
     await isReporterHandoffSource(
       input.db as Db,

@@ -554,6 +554,34 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     }
   }, 30_000);
 
+  it("lets an ordinary non-Wiki card write complete while the Wiki resolution lock is held", async () => {
+    const { company } = await seedWikiCompany("maintainer");
+    const card = await seedUnassignedHandoff(company.id);
+    await db.update(issues).set({ title: "Ordinary card", description: "before" }).where(eq(issues.id, card.id));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const mutex = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`wiki-maintainer-resolution:${company.id}`}, 0))`);
+      acquired();
+      await held;
+    });
+    await holding;
+    try {
+      const res = await request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${card.id}`).send({ description: "after" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const stored = await readAssignee(card.id);
+      expect(stored?.assigneeAgentId).toBeNull();
+      const [row] = await db.select({ description: issues.description }).from(issues).where(eq(issues.id, card.id));
+      expect(row?.description).toBe("after");
+    } finally {
+      release();
+      await mutex;
+    }
+  }, 20_000);
+
   it("does not take the resolution lock for unrelated or key-reordered marker metadata updates", async () => {
     const { company, intruder, maintainer } = await seedWikiCompany("maintainer");
     let release!: () => void;
