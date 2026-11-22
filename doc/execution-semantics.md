@@ -883,10 +883,12 @@ removed): auto-adoption fails closed with 422, while an ordinary write keeps the
 historical no-canonical exception below.
 
 The metadata fallback also takes a company-scoped advisory lock (shared) before
-it scans agents, and creating a Maintainer-marked agent takes the same lock
-(exclusive). A marked agent therefore cannot be inserted between the guard's
-resolution and the issue UPDATE, because row locks cannot cover a row that does
-not exist yet.
+it scans agents, and every agent creation takes the same lock (exclusive).
+This includes unmarked agents: a new unmarked row must not escape the scan's
+row locks and then acquire the Maintainer marker before the issue UPDATE.
+Existing candidate rows remain protected by their shared row locks. The advisory
+lock also serializes concurrent agent creations within that company; it does
+not block another company's agent creation.
 
 Adoption is decided against an unassigned read. If an agent or user owner lands
 before the locked write, the repair returns 409 `wiki_handoff_adoption_conflict`

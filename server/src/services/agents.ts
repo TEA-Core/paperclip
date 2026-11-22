@@ -61,7 +61,7 @@ import {
   builtInAgentMarkersEqual,
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
-import { lockWikiMaintainerResolution, metadataMarksWikiMaintainer } from "./issue-assignee-review-gate.js";
+import { lockWikiMaintainerResolution } from "./issue-assignee-review-gate.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 
 function hashToken(token: string) {
@@ -930,11 +930,9 @@ export function agentService(db: Db) {
       });
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
-        // A Maintainer-marked insert must serialize with the Wiki handoff
-        // guard's metadata fallback, which row locks cannot cover.
-        if (metadataMarksWikiMaintainer(data.metadata)) {
-          await lockWikiMaintainerResolution(txDb, companyId, "exclusive");
-        }
+        // New rows escape the fallback's row-lock snapshot, even if they only
+        // acquire the Maintainer marker in a later update.
+        await lockWikiMaintainerResolution(txDb, companyId, "exclusive");
         // Consume the stored-session claim and create the fixed definition inside
         // the same transaction that inserts the binding. A rejected claim rolls
         // back the whole transaction and inserts no binding.

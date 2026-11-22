@@ -156,7 +156,7 @@ const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
 export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
 const UNRESOLVED_WIKI_MAINTAINER_AGENT_ID = "unresolved-wiki-maintainer";
 
-export function metadataMarksWikiMaintainer(metadata: unknown): boolean {
+function metadataMarksWikiMaintainer(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
   const record = metadata as Record<string, unknown>;
   return [record.paperclipManagedResource, record.pluginManagedAgent].some((marker) => {
@@ -175,9 +175,9 @@ export function metadataMarksWikiMaintainer(metadata: unknown): boolean {
 /**
  * Row locks cannot cover an agent that does not exist yet. The metadata
  * fallback therefore takes this company-scoped advisory lock (shared) before
- * it scans agents, and agent creation takes it (exclusive) before inserting a
- * Maintainer-marked agent. A marked insert then cannot land between the
- * guard's resolution and the issue UPDATE that relies on it.
+ * it scans agents, and every agent creation takes it (exclusive) before
+ * inserting. This also covers an unmarked insert followed by a marker update:
+ * no new candidate can appear before the guarded issue UPDATE commits.
  */
 export async function lockWikiMaintainerResolution(
   db: Db,
