@@ -279,6 +279,16 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
   });
 
+  it("admits an explicit assignment of a paused canonical maintainer without a status", async () => {
+    const { company, maintainer } = await seedWikiCompany("maintainer");
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, maintainer.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    const res = await request(createApp(db, boardActor(company.id)))
+      .patch(`/api/issues/${stub.id}`).send({ assigneeAgentId: maintainer.id });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
+  });
+
   it("preserves the no-reference, no-marked-agent field write without adoption", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");
     await db.delete(pluginManagedResources);

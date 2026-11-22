@@ -11937,6 +11937,12 @@ export function issueService(db: Db) {
          * without writing an assignee. Never a column; never from a request body.
          */
         boardStageDecision?: boolean;
+        /**
+         * Internal only. Set by the PATCH route on the write that auto-adopts
+         * the live canonical Wiki Maintainer for an unassigned Wiki handoff
+         * field repair. Never a column; never from a request body.
+         */
+        wikiHandoffAutoAdoption?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11997,6 +12003,7 @@ export function issueService(db: Db) {
         expectedUpdatedAt,
         workflowControlledAssignment,
         boardStageDecision,
+        wikiHandoffAutoAdoption,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -12492,10 +12499,7 @@ export function issueService(db: Db) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,
             lockCanonicalResolution: true,
-            requireAvailableCanonical:
-              receiptExisting.assigneeAgentId === null &&
-              issueData.assigneeAgentId != null &&
-              issueData.status === undefined,
+            requireAvailableCanonical: wikiHandoffAutoAdoption === true,
             companyId: receiptExisting.companyId,
             issue: {
               title:

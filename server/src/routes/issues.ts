@@ -20346,6 +20346,7 @@ export function issueRoutes(
     // sets no assignee and no status. Adopt the live canonical Maintainer in
     // this same write so the guard sees that assignee. A stale or ambiguous
     // resolver result does not adopt, and the unassigned refusal stands.
+    let wikiHandoffAutoAdoption = false;
     const fieldRepairTitle = updateFields.title !== undefined ? updateFields.title : existing.title;
     const requestOmitsAssignee =
       normalizedAssigneeAgentId === undefined && req.body.assigneeUserId === undefined;
@@ -20388,6 +20389,7 @@ export function issueRoutes(
       if (adoptedMaintainerId) {
         updateFields.assigneeAgentId = adoptedMaintainerId;
         updateFields.assigneeUserId = null;
+        wikiHandoffAutoAdoption = true;
       }
     }
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
@@ -21713,6 +21715,7 @@ export function issueRoutes(
       ...(transition.workflowControlledAssignment
         ? { workflowControlledAssignment: true }
         : {}),
+      ...(wikiHandoffAutoAdoption ? { wikiHandoffAutoAdoption: true } : {}),
       ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
         ? { executionWorkspaceId: existing.executionWorkspaceId }
         : {}),
