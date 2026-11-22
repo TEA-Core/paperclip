@@ -683,6 +683,9 @@ wake preflight use the lock-holding transaction; wake publication follows commit
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.
+Stale execution-pointer cleanup rechecks the source-action gate under the source
+lock. Active typed parks also prevent automatic stale-review carrier archival;
+ordinary unparked cleanup and review-stage archival rules are unchanged.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
 the source's unresolved escalation and from actual dependency counts/tree

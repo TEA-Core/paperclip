@@ -9620,28 +9620,36 @@ export function recoveryService(
         return;
       }
 
-      const updated = await db
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issue.id),
-            issue.checkoutRunId
-              ? eq(issues.checkoutRunId, issue.checkoutRunId)
-              : isNull(issues.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async tx => {
+        const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+        )).for("update");
+        const runner = tx as unknown as Db; // Recheck consent while retaining the source lock.
+        if (!source || await hasBoardParkedRecoveryAction(runner, issue.companyId, issue.id)) return null;
+        return tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, issue.companyId),
+              issue.checkoutRunId
+                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+                : isNull(issues.checkoutRunId),
+              issue.executionRunId
+                ? eq(issues.executionRunId, issue.executionRunId)
+                : isNull(issues.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (!updated) return;
 
@@ -12344,7 +12352,13 @@ export function recoveryService(
         continue;
       }
 
-      await db.transaction(async (tx) => {
+      const archived = await db.transaction(async (tx) => {
+        const [carrier] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId),
+        )).for("update");
+        const runner = tx as unknown as Db; // Serialize visibility with board park admission.
+        if (!carrier || (await issueTreeControlService(runner)
+          .getActivePauseHoldGate(candidate.companyId, candidate.id))?.recoveryCarrierPark) return false;
         await tx
           .update(issues)
           .set({ hiddenAt: new Date() })
@@ -12355,7 +12369,9 @@ export function recoveryService(
           issueId: candidate.id,
           policy: "stale_in_review_child",
         });
+        return true;
       });
+      if (!archived) continue;
 
       result.archived += 1;
       result.issueIds.push(candidate.id);
