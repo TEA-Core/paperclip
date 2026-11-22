@@ -98,7 +98,12 @@ automatic attachment-recovery consumer.
 
 The carrier owner's separate gate requires every contributing child to have a
 current, complete approved proof. A completely enumerated, disjoint child branch
-does not contribute; partial or unreadable contribution still refuses. The live
+does not contribute; partial or unreadable contribution still refuses. The one exception is a
+`done` descendant whose own branch lookup returns HTTP 404 (the branch was
+deleted) and whose own recorded delivery, read through `resolveDeliveryIdentity`,
+binds a live PR that is merged at the recorded head on that branch in the same
+repository; it contributes nothing. Any other enumeration failure, a
+non-`done` descendant, or an unverifiable own delivery refuses. The live
 carrier branch must match even when a caller does not provide a branch.
 Required attribution rows are read after remote enumeration and scoped to the
 target repository. All carrier and child comparisons in one owner gate use a
