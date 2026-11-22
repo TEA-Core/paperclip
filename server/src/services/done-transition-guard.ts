@@ -331,7 +331,7 @@ export interface DoneTierDeclarationResult {
   // Set when the refusal carries its own route error code. A door that maps every
   // refused declaration to done_transition_missing_tier_declaration uses this one
   // instead when it is set.
-  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE | "done_transition_record_only_probe_contradiction";
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -1959,6 +1959,23 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
   "i",
 );
 
+// Named, token-anchored contradictions in the record-only declaration's trailing
+// predicate/result only. This is a bounded denylist, NOT natural-language verdict
+// inference: command/target text and unrelated comment prose are not evidence.
+// Numeric markers accept integer tokens (including leading zeroes); only exit
+// codes may be signed. Zero exits/failed counts and nonzero scanned counts pass.
+// Keep these eight names and forms synchronized with the done-close documentation.
+const RECORD_ONLY_PASS_CONTRADICTIONS = [
+  { name: "exit_nonzero", pattern: /\bexit[ \t]+[+-]?0*[1-9]\d*\b/i },
+  { name: "exited_nonzero", pattern: /\bexited[ \t]+[+-]?0*[1-9]\d*\b/i },
+  { name: "failed_positive", pattern: /\bfailed=0*[1-9]\d*\b/i },
+  { name: "scanned_zero", pattern: /\bscanned=0+\b/i },
+  { name: "non_clean", pattern: /\bnon-clean\b/i },
+  { name: "failed_closed", pattern: /\bfailed[ \t]+closed\b/i },
+  { name: "refused", pattern: /\bREFUSED\b/i },
+  { name: "partial_failure", pattern: /\bpartial[ \t]+failure\b/i },
+] as const;
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -2138,6 +2155,24 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
+  for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
+    if (marker.pattern.test(predicateResult!)) {
+      const remedy =
+        "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
+        `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+      return {
+        ...refuseTier2(
+          `record-only close Tier 2 result: pass contradicts failed probe evidence (${marker.name}); ` +
+          remedy,
+        ),
+        code: "done_transition_record_only_probe_contradiction",
+        remedy,
+      };
+    }
+  }
+  // Every accepting door persists this audit as issue.done_transition_tier2_close
+  // in the terminal write's transaction. tierForm=record-only counts this class;
+  // contradictions above never mint a green row or an accepted-failure event.
   return acceptTier2(evidence.trim(), sameRun, {
     probeCommand: probeCommand!.trim(),
     probeTarget: observedTarget!.trim(),
@@ -3832,7 +3867,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       code:
         | "done_transition_missing_delivery"
         | "done_transition_missing_tier_declaration"
-        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+        | NonNullable<DoneTierDeclarationResult["code"]>;
       reason: string;
     }
 > {

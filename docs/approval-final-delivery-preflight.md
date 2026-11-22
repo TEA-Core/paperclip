@@ -45,6 +45,29 @@ The query reads one page of 100 check contexts. When GitHub reports a next page,
 
 `BLOCKED` alone does not refuse: it is the normal state while required checks run or a review is pending. `UNKNOWN` does not refuse: GitHub is still computing it. A merged or closed PR, a failed hydration, or an unreadable probe (non-2xx, GraphQL errors, no token, or no answer within 10 seconds) also does not refuse, because a refusal must rest on live proof. The probe runs only at close time. A carrier that fails after the close stays with the hourly done-close landing backstop and its 24-hour landing verdict.
 
+## Record-only Tier 2 pass contradictions
+
+A `record_only` live close uses `Closed at Tier 2 (live): record-only probe ` followed by a backticked command, `target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>` (or the existing UTC observation range). The structured `doneTier.probeEvidence` carries the same evidence without the close prefix. No merge head is required.
+
+The guard refuses a `result: pass` declaration with `done_transition_record_only_probe_contradiction` when its trailing predicate/result contains one of these eight token-anchored markers, case-insensitively:
+
+| Marker name | Recognized form |
+| --- | --- |
+| `exit_nonzero` | `exit <integer>` with a nonzero value |
+| `exited_nonzero` | `exited <integer>` with a nonzero value |
+| `failed_positive` | `failed=<integer>` with a positive value |
+| `scanned_zero` | `scanned=0` |
+| `non_clean` | `non-clean` |
+| `failed_closed` | `failed closed` |
+| `refused` | `REFUSED` |
+| `partial_failure` | `partial failure` |
+
+Numbers may have leading zeroes; exit codes may have a sign. Words have word-boundary anchors; phrase separators accept spaces or tabs. This is a bounded marker list, not arbitrary prose inference: it checks only the declaration's predicate/result, not the probe command, target, or unrelated comment text. `exit criteria met`, `exit 0`, `exited 0`, `failed=0`, and `scanned=42` do not contradict a pass. `result: fail` remains refused by the existing failing-predicate rule.
+
+The refusal names the marker, repeats the accepted form verbatim, and states the honest alternative: **Report the non-clean cycle and do not close.** Re-probe before claiming a genuine pass; do not relabel a failed probe to force a close.
+
+Every accepted Tier 2 record-only close retains the existing machine-readable `issue.done_transition_tier2_close` activity row with `details.tierForm: "record-only"`, probe evidence, observation, and closing-run identity. The row commits atomically with the terminal status, including approval and system-backstop closes. Count that action and `tierForm` to count this class. No contradiction is accepted, so no `issue.done_transition_declared_pass_with_failed_evidence` row is needed.
+
 ## Certification and publication
 
 The decision transaction persists `executionState.approvalStatus.approvedHeadSha` and `finalDelivery` (`owner`, `repo`, `number`, `headSha`, `displayName`) from the preflight. Credentials are never persisted in that anchor. The post-commit hook uses this certification instead of certifying a later live head. `finalDelivery` is tagged with the decision id and every decision patch clears any prior-cycle `finalDelivery` first, so the hook only trusts a certification whose `decisionId` equals the card's `lastDecisionId`; a terminal approval that skips the preflight (sanctioned override accepted, repository-free) re-resolves the live head instead. The escalation-accept door mints its decision id inside the shared decision helper, so it re-tags the preflight certification with that id before running the hook. Publication remains delivery-identity-gated and pinned to both the reviewed SHA and repo/PR identity.

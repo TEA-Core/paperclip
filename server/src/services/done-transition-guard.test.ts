@@ -6287,6 +6287,84 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
+    describe("record-only pass contradictions", () => {
+      it.each([
+        ["exit_nonzero", "exit 2"],
+        ["exited_nonzero", "exited 2"],
+        ["failed_positive", "failed=1"],
+        ["scanned_zero", "scanned=0"],
+        ["non_clean", "non-clean"],
+        ["failed_closed", "failed closed"],
+        ["refused", "REFUSED"],
+        ["partial_failure", "partial failure"],
+      ])("refuses %s in a pass predicate", async (marker, prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier2Audit).toBeUndefined();
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.reason).toContain(marker);
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(result.remedy).toContain("Report the non-clean cycle and do not close");
+      });
+
+      it.each(["exit -2", "exited +02", "failed=001", "scanned=00", "NON-CLEAN", "refused"])(
+        "refuses integer and case variants: %s",
+        async (prose) => {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        },
+      );
+
+      it("refuses a contradiction on the same-run comment path", async () => {
+        setupDbMock({
+          heartbeatRuns: [
+            { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+          ],
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), null, "run-1",
+          () => Promise.resolve([mockComment(tier2Line(`${RECORD_ONLY_EVIDENCE}; exit 2`), "run-1")]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+      });
+
+      it("keeps a structured system-backstop contradiction from producing a close audit", async () => {
+        const result = await evaluateDoneTransitionGuardForBackstopClose({
+          db: mockDb,
+          issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+          actorId: "execution-control-reconciliation",
+          closeComment: null,
+          structuredDoneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}; exit 2` },
+        });
+        expect(result.allowed).toBe(false);
+        if (result.allowed) return;
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(logActivity).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        "exit criteria met",
+        "exit 0; exited 0; exit -0; exited +00; failed=0; scanned=12",
+        "preexit 2; failed=0; scanned=01; unREFUSED; non-cleanliness",
+      ])("accepts harmless trailing prose: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only" });
+      });
+    });
+
     // SUP-24299: "Liveness unverified." is the Tier 1 suffix. The record-only
     // matcher ends in a catch-all predicate, so it used to accept the suffix as
     // predicate text and the close landed as both live and unverified.

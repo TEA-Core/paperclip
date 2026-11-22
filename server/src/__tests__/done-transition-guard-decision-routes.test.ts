@@ -1045,6 +1045,80 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     });
   });
 
+  describe("record-only pass contradictions", () => {
+    it.each([
+      ["exit_nonzero", "exit 2"],
+      ["exited_nonzero", "exited 2"],
+      ["failed_positive", "failed=1"],
+      ["scanned_zero", "scanned=0"],
+      ["non_clean", "non-clean"],
+      ["failed_closed", "failed closed"],
+      ["refused", "REFUSED"],
+      ["partial_failure", "partial failure"],
+    ])("PATCH refuses %s without a terminal write or green audit", async (marker, prose) => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview(`D25007R${marker.replaceAll("_", "").toUpperCase()}`, { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done",
+        comment: `Closed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}; ${prose}`,
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_record_only_probe_contradiction");
+      expect(res.body.error).toContain(marker);
+      expect(res.body.error).toContain("record-only probe `<probe command>`");
+      expect(res.body.details?.remedy).toContain("Report the non-clean cycle and do not close");
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+
+    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42"])(
+      "PATCH closes honest evidence at Tier 2 and records its class: %s",
+      async (prose) => {
+        const { companyId, reviewerAgentId, issueId, identifier } =
+          await seedIssueAwaitingReview(prose === "clean probe" ? "D25007C1" : "D25007C2", { deliveryRequirement: "record_only" });
+        await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+        const runId = await seedRun(companyId, reviewerAgentId, issueId);
+        currentActor = agentActor(companyId, reviewerAgentId, runId);
+        mockNoOpenPulls();
+        const probeEvidence = `${RECORD_ONLY_EVIDENCE}; ${prose}`;
+
+        const res = await request(app).patch(`/api/issues/${identifier}`).send({
+          status: "done", doneTier: { tier: "tier2", probeEvidence },
+        });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(await statusOf(issueId)).toBe("done");
+        const rows = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.details).toMatchObject({
+          tierForm: "record-only", probeEvidence, closingRunId: runId,
+        });
+      },
+    );
+
+    it("PATCH still refuses result: fail", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("D25007F", { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done", doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE.replace("result: pass", "result: fail") },
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain("failing predicate (result: fail)");
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+  });
+
   it("PATCH: record_only close citing an observation predating the closing run is refused as a restatement (SUP-23490)", async () => {
     // The SUP-22817 shape: the closing run started AFTER the cited observation
     // (here 5 minutes after, matching the real restatement), so the cited
