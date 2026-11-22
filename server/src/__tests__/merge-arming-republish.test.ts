@@ -2005,9 +2005,14 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA],
         writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
       }).returning();
-      installReleaseTransport();
       const body = route === "release" ? { headSha: HEAD_SHA, reason: RELEASE_REASON }
         : { headSha: HEAD_SHA, overrideReason: RELEASE_REASON };
+      installReleaseTransport({ onStatusRead: () => { throw new Error("provider status is unavailable"); } });
+      const unavailable = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(unavailable.status).toBe(409);
+      expect(unavailable.body.message).toContain("child-carrier-attribution");
+
+      installReleaseTransport();
       const refused = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
       expect(refused.status).toBe(409);
       expect(refused.body.message).toContain("child-carrier-attribution");

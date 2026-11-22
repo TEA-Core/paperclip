@@ -70,7 +70,7 @@ function livePr(overrides: Record<string, unknown> = {}) {
   };
 }
 
-type CompareFault = "truncate" | "base" | "next" | null;
+type CompareFault = "truncate" | "base" | "next" | "oversize" | "duplicate" | "total" | null;
 
 function mockCommitSources(carrierShas = [COMMIT, HEAD], childShas = [COMMIT]) {
   const baseSha = "f".repeat(40);
@@ -99,15 +99,18 @@ function mockCommitSources(carrierShas = [COMMIT, HEAD], childShas = [COMMIT]) {
       const fault = carrier ? controls.carrierFault : controls.childFault;
       controls.comparisons.push({ base: base!, head: head!, page });
       const paged = target.searchParams.has("per_page");
-      const rows = paged ? source.slice((page - 1) * 100, page * 100) : source.slice(0, 250);
+      let rows = paged ? source.slice((page - 1) * 100, page * 100) : source.slice(0, 250);
       if (fault === "truncate" && page === Math.ceil(source.length / 100)) rows.pop();
+      if (fault === "oversize" && page === 1) rows = source.slice();
+      if (fault === "duplicate" && rows.length > 1) rows[1] = rows[0]!;
       const moved = !carrier && controls.namedBaseMoved && base !== baseSha;
       body = {
         base_commit: { sha: moved || (fault === "base" && page === Math.min(2, Math.ceil(source.length / 100))) ? "d".repeat(40) : baseSha },
-        total_commits: moved ? 0 : source.length,
+        total_commits: moved ? 0 : source.length + (fault === "total" && page === 1 ? 1 : 0),
         commits: moved ? [] : rows.map((sha) => ({ sha })),
       };
       next = fault === "next" || (paged && page * 100 < source.length);
+      if (fault === "oversize" && page === 1) next = false;
     } else {
       body = livePr();
     }
@@ -415,6 +418,55 @@ describePg("child carrier attribution", () => {
     expect((await realEnumerate({
       token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH,
     })).ok).toBe(false);
+  });
+
+  it.each(["oversize", "duplicate", "total"] as const)("refuses a %s comparison response without relying on a bad tip or missing child", async (fault) => {
+    const carrier = [COMMIT, ...Array.from({ length: 249 }, (_, i) => (i + 1).toString(16).padStart(40, "0")), HEAD];
+    const controls = mockCommitSources(carrier);
+    const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
+    expect(await realEnumerate(input)).toEqual({ ok: true, shas: [COMMIT] });
+
+    controls.carrierFault = fault;
+    expect((await realEnumerate(input)).ok).toBe(false);
+  });
+
+  it("keeps an over-limit proof refusal independent of an unavailable later page", async () => {
+    const carrier = [COMMIT, ...Array.from({ length: 1_999 }, (_, i) => (i + 1).toString(16).padStart(40, "0")), HEAD];
+    mockCommitSources(carrier);
+    const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
+    const overLimit = await realEnumerate(input);
+    expect(overLimit.ok).toBe(false);
+
+    const transport = github.getMockImplementation()!;
+    github.mockImplementation(async (url: unknown) => {
+      const target = new URL(String(url));
+      if (target.pathname.includes("/compare/") && Number(target.searchParams.get("page") ?? 1) > 1) {
+        return { ok: false, status: 403, json: async () => ({ message: "later page is not readable" }) };
+      }
+      return transport(url);
+    });
+    expect(await realEnumerate(input)).toEqual(overLimit);
+  });
+
+  it("classifies malformed provider JSON as invalid proof rather than transport loss", async () => {
+    const input = { token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653, headSha: HEAD, baseRef: "main", childBranch: CHILD_BRANCH };
+    mockCommitSources(["not-a-sha", HEAD]);
+    const invalidCommits = await realEnumerate(input);
+    expect(invalidCommits.ok).toBe(false);
+
+    mockCommitSources();
+    const transport = github.getMockImplementation()!;
+    github.mockImplementation(async (url: unknown) => {
+      const response = await transport(url);
+      return String(url).includes("/compare/") ? { ...response, json: async () => null } : response;
+    });
+    const malformed = await realEnumerate(input);
+    github.mockRejectedValue(new Error("provider is unreachable"));
+    const unavailable = await realEnumerate(input);
+
+    expect(unavailable.ok).toBe(false);
+    expect(malformed).toEqual(invalidCommits);
+    expect(malformed).not.toEqual(unavailable);
   });
 
   it("refuses an empty comparison while the contributing child's approved system attribution is still current", async () => {
