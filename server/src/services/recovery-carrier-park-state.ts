@@ -10,7 +10,7 @@ export function recoveryActionIdentityMatches(saved: SQL, actionId: string | SQL
 }
 
 /** Release ends the carrier hold, not automatic source denial. Only independent board resolution uses activeOnly. */
-export function recoveryActionNotBoardParked(companyId: string, actionId: string | SQL, activeOnly = false) {
+export function recoveryActionNotBoardParked(companyId: string | SQL, actionId: string | SQL, activeOnly = false) {
   return sql`not exists (select 1 from ${issueTreeHolds}
     where ${issueTreeHolds.companyId} = ${companyId} and ${activeOnly
       ? sql`${issueTreeHolds.status} = 'active'`

@@ -122,7 +122,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
   async function snapshot(f: Fixture) {
     return {
       source: await db.select().from(issues).where(eq(issues.id, f.sourceId)),
-      actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)),
+      actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)).orderBy(issueRecoveryActions.id),
       cards: await db.select().from(issues).where(eq(issues.companyId, f.companyId)).orderBy(issues.id),
       wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
     };

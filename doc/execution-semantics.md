@@ -677,6 +677,9 @@ consistently, including older bindings, without casting untrusted saved JSON,
 rewriting stored consent or touching the action row. Malformed aliases sharing
 the protected UUID's hex digits fail closed. Admission also checks the
 server-derived action identity in queued wake context.
+Exhaustion drain excludes the exact parked action before its bounded candidate
+page, so parked rows cannot hide later eligible work. Carrier eligibility and
+wake preflight use the lock-holding transaction; wake publication follows commit.
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.

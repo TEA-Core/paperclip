@@ -2582,8 +2582,8 @@ export function recoveryService(
   // the in_progress/D1/D3 park, review-participant recovery,
   // blocked_without_blockers and accepted-interaction continuation sweeps,
   // which are out of scope here and must stay behaviourally unchanged.
-  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null) {
-    return db
+  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null, runner: Db = db) {
+    return runner
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
       .where(
@@ -3725,10 +3725,11 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
     opts?: { evaluateAsAssignee?: boolean },
+    authorizer = authz,
   ): Promise<boolean> {
     const assigneeAgentId = opts?.evaluateAsAssignee ? agentId : issue.assigneeAgentId;
     const assigneeUserId = opts?.evaluateAsAssignee ? null : issue.assigneeUserId;
-    const decision = await authz.decide({
+    const decision = await authorizer.decide({
       actor: { type: "agent", agentId, companyId: issue.companyId },
       action: "issue:comment",
       resource: {
@@ -3757,20 +3758,21 @@ export function recoveryService(
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
+    runner: Db = db,
   ) {
     const candidateIds: string[] = [];
     if (preferredOwnerAgentId) candidateIds.push(preferredOwnerAgentId);
     if (issue.assigneeAgentId) {
-      const assignee = await getAgent(issue.assigneeAgentId);
+      const assignee = await getAgent(issue.assigneeAgentId, runner);
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
     }
     if (issue.createdByAgentId) {
-      const creator = await getAgent(issue.createdByAgentId);
+      const creator = await getAgent(issue.createdByAgentId, runner);
       if (creator?.reportsTo) candidateIds.push(creator.reportsTo);
       candidateIds.push(issue.createdByAgentId);
     }
 
-    const roleCandidates = await db
+    const roleCandidates = await runner
       .select()
       .from(agents)
       .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
@@ -3779,7 +3781,7 @@ export function recoveryService(
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
     const projectPolicy = issue.projectId
-      ? await db
+      ? await runner
           .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
           .from(projects)
           .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId)))
@@ -3790,12 +3792,14 @@ export function recoveryService(
     const seen = new Set<string>();
     const eligible: Array<{ agentId: string; status: string; order: number }> = [];
     let order = 0;
+    const ownerBudgets = runner === db ? budgets : budgetService(runner);
+    const ownerAuthorization = runner === db ? authz : authorizationService(runner);
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
-      const candidate = await getAgent(agentId);
+      const candidate = await getAgent(agentId, runner);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
-      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+      const budgetBlock = await ownerBudgets.getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
       });
@@ -3810,14 +3814,14 @@ export function recoveryService(
         projectPolicy: parsedProjectPolicy,
         agentConfig: candidate.adapterConfig,
       })) continue;
-      if (!(await isAgentInvokable(candidate)) || budgetBlock) continue;
+      if (!(await isAgentInvokable(candidate, runner)) || budgetBlock) continue;
       // SUP-17884 C2: an observably-dead agent (K consecutive failed wakes) is
       // not a recovery target even though its `status` may still be invokable.
-      if (await hasConsecutiveWakeFailuresForAgent(candidate.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)) continue;
+      if (await hasConsecutiveWakeFailuresForAgent(candidate.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner)) continue;
       if (
         !(await candidateCanWriteSourceIssue(issue, candidate.id, {
           evaluateAsAssignee: candidate.id === preferredOwnerAgentId,
-        }))
+        }, ownerAuthorization))
       )
         continue;
       eligible.push({ agentId: candidate.id, status: candidate.status, order: order += 1 });
@@ -9861,6 +9865,7 @@ export function recoveryService(
     const filters = [
       eq(issueRecoveryActions.status, "escalated"),
       eq(issueRecoveryActions.outcome, "exhausted"),
+      recoveryActionNotBoardParked(sql`${issueRecoveryActions.companyId}`, sql`${issueRecoveryActions.id}`),
     ];
     if (opts?.companyId) filters.push(eq(issueRecoveryActions.companyId, opts.companyId));
 
@@ -10039,7 +10044,7 @@ export function recoveryService(
     ): Promise<boolean> => {
       const ownerAgentId = recoveryIssue.assigneeAgentId;
       if (!ownerAgentId || recoveryIssue.assigneeUserId) return false;
-      if (await hasLiveIssueWake(input.issue.companyId, recoveryIssue.id, ownerAgentId)) {
+      if (await hasLiveIssueWake(input.issue.companyId, recoveryIssue.id, ownerAgentId, db)) {
         return false;
       }
 
@@ -10099,7 +10104,7 @@ export function recoveryService(
       return reusableRecoveryIssue.id;
     }
 
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);
     if (!ownerAgentId) return null;
 
     // The issue write boundary refuses ANY explicit workspace preference on a
