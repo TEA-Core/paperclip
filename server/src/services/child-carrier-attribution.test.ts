@@ -32,12 +32,13 @@ import {
 import { publishApprovalStatus, resolveApprovalDecisionHead } from "./merge-arming.js";
 
 const github = vi.hoisted(() => vi.fn());
+const credentialCandidates = vi.hoisted(() => vi.fn());
 vi.mock("./github-fetch.js", () => ({
   ghFetch: (...args: unknown[]) => github(...args),
   gitHubApiBase: () => "https://api.github.com",
 }));
 vi.mock("./github-credential.js", () => ({
-  resolveGitHubTokenCandidatesForRepo: async () => [{ token: "sandbox-token", scope: "company", secretName: "GITHUB_TOKEN" }],
+  resolveGitHubTokenCandidatesForRepo: (...args: unknown[]) => credentialCandidates(...args),
   resolveGitHubTokenForRepo: async () => ({ token: "sandbox-token", scope: "company", secretName: "GITHUB_TOKEN" }),
   isGitHubTokenResolution: () => true,
 }));
@@ -138,6 +139,7 @@ describePg("child carrier attribution", () => {
   });
 
   beforeEach(async () => {
+    credentialCandidates.mockReset().mockResolvedValue([{ token: "sandbox-token", scope: "company", secretName: "GITHUB_TOKEN" }]);
     github.mockReset();
     github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr() }));
     childCarrierCommits.enumerate = async () => ({ ok: true, shas: [COMMIT] });
@@ -1357,6 +1359,7 @@ describePg("child carrier attribution", () => {
       const { ownerId } = await approvedPair();
       const secondId = await addSibling(ownerId);
       await resolveChildCarrierDecisionHead(db, companyId, secondId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
       await approveChild(secondId);
       await recordChildCarrierDecision(db, companyId, secondId);
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
@@ -1475,99 +1478,134 @@ describePg("child carrier attribution", () => {
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
   });
-  describe("owner gate with a deleted descendant branch", () => {
+  describe("owner gate with an unreadable descendant branch", () => {
     const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
     const OWN_PR = 700;
-
     const OWN_HEAD = "9".repeat(40);
+    const LATER_COMMIT = "b".repeat(40);
 
-    async function terminalChild(
-      childId: string,
-      opts: { status?: string; recorded?: boolean; delivery?: (record: Record<string, unknown>) => Record<string, unknown> } = {},
-    ) {
-      const record = {
-        branch: CHILD_BRANCH,
-        headSha: OWN_HEAD,
-        prNumber: OWN_PR,
-        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${OWN_PR}`,
-        repo: { owner: OWNER, repo: REPO },
-      };
+    async function terminalChild(childId: string, status = "done") {
       await db.update(issues).set({
-        status: opts.status ?? "done",
-        executionState: opts.recorded === false ? {} : { delivery: opts.delivery ? opts.delivery(record) : record },
+        status,
+        executionState: { delivery: {
+          branch: CHILD_BRANCH,
+          headSha: OWN_HEAD,
+          prNumber: OWN_PR,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${OWN_PR}`,
+          repo: { owner: OWNER, repo: REPO },
+        } },
       }).where(eq(issues.id, childId));
     }
 
-    function mockDeletedChildBranch(opts: { childStatus?: number; ownPrMerged?: boolean; childBody?: unknown } = {}) {
+    function mockUnreadableChild(opts: {
+      childStatus?: number;
+      childBody?: unknown;
+      laterCommit?: boolean;
+      deleted?: boolean;
+      restoreAfterMissing?: boolean;
+      firstCredentialOnly?: boolean;
+    } = {}) {
       childCarrierCommits.enumerate = realEnumerate;
-      mockCommitSources();
+      const controls = mockCommitSources(
+        opts.laterCommit ? [LATER_COMMIT, HEAD] : [COMMIT, HEAD],
+        opts.laterCommit ? [LATER_COMMIT] : [COMMIT],
+      );
       const sources = github.getMockImplementation()!;
+      let deleted = opts.deleted ?? true;
       github.mockImplementation(async (url: unknown, ...rest: unknown[]) => {
         const path = new URL(String(url)).pathname;
         if (path.endsWith(`/pulls/${OWN_PR}`)) {
           return {
             ok: true, status: 200,
             json: async () => livePr({
-              state: opts.ownPrMerged === false ? "open" : "closed",
-              merged: opts.ownPrMerged !== false,
+              state: "closed", merged: true,
               head: { ref: CHILD_BRANCH, sha: OWN_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
             }),
           };
         }
-        if (path.endsWith(`/commits/${encodeURIComponent(CHILD_BRANCH)}`)) {
+        const headers = new Headers((rest[0] as { headers?: HeadersInit } | undefined)?.headers);
+        const hidden = !opts.firstCredentialOnly || headers.get("authorization") === "Bearer sandbox-token";
+        if (deleted && hidden && path.endsWith(`/commits/${encodeURIComponent(CHILD_BRANCH)}`)) {
           const status = opts.childStatus ?? 404;
+          if (opts.restoreAfterMissing) deleted = false;
           return { ok: status < 400, status, headers: { get: () => null }, json: async () => opts.childBody ?? {} };
         }
         return sources(url, ...rest);
       });
+      return { controls, deleteBranch: () => { deleted = true; }, restoreBranch: () => { deleted = false; } };
     }
 
-    it("does not let a done child with a verified merged own PR and a deleted branch block the owner", async () => {
+    it.each(["done", "in_review"])("refuses a %s child with an exact merged own PR and a deleted branch", async (status) => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId, status);
+      mockUnreadableChild();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("does not lose later child B on the carrier when its branch is deleted after merged own PR A", async () => {
       const { ownerId, childId } = await seedPair();
       await terminalChild(childId);
-      mockDeletedChildBranch();
+      const branch = mockUnreadableChild({ laterCommit: true, deleted: false });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+      branch.deleteBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses the missing-branch observation even if the branch reappears before the gate returns", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      mockUnreadableChild({ laterCommit: true, restoreAfterMissing: true });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+      expect(await realEnumerate({
+        token: "sandbox-token", owner: OWNER, repo: REPO, pullRequestNumber: 653,
+        headSha: HEAD, baseRef: "fold/tea-patches-v2026.722.0", childBranch: CHILD_BRANCH,
+      })).toEqual({ ok: true, shas: [LATER_COMMIT] });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("refuses a first-credential child-ref 404 instead of inferring no contribution", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      credentialCandidates.mockResolvedValue([
+        { token: "sandbox-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        { token: "sandbox-visible", scope: "company", secretName: "OTHER_TOKEN" },
+      ]);
+      mockUnreadableChild({ laterCommit: true, firstCredentialOnly: true });
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+      expect(await realEnumerate({
+        token: "sandbox-visible", owner: OWNER, repo: REPO, pullRequestNumber: 653,
+        headSha: HEAD, baseRef: "fold/tea-patches-v2026.722.0", childBranch: CHILD_BRANCH,
+      })).toEqual({ ok: true, shas: [LATER_COMMIT] });
+    });
+
+    it("allows a restored branch only after complete enumeration proves it disjoint", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId);
+      const branch = mockUnreadableChild();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+      branch.controls.childShas = [];
+      branch.restoreBranch();
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
     });
 
-    it("still refuses a deleted branch when the own PR is not verified merged", async () => {
+    it.each([403, 429, 500, 503])("refuses a done child with a merged own PR when its branch lookup is HTTP %s", async (childStatus) => {
       const { ownerId, childId } = await seedPair();
       await terminalChild(childId);
-      mockDeletedChildBranch({ ownPrMerged: false });
+      mockUnreadableChild({ childStatus });
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
 
-    it("still refuses a deleted branch when the done child has no recorded own PR", async () => {
-      const { ownerId, childId } = await seedPair();
-      await terminalChild(childId, { recorded: false });
-      mockDeletedChildBranch();
-      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
-    });
-
-    it("still refuses a deleted branch for a non-terminal child", async () => {
-      const { ownerId, childId } = await seedPair();
-      await terminalChild(childId, { status: "in_review" });
-      mockDeletedChildBranch();
-      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
-    });
-
-    it.each([403, 429, 500, 503])("still refuses a done child with a merged own PR when its branch lookup is HTTP %s", async (childStatus) => {
+    it("refuses a malformed child branch lookup", async () => {
       const { ownerId, childId } = await seedPair();
       await terminalChild(childId);
-      mockDeletedChildBranch({ childStatus });
+      mockUnreadableChild({ childStatus: 200, childBody: { sha: "not-a-sha" } });
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
 
-    it("still refuses a malformed child branch lookup", async () => {
+    it("refuses when the comparison base cannot be read", async () => {
       const { ownerId, childId } = await seedPair();
       await terminalChild(childId);
-      mockDeletedChildBranch({ childStatus: 200, childBody: { sha: "not-a-sha" } });
-      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
-    });
-
-    it("does not treat a missing base branch as a deleted child branch", async () => {
-      const { ownerId, childId } = await seedPair();
-      await terminalChild(childId);
-      mockDeletedChildBranch();
+      mockUnreadableChild();
       const inner = github.getMockImplementation()!;
       github.mockImplementation(async (url: unknown, ...rest: unknown[]) => {
         const path = new URL(String(url)).pathname;
@@ -1579,34 +1617,11 @@ describePg("child carrier attribution", () => {
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
 
-    it.each([
-      ["no recorded head", (r: Record<string, unknown>) => { const { headSha: _h, ...rest } = r; return rest; }],
-      ["no recorded repository", (r: Record<string, unknown>) => { const { repo: _r, ...rest } = r; return rest; }],
-      ["a foreign recorded repository", (r: Record<string, unknown>) => ({ ...r, repo: { owner: "other-owner", repo: REPO } })],
-      ["an AS-05 record without a card branch", (r: Record<string, unknown>) => ({ ...r, kind: "as05_bound_pr" })],
-      ["an AS-05 record naming a foreign card branch", (r: Record<string, unknown>) => ({ ...r, kind: "as05_bound_pr", cardBranch: "foreign-card-branch" })],
-      ["a stale recorded head", (r: Record<string, unknown>) => ({ ...r, headSha: "8".repeat(40) })],
-      ["a PR URL that does not match its number", (r: Record<string, unknown>) => ({ ...r, prUrl: `https://github.com/${OWNER}/${REPO}/pull/701` })],
-      ["a foreign recorded source issue", (r: Record<string, unknown>) => ({ ...r, sourceIssueId: randomUUID() })],
-    ] as const)("refuses a deleted branch whose recorded own identity has %s", async (_name, delivery) => {
-      const { ownerId, childId } = await seedPair();
-      await terminalChild(childId, { delivery });
-      mockDeletedChildBranch();
-      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
-    });
-
-    it("accepts a producer-shaped AS-05 own identity for a deleted merged branch", async () => {
-      const { ownerId, childId } = await seedPair();
-      await terminalChild(childId, { delivery: (r) => ({ ...r, kind: "as05_bound_pr", cardBranch: CHILD_BRANCH }) });
-      mockDeletedChildBranch();
-      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
-    });
-
-    it("keeps refusing a deleted branch when a current attribution row already exists", async () => {
+    it("refuses a deleted branch even when a current attribution row exists", async () => {
       const { ownerId, childId } = await seedPair();
       await resolveChildCarrierDecisionHead(db, companyId, childId);
       await terminalChild(childId);
-      mockDeletedChildBranch();
+      mockUnreadableChild();
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
     });
   });

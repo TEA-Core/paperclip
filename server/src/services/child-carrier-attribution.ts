@@ -11,7 +11,6 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import { logActivity } from "./activity-log.js";
-import { deliveryBindingValidationError, resolveDeliveryIdentity } from "./merge-arming.js";
 
 export const CHILD_CARRIER_ATTRIBUTION_ACTOR_ID = "system:child-carrier-attribution";
 
@@ -64,7 +63,7 @@ type CommitEnumerator = (input: {
   baseRef: string | null;
   childBranch: string;
   comparisonBase?: { sha?: string };
-}) => Promise<{ ok: true; shas: string[] } | { ok: false; reason: string; branchNotFound?: true }>;
+}) => Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }>;
 
 export const childCarrierCommits: { enumerate: CommitEnumerator } = {
   enumerate: enumerateChildCarrierCommits,
@@ -152,24 +151,6 @@ function readBindingPr(executionState: unknown, cardBranch: string, repo: { owne
     : null;
 }
 
-async function ownDeliveryIsMerged(
-  db: Db,
-  companyId: string,
-  childId: string,
-  card: { issue: { status: string }; branch: string; repo: { owner: string; repo: string } },
-): Promise<boolean> {
-  if (card.issue.status !== "done") return false;
-  const identity = await resolveDeliveryIdentity(db, companyId, childId);
-  const binding = identity.binding;
-  if (identity.recordedUnusable || !binding || !identity.repo || !identity.branchIsOwn) return false;
-  if (identity.repo.owner.toLowerCase() !== card.repo.owner.toLowerCase()
-    || identity.repo.repo.toLowerCase() !== card.repo.repo.toLowerCase()) return false;
-  if (binding.branch !== card.branch || deliveryBindingValidationError(binding, identity.repo, childId)) return false;
-  const live = await fetchLivePullRequest(db, companyId, identity.repo.owner, identity.repo.repo, binding.prNumber);
-  return live.ok && live.live.merged === true && live.live.state === "closed"
-    && live.live.headRef === card.branch && live.live.headSha === binding.headSha.toLowerCase();
-}
-
 async function fetchLivePullRequest(
   db: Db,
   companyId: string,
@@ -234,7 +215,7 @@ async function enumerateChildCarrierCommits(input: {
   baseRef: string | null;
   childBranch: string;
   comparisonBase?: { sha?: string };
-}): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string; branchNotFound?: true }> {
+}): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }> {
   const headers = {
     accept: "application/vnd.github+json",
     authorization: `Bearer ${input.token}`,
@@ -245,7 +226,7 @@ async function enumerateChildCarrierCommits(input: {
   // Each is bounded to 20 pages / 2,000 commits; larger complete sets are
   // deliberately refused to bound verification work, not treated as partial proof.
   let baseSha: string | null = input.comparisonBase?.sha ?? null;
-  const completeComparison = async (headRef: string): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string; branchNotFound?: true }> => {
+  const completeComparison = async (headRef: string): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }> => {
     const root = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}`;
     try {
       if (!baseSha) {
@@ -260,7 +241,6 @@ async function enumerateChildCarrierCommits(input: {
       let headSha = headRef.toLowerCase();
       if (!SHA_RE.test(headSha)) {
         const response = await ghFetch(`${root}/commits/${encodeURIComponent(headRef)}`, { headers, signal: AbortSignal.timeout(8_000) });
-        if (response.status === 404) return { ok: false, reason: "child carrier comparison failed: HTTP 404", branchNotFound: true };
         if (!response.ok) return { ok: false, reason: `child carrier comparison failed: HTTP ${response.status}` };
         const body = await response.json().catch(() => null);
         if (typeof body?.sha !== "string" || !SHA_RE.test(body.sha)) return { ok: false, reason: "child carrier comparison has no immutable head" };
@@ -554,7 +534,7 @@ async function enumerateWithCredentials(input: {
   baseRef: string | null;
   childBranch: string;
   comparisonBase?: { sha?: string };
-}): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string; branchNotFound?: true }> {
+}): Promise<{ ok: true; shas: string[] } | { ok: false; reason: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(input.db, input.companyId, input.owner, input.repo);
   if (candidates.length === 0) {
     return { ok: false, reason: "child carrier commit enumeration has no GitHub token" };
@@ -839,13 +819,7 @@ export async function carrierOwnerChildAttributionBlock(
       childBranch: card.branch,
       comparisonBase,
     });
-    if (!enumerated.ok) {
-      if (enumerated.branchNotFound && await ownDeliveryIsMerged(db, companyId, descendant.id, card)) {
-        required.set(descendant.id, { shas: [], branch: card.branch });
-        continue;
-      }
-      return CHILD_CARRIER_OWNER_GATE_SKIP;
-    }
+    if (!enumerated.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
     const shas = normalizeShas(enumerated.shas);
     if (enumerated.shas.length === 0) {
       required.set(descendant.id, { shas: [], branch: card.branch });

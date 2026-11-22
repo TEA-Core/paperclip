@@ -98,13 +98,16 @@ automatic attachment-recovery consumer.
 
 The carrier owner's separate gate requires every contributing child to have a
 current, complete approved proof. A completely enumerated, disjoint child branch
-does not contribute; partial or unreadable contribution still refuses. The one exception is a
-`done` descendant whose own branch lookup returns HTTP 404 (the branch was
-deleted) and whose own recorded delivery, read through `resolveDeliveryIdentity`,
-binds a live PR that is merged at the recorded head on that branch in the same
-repository; it contributes nothing. Any other enumeration failure, a
-non-`done` descendant, or an unverifiable own delivery refuses. The live
-carrier branch must match even when a caller does not provide a branch.
+does not contribute. Partial or unreadable enumeration always refuses, including
+HTTP 404 for a deleted branch, regardless of whether the descendant is `done`
+or its recorded own PR was merged. A past merge does not prove that later child
+work is absent from the carrier. A finished child with a deleted branch therefore
+blocks the carrier owner until an operator re-creates the actual branch ref so
+its complete contribution can be enumerated, or cancels the child if its work is
+no longer required. Cancellation is not approval of a required contribution.
+Automatic deleted-branch admission would require authoritative provenance and a
+separately authorized work item; it is not implemented here. The live carrier
+branch must match even when a caller does not provide a branch.
 Required attribution rows are read after remote enumeration and scoped to the
 target repository. All carrier and child comparisons in one owner gate use a
 single pinned base SHA and immutable head SHAs, including small comparisons.
