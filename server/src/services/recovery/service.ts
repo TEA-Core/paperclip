@@ -3795,8 +3795,8 @@ export function recoveryService(
     const seen = new Set<string>();
     const eligible: Array<{ agentId: string; status: string; order: number }> = [];
     let order = 0;
-    const ownerBudgets = runner === db ? budgets : budgetService(runner);
-    const ownerAuthorization = runner === db ? authz : authorizationService(runner);
+    const ownerBudgets = budgetService(runner);
+    const ownerAuthorization = authorizationService(runner);
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
