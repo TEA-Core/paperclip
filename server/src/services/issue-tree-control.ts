@@ -603,6 +603,7 @@ export function issueTreeControlService(db: Db) {
     let currentIssueId: string | null = issueId;
     const visited = new Set<string>();
     let effectiveHold: typeof activePauseHolds[number] | null = null;
+    let ancestorParents: Map<string, string | null> | undefined;
 
     while (
       currentIssueId
@@ -621,12 +622,33 @@ export function issueTreeControlService(db: Db) {
         }
       }
 
-      const parent: { parentId: string | null } | null = await db
-        .select({ parentId: issues.parentId })
-        .from(issues)
-        .where(and(eq(issues.id, currentIssueId), eq(issues.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
-      currentIssueId = parent?.parentId ?? null;
+      if (hasTypedPark) {
+        if (!ancestorParents) {
+          // UNION bounds legacy cycles without copying a growing path for each
+          // ancestor. Keep the root fast path above and batch the remaining walk.
+          const parents = await db.execute<{ id: string; parentId: string | null }>(sql`
+            with recursive ancestors(id, parent_id) as (
+              select ${issues.id}, ${issues.parentId} from ${issues}
+                where ${issues.id} = ${currentIssueId} and ${issues.companyId} = ${companyId}
+              union
+              select parent.id, parent.parent_id from ${issues} parent
+                inner join ancestors child on parent.id = child.parent_id
+                where parent.company_id = ${companyId}
+            )
+            select id, parent_id as "parentId" from ancestors
+          `);
+          ancestorParents = new Map();
+          for (const parent of parents) ancestorParents.set(parent.id, parent.parentId);
+        }
+        currentIssueId = ancestorParents.get(currentIssueId) ?? null;
+      } else {
+        const parent: { parentId: string | null } | null = await db
+          .select({ parentId: issues.parentId })
+          .from(issues)
+          .where(and(eq(issues.id, currentIssueId), eq(issues.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
+        currentIssueId = parent?.parentId ?? null;
+      }
     }
 
     if (!effectiveHold) return null;

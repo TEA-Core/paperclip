@@ -700,8 +700,9 @@ Action-only queue insertion and coalescing share a source-then-carrier locked
 park gate. Coalescing preserves the existing run-first lock order before that
 gate. A typed park takes priority over ordinary holds anywhere in its subtree;
 nested ordinary holds remain active and require their own explicit release.
-Typed inheritance follows the full parent chain with visited-set cycle
-protection; the ordinary non-park search budget and nearest fallback stay unchanged.
+Typed inheritance follows the full same-company parent chain in one recursive
+read for non-root lookups, using UNION cycle deduplication and a visited set.
+The root fast path, ordinary 100-node budget and nearest fallback stay unchanged.
 Native dependency/child-completion producers persist a terminal skipped intent
 when the carrier is parked. A native dispatch attempt suppressed by a park also
 marks its original intent skipped; release cannot replay it. Other native
