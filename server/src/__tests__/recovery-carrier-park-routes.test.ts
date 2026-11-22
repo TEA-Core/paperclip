@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns,
+  activityLog, agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, heartbeatRunEvents,
   issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
   nativeRunFinalizations, nativeRunResults, workAssessments, type Db, type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
@@ -21,6 +21,9 @@ import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { dispatchQuiesce } from "../services/dispatch-quiesce.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
@@ -1863,4 +1866,223 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(result).toMatchObject({ monitorArmed: 0, monitorDueAwaitingClaim: 1, alreadyLive: 1, recoveryIssueMinted: 0 });
     await assertNoProtectedWrites();
   });
+
+  it.each([false, true])("keeps dormant-module verified interaction promotion behind the typed fence, parked %s", async parked => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    if (parked) expect((await park(f)).status).toBe(201);
+    else await issueTreeControlService(db).createHold(f.companyId, f.carrierId, {
+      mode: "pause", reason: "Ordinary verified-interaction control", releasePolicy: { strategy: "manual" },
+      actor: { actorType: "user", actorId: "park-operator", userId: "park-operator" },
+    });
+    const { finished, wake } = await deferredInteraction(f);
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, finished.id));
+    await db.update(issues).set({ executionRunId: finished.id }).where(eq(issues.id, f.carrierId));
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "park-operator",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("Saved input must not become a missing-owner escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("Saved input must not become a carrier escalation"); },
+      },
+    });
+    const result = await release({ companyId: f.companyId, runId: finished.id, now: new Date() });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+    if (parked) {
+      expect(result.outcome.kind).not.toBe("promoted");
+      expect(runs.filter(run => run.id !== finished.id)).toEqual([]);
+      expect(receipt.runId).toBeNull();
+    } else {
+      expect(result.outcome.kind).toBe("promoted");
+      const successor = runs.find(run => run.id !== finished.id);
+      expect(successor).toMatchObject({ companyId: f.companyId, agentId: f.agentId, status: "queued",
+        contextSnapshot: { issueId: f.carrierId, wakeCommentIds: [wake.payload?.commentId] } });
+      expect(receipt.runId).toBe(successor!.id);
+    }
+    expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual(before.source);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toEqual(before.actions);
+    await assertNoProtectedWrites();
+  });
+
+  it.each(["active source", "released source", "descendant"] as const)("reaches ordinary blocked work beyond100protected %s candidates", async scope => {
+    const f = await fixture(), ordinaryId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const accepted = await park(f);
+    expect(accepted.status).toBe(201);
+    if (scope === "released source") expect((await request(app(f.companyId))
+      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${accepted.body.hold.id}/release`)
+      .send({ recoveryActionId: f.actionId, reason: "Source fence survives this release" })).status).toBe(200);
+    const old = new Date("2026-01-01T00:00:00Z");
+    const copies = Array.from({ length: 100 }, (_, index) => ({
+      sourceId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+      carrierId: randomUUID(), actionId: randomUUID(), decisionId: randomUUID(), holdId: randomUUID(),
+    }));
+    if (scope === "descendant") {
+      await db.insert(issues).values(copies.map(copy => ({ id: copy.sourceId, companyId: f.companyId,
+        title: "Later descendant of an active park", status: "blocked", parentId: f.carrierId, updatedAt: old })));
+    } else {
+      const [source] = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+      const [carrier] = await db.select().from(issues).where(eq(issues.id, f.carrierId));
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+      const [decision] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.decisionId));
+      const [hold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, accepted.body.hold.id));
+      // Internally consistent persisted histories copied from the real accepted route above.
+      const cards = copies.flatMap(copy => [
+        { ...source, id: copy.sourceId },
+        { ...carrier, id: copy.carrierId, originId: copy.sourceId, status: "backlog" },
+      ]);
+      for (let offset = 0; offset < cards.length; offset += 100) await db.insert(issues).values(cards.slice(offset, offset + 100));
+      await db.insert(issueRecoveryActions).values(copies.map(copy => ({
+        ...action, id: copy.actionId, sourceIssueId: copy.sourceId, recoveryIssueId: copy.carrierId,
+      })));
+      await db.insert(issueThreadInteractions).values(copies.map(copy => ({ ...decision, id: copy.decisionId, issueId: copy.carrierId })));
+      await db.insert(issueRelations).values(copies.map(copy => ({ companyId: f.companyId,
+        issueId: f.blockerId, relatedIssueId: copy.carrierId, type: "blocks" as const })));
+      await db.insert(issueTreeHolds).values(copies.map(copy => ({
+        ...hold, id: copy.holdId, rootIssueId: copy.carrierId,
+        recoveryCarrierPark: { ...hold.recoveryCarrierPark!, sourceIssueId: copy.sourceId, expectedStatus: "backlog",
+          recoveryActionId: copy.actionId, decisionInteractionId: copy.decisionId },
+      })));
+    }
+    await db.insert(issues).values({ id: ordinaryId, companyId: f.companyId,
+      title: "Unparked attention target", status: "blocked", updatedAt: old });
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    const result = await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Board attention is not an agent wake"); } })
+      .reconcileBlockedWithoutBlockers({ companyId: f.companyId });
+    const created = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, ordinaryId));
+    expect(created).toEqual([expect.objectContaining({ companyId: f.companyId, sourceIssueId: ordinaryId,
+      kind: "blocked_without_blockers", ownerType: "board" })]);
+    expect(["active", "escalated"]).toContain(created[0].status);
+    expect(result.issueIds).toContain(ordinaryId);
+    const after = await snapshot(f), protectedIds = new Set(before.actions.map(action => action.id));
+    expect(after.actions.filter(action => protectedIds.has(action.id))).toEqual(before.actions);
+    expect(after.cards.filter(card => card.id !== ordinaryId)).toEqual(before.cards.filter(card => card.id !== ordinaryId));
+    expect(after.wakes).toEqual(before.wakes);
+    expect((await parkRecords(f)).holds).toEqual(records.holds);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it.each([false, true])("keeps native quiescence deferral distinct from terminal park suppression, parked %s", async parked => {
+    const f = await fixture();
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.carrierId));
+    f.body.expectedAssigneeAgentId = f.agentId;
+    f.body.expectedAssigneeUserId = null;
+    const accepted = parked ? await park(f) : null;
+    if (accepted) expect(accepted.status).toBe(201);
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId: f.agentId, source: "automation", reason: "issue_blockers_resolved",
+      triggerDetail: "system", status: "queued", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `quiesced-native:${randomUUID()}`, payload: { issueId: f.carrierId,
+        _paperclipWakeContext: { issueId: f.carrierId, wakeReason: "issue_blockers_resolved",
+          source: "native_status_decision", statusDecisionSource: "native_status_decision" } },
+    }).returning();
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = parked ? await protectWakeAdmission(f) : null;
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    dispatchQuiesce.engage({ reason: "Isolated carrier fixture", ttlMs: 60_000 });
+    try {
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    } finally {
+      dispatchQuiesce.release();
+    }
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+    if (parked) {
+      expect(saved).toMatchObject({ status: "skipped", runId: null, error: "Board-parked recovery carrier: native wake suppressed without replay" });
+      expect(saved.finishedAt).not.toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual([saved]);
+      expect((await request(app(f.companyId))
+        .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${accepted!.body.hold.id}/release`)
+        .send({ recoveryActionId: f.actionId, reason: "Release cannot revive quiesced native work" })).status).toBe(200);
+      await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park-suppressed native work replayed"); } })
+        .reconcileDeferredWakeupReplay({ companyId: f.companyId });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual([saved]);
+      await assertNoAdmission!();
+    } else {
+      expect(await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
+      ))).toEqual([expect.objectContaining({ status: "skipped", finishedAt: null })]);
+    }
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toEqual([]);
+    expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual(before.source);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toEqual(before.actions);
+    await assertNoProtectedWrites();
+  });
+
+  it("serializes a new deferrable receipt behind a winning park without persisting replay work", async () => {
+    const f = await fixture(), before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoAdmission = await protectWakeAdmission(f);
+    const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
+    let settled = false;
+    const wake = heartbeatService(db, { runtimeEnv: { PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "1" } })
+      .wakeup(f.agentId, { source: "automation", reason: "issue_assigned", payload: { issueId: f.carrierId } })
+      .then(run => { settled = true; return { run, error: null }; }, error => { settled = true; return { run: null, error }; });
+    try {
+      await expect.poll(async () => {
+        if (settled) throw new Error("Deferral settled before requesting the park's issue lock");
+        return (await db.execute(sql`select exists (
+          select 1 from pg_stat_activity where datname = current_database()
+          and ${parkPid} = any(pg_blocking_pids(pid))) as blocked`))[0].blocked;
+      }, { timeout: 10_000 }).toBe(true);
+    } finally {
+      releaseBarrier();
+      await Promise.all([barrier, acceptance, wake]);
+    }
+    expect((await acceptance).status).toBe(201);
+    expect(await wake).toEqual({ run: null, error: null });
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoAdmission();
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("keeps action coalescing usable after a real snapshot error with one pool connection", async () => {
+    const f = await fixture(), applicationName = `coalesce-error-one-${randomUUID()}`;
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "queued", invocationSource: "on_demand", contextSnapshot: {} }).returning();
+    await db.execute(sql`create or replace function fail_fixture_context_snapshot() returns trigger language plpgsql as $$
+      begin raise exception using errcode = '22001', message = 'fixture snapshot persistence failure'; end $$`);
+    await db.execute(sql.raw(`create trigger fail_context_${queued.id.replaceAll("-", "")} before update of context_snapshot on heartbeat_runs
+      for each row when (old.id = '${queued.id}') execute function fail_fixture_context_snapshot()`));
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const limited = createDb(postgres.connectionString, { maxConnections: 1, applicationName });
+    const work = heartbeatService(limited).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { recoveryActionId: f.actionId } });
+    let expire!: () => void;
+    const deadline = new Promise<{ kind: "timed_out" }>(resolve => { expire = () => resolve({ kind: "timed_out" }); });
+    const timer = setTimeout(expire, 4000);
+    try {
+      const outcome = await Promise.race([deadline, work.then(
+        value => ({ kind: "completed" as const, value }), error => ({ kind: "failed" as const, error }),
+      )]);
+      if (outcome.kind === "timed_out") {
+        await db.execute(sql`select pg_terminate_backend(pid) from pg_stat_activity where application_name = ${applicationName}`);
+        await work.catch(() => undefined);
+      }
+      expect(outcome.kind).toBe("completed");
+      if (outcome.kind === "failed") throw outcome.error;
+      if (outcome.kind === "completed") expect(outcome.value?.id).toBe(queued.id);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+        .toEqual([expect.objectContaining({ status: "coalesced", runId: queued.id, payload: { recoveryActionId: f.actionId } })]);
+      expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, queued.id), eq(heartbeatRunEvents.eventType, "error"))))
+        .toEqual([expect.objectContaining({ level: "error", payload: { writeSite: "enqueueWakeup:same-scope-coalesce",
+          runId: queued.id, errorClasses: expect.arrayContaining([expect.objectContaining({ code: "22001" })]) } })]);
+      expect((await park(f)).status).toBe(409);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id));
+      expect((await park(f)).status).toBe(201);
+      expect(await db.select().from(issues).where(eq(issues.id, f.sourceId))).toEqual(before.source);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toEqual(before.actions);
+      await assertNoProtectedWrites();
+    } finally {
+      clearTimeout(timer);
+      await limited.$client.end({ timeout: 0 });
+    }
+  }, 15_000);
 });
