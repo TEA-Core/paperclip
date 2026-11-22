@@ -714,7 +714,7 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
   const decisionId = typeof state?.lastDecisionId === "string" ? state.lastDecisionId : null;
   if (!decisionId || state?.lastDecisionOutcome !== "approved") return;
   const current = await readCurrent(db, companyId, issueId);
-  if (!current || current.childDecisionId) return;
+  if (!current || current.childDecisionId === decisionId) return;
   const [decision] = await db
     .select({ id: issueExecutionDecisions.id, outcome: issueExecutionDecisions.outcome })
     .from(issueExecutionDecisions)
@@ -857,6 +857,12 @@ export async function carrierOwnerChildAttributionBlock(
       .from(issues)
       .where(and(eq(issues.id, childId), eq(issues.companyId, companyId)))
       .limit(1);
+    const state = childIssue?.executionState;
+    const approval = state?.approvalStatus as Record<string, unknown> | null | undefined;
+    const certificate = approval?.finalDelivery as Record<string, unknown> | null | undefined;
+    // A historical approval is not authority after the current protected proof is cleared or superseded.
+    if (state?.lastDecisionId !== row.childDecisionId || state?.lastDecisionOutcome !== "approved"
+      || certificate?.decisionId !== row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
     const binding = readBindingPr(childIssue?.executionState, branch, owner.repo);
     const claim = readClaim(childIssue?.executionState, owner.repo) ?? binding;
     if (binding && (!binding.repoMatches || binding.branch !== row.branchName)) return CHILD_CARRIER_OWNER_GATE_SKIP;

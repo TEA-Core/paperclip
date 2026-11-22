@@ -339,16 +339,8 @@ describePg("child carrier attribution", () => {
     });
     expect(pending).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
 
-    const [decision] = await db.insert(issueExecutionDecisions).values({
-      id: randomUUID(),
-      companyId,
-      issueId: childId,
-      stageId: randomUUID(),
-      stageType: "approval",
-      outcome: "approved",
-      body: "approved",
-    }).returning();
-    await db.update(issueChildCarrierAttributions).set({ childDecisionId: decision!.id }).where(eq(issueChildCarrierAttributions.childIssueId, childId));
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
     const approved = await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
       owner: OWNER,
       repo: REPO,

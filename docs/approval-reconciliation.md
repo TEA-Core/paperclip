@@ -82,11 +82,19 @@ it is not authority. Callers cannot supply the certificate through issue or
 plugin patches. Child approval never publishes `paperclip/approved` or arms the
 carrier, and the carrier must remain open and unmerged through final preflight.
 
-Decision attachment runs after the child approval commits. If attachment fails,
-`childDecisionId` stays unset and blocks the carrier owner. This is a known
-fail-closed availability residual. The publication reconciler does not retry
-this attachment. Existing operator/reconciliation recovery paths are unchanged;
-this change adds no automatic attachment-recovery consumer.
+The owner's attribution decision must match the child's current approved
+`lastDecisionId` and protected final-delivery certificate. A cleared or superseded
+current proof refuses. An intermediate approval cannot revive a revoked final
+approval from the child's history.
+
+Decision attachment runs after the child approval commits. A new eligible
+terminal certificate can replace an older attached decision only for the same
+complete proof and through the existing full-row snapshot comparison-and-set.
+If attachment fails, `childDecisionId` stays unset or references the older
+decision, and blocks the carrier owner. This is a known fail-closed availability
+residual. The publication reconciler does not retry this attachment. Existing
+operator/reconciliation recovery paths are unchanged; this change adds no
+automatic attachment-recovery consumer.
 
 The carrier owner's separate gate requires every contributing child to have a
 current, complete approved proof. A completely enumerated, disjoint child branch
