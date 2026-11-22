@@ -554,61 +554,82 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     }
   }, 30_000);
 
-  it("lets an ordinary non-Wiki card write complete while the Wiki resolution lock is held", async () => {
-    const { company } = await seedWikiCompany("maintainer");
-    const card = await seedUnassignedHandoff(company.id);
-    await db.update(issues).set({ title: "Ordinary card", description: "before" }).where(eq(issues.id, card.id));
+  async function holdWikiResolutionMutex(companyId: string) {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let acquired!: () => void;
     const holding = new Promise<void>((resolve) => { acquired = resolve; });
-    const mutex = db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`wiki-maintainer-resolution:${company.id}`}, 0))`);
+    const tx = db.transaction(async (t) => {
+      await t.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`wiki-maintainer-resolution:${companyId}`}, 0))`);
       acquired();
       await held;
     });
     await holding;
+    return { release, done: tx };
+  }
+
+  async function completesWithoutQueueing<T>(started: Promise<T>): Promise<T> {
+    let settled = false;
+    const tracked = started.then((v) => { settled = true; return v; }, (e) => { settled = true; throw e; });
+    tracked.catch(() => undefined);
+    const waiters = async () => (await db.execute(sql`SELECT 1 FROM pg_locks
+      WHERE locktype = 'advisory' AND NOT granted`)).length;
+    await expect.poll(async () => settled || (await waiters()) > 0, { timeout: 10_000 }).toBe(true);
+    expect(await waiters(), "operation queued on the Wiki resolution mutex").toBe(0);
+    expect(settled).toBe(true);
+    return tracked;
+  }
+
+  it("lets an ordinary non-Wiki card write complete while the Wiki resolution lock is held", async () => {
+    const { company } = await seedWikiCompany("maintainer");
+    const card = await seedUnassignedHandoff(company.id);
+    await db.update(issues).set({ title: "Ordinary card", description: "before" }).where(eq(issues.id, card.id));
+    const mutex = await holdWikiResolutionMutex(company.id);
+    const started: Promise<request.Response> = Promise.resolve(
+      request(createApp(db, boardActor(company.id)))
+        .patch(`/api/issues/${card.id}`).send({ description: "after" }),
+    );
+    started.catch(() => undefined);
     try {
-      const res = await request(createApp(db, boardActor(company.id)))
-        .patch(`/api/issues/${card.id}`).send({ description: "after" });
+      const res = await completesWithoutQueueing(started);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const stored = await readAssignee(card.id);
       expect(stored?.assigneeAgentId).toBeNull();
       const [row] = await db.select({ description: issues.description }).from(issues).where(eq(issues.id, card.id));
       expect(row?.description).toBe("after");
     } finally {
-      release();
-      await mutex;
+      mutex.release();
+      await mutex.done;
+      await started.catch(() => undefined);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("does not take the resolution lock for unrelated or key-reordered marker metadata updates", async () => {
     const { company, intruder, maintainer } = await seedWikiCompany("maintainer");
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    let acquired!: () => void;
-    const holding = new Promise<void>((resolve) => { acquired = resolve; });
-    const mutex = db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`wiki-maintainer-resolution:${company.id}`}, 0))`);
-      acquired();
-      await held;
-    });
-    await holding;
+    const [row] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, maintainer.id));
+    const marker = (row!.metadata as { pluginManagedAgent: Record<string, unknown> }).pluginManagedAgent;
+    const reordered = Object.fromEntries(Object.entries(marker).reverse());
+    const mutex = await holdWikiResolutionMutex(company.id);
+    const pending: Promise<unknown>[] = [];
     try {
-      const unrelated = await agentService(db).update(intruder.id, { metadata: { note: "unrelated" } });
+      const unrelatedOp = agentService(db).update(intruder.id, { metadata: { note: "unrelated" } });
+      pending.push(unrelatedOp);
+      const unrelated = await completesWithoutQueueing(unrelatedOp);
       expect(unrelated?.metadata).toEqual({ note: "unrelated" });
-      const [row] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, maintainer.id));
-      const marker = (row!.metadata as { pluginManagedAgent: Record<string, unknown> }).pluginManagedAgent;
-      const reordered = Object.fromEntries(Object.entries(marker).reverse());
-      const result = await agentService(db).update(maintainer.id, {
+      const reorderOp = agentService(db).update(maintainer.id, {
         metadata: { ...(row!.metadata as object), pluginManagedAgent: reordered },
       });
+      pending.push(reorderOp);
+      const result = await completesWithoutQueueing(reorderOp);
       expect(result?.id).toBe(maintainer.id);
+      const [stored] = await db.select({ metadata: agents.metadata }).from(agents).where(eq(agents.id, maintainer.id));
+      expect(stored?.metadata).toEqual({ ...(row!.metadata as object), pluginManagedAgent: reordered });
     } finally {
-      release();
-      await mutex;
+      mutex.release();
+      await mutex.done;
+      await Promise.allSettled(pending);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("adopts the canonical Wiki Maintainer on the emitter field-repair PATCH", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");
