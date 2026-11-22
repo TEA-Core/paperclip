@@ -60,19 +60,19 @@ export async function listRecoveryCarrierParks(db: Db, companyId: string, carrie
   const decisionMap = new Map(decisions.map(row => [row.id, row]));
   for (const hold of holds) {
     const b = hold.recoveryCarrierPark!;
-    const carrier = carrierMap.get(hold.rootIssueId), action = actionMap.get(b.recoveryActionId), decision = decisionMap.get(b.decisionInteractionId);
+    const carrier = carrierMap.get(hold.rootIssueId), action = actionMap.get(b.recoveryActionId.toLowerCase()), decision = decisionMap.get(b.decisionInteractionId.toLowerCase());
     const currentBlockers = blockers.filter(row => row.carrierId === hold.rootIssueId);
     const accepted = b.version === 1 && hold.releasePolicy?.strategy === "manual" && carrier && !carrier.hiddenAt &&
       carrier.status === b.expectedStatus && carrier.statusVersion === b.expectedStatusVersion &&
       carrier.assigneeAgentId === b.expectedAssigneeAgentId && carrier.assigneeUserId === b.expectedAssigneeUserId &&
-      action?.sourceIssueId === b.sourceIssueId && action.recoveryIssueId === carrier.id &&
+      action?.sourceIssueId === b.sourceIssueId.toLowerCase() && action.recoveryIssueId === carrier.id &&
       action.status === "escalated" && action.outcome === "exhausted" && action.ownerType === "board" && !action.ownerAgentId &&
       !action.wakePolicy && !action.monitorPolicy && !action.resolvedAt && action.updatedAt.toISOString() === b.expectedActionUpdatedAt &&
       decision?.issueId === carrier.id && decision.kind === "request_confirmation" && decision.status === "rejected" &&
       Boolean(decision.resolvedByUserId) && !decision.resolvedByAgentId && Boolean(decision.resolvedAt) &&
       decision.updatedAt.toISOString() === b.expectedDecisionUpdatedAt &&
       currentBlockers.length === b.expectedBlockers.length && currentBlockers.every(row => b.expectedBlockers.some(expected =>
-        row.id === expected.id && row.status === expected.status && row.statusVersion === expected.statusVersion));
+        row.id === expected.id.toLowerCase() && row.status === expected.status && row.statusVersion === expected.statusVersion));
     result.set(hold.rootIssueId, { state: accepted ? "accepted" : "stale", holdId: hold.id,
       sourceIssueId: b.sourceIssueId, recoveryActionId: b.recoveryActionId, decisionInteractionId: b.decisionInteractionId, reason: b.reason });
   }

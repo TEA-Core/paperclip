@@ -658,7 +658,8 @@ decision and blocker snapshots, and no carrier-subtree execution, queued work,
 execution locks or scheduled monitor. A source with a scheduled monitor must
 settle that schedule before parking; this operation never clears it.
 Deferred issue-execution receipts count as queued work, including verified
-interaction input; park admission must not silently abandon that input.
+interaction input and persisted issue/task identities in wake context or deferred
+skip metadata; park admission must not silently abandon that input.
 
 The acceptance binding, ordinary manual pause hold and audit event commit
 together. Source and recovery-action rows are read-only: no resolution,
@@ -670,12 +671,15 @@ new source repair authority. Independent authorized board resolution remains
 separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
-New bindings store the database's canonical source, action and decision UUIDs.
+New bindings store the database's canonical source, action, decision and blocker UUIDs.
 Source and admission gates compare uppercase, compact and braced UUID spellings
 consistently, including older bindings, without casting untrusted saved JSON,
 rewriting stored consent or touching the action row. Malformed aliases sharing
 the protected UUID's hex digits fail closed. Admission also checks the
 server-derived action identity in queued wake context.
+Attention projection treats uppercase legacy UUIDs as the same identity without
+rewriting consent. A candidate with live blockers remains discoverable, but its
+board form explains the blocker that prevents terminal-only admission.
 
 The carrier stays visible and nonterminal. Its accepted park is separate from
 the source's unresolved escalation and from actual dependency counts/tree

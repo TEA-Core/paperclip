@@ -65,7 +65,7 @@ export function recoveryCarrierParkService(db: Db) {
       const blockers = relationRows.length ? await tx.select().from(issues).where(and(eq(issues.companyId, companyId),
         inArray(issues.id, relationRows.map(row => row.issueId)))).orderBy(asc(issues.id)).for("share") : [];
       if (blockers.length !== input.expectedBlockers.length || !blockers.every(row => ["done", "cancelled"].includes(row.status) &&
-          input.expectedBlockers.some(expected => expected.id === row.id && expected.status === row.status && expected.statusVersion === row.statusVersion))) {
+          input.expectedBlockers.some(expected => expected.id.toLowerCase() === row.id && expected.status === row.status && expected.statusVersion === row.statusVersion))) {
         throw conflict("Carrier blockers changed");
       }
 
@@ -100,6 +100,9 @@ export function recoveryCarrierParkService(db: Db) {
           inArray(sql<string>`${agentWakeupRequests.payload} ->> 'taskId'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,issueId}'`, treeIds),
           inArray(sql<string>`${agentWakeupRequests.payload} #>> '{contextSnapshot,paperclipIssue,id}'`, treeIds),
+          inArray(sql<string>`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,issueId}'`, treeIds),
+          inArray(sql<string>`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,taskId}'`, treeIds),
+          inArray(sql<string>`${agentWakeupRequests.payload} #>> '{heartbeatSkip,issueId}'`, treeIds),
           recoveryActionIdentityMatches(sql`${agentWakeupRequests.payload} ->> 'recoveryActionId'`, action.id),
           recoveryActionIdentityMatches(sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,recoveryActionId}'`, action.id),
         ),
@@ -109,7 +112,8 @@ export function recoveryCarrierParkService(db: Db) {
       }
       const existing = await treeControl.getActivePauseHoldGate(companyId, carrier.id);
       const binding: RecoveryCarrierParkBinding = { version: 1, ...input, recoveryActionId: action.id,
-        sourceIssueId: source.id, decisionInteractionId: decision.id };
+        sourceIssueId: source.id, decisionInteractionId: decision.id,
+        expectedBlockers: input.expectedBlockers.map(row => ({ ...row, id: row.id.toLowerCase() })) };
       if (existing) {
         const hold = await treeControl.getHold(companyId, existing.holdId);
         const summary = (await listRecoveryCarrierParks(runner, companyId, [carrierId])).get(carrierId);

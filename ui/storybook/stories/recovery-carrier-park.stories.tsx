@@ -5,14 +5,16 @@ import { RecoveryCarrierParkForm } from "@/components/RecoveryCarrierParkForm";
 import { TaskChatPausedTakeover } from "@/components/task-chat/TaskChatPausedTakeover";
 import { recoveryCarrierParkFixture } from "@/fixtures/recoveryCarrierParkFixture";
 
-function CarrierParkExample({ initialPark = false, stale = false, reject = false }: { initialPark?: boolean; stale?: boolean; reject?: boolean }) {
+function CarrierParkExample({ initialPark = false, stale = false, reject = false, liveBlocker = false }: { initialPark?: boolean; stale?: boolean; reject?: boolean; liveBlocker?: boolean }) {
   const [reason, setReason] = useState(initialPark ? "The board rejected further repair." : "");
   const [error, setError] = useState<string | null>(null);
   const [released, setReleased] = useState(false);
   return <div className="max-w-xl p-4">
     {reason && !released ? <TaskChatPausedTakeover scope="leaf" carrierPark={{ state: stale ? "stale" : "accepted", reason }}
       onResume={() => setReleased(true)} /> : released ? <p role="status">Board park released. Source recovery is still escalated and unresolved.</p> :
-      <RecoveryCarrierParkForm candidate={recoveryCarrierParkFixture} error={error} onPark={input => {
+      <RecoveryCarrierParkForm candidate={liveBlocker ? { ...recoveryCarrierParkFixture,
+        expectedBlockers: recoveryCarrierParkFixture.expectedBlockers.map(row => ({ ...row, status: "in_progress" as const })) }
+        : recoveryCarrierParkFixture} error={error} onPark={input => {
         if (reject) setError("Carrier ownership changed. Refresh the task before choosing a disposition.");
         else setReason(input.reason);
       }} />}
@@ -40,6 +42,7 @@ export const AcceptanceAndRelease: Story = {
 export const Parked: Story = { args: { initialPark: true } };
 export const StaleAcceptance: Story = { args: { initialPark: true, stale: true } };
 export const OwnershipConflict: Story = { args: { reject: true } };
+export const LiveBlocker: Story = { args: { liveBlocker: true } };
 export const TouchDecisionControl: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
