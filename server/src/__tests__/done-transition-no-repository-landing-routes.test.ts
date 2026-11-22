@@ -2717,22 +2717,6 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           status: "succeeded",
         });
       }],
-      ["a workspace operation on a run linked only through an unindexed context key", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        const [run] = await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { wake: { "issue-ref": fixture.issueId } },
-        }).returning({ id: heartbeatRuns.id });
-        await db.insert(workspaceOperations).values({
-          companyId: fixture.companyId,
-          executionWorkspaceId: workspaceId,
-          heartbeatRunId: run.id,
-          phase: "worktree_prepare",
-          status: "succeeded",
-        });
-      }],
       ["a run whose context named a workspace that no longer exists", async (fixture: NoWorkspaceIssue) => {
         await db.insert(heartbeatRuns).values({
           companyId: fixture.companyId,
@@ -2769,6 +2753,30 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await record(fixture);
 
       await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+    });
+
+    it("refuses a card with a workspace operation on a run linked only through an unindexed context key, naming the census evidence", async () => {
+      const fixture = await seedAdmissible();
+      const { workspaceId } = await insertWorkspace(fixture.companyId);
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: fixture.companyId,
+        agentId: fixture.closerAgentId,
+        status: "succeeded",
+        contextSnapshot: { wake: { "issue-ref": fixture.issueId } },
+      }).returning({ id: heartbeatRuns.id });
+      await db.insert(workspaceOperations).values({
+        companyId: fixture.companyId,
+        executionWorkspaceId: workspaceId,
+        heartbeatRunId: run.id,
+        phase: "worktree_prepare",
+        status: "succeeded",
+      });
+
+      await expectRefused(
+        fixture,
+        await close(fixture.identifier),
+        `Tier 1 "no-repository-landing" cannot be declared on an issue whose workspace_operations row carries unread workspace or repository evidence (a project or workspace reference).`,
+      );
     });
 
     it("keeps today's refusal for a card whose holder detached its own workspace and project", async () => {
