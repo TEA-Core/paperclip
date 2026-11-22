@@ -27,6 +27,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { agentService } from "../services/agents.js";
+import { lockWikiMaintainerResolution } from "../services/issue-assignee-review-gate.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { StorageService } from "../storage/types.js";
@@ -495,6 +496,41 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     },
     20_000,
   );
+
+  it("serializes a Maintainer marker update with a fallback resolver holding the shared lock", async () => {
+    const { company, intruder } = await seedWikiCompany("maintainer");
+    const advisoryWaiters = async () => (await db.execute(sql`SELECT 1 FROM pg_locks
+      WHERE locktype = 'advisory' AND NOT granted`)).length;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const resolver = db.transaction(async (tx) => {
+      await lockWikiMaintainerResolution(tx as unknown as Db, company.id, "shared");
+      acquired();
+      await held;
+    });
+    await holding;
+    try {
+      const unrelated = await agentService(db).update(intruder.id, { metadata: { note: "unrelated" } });
+      expect(unrelated?.metadata).toEqual({ note: "unrelated" });
+      expect(await advisoryWaiters()).toBe(0);
+
+      let markerDone = false;
+      const markerUpdate = agentService(db)
+        .update(intruder.id, { metadata: maintainerMetadata(randomUUID()) })
+        .then((row) => { markerDone = true; return row; });
+      await expect.poll(advisoryWaiters, { timeout: 10_000 }).toBe(1);
+      expect(markerDone).toBe(false);
+      release();
+      await resolver;
+      await markerUpdate;
+      expect(markerDone).toBe(true);
+    } finally {
+      release();
+      await resolver;
+    }
+  }, 20_000);
 
   it("adopts the canonical Wiki Maintainer on the emitter field-repair PATCH", async () => {
     const { company, maintainer } = await seedWikiCompany("maintainer");

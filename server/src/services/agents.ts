@@ -61,7 +61,7 @@ import {
   builtInAgentMarkersEqual,
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
-import { lockWikiMaintainerResolution } from "./issue-assignee-review-gate.js";
+import { lockWikiMaintainerResolution, metadataMarksWikiMaintainer } from "./issue-assignee-review-gate.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 
 function hashToken(token: string) {
@@ -800,7 +800,12 @@ export function agentService(db: Db) {
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
+    const changesWikiMaintainerMarker = Object.prototype.hasOwnProperty.call(data, "metadata")
+      && metadataMarksWikiMaintainer(data.metadata) !== metadataMarksWikiMaintainer(existing.metadata);
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      if (changesWikiMaintainerMarker) {
+        await lockWikiMaintainerResolution(txDb, existing.companyId, "exclusive");
+      }
       const current = data.status !== undefined
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
