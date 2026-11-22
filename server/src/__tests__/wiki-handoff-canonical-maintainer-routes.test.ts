@@ -286,6 +286,26 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     expect((await readAssignee(stub.id))?.assigneeAgentId).toBe(maintainer.id);
   });
 
+  it.each(["engineer", "pm"] as const)("refuses a title-shaped card created by a non-emitter %s agent", async (role) => {
+    const { company, intruder } = await seedWikiCompany("maintainer");
+    await db.update(agents).set({ role }).where(eq(agents.id, intruder.id));
+    const stub = await seedUnassignedHandoff(company.id);
+    await db.update(issues).set({
+      createdByAgentId: intruder.id,
+      createdByUserId: null,
+      status: "todo",
+    }).where(eq(issues.id, stub.id));
+    const res = await request(createApp(db, { ...boardActor(company.id), isInstanceAdmin: false }))
+      .patch(`/api/issues/${stub.id}`).send({ description: "Not a Reporter handoff" });
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({ reason: "wiki_handoff_unassigned" });
+    expect((await readAssignee(stub.id))?.assigneeAgentId).toBeNull();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id))).toEqual([]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).toEqual([]);
+  });
+
   it.each([{}, { comment: "Observation only" }])("keeps a field-less PATCH unassigned: %j", async (body) => {
     const { company } = await seedWikiCompany("maintainer");
     const stub = await seedUnassignedHandoff(company.id);
