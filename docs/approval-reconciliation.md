@@ -112,6 +112,10 @@ refusal or terminal write failure. A deterministic rejection with no possible
 earlier write needs no compensating status.
 The approval actuator and landing backstop check attribution before each enable
 attempt and after an accepted enable. Direct-merge retries recheck authority too.
+The enable attempt's deadline covers the authority callback and provider request
+together. If validation finishes after that deadline, it cannot send a late
+enable mutation. The default worst-case bound includes callbacks and retry
+back-off and stays below the existing in-flight arm-record grace period.
 A new block takes an arm back through the existing disarm/fence recovery path.
 A lost response or transient enable failure retains the take-back record even
 when a later retry refuses on changed authority. The outcome stays unconfirmed;

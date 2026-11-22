@@ -730,7 +730,7 @@ describePg("child carrier attribution", () => {
   it("refuses a delivery-only branch mismatch before returning child approval proof", async () => {
     const { childId } = await seedPair();
     await db.update(issues).set({ executionState: { delivery: {
-      prNumber: 653, branch: "release-old", headSha: HEAD,
+      prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, branch: "release-old", headSha: HEAD,
     } } }).where(eq(issues.id, childId));
     expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
     expect((await resolveApprovalDecisionHead(db, companyId, childId, "SUP-22878", true)).kind).toBe("unresolvable");

@@ -1079,8 +1079,10 @@ async function fetchGitHubNodeIdOnce(
 }
 
 /**
- * Each enable request is given up on (and its HTTP request aborted) after this long, so a call is over within
- * `ENABLE_WORST_CASE_MS` (attempts, back-off included), well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
+ * Each enable attempt, including its authority callback and HTTP request, is bounded by this deadline.
+ * On expiry the request is aborted and a late callback cannot send an enable mutation.
+ * `ENABLE_WORST_CASE_MS` includes callbacks, requests and back-off under default options,
+ * well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
  */
 export const ENABLE_ATTEMPT_TIMEOUT_MS = 10_000;
 export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
@@ -1088,7 +1090,7 @@ export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
 export const enableTiming: { attemptTimeoutMs: number } = { attemptTimeoutMs: ENABLE_ATTEMPT_TIMEOUT_MS };
 
 export interface EnableAutoMergeOptions {
-  /** Per-request bound in ms (the request is aborted at it); defaults to ENABLE_ATTEMPT_TIMEOUT_MS. */
+  /** Per-attempt bound in ms, covering authority validation and the request; the request is aborted at expiry. */
   attemptTimeoutMs?: number;
   /** Total attempts for the arming mutation; the first call counts as attempt 1. Defaults to 3. */
   maxAttempts?: number;
@@ -1573,11 +1575,6 @@ export async function enableAutoMerge(
     return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0, mayHaveApplied: false };
   }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
-    const refusal = await options.beforeAttempt?.();
-    if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
-    const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
-    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
-
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<"timeout">((resolve) => {
@@ -1586,6 +1583,12 @@ export async function enableAutoMerge(
     type Answer = { success: boolean; alreadyQueued: boolean; error: string | null; status: number };
     const work = (async (): Promise<Answer> => {
       try {
+        const refusal = await options.beforeAttempt?.();
+        if (controller.signal.aborted) return { success: false, alreadyQueued: false, error: `timeout after ${attemptTimeoutMs}ms`, status: 0 };
+        if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
+        const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
+        const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
+
         const response = await ghFetch(GITHUB_GRAPHQL_URL, {
           method: "POST",
           headers: {

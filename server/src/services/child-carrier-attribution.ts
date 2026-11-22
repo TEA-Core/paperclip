@@ -135,7 +135,7 @@ function readClaim(executionState: unknown, repo: { owner: string; repo: string 
   return { prNumber, headSha, repoMatches: record.prUrl === `https://github.com/${repo.owner}/${repo.repo}/pull/${prNumber}` };
 }
 
-function readBindingPr(executionState: unknown, cardBranch: string): { prNumber: number; headSha: string | null; branch: string } | null {
+function readBindingPr(executionState: unknown, cardBranch: string, repo: { owner: string; repo: string }): { prNumber: number; headSha: string | null; branch: string; repoMatches: boolean } | null {
   if (!executionState || typeof executionState !== "object" || Array.isArray(executionState)) return null;
   const delivery = (executionState as Record<string, unknown>).delivery;
   if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
@@ -146,7 +146,9 @@ function readBindingPr(executionState: unknown, cardBranch: string): { prNumber:
   const headSha = typeof record.headSha === "string" && SHA_RE.test(record.headSha.toLowerCase())
     ? record.headSha.toLowerCase()
     : null;
-  return typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0 ? { prNumber, headSha, branch } : null;
+  return typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0
+    ? { prNumber, headSha, branch, repoMatches: record.prUrl === `https://github.com/${repo.owner}/${repo.repo}/pull/${prNumber}` }
+    : null;
 }
 
 async function fetchLivePullRequest(
@@ -562,15 +564,15 @@ export async function resolveChildCarrierDecisionHead(
 ): Promise<ChildCarrierResolution> {
   const card = await readChildWorkspace(db, companyId, issueId);
   if (!card) return { kind: "absent" };
-  const claim = readClaim(card.issue.executionState, card.repo) ?? readBindingPr(card.issue.executionState, card.branch);
+  const binding = readBindingPr(card.issue.executionState, card.branch, card.repo);
+  const claim = readClaim(card.issue.executionState, card.repo) ?? binding;
   if (!claim) return { kind: "absent" };
-  if ("repoMatches" in claim && !claim.repoMatches) {
+  if (!claim.repoMatches || (binding && !binding.repoMatches)) {
     return { kind: "unresolvable", reason: "delivery_identity_unresolved: recorded child carrier PR URL does not match its repository and number" };
   }
   const liveResult = await fetchLivePullRequest(db, companyId, card.repo.owner, card.repo.repo, claim.prNumber);
   if (!liveResult.ok) return { kind: "unresolvable", reason: `delivery_identity_unresolved: ${liveResult.reason}` };
   const live = liveResult.live;
-  const binding = readBindingPr(card.issue.executionState, card.branch);
   if (binding && binding.branch !== live.headRef) {
     return { kind: "unresolvable", reason: "delivery_identity_unresolved: recorded child carrier branch does not match the live pull request branch" };
   }
@@ -723,8 +725,9 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     ))
     .limit(1);
   if (!decision || decision.outcome !== "approved") return;
-  const claim = readClaim(state, card.repo) ?? readBindingPr(state, card.branch);
-  if (!claim || ("repoMatches" in claim && !claim.repoMatches)
+  const binding = readBindingPr(state, card.branch, card.repo);
+  const claim = readClaim(state, card.repo) ?? binding;
+  if (!claim || !claim.repoMatches || (binding && !binding.repoMatches)
     || claim.prNumber !== current.pullRequestNumber || claim.headSha !== current.headSha) return;
   const approval = state?.approvalStatus as Record<string, unknown> | null | undefined;
   const certificate = approval?.finalDelivery as Record<string, unknown> | null | undefined;
@@ -739,7 +742,6 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
   if (!proof || proof.attributionId !== current.id || proof.ancestorIssueId !== current.ancestorIssueId
     || proof.branchName !== current.branchName || !certifiedShas
     || certifiedShas.join() !== normalizeShas(current.commitShas)?.join()) return;
-  const binding = readBindingPr(state, card.branch);
   if (binding && binding.branch !== current.branchName) return;
   await db
     .update(issueChildCarrierAttributions)
@@ -855,10 +857,10 @@ export async function carrierOwnerChildAttributionBlock(
       .from(issues)
       .where(and(eq(issues.id, childId), eq(issues.companyId, companyId)))
       .limit(1);
-    const claim = readClaim(childIssue?.executionState, owner.repo) ?? readBindingPr(childIssue?.executionState, branch);
-    const binding = readBindingPr(childIssue?.executionState, branch);
-    if (binding && binding.branch !== row.branchName) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (!claim || ("repoMatches" in claim && !claim.repoMatches)
+    const binding = readBindingPr(childIssue?.executionState, branch, owner.repo);
+    const claim = readClaim(childIssue?.executionState, owner.repo) ?? binding;
+    if (binding && (!binding.repoMatches || binding.branch !== row.branchName)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!claim || !claim.repoMatches
       || claim.prNumber !== row.pullRequestNumber || (claim.headSha !== null && claim.headSha !== row.headSha)) {
       return CHILD_CARRIER_OWNER_GATE_SKIP;
     }

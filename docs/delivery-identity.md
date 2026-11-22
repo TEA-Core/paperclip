@@ -61,6 +61,14 @@ publication each check that anchor. A missing or mismatched URL refuses;
 record delivery again through the control plane. Recording a new child-carrier
 claim removes an obsolete ordinary delivery binding.
 
+Delivery-only attribution applies the same canonical URL anchor at preflight,
+decision attachment and owner publication. It cannot reinterpret an older
+receipt as a same-numbered pull request in another repository.
+
+Canonical URL matching remains exact. A casing-only change to the control-plane
+repository spelling can refuse an otherwise valid attribution. This is a known
+fail-closed canonicalization limitation; this change does not add normalization.
+
 ## Authoritative flow
 
 `resolveDeliveryIdentity` reads the recorded identity. `resolveExactBoundPullRequest` verifies the exact live PR and head. `narrowToDelivered` restricts candidates to that verified PR, while `publishApprovalStatus` and `armMergeOnApproval` reject any mismatch before writing approval status or arming merge. The decision-time head resolver uses the same exact binding so the approving card and the actuator target cannot diverge.
