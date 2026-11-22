@@ -11,6 +11,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import { logActivity } from "./activity-log.js";
+import { deliveryBindingValidationError, resolveDeliveryIdentity } from "./merge-arming.js";
 
 export const CHILD_CARRIER_ATTRIBUTION_ACTOR_ID = "system:child-carrier-attribution";
 
@@ -151,26 +152,22 @@ function readBindingPr(executionState: unknown, cardBranch: string, repo: { owne
     : null;
 }
 
-function readOwnDeliveryPr(executionState: unknown, cardBranch: string, repo: { owner: string; repo: string }): number | null {
-  if (!executionState || typeof executionState !== "object" || Array.isArray(executionState)) return null;
-  const delivery = (executionState as Record<string, unknown>).delivery;
-  if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
-  const record = delivery as Record<string, unknown>;
-  const prNumber = record.prNumber;
-  if (record.branch !== cardBranch || typeof prNumber !== "number" || !Number.isInteger(prNumber) || prNumber <= 0) return null;
-  return record.prUrl === `https://github.com/${repo.owner}/${repo.repo}/pull/${prNumber}` ? prNumber : null;
-}
-
 async function ownDeliveryIsMerged(
   db: Db,
   companyId: string,
-  card: { issue: { status: string; executionState: unknown }; branch: string; repo: { owner: string; repo: string } },
+  childId: string,
+  card: { issue: { status: string }; branch: string; repo: { owner: string; repo: string } },
 ): Promise<boolean> {
   if (card.issue.status !== "done") return false;
-  const prNumber = readOwnDeliveryPr(card.issue.executionState, card.branch, card.repo);
-  if (prNumber === null) return false;
-  const live = await fetchLivePullRequest(db, companyId, card.repo.owner, card.repo.repo, prNumber);
-  return live.ok && live.live.merged === true && live.live.state === "closed" && live.live.headRef === card.branch;
+  const identity = await resolveDeliveryIdentity(db, companyId, childId);
+  const binding = identity.binding;
+  if (identity.recordedUnusable || !binding || !identity.repo || !identity.branchIsOwn) return false;
+  if (identity.repo.owner.toLowerCase() !== card.repo.owner.toLowerCase()
+    || identity.repo.repo.toLowerCase() !== card.repo.repo.toLowerCase()) return false;
+  if (binding.branch !== card.branch || deliveryBindingValidationError(binding, identity.repo, childId)) return false;
+  const live = await fetchLivePullRequest(db, companyId, identity.repo.owner, identity.repo.repo, binding.prNumber);
+  return live.ok && live.live.merged === true && live.live.state === "closed"
+    && live.live.headRef === card.branch && live.live.headSha === binding.headSha.toLowerCase();
 }
 
 async function fetchLivePullRequest(
@@ -843,7 +840,7 @@ export async function carrierOwnerChildAttributionBlock(
       comparisonBase,
     });
     if (!enumerated.ok) {
-      if (enumerated.branchNotFound && await ownDeliveryIsMerged(db, companyId, card)) {
+      if (enumerated.branchNotFound && await ownDeliveryIsMerged(db, companyId, descendant.id, card)) {
         required.set(descendant.id, { shas: [], branch: card.branch });
         continue;
       }

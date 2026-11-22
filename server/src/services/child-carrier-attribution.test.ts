@@ -1427,16 +1427,22 @@ describePg("child carrier attribution", () => {
     const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
     const OWN_PR = 700;
 
-    async function terminalChild(childId: string, opts: { status?: string; recorded?: boolean } = {}) {
+    const OWN_HEAD = "9".repeat(40);
+
+    async function terminalChild(
+      childId: string,
+      opts: { status?: string; recorded?: boolean; delivery?: (record: Record<string, unknown>) => Record<string, unknown> } = {},
+    ) {
+      const record = {
+        branch: CHILD_BRANCH,
+        headSha: OWN_HEAD,
+        prNumber: OWN_PR,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${OWN_PR}`,
+        repo: { owner: OWNER, repo: REPO },
+      };
       await db.update(issues).set({
         status: opts.status ?? "done",
-        executionState: opts.recorded === false ? {} : {
-          delivery: {
-            branch: CHILD_BRANCH,
-            prNumber: OWN_PR,
-            prUrl: `https://github.com/${OWNER}/${REPO}/pull/${OWN_PR}`,
-          },
-        },
+        executionState: opts.recorded === false ? {} : { delivery: opts.delivery ? opts.delivery(record) : record },
       }).where(eq(issues.id, childId));
     }
 
@@ -1452,7 +1458,7 @@ describePg("child carrier attribution", () => {
             json: async () => livePr({
               state: opts.ownPrMerged === false ? "open" : "closed",
               merged: opts.ownPrMerged !== false,
-              head: { ref: CHILD_BRANCH, sha: "9".repeat(40), repo: { full_name: `${OWNER}/${REPO}` } },
+              head: { ref: CHILD_BRANCH, sha: OWN_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
             }),
           };
         }
@@ -1519,6 +1525,29 @@ describePg("child carrier attribution", () => {
         return inner(url, ...rest);
       });
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each([
+      ["no recorded head", (r: Record<string, unknown>) => { const { headSha: _h, ...rest } = r; return rest; }],
+      ["no recorded repository", (r: Record<string, unknown>) => { const { repo: _r, ...rest } = r; return rest; }],
+      ["a foreign recorded repository", (r: Record<string, unknown>) => ({ ...r, repo: { owner: "other-owner", repo: REPO } })],
+      ["an AS-05 record without a card branch", (r: Record<string, unknown>) => ({ ...r, kind: "as05_bound_pr" })],
+      ["an AS-05 record naming a foreign card branch", (r: Record<string, unknown>) => ({ ...r, kind: "as05_bound_pr", cardBranch: "foreign-card-branch" })],
+      ["a stale recorded head", (r: Record<string, unknown>) => ({ ...r, headSha: "8".repeat(40) })],
+      ["a PR URL that does not match its number", (r: Record<string, unknown>) => ({ ...r, prUrl: `https://github.com/${OWNER}/${REPO}/pull/701` })],
+      ["a foreign recorded source issue", (r: Record<string, unknown>) => ({ ...r, sourceIssueId: randomUUID() })],
+    ] as const)("refuses a deleted branch whose recorded own identity has %s", async (_name, delivery) => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId, { delivery });
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it("accepts a producer-shaped AS-05 own identity for a deleted merged branch", async () => {
+      const { ownerId, childId } = await seedPair();
+      await terminalChild(childId, { delivery: (r) => ({ ...r, kind: "as05_bound_pr", cardBranch: CHILD_BRANCH }) });
+      mockDeletedChildBranch();
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
     });
 
     it("keeps refusing a deleted branch when a current attribution row already exists", async () => {
