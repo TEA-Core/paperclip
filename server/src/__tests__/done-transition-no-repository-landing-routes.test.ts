@@ -2717,6 +2717,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           status: "succeeded",
         });
       }],
+      ["a workspace operation on a run linked only through an unindexed context key", async (fixture: NoWorkspaceIssue) => {
+        const { workspaceId } = await insertWorkspace(fixture.companyId);
+        const [run] = await db.insert(heartbeatRuns).values({
+          companyId: fixture.companyId,
+          agentId: fixture.closerAgentId,
+          status: "succeeded",
+          contextSnapshot: { wake: { "issue-ref": fixture.issueId } },
+        }).returning({ id: heartbeatRuns.id });
+        await db.insert(workspaceOperations).values({
+          companyId: fixture.companyId,
+          executionWorkspaceId: workspaceId,
+          heartbeatRunId: run.id,
+          phase: "worktree_prepare",
+          status: "succeeded",
+        });
+      }],
       ["a run whose context named a workspace that no longer exists", async (fixture: NoWorkspaceIssue) => {
         await db.insert(heartbeatRuns).values({
           companyId: fixture.companyId,

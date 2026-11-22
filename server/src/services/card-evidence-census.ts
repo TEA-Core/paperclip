@@ -268,10 +268,11 @@ async function workspaceValue(db: Db, companyId: string, ids: Set<string>, state
 export async function scanCardEvidence(
   db: Db,
   card: { id: string; companyId: string; identifier: string; createdAt: Date },
+  seedRunIds: readonly string[] = [],
 ): Promise<CensusHit | null> {
   const tables = await catalog(db);
   const byName = new Map(tables.map((table) => [table.name, table]));
-  const state: ScanState = { runs: new Set(), agents: new Set(), documents: new Set(), seen: new Set(), checkedUuids: new Set(), bytes: 0 };
+  const state: ScanState = { runs: new Set(seedRunIds), agents: new Set(), documents: new Set(), seen: new Set(), checkedUuids: new Set(), bytes: 0 };
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     const size = state.runs.size + state.agents.size + state.documents.size;
     const runs = [...state.runs];

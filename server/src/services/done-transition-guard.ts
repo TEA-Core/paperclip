@@ -2950,7 +2950,7 @@ async function noWorkspaceHistoryRefusal(
       companyId: issue.companyId,
       identifier: issue.identifier,
       createdAt: issueRow.createdAt,
-    });
+    }, runIds);
     if (census) {
       return noRepositoryRefusal(
         `cannot be declared on an issue whose ${census.table} row carries unread workspace or repository evidence (${census.label}).`,

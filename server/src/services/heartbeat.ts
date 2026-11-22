@@ -21788,7 +21788,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), ne(agents.status, "deleted")))
       .returning()
       .then((rows) => rows[0] ?? null);
 

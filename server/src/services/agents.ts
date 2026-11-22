@@ -799,6 +799,9 @@ export function agentService(db: Db) {
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
+      if (current.status === "deleted" && data.status && data.status !== "deleted") {
+        throw conflict("Deleted agents cannot be updated");
+      }
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }
