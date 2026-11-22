@@ -693,6 +693,8 @@ liveness. Terminal blocker history is retained; the ordinary all-done re-block
 PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
 rejection never create acceptance. A stale binding surfaces attention and keeps
 the manual execution hold; it cannot grant a fresh run.
+Attention revalidates park consent after reading blocker facts, so a concurrent
+blocker reopen cannot retain an obsolete accepted projection.
 Deferred promotion rechecks the typed park under the issue lock. The ordinary
 pause's verified-interaction exception cannot bypass a carrier park: a legacy
 deferred receipt is cancelled without a run and cannot replay on release.

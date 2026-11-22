@@ -4324,15 +4324,21 @@ async function listIssueBlockerAttentionMap(
     (row) => row.companyId === companyId && row.status === "blocked",
   );
   const attentionMap = new Map<string, IssueBlockerAttention>();
-  const carrierParks = await listRecoveryCarrierParks(dbOrTx, companyId, issueRows.map(row => row.id));
-  for (const row of issueRows) {
-    if (row.status !== "blocked") {
-      const carrierPark = carrierParks.get(row.id);
-      attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
-        ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
+  const loadCarrierParkAttention = async () => {
+    const carrierParks = await listRecoveryCarrierParks(dbOrTx, companyId, issueRows.map(row => row.id));
+    for (const row of issueRows) {
+      if (row.status !== "blocked") {
+        const carrierPark = carrierParks.get(row.id);
+        attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
+          ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
+      }
     }
+    return carrierParks;
+  };
+  if (roots.length === 0) {
+    await loadCarrierParkAttention();
+    return attentionMap;
   }
-  if (roots.length === 0) return attentionMap;
 
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
@@ -4924,6 +4930,9 @@ async function listIssueBlockerAttentionMap(
     }
     return null;
   };
+  // Consent must follow graph reads: a concurrent blocker reopen must not
+  // combine new blocker facts with an obsolete accepted park projection.
+  const carrierParks = await loadCarrierParkAttention();
 
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
