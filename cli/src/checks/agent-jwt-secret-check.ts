@@ -1,3 +1,4 @@
+import { setBootDerivedEnv } from "@paperclipai/shared/boot-env";
 import {
   ensureAgentJwtSecret,
   readAgentJwtSecretFromEnv,
@@ -33,7 +34,8 @@ export function agentJwtSecretCheck(configPath?: string): CheckResult {
     message: `PAPERCLIP_AGENT_JWT_SECRET missing from environment and ${envPath}`,
     canRepair: true,
     repair: () => {
-      ensureAgentJwtSecret(configPath);
+      const result = ensureAgentJwtSecret(configPath);
+      if (result.created) setBootDerivedEnv("PAPERCLIP_AGENT_JWT_SECRET", result.secret);
     },
     repairHint: `Run with --repair to create ${envPath} containing PAPERCLIP_AGENT_JWT_SECRET`,
   };
