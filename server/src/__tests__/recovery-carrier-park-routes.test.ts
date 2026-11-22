@@ -5,7 +5,7 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns,
   issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, issueTreeHolds,
@@ -1263,6 +1263,43 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       expect(carrier.status).toBe("in_review");
     }
     await assertNoProtectedWrites();
+  });
+
+  it("surfaces a failed park barrier without partial state and leaves board acceptance usable", async () => {
+    const f = await fixture(), before = await snapshot(f), records = await parkRecords(f);
+    const fault = new Error("Disposable barrier connection failed before readiness");
+    let markFailed!: () => void;
+    const failed = new Promise<void>(resolve => { markFailed = resolve; });
+    const transaction = vi.spyOn(db, "transaction").mockImplementationOnce(() => {
+      const rejected = Promise.reject(fault);
+      // The fault injector observes its promise too; old broken readiness
+      // handling must fail on the outcome, not on an unrelated unhandled error.
+      void rejected.catch(() => undefined);
+      markFailed();
+      return rejected;
+    });
+    const work = blockParkAdmission(f).then(
+      value => ({ kind: "accepted" as const, value }),
+      error => ({ kind: "rejected" as const, error }),
+    );
+    try {
+      await Promise.race([failed, work.then(() => { throw new Error("Barrier setup ended before the injected failure"); })]);
+      // Once the actual transaction rejected, its promise cleanup must finish
+      // before the next event-loop turn; no clock delay or database race.
+      const outcome = await Promise.race([work,
+        new Promise<{ kind: "pending" }>(resolve => { setImmediate(() => resolve({ kind: "pending" })); })]);
+      if (outcome.kind === "accepted") {
+        outcome.value.releaseBarrier();
+        await Promise.allSettled([outcome.value.barrier, outcome.value.acceptance]);
+      }
+      expect(outcome.kind).toBe("rejected");
+      if (outcome.kind === "rejected") expect(outcome.error).toBe(fault);
+    } finally {
+      transaction.mockRestore();
+    }
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    expect((await park(f)).status).toBe(201);
   });
 
   it("keeps ordinary all-done re-block rejected even with a descriptor", async () => {
