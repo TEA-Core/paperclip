@@ -629,7 +629,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#42");
 
       expect(mockGetByName).toHaveBeenCalledWith(companyId, "GITHUB_TOKEN");
-      expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-1", "latest");
+      expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-1", "latest", undefined);
 
       const graphqlCall = mockGhFetch.mock.calls[0]!;
       expect(graphqlCall[0]).toBe("https://api.github.com/graphql");
@@ -2392,7 +2392,7 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
       expect(result.scope).toBe("project_env");
       expect(result.secretName).toBe("GITHUB_TOKEN");
     }
-    expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-tsp", "latest");
+    expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-tsp", "latest", undefined);
   });
 
   it("prefers project env secret_ref binding over company-scoped token", async () => {

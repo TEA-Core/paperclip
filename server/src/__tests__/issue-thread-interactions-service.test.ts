@@ -253,7 +253,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     }, { userId: "local-board" });
 
-    await expect(interactionsSvc.acceptInteraction({ id: issueId, companyId }, created.id, {}, {
+    await expect(interactionsSvc.acceptInteraction({ id: issueId, companyId, goalId: null, projectId: null }, created.id, {}, {
       userId: "local-board",
     })).rejects.toMatchObject({ status: 409 });
 
