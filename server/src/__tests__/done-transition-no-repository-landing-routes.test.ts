@@ -3023,7 +3023,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     it.each([
       ["after the holder also strips its project", true],
       ["on a card that never had a project", false],
-    ] as const)("keeps today's refusal for a board reclassification from repository_delivery %s", async (_label, hadProject) => {
+    ] as const)("preserves landing debt after a board reclassification from repository_delivery %s", async (_label, hadProject) => {
       const fixture = await seedAdmissible({ deliveryRequirement: "repository_delivery" });
       if (hadProject) await attachProject(fixture, false);
       asBoard();
@@ -3037,7 +3037,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         expect(stripped.status, JSON.stringify(stripped.body)).toBe(200);
       }
 
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+      const refused = await close(fixture.identifier);
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+      expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(0);
     });
 
     it.each([

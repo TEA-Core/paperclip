@@ -1974,7 +1974,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(closed.body.code).toBe("done_transition_missing_delivery");
       const debt = await debtRows(issueId);
       expect(debt).toHaveLength(1);
-      expect(debt[0]).toMatchObject({ actorType: "agent", actorId: agentId, agentId: null, runId: null });
+      expect(debt[0]).toMatchObject({ actorType: "agent", actorId: agentId, agentId: link === "agentId" ? agentId : null, runId: link === "runId" ? runId : null });
       expect(debt[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
