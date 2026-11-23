@@ -669,9 +669,9 @@ The acceptance binding, ordinary manual pause hold and audit event commit
 together. Source and recovery-action rows are read-only: no resolution,
 cancellation, attempt/evidence refresh, supersession, replacement action, monitor
 or wake is authorized. Repeated identical acceptance returns the same hold.
-The exact-action binding gates automatic action upserts and source recovery
-re-arm, including exhaustion drain, even after carrier release. Release is not
-new source repair authority. Independent authorized board resolution remains
+While the acceptance is active, the exact-action binding gates automatic action
+upserts and source recovery re-arm, including exhaustion drain; board release
+lifts that gate but is not new source repair authority. Independent authorized board resolution remains
 separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
