@@ -2401,6 +2401,25 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       }
     });
 
+    it("does not re-count rows from earlier attribution rounds against the card byte budget", async () => {
+      try {
+        await db.execute(sql`create table task_census_probe_a (company_id uuid, issue_id uuid, run_id uuid, note text)`);
+        await db.execute(sql`create table task_census_probe_b (company_id uuid, run_id uuid, note text)`);
+        const fixture = await seedAdmissible();
+        const runId = randomUUID();
+        // Round 0: 17 direct rows (~16.1 MiB). Round 1 re-selects them and adds one new run-linked row
+        // from a later table. Distinct evidence (~17 MiB) fits the 32 MiB budget; double counting does not.
+        await db.execute(sql`insert into task_census_probe_a
+          select ${fixture.companyId}, ${fixture.issueId}, ${runId}::uuid, repeat('lorem ipsum ', 83000) from generate_series(1, 17)`);
+        await db.execute(sql`insert into task_census_probe_b values (${fixture.companyId}, ${runId}::uuid, repeat('lorem ipsum ', 83000))`);
+        const res = await close(fixture.identifier);
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+      } finally {
+        await db.execute(sql`drop table if exists task_census_probe_a`);
+        await db.execute(sql`drop table if exists task_census_probe_b`);
+      }
+    });
+
     it("closes a parentless card whose issue.created_without_parent row sits beside a complete creation snapshot", async () => {
       const fixture = await seedAdmissible();
       await db.insert(activityLog).values({

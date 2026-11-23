@@ -72,7 +72,7 @@ describe("runner backlog task creation", () => {
     const f = await fixture(false);
     const sentinel = `SENTINEL-${randomUUID()}`;
     const live = vi.spyOn(liveEvents, "publishLiveEvent");
-    const emit = vi.fn();
+    const emit = vi.fn().mockResolvedValue({ errors: [] });
     setPluginEventBus({ emit } as never);
     try {
       const receipt = await f.authority.execute({ tool: "create_task", callId: "desc", arguments: { idempotencyKey: "desc", title: "Described", description: sentinel } }) as { task: { id: string } };
