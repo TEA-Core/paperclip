@@ -38,6 +38,8 @@ import { companyService } from "../services/companies.js";
 import { prunePluginLogs } from "../services/plugin-log-retention.js";
 import { detachIssuesFromClosedExecutionWorkspace } from "../services/execution-workspaces.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import * as hardenedGit from "../services/hardened-git-probe.js";
+import * as githubFetch from "../services/github-fetch.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
@@ -2212,6 +2214,69 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       ), { status: 200 }));
       expect((await patch(issueId, { status: "done" })).status).toBe(matches ? 200 : 409);
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(matches ? "discharged" : "outstanding");
+    });
+
+    it.each(
+      (["shared", "absent", "own"] as const).flatMap((path) =>
+        ([401, 403, 500, 502, "network", "non-Error", "malformed JSON", "missing SHA"] as const)
+          .map((failure) => [path, failure] as const)),
+    )("refuses %s carrier-head lookup failure (%s) without closing or discharging debt", async (path, failure) => {
+      const { issueId, identifier, branchName, executionWorkspaceId } = await seedIssue("LOOKUP");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-head-failure-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      const branch = path === "shared" ? "shared-carrier" : branchName;
+      const runGit = hardenedGit.runHardenedGit;
+      const localHead = vi.spyOn(hardenedGit, "runHardenedGit").mockImplementation((args, options) => {
+        // Attribution still uses real Git. A later local-head failure forces the
+        // remote fallback at both carrier call sites, including the compare-404 catch.
+        if (args.length === 4 && args[1] === cwd && args[2] === "rev-parse" && args[3] === "HEAD") {
+          return Promise.reject(new Error("local head unavailable"));
+        }
+        return runGit(args, options);
+      });
+      const remote = vi.spyOn(githubFetch, "ghFetch");
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        git("commit", "--allow-empty", "-qm", "base");
+        git("checkout", "-qb", branch);
+        git("commit", "--allow-empty", "-qm", `Implement ${identifier}`);
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: branch, baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        let headLookups = 0;
+        remote.mockImplementation((url: string) => {
+          if (url.endsWith(`/commits/${encodeURIComponent(branch)}`)) {
+            headLookups++;
+            if (failure === "network") return Promise.reject(new Error("network unavailable"));
+            if (failure === "non-Error") throw "non-Error transport failure";
+            return Promise.resolve(new Response(
+              failure === "malformed JSON" ? "not JSON" : "{}",
+              { status: typeof failure === "number" ? failure : 200 },
+            ));
+          }
+          return Promise.resolve(new Response(JSON.stringify(url.includes("/compare/") ? { ahead_by: 1 } : []), {
+            status: path === "absent" && (url.includes("/compare/") || url.includes("/git/ref/heads/")) ? 404 : 200,
+          }));
+        });
+        const refused = await patch(issueId, { status: "done" });
+        // A wrong mock URL must not silently turn every variant into missing-SHA coverage.
+        expect(headLookups).toBeGreaterThan(0);
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        localHead.mockRestore();
+        remote.mockRestore();
+        rmSync(cwd, { recursive: true, force: true });
+      }
     });
 
     it.each([false, true])("checks attributable shared-branch work against carrier contents (landed=%s)", async (landed) => {

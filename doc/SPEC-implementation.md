@@ -292,6 +292,9 @@ accepted done transition, is settled history: it is ignored on read, never
 rewritten. A later close audit cannot settle explicit outstanding debt. A
 debt-bearing issue with no probe-able repository/branch or merged PR is refused
 fail-closed; the refusal names the exits (verify landing, or cancel).
+An unavailable or malformed carrier-head lookup remains unverified and produces
+the same HTTP 409 delivery refusal, including auth errors and rejected requests;
+it must not escape as HTTP 500 or authorize a close.
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 An owing reclassification also writes a system-owned

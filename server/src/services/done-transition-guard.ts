@@ -678,7 +678,12 @@ async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRep
       if (/^[0-9a-f]{40}$/i.test(head)) return head;
     } catch { /* The remote branch can still provide the delivery head. */ }
   }
-  return ctx.branch ? resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
+  try {
+    // Await here so rejected lookups, including non-Error throws, stay unverified.
+    return ctx.branch ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
