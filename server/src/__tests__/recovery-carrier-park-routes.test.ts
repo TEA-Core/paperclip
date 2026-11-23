@@ -497,7 +497,30 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     const after = await snapshot(f);
     expect(after.actions).toEqual(before.actions);
     expect(after.cards.map(card => card.id)).toEqual(before.cards.map(card => card.id));
+    expect(after.source[0]!.assigneeAgentId).toBe(f.agentId);
+    expect(wakes).toEqual([f.agentId]);
   }, 30_000);
+
+  it("assigns and wakes an already parked source without changing its action", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ capabilities: "Implements repository changes" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ createdByAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    const dependentId = randomUUID();
+    await db.insert(issues).values({ id: dependentId, companyId: f.companyId, title: "Other dependent work", status: "blocked", assigneeUserId: "park-operator" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.sourceId, relatedIssueId: dependentId, type: "blocks" });
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
+    const wakes: string[] = [];
+    await recoveryService(db, { enqueueWakeup: async agentId => { wakes.push(agentId); return null; } })
+      .reconcileStrandedAssignedIssues();
+    const after = await snapshot(f);
+    await assertNoProtectedWrites();
+    expect(after.actions).toEqual(before.actions);
+    expect(after.cards.map(card => card.id)).toEqual(before.cards.map(card => card.id));
+    expect(after.source[0]!.assigneeAgentId).toBe(f.agentId);
+    expect(wakes).toEqual([f.agentId]);
+  });
 
   it("serializes board resolution behind park admission's source lock", async () => {
     const f = await fixture(), before = await snapshot(f);
@@ -752,19 +775,86 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     f.body.expectedStatusVersion = carrier!.statusVersion;
     const parked = await park(f);
     expect(parked.status).toBe(201);
+    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
+    expect(await recoveryService(db, { enqueueWakeup: async () => {
+      throw new Error("Park must not dispatch an agent");
+    } }).reconcileExhaustedRecoveryDrain({ companyId: f.companyId }))
+      .toMatchObject({ checked: 0, monitorArmed: 0, alreadyLive: 0, noInvokableOwner: 0 });
     expect((await request(app(f.companyId))
       .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
       .send({ recoveryActionId: f.actionId, reason: "Carrier release is not source repair authority" })).status).toBe(200);
     const before = await snapshot(f);
-    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
     for (let tick = 0; tick < 2; tick++) {
       const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Released source must not wake"); } });
-      await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      const drained = await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+      expect(drained.checked).toBe(1);
+      expect(drained.monitorArmed + drained.alreadyLive + drained.noInvokableOwner).toBe(1);
       await recovery.reconcileBlockedWithoutBlockers({ companyId: f.companyId });
     }
     await assertNoProtectedWrites();
     expect((await snapshot(f)).actions).toEqual(before.actions);
   });
+
+  it.each(["unrelated need", "bound supersession", "released"] as const)(
+    "stranded escalation preserves the bound action for %s", async mode => {
+      const f = await fixture();
+      const prepareSource = async (target: Fixture) => {
+        await db.update(issues).set({ status: "in_progress", assigneeAgentId: target.agentId })
+          .where(eq(issues.id, target.sourceId));
+        const needId = randomUUID();
+        await db.insert(issues).values({ id: needId, companyId: target.companyId,
+          title: "Unfinished source requirement", status: "todo", assigneeUserId: "park-operator" });
+        await db.insert(issueRelations).values({ companyId: target.companyId, issueId: needId,
+          relatedIssueId: target.sourceId, type: "blocks" });
+        return (await snapshot(target)).source[0]!;
+      };
+      const source = await prepareSource(f);
+      if (mode === "bound supersession") {
+        await db.update(issueRecoveryActions).set({ kind: "configuration_validation",
+          cause: "configuration_incomplete", fingerprint: "original-configuration" })
+          .where(eq(issueRecoveryActions.id, f.actionId));
+      }
+      const accepted = await park(f);
+      expect(accepted.status).toBe(201);
+      const before = await snapshot(f);
+      const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
+      const recovery = recoveryService(db, { enqueueWakeup: async () => {
+        throw new Error("Board-owned escalation must not dispatch an agent");
+      } });
+      const escalate = () => recovery.escalateStrandedAssignedIssue({
+        issue: source, previousStatus: "in_progress", latestRun: null,
+        recoveryCause: mode === "released" ? "process_lost" : "configuration_incomplete",
+        boardEscalation: true,
+      });
+      if (mode === "unrelated need") {
+        const ordinary = await fixture(f.companyId);
+        const ordinarySource = await prepareSource(ordinary);
+        const control = await recovery.escalateStrandedAssignedIssue({
+          issue: ordinarySource, previousStatus: "in_progress", latestRun: null,
+          recoveryCause: "configuration_incomplete", boardEscalation: true,
+        });
+        expect(control?.status).toBe("blocked");
+      }
+      if (mode === "released") {
+        expect(await escalate()).toBeNull();
+        expect((await request(app(f.companyId))
+          .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${accepted.body.hold.id}/release`)
+          .send({ recoveryActionId: f.actionId, reason: "Release the exact-action gate" })).status).toBe(200);
+      }
+      const result = await escalate();
+      const after = await snapshot(f);
+      await assertNoProtectedWrites();
+      expect(after.actions.find(action => action.id === f.actionId))
+        .toEqual(before.actions.find(action => action.id === f.actionId));
+      // A different need still targets the occupied source slot; release lifts only the park gate.
+      if (mode !== "released") {
+        expect(result).toBeNull();
+        expect(after.source).toEqual(before.source);
+      } else {
+        expect(result?.status).toBe("blocked");
+        expect(after.source[0]!.status).toBe("blocked");
+      }
+    });
 
   it.each([false, true])("serializes action-only wake admission with a winning park (coalescing=%s)", async coalescing => {
     const f = await fixture();
