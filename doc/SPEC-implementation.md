@@ -587,6 +587,15 @@ The current implementation includes additional V1-control-plane tables beyond th
 - Plugins and routines: `plugins`, plugin config/state/entities/jobs/logs/webhooks, plugin database namespaces/migrations, plugin company settings, `routines`, `routine_revisions`, `routine_triggers`, and `routine_runs`.
 - Access and operations: company memberships, instance roles, principal permission grants, invites, join requests, board API keys, CLI auth challenges, budget policies/incidents, feedback exports/votes, company skills, sidebar preferences, and company logos.
 
+Child-carrier attribution history is company-scoped and keyed by child, provider,
+case-insensitive repository owner/name, ancestor, PR number, and head SHA. There
+is still at most one current proof per child. Changing carrier identity retires
+the previous proof without deleting its obligation or transferring its approval.
+Detached/reparented children retain their former owner's obligations in both
+current and invalidated history; unverifiable ancestry blocks publication.
+Explicit child cancellation releases the obligation, not proof invalidation.
+See `doc/DATABASE.md` for retention, migration, and rollback requirements.
+
 Decision-desk triage uses company-scoped sidecars rather than adding queue fields to every attention source:
 
 - `decision_queues` stores durable named queues, optional retention overrides, server-derived creator/run provenance, and data-backed seed rules.

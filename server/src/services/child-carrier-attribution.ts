@@ -382,11 +382,15 @@ type ChildCarrierAttribution = typeof issueChildCarrierAttributions.$inferSelect
 type VerifiedChildCarrierProof = Pick<ChildCarrierAttribution,
   "companyId" | "childIssueId" | "ancestorIssueId" | "owner" | "repo" | "pullRequestNumber" | "branchName" | "headSha" | "commitShas">;
 
-function sameVerifiedProof(row: ChildCarrierAttribution, proof: VerifiedChildCarrierProof): boolean {
+function sameCarrierIdentity(row: ChildCarrierAttribution, proof: Omit<VerifiedChildCarrierProof, "branchName" | "headSha" | "commitShas">): boolean {
   return row.companyId === proof.companyId && row.childIssueId === proof.childIssueId
     && row.ancestorIssueId === proof.ancestorIssueId && row.provider === "github"
-    && row.owner === proof.owner.toLowerCase() && row.repo === proof.repo.toLowerCase()
-    && row.pullRequestNumber === proof.pullRequestNumber && row.branchName === proof.branchName
+    && row.owner.toLowerCase() === proof.owner.toLowerCase() && row.repo.toLowerCase() === proof.repo.toLowerCase()
+    && row.pullRequestNumber === proof.pullRequestNumber;
+}
+
+function sameVerifiedProof(row: ChildCarrierAttribution, proof: VerifiedChildCarrierProof): boolean {
+  return sameCarrierIdentity(row, proof) && row.branchName === proof.branchName
     && row.headSha === proof.headSha && normalizeShas(row.commitShas)?.join() === normalizeShas(proof.commitShas)?.join();
 }
 
@@ -433,25 +437,32 @@ async function writeCurrent(
         if (current && sameVerifiedProof(current, input)) return current.id;
         throw new Error("child_carrier_proof_conflict");
       }
-      if (current && (current.headSha !== input.headSha || current.pullRequestNumber !== input.pullRequestNumber)) {
+      const now = new Date();
+      let existing: ChildCarrierAttribution | null = current;
+      if (current && !sameCarrierIdentity(current, input)) {
+        // Retire authority, not the historical obligation or its decision.
+        const [retired] = await tx.update(issueChildCarrierAttributions).set({
+          state: "invalidated", invalidatedAt: now, updatedAt: now,
+        }).where(attributionSnapshot(current)).returning({ id: issueChildCarrierAttributions.id });
+        if (!retired) throw new Error("child_carrier_proof_conflict");
+        existing = null;
+      } else if (current && current.headSha !== input.headSha) {
         throw new Error("child_carrier_proof_conflict");
       }
-      let existing = current;
       if (!existing) {
         const [historical] = await tx.select().from(issueChildCarrierAttributions).where(and(
           eq(issueChildCarrierAttributions.companyId, input.companyId),
           eq(issueChildCarrierAttributions.childIssueId, input.childIssueId),
+          eq(issueChildCarrierAttributions.provider, "github"),
+          eq(sql`lower(${issueChildCarrierAttributions.owner})`, input.owner.toLowerCase()),
+          eq(sql`lower(${issueChildCarrierAttributions.repo})`, input.repo.toLowerCase()),
+          eq(issueChildCarrierAttributions.ancestorIssueId, input.ancestorIssueId),
           eq(issueChildCarrierAttributions.pullRequestNumber, input.pullRequestNumber),
           eq(issueChildCarrierAttributions.headSha, input.headSha),
         )).limit(1);
         existing = historical ?? null;
       }
-      const now = new Date();
       if (existing) {
-        if (existing.provider !== "github" || existing.owner !== input.owner.toLowerCase()
-          || existing.repo !== input.repo.toLowerCase() || existing.ancestorIssueId !== input.ancestorIssueId) {
-          throw new Error("child_carrier_proof_conflict");
-        }
         const [refreshed] = await tx.update(issueChildCarrierAttributions).set({
           state: "current",
           invalidatedAt: null,
@@ -575,9 +586,13 @@ export async function resolveChildCarrierDecisionHead(
   if (!live.headSha || !SHA_RE.test(live.headSha)) {
     return { kind: "unresolvable", reason: "head_unverifiable: recorded child carrier pull request has no readable head" };
   }
+  const currentCarrier = current && sameCarrierIdentity(current, {
+    companyId, childIssueId: issueId, ancestorIssueId: ancestors[0]!,
+    owner: card.repo.owner, repo: card.repo.repo, pullRequestNumber: claim.prNumber,
+  });
   const claimedHead = "headSha" in claim ? claim.headSha : null;
   if (claimedHead && claimedHead !== live.headSha) {
-    if (current && current.headSha !== live.headSha) {
+    if (currentCarrier && current.headSha !== live.headSha) {
       await db
         .update(issueChildCarrierAttributions)
         .set({ state: "invalidated", invalidatedAt: new Date(), updatedAt: new Date() })
@@ -585,7 +600,7 @@ export async function resolveChildCarrierDecisionHead(
     }
     return { kind: "unresolvable", reason: `head_moved: child carrier head moved to ${live.headSha.slice(0, 7)}; review the new head` };
   }
-  if (current && current.headSha !== live.headSha) {
+  if (currentCarrier && current.headSha !== live.headSha) {
     await db
       .update(issueChildCarrierAttributions)
       .set({ state: "invalidated", invalidatedAt: new Date(), updatedAt: new Date() })
@@ -605,7 +620,7 @@ export async function resolveChildCarrierDecisionHead(
   if (!enumerated.ok) return { kind: "unresolvable", reason: `delivery_identity_unresolved: ${enumerated.reason}` };
   const shas = normalizeShas(enumerated.shas);
   if (!shas) return { kind: "unresolvable", reason: "delivery_identity_unresolved: child carrier commit enumeration is empty" };
-  if (current) {
+  if (currentCarrier) {
     const stored = normalizeShas(current.commitShas) ?? [];
     if (stored.join() !== shas.join() || current.branchName !== live.headRef || current.pullRequestNumber !== claim.prNumber) {
       await db
@@ -653,8 +668,8 @@ export async function childCarrierMustNotPublish(
   const current = await readCurrent(db, companyId, issueId);
   if (!current) return null;
   if (
-    current.owner === pr.owner.toLowerCase()
-    && current.repo === pr.repo.toLowerCase()
+    current.owner.toLowerCase() === pr.owner.toLowerCase()
+    && current.repo.toLowerCase() === pr.repo.toLowerCase()
     && current.pullRequestNumber === pr.number
   ) {
     return CHILD_CARRIER_STAMP_SKIP;
@@ -682,8 +697,8 @@ export async function childCarrierAttributionMatches(
 ): Promise<boolean> {
   const current = await readCurrent(db, companyId, issueId);
   if (!current || !pr.headRefName) return false;
-  return current.owner === pr.owner.toLowerCase()
-    && current.repo === pr.repo.toLowerCase()
+  return current.owner.toLowerCase() === pr.owner.toLowerCase()
+    && current.repo.toLowerCase() === pr.repo.toLowerCase()
     && current.pullRequestNumber === pr.number
     && current.branchName === pr.headRefName;
 }
@@ -722,8 +737,8 @@ export async function recordChildCarrierDecision(db: Db, companyId: string, issu
     const certificate = approval?.finalDelivery as Record<string, unknown> | null | undefined;
     if (!certificate || certificate.decisionId !== decisionId || certificate.headSha !== current.headSha
       || certificate.number !== current.pullRequestNumber
-      || typeof certificate.owner !== "string" || certificate.owner.toLowerCase() !== current.owner
-      || typeof certificate.repo !== "string" || certificate.repo.toLowerCase() !== current.repo) return;
+      || typeof certificate.owner !== "string" || certificate.owner.toLowerCase() !== current.owner.toLowerCase()
+      || typeof certificate.repo !== "string" || certificate.repo.toLowerCase() !== current.repo.toLowerCase()) return;
     const proof = certificate.childCarrierProof as Record<string, unknown> | null | undefined;
     const certifiedShas = Array.isArray(proof?.commitShas) && proof.commitShas.every((sha) => typeof sha === "string")
       ? normalizeShas(proof.commitShas)
@@ -767,8 +782,8 @@ export async function carrierOwnerChildAttributionBlock(
   pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null },
 ): Promise<string | null> {
   const descendants = await descendantIds(db, companyId, ownerIssueId);
-  // Recorded obligations survive mutable workspace metadata. This is only an
-  // applicability fence; complete current proof is read again after enumeration.
+  // Recorded obligations survive detachment, reparenting, and invalidation.
+  // Only explicit cancellation releases them; unverifiable ancestry cannot.
   const recorded = await db
     .select({ childIssueId: issueChildCarrierAttributions.childIssueId })
     .from(issueChildCarrierAttributions)
@@ -776,8 +791,8 @@ export async function carrierOwnerChildAttributionBlock(
       eq(issueChildCarrierAttributions.companyId, companyId),
       eq(issueChildCarrierAttributions.ancestorIssueId, ownerIssueId),
       eq(issueChildCarrierAttributions.provider, "github"),
-      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
-      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(sql`lower(${issueChildCarrierAttributions.owner})`, pr.owner.toLowerCase()),
+      eq(sql`lower(${issueChildCarrierAttributions.repo})`, pr.repo.toLowerCase()),
       eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
       sql`EXISTS (
         SELECT 1 FROM ${issues}
@@ -857,8 +872,9 @@ export async function carrierOwnerChildAttributionBlock(
     .where(and(
       eq(issueChildCarrierAttributions.companyId, companyId),
       eq(issueChildCarrierAttributions.ancestorIssueId, ownerIssueId),
-      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
-      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(issueChildCarrierAttributions.provider, "github"),
+      eq(sql`lower(${issueChildCarrierAttributions.owner})`, pr.owner.toLowerCase()),
+      eq(sql`lower(${issueChildCarrierAttributions.repo})`, pr.repo.toLowerCase()),
       eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
       eq(issueChildCarrierAttributions.state, "current"),
     ));
@@ -870,7 +886,7 @@ export async function carrierOwnerChildAttributionBlock(
     }
     const stored = row ? normalizeShas(row.commitShas) : null;
     if (!row || !stored || stored.join() !== shas.join()) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (row.owner.toLowerCase() !== pr.owner.toLowerCase() || row.repo.toLowerCase() !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.headSha !== headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (row.branchName !== live.live.headRef) return CHILD_CARRIER_OWNER_GATE_SKIP;
     if (!row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
@@ -936,10 +952,10 @@ export async function childCarrierStampBlock(
     .from(issueChildCarrierAttributions)
     .where(and(
       eq(issueChildCarrierAttributions.companyId, companyId),
-      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
-      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(issueChildCarrierAttributions.provider, "github"),
+      eq(sql`lower(${issueChildCarrierAttributions.owner})`, pr.owner.toLowerCase()),
+      eq(sql`lower(${issueChildCarrierAttributions.repo})`, pr.repo.toLowerCase()),
       eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
-      eq(issueChildCarrierAttributions.state, "current"),
     ));
   const checkedOwners = new Set(issueId ? [issueId] : []);
   for (const row of rows) {

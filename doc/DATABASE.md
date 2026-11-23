@@ -242,6 +242,67 @@ When authoring migrations or one-time backfills:
 - The repo keeps only the newest 5 snapshots. `generate` runs `prune:snapshots` afterwards to delete older ones. Drizzle only reads the newest snapshot, and each snapshot is a full copy of the schema (over 1 MB each). Older snapshots are still in git history.
 - `packages/db/src/migration-snapshot-drift.test.ts` is the enforcement backstop. It repeats the diff that `generate` performs and fails when the newest snapshot no longer matches `packages/db/src/schema/`.
 
+## Child-carrier attribution history
+
+Migration `0332_child_carrier_history_identity` replaces the historical key with
+`(company_id, child_issue_id, provider, lower(owner), lower(repo),
+ancestor_issue_id, pull_request_number, head_sha)`. GitHub repository names are
+case-insensitive; branch names and commit identities are not folded by this key.
+The ancestor belongs in the key because reparenting must not overwrite the former
+carrier owner's obligation. The separate partial unique index still permits only
+one `current` attribution per company/child.
+
+The backfill is the new index build over the identity already stored in each row,
+not an inference from today's workspace or issue tree. It preserves every row,
+ID, decision, provenance value, timestamp, and original repository spelling.
+The old key is a subset of the new key, so legacy rows cannot collide during
+the build. The migration creates the new index before dropping the old one,
+inside the migration transaction; failure rolls back the whole swap.
+Migration 0330 is unchanged. Number 0331 is reserved for the independent recovery
+carrier migration; merge ordering must preserve journal timestamp order.
+
+When a child is verified against another repository or ancestor, the control
+plane atomically invalidates its previous current proof and inserts or reuses
+the exact historical identity. It never copies approval authority to a different
+identity. Refreshing the same identity remains idempotent; changed branch/commit
+proof still requires a new decision.
+
+### Detached-child retention
+
+Detachment, reparenting, workspace loss, and proof invalidation do not erase an
+attribution or discharge its original owner's obligation. Keep both current and
+invalidated rows without a time-based expiry. Owner checks and global stamp/arm
+checks consider historical obligations for the exact provider/repository/PR.
+If ancestry or required proof is no longer verifiable, publication stays blocked.
+Reattaching a child and supplying current complete approved proof can restore
+eligibility; a new attribution under another owner cannot release the former one.
+
+Explicit child cancellation releases the obligation while the cancelled row
+remains inspectable. Reopening it restores the obligation. The existing issue
+deletion service refuses deletion of a non-cancelled attributed child, or an
+ancestor still referenced by such a child, regardless of attribution state.
+Deleting an eligible cancelled child or an ancestor with only cancelled
+attributed children removes the associated history through the existing foreign
+keys. Company deletion retains its existing cascade behavior. Direct operator
+SQL that bypasses these service guards is not a supported release mechanism.
+
+### Deployment and rollback
+
+Stop attribution writers during upgrade: old binaries still select the old
+incomplete key and are not safe alongside multiple historical identities.
+Apply the migration before starting the new binaries. This is a normal,
+non-concurrent index build: it scans the attribution table once, requires space
+for both indexes until commit, and blocks writes during the build/swap. Lock
+wait and build time depend on table size and concurrent transactions; no fixed
+duration is guaranteed. Schedule a maintenance window and measure on a restored
+production dump for a large table.
+
+Take a database dump before upgrading. An uncommitted failed migration is
+transactionally reversible. After new identities are written, restoring the old
+unique key can fail, and deleting collisions would lose obligations. Do not
+downgrade by dropping rows: retain the new schema/code or restore the pre-upgrade
+dump with its matching application version, accounting for all later writes.
+
 ## Cloud runtime identity singleton
 
 The private `instance_settings` row whose singleton key is

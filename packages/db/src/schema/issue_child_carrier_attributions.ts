@@ -52,9 +52,13 @@ export const issueChildCarrierAttributions = pgTable(
     currentChildUq: uniqueIndex("issue_child_carrier_attributions_current_child_uq")
       .on(table.companyId, table.childIssueId)
       .where(sql`${table.state} = 'current'`),
-    childPrHeadUq: uniqueIndex("issue_child_carrier_attributions_child_pr_head_uq").on(
+    historicalIdentityUq: uniqueIndex("issue_child_carrier_attributions_history_uq").on(
       table.companyId,
       table.childIssueId,
+      table.provider,
+      sql`lower(${table.owner})`,
+      sql`lower(${table.repo})`,
+      table.ancestorIssueId,
       table.pullRequestNumber,
       table.headSha,
     ),

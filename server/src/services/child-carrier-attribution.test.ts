@@ -1243,11 +1243,13 @@ describePg("child carrier attribution", () => {
       ["repository owner", "current"], ["repository owner", "invalidated"],
       ["repository", "current"], ["repository", "invalidated"],
       ["ancestor", "current"], ["ancestor", "invalidated"],
-    ] as const)("preserves historical %s identity on a %s proof collision", async (field, state) => {
+    ] as const)("retains separate historical %s identity when replacing a %s proof", async (field, state) => {
       const { ownerId, childId } = await seedPair();
       const first = await resolveChildCarrierDecisionHead(db, companyId, childId);
       expect(first.kind).toBe("resolved");
       expect(await resolveChildCarrierDecisionHead(db, companyId, childId)).toEqual(first);
+      const decisionId = await approveChild(childId);
+      await recordChildCarrierDecision(db, companyId, childId);
       if (state === "invalidated") {
         await db.update(issueChildCarrierAttributions).set({ state, invalidatedAt: new Date() });
       }
@@ -1280,9 +1282,36 @@ describePg("child carrier attribution", () => {
           head: { ref: CARRIER_BRANCH, sha: HEAD, repo: { full_name: `${owner}/${repo}` } },
         }) }));
       }
-      expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
-      expect(await db.select().from(issueChildCarrierAttributions)).toEqual(before);
+      const replacement = await resolveChildCarrierDecisionHead(db, companyId, childId);
+      expect(replacement.kind).toBe("resolved");
+      const after = await db.select().from(issueChildCarrierAttributions);
+      expect(after).toHaveLength(2);
+      const previous = after.find((row) => row.id === before[0]!.id)!;
+      expect(previous).toEqual({
+        ...before[0],
+        state: "invalidated",
+        invalidatedAt: expect.any(Date),
+        updatedAt: expect.any(Date),
+      });
+      expect(previous.childDecisionId).toBe(decisionId);
+      const current = after.find((row) => row.state === "current")!;
+      expect(current.id).not.toBe(previous.id);
+      expect(current.childDecisionId).toBeNull();
+      expect(await resolveChildCarrierDecisionHead(db, companyId, childId)).toEqual(replacement);
+      expect(await db.select().from(issueChildCarrierAttributions)).toHaveLength(2);
       expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each(["detached", "cancelled"] as const)("checks invalidated historical obligations on the global stamp path for a %s child", async (status) => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      await db.update(issueChildCarrierAttributions).set({ state: "invalidated", invalidatedAt: new Date() });
+      await issueService(db).update(childId, { parentId: null });
+      if (status === "cancelled") await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
+      const expected = status === "cancelled" ? null : CHILD_CARRIER_OWNER_GATE_SKIP;
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(expected);
+      expect(await childCarrierStampBlock(db, companyId, target)).toBe(expected);
+      expect(await childCarrierStampBlock(db, companyId, { ...target, repo: "unrelated" })).toBeNull();
     });
 
     it.each([
