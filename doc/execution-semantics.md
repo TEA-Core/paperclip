@@ -947,7 +947,6 @@ The service rechecks the persisted creator and holds its row lock through
 the issue UPDATE. Renaming the emitter or changing its role removes repair
 eligibility; no instance-specific agent UUID is hardcoded.
 
-
 The route's lookup is preliminary. The service repeats the canonical check
 inside the issue-update transaction and holds shared locks on existing
 resource rows, entity bindings, and the candidate agent rows through the
