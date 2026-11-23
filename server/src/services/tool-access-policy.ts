@@ -319,20 +319,6 @@ function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string,
   return `${DERIVED_SIDE_EFFECT_KEY_PREFIX}v2:${sha256({ ...scope, actorType: ctx.actorType, actorId: ctx.actorId, agentId: ctx.agentId })}`;
 }
 
-function isIdempotencyKeyConflict(error: unknown): boolean {
-  const seen = new Set<unknown>();
-  let current: unknown = error;
-  while (typeof current === "object" && current !== null && !seen.has(current)) {
-    seen.add(current);
-    const maybe = current as { code?: string; constraint?: string; constraint_name?: string; cause?: unknown };
-    if (maybe.code === "23505" && (maybe.constraint ?? maybe.constraint_name) === "tool_invocations_company_idempotency_uq") {
-      return true;
-    }
-    current = maybe.cause;
-  }
-  return false;
-}
-
 /**
  * How long a derived-key retry replays a failure that never reached the tool
  * (a policy denial, a rate limit, or a failure before dispatch). Afterwards an
@@ -1711,6 +1697,8 @@ export function toolAccessPolicyService(db: Db) {
     }
   }
 
+  type InvocationWriter = Pick<Db, "select" | "insert" | "update">;
+
   /**
    * A recorded key belongs to the principal that recorded it: the stored row's
    * actor type, actor id and agent id must equal the caller's. Any other
@@ -1718,8 +1706,8 @@ export function toolAccessPolicyService(db: Db) {
    * outcome (no invocation id, result, provider links or failure text). The
    * same principal's retry, in this or a later run, finds and replays its row.
    */
-  async function callerInvocationByIdempotencyKey(ctx: ToolAccessContext, idempotencyKey: string) {
-    const [existing] = await db.select().from(toolInvocations).where(and(
+  async function callerInvocationByIdempotencyKey(ctx: ToolAccessContext, idempotencyKey: string, writer: InvocationWriter) {
+    const [existing] = await writer.select().from(toolInvocations).where(and(
       eq(toolInvocations.companyId, ctx.companyId),
       eq(toolInvocations.idempotencyKey, idempotencyKey),
     ));
@@ -1751,11 +1739,11 @@ export function toolAccessPolicyService(db: Db) {
 
   /**
    * A stored row is replayed only once it has an outcome. A row still pending,
-   * authorized or executing has none yet, so the caller gets 409 in-progress
+   * authorized, awaiting approval or executing has none yet, so the caller gets 409 in-progress
    * rather than a replay with no result; its retry after the outcome replays.
    */
   function replayRecorded(invocation: typeof toolInvocations.$inferSelect) {
-    if (["pending", "authorized", "executing"].includes(invocation.status)) {
+    if (["pending", "authorized", "awaiting_approval", "executing"].includes(invocation.status)) {
       throw conflict("An identical call is still running; retry after it finishes.", { reasonCode: "tool_invocation_in_progress", invocationId: invocation.id });
     }
     return { invocation, replayed: true, actionRequest: null };
@@ -1775,50 +1763,51 @@ export function toolAccessPolicyService(db: Db) {
     }
     const idempotencyKey = input.request.idempotencyKey
       ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash, "v2") : null);
-    if (idempotencyKey) {
-      const existing = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
-      if (existing && !(derivedKey && failureReplayExpired(existing))) {
-        return replayRecorded(existing);
+    const store = async (writer: InvocationWriter) => {
+      if (idempotencyKey) {
+        const existing = await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+        if (existing && !(derivedKey && failureReplayExpired(existing))) {
+          return replayRecorded(existing);
+        }
+        if (existing) {
+          // Release the derived key from the expired failure so this retry
+          // records (and is authorized as) a fresh invocation. A concurrent
+          // retry that released it first owns the key: replay its row.
+          const [released] = await writer.update(toolInvocations)
+            .set({ idempotencyKey: null, updatedAt: new Date() })
+            .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
+            .returning({ id: toolInvocations.id });
+          const winner = released ? null : await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+          if (winner) return replayRecorded(winner);
+        }
       }
-      if (existing) {
-        // Release the derived key from the expired failure so this retry
-        // records (and is authorized as) a fresh invocation. A concurrent
-        // retry that released it first owns the key: replay its row.
-        const [released] = await db.update(toolInvocations)
-          .set({ idempotencyKey: null, updatedAt: new Date() })
-          .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
-          .returning({ id: toolInvocations.id });
-        const winner = released ? null : await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
-        if (winner) return replayRecorded(winner);
+      const legacyKey = derivedKey ? sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy") : null;
+      let storageKey = idempotencyKey;
+      if (legacyKey) {
+        const [legacy] = await writer.select().from(toolInvocations).where(and(
+          eq(toolInvocations.companyId, ctx.companyId),
+          eq(toolInvocations.idempotencyKey, legacyKey),
+        ));
+        if (legacy) {
+          const replay = replayLegacyInvocation(ctx, legacy, idempotencyKey!);
+          if (replay) return replay;
+        } else {
+          // Keep the actual invocation under the key old binaries read. Its
+          // server-owned JSONB marker identifies the full arguments for new
+          // binaries, with no schema change or unsynchronized shadow outcome.
+          // If that legacy key is occupied, use the principal-scoped full key.
+          storageKey = legacyKey;
+        }
       }
-    }
-    const legacyKey = derivedKey ? sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy") : null;
-    let storageKey = idempotencyKey;
-    if (legacyKey) {
-      const [legacy] = await db.select().from(toolInvocations).where(and(
-        eq(toolInvocations.companyId, ctx.companyId),
-        eq(toolInvocations.idempotencyKey, legacyKey),
-      ));
-      if (legacy) {
-        const replay = replayLegacyInvocation(ctx, legacy, idempotencyKey!);
-        if (replay) return replay;
-      } else {
-        // Keep the actual invocation under the key old binaries read. Its
-        // server-owned JSONB marker identifies the full arguments for new
-        // binaries, with no schema change or unsynchronized shadow outcome.
-        // If that legacy key is occupied, use the principal-scoped full key.
-        storageKey = legacyKey;
-      }
-    }
-    const status = accessDecision.decision === "allow"
-      ? "authorized"
-      : accessDecision.decision === "require_approval"
-        ? "awaiting_approval"
-        : accessDecision.decision === "rate_limited"
-          ? "rate_limited"
-          : "denied";
-    const argumentsSummary = derivedKey ? { ...redaction.summary, sideEffectReplayKey: idempotencyKey } : redaction.summary;
-    const insertInvocation = (key: string | null) => db.insert(toolInvocations).values({
+      const status = accessDecision.decision === "allow"
+        ? "authorized"
+        : accessDecision.decision === "require_approval"
+          ? "awaiting_approval"
+          : accessDecision.decision === "rate_limited"
+            ? "rate_limited"
+            : "denied";
+      const argumentsSummary = derivedKey ? { ...redaction.summary, sideEffectReplayKey: idempotencyKey } : redaction.summary;
+      const insertInvocation = (key: string | null) => writer.insert(toolInvocations).values({
         companyId: ctx.companyId,
         idempotencyKey: key,
         actorType: ctx.actorType,
@@ -1845,50 +1834,48 @@ export function toolAccessPolicyService(db: Db) {
         errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
         errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
         completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
-      }).returning();
-    let invocation: typeof toolInvocations.$inferSelect;
-    try {
-      [invocation] = await insertInvocation(storageKey);
-    } catch (error) {
-      if (!isIdempotencyKeyConflict(error) || !idempotencyKey) throw error;
-      if (storageKey === legacyKey) {
-        // Another new or old binary reserved the legacy key first. Re-read
-        // its durable marker and owner, never a timestamp or a process cache.
-        const [winner] = await db.select().from(toolInvocations).where(and(
+      }).onConflictDoNothing({ target: [toolInvocations.companyId, toolInvocations.idempotencyKey] }).returning();
+      let [invocation] = await insertInvocation(storageKey);
+      if (!invocation && storageKey === legacyKey && idempotencyKey) {
+        // Another full identity or an old binary reserved the legacy key first.
+        const [winner] = await writer.select().from(toolInvocations).where(and(
           eq(toolInvocations.companyId, ctx.companyId),
           eq(toolInvocations.idempotencyKey, legacyKey!),
         ));
-        if (!winner) throw error;
-        const replay = replayLegacyInvocation(ctx, winner, idempotencyKey);
-        if (replay) return replay;
-        try {
+        if (winner) {
+          const replay = replayLegacyInvocation(ctx, winner, idempotencyKey);
+          if (replay) return replay;
           [invocation] = await insertInvocation(idempotencyKey);
-        } catch (fallbackError) {
-          if (!isIdempotencyKeyConflict(fallbackError)) throw fallbackError;
-          const fullKeyWinner = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
-          if (!fullKeyWinner) throw fallbackError;
-          return replayRecorded(fullKeyWinner);
         }
-      } else {
-        const winner = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
-        if (!winner) throw error;
-        return replayRecorded(winner);
       }
-    }
-    let actionRequest = null;
-    if (accessDecision.decision === "require_approval") {
-      [actionRequest] = await db.insert(toolActionRequests).values({
-        companyId: ctx.companyId,
-        invocationId: invocation.id,
-        issueId: ctx.issueId,
-        status: "pending",
-        canonicalArgumentsHash: invocation.argumentsHash ?? argumentsHash,
-        canonicalArgumentsSummary: redaction.summary,
-        requestedByAgentId: ctx.actorType === "agent" ? ctx.agentId : null,
-        requestedByUserId: ctx.actorType === "user" ? ctx.actorId : null,
-      }).returning();
-    }
-    return { invocation, replayed: false, actionRequest };
+      if (!invocation) {
+        const winner = idempotencyKey && await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+        if (winner) return replayRecorded(winner);
+        throw conflict("The invocation reservation changed; retry after it settles.", { reasonCode: "tool_invocation_in_progress" });
+      }
+      let actionRequest = null;
+      if (accessDecision.decision === "require_approval") {
+        [actionRequest] = await writer.insert(toolActionRequests).values({
+          companyId: ctx.companyId,
+          invocationId: invocation.id,
+          issueId: ctx.issueId,
+          status: "pending",
+          canonicalArgumentsHash: invocation.argumentsHash ?? argumentsHash,
+          canonicalArgumentsSummary: redaction.summary,
+          requestedByAgentId: ctx.actorType === "agent" ? ctx.agentId : null,
+          requestedByUserId: ctx.actorType === "user" ? ctx.actorId : null,
+        }).returning();
+      }
+      return { invocation, replayed: false, actionRequest };
+    };
+    if (!derivedKey || !idempotencyKey) return store(db);
+    return db.transaction(async (tx) => {
+      // Both legacy and v2 storage slots name this same full identity. Hold
+      // its lock across lookup, expired-key release, insert and approval
+      // recording, even if a different call releases the legacy slot meanwhile.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyKey}, 0))`);
+      return store(tx);
+    });
   }
 
   async function matchingApprovedActionRequestCount(input: {

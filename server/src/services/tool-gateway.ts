@@ -6084,8 +6084,10 @@ export function createToolGatewayService(
     }
     const grant = await resolveConnectionGrant(session, connection);
     if (isBrowserUseConnection(connection)) {
-      await markInvocationDispatchStarted(invocationId);
-      const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
+      const data = await browserUseService(db, options.remoteHttpRequest).execute(
+        session, grant, invocationId, entry.toolName, parameters,
+        () => markInvocationDispatchStarted(invocationId),
+      );
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
     const endpoint = await resolvedRemoteEndpoint(session, connection, grant);
@@ -6521,6 +6523,7 @@ export function createToolGatewayService(
     tool: ToolGatewayDescriptor,
     parameters: unknown,
     ms: number,
+    invocationId: string,
     useProviderDefaultTimeout = false,
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedLocalStdioTool(
@@ -6535,8 +6538,11 @@ export function createToolGatewayService(
       template,
       grant,
     );
-    const invoke = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
-      timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    const invoke = async () => {
+      await markInvocationDispatchStarted(invocationId);
+      return callLocalStdioMcp({ connection, entry, template, env, parameters,
+        timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    };
     // Cognee is a bundled HTTP client. Provider failures are tool failures, not
     // crashed local processes, and must never consume slots or restart budgets.
     const result = template.templateId === "paperclip.cognee-cloud"
@@ -7371,7 +7377,6 @@ export function createToolGatewayService(
       .update(toolInvocations)
       .set({
         status: "executing",
-        startedAt: new Date(),
         updatedAt: new Date(),
       })
       .where(eq(toolInvocations.id, args.invocationId));
@@ -7416,6 +7421,7 @@ export function createToolGatewayService(
                 args.tool,
                 args.parameters,
                 executionTimeoutMs,
+                args.invocationId,
                 args.timeoutMs === undefined,
               )
             : null;
@@ -8301,7 +8307,7 @@ export function createToolGatewayService(
       .set({
         status: "executing",
         approvalState: "approved",
-        startedAt: new Date(),
+        ...((tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest" || tool.providerType === "mcp_local_stdio") ? {} : { startedAt: new Date() }),
         updatedAt: new Date(),
       })
       .where(eq(toolInvocations.id, invocation.id));
@@ -8330,6 +8336,7 @@ export function createToolGatewayService(
                   tool,
                   parameters,
                   executionTimeoutMs,
+                  invocation.id,
                 )
               ).result
             : tool.providerType !== "paperclip_plugin"
@@ -10782,7 +10789,7 @@ export function createToolGatewayService(
           .set({
             status: "executing",
             approvalState: "approved",
-            startedAt: new Date(),
+            ...((tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest" || tool.providerType === "mcp_local_stdio") ? {} : { startedAt: new Date() }),
             updatedAt: new Date(),
           })
           .where(eq(toolInvocations.id, invocationId));
@@ -10907,10 +10914,10 @@ export function createToolGatewayService(
             },
           );
         }
-        // A remote call is stamped started only once its credentials resolve
-        // (see executeRemoteHttpTool): a failure before that never reached the
-        // provider, so its derived-key replay can expire and be retried.
-        const remoteDispatch = tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest";
+        // Connected tools stamp only after credentials resolve, immediately
+        // before their HTTP request or process call. A credential failure
+        // before that boundary remains retryable.
+        const remoteDispatch = tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest" || tool.providerType === "mcp_local_stdio";
         await db
           .update(toolInvocations)
           .set({
@@ -10971,6 +10978,7 @@ export function createToolGatewayService(
                   tool,
                   effectiveParameters,
                   executionTimeoutMs,
+                  invocationId,
                   input.timeoutMs === undefined,
                 )
               : null;

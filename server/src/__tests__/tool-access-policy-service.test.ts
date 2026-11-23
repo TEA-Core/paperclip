@@ -1006,21 +1006,32 @@ describeEmbeddedPostgres("tool access policy service", () => {
     let arrivals = 0;
     let release!: () => void;
     const bothArrived = new Promise<void>((resolve) => { release = resolve; });
-    const racingDb = new Proxy(db, {
+    type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+    const wrap = (target: typeof db): typeof db => new Proxy(target, {
       get(target, prop) {
+        if (prop === "transaction") {
+          return (callback: (tx: Transaction) => Promise<unknown>) => target.transaction(
+            (tx) => callback(wrap(tx as unknown as typeof db) as unknown as Transaction),
+          );
+        }
         if (prop === "insert") {
           return (table: Parameters<typeof target.insert>[0]) => {
             const builder = target.insert(table);
             if (table !== toolInvocations) return builder;
             return {
-              values: (values: Parameters<typeof builder.values>[0]) => ({
-                returning: async () => {
-                  arrivals += 1;
-                  if (arrivals === 2) release();
-                  await bothArrived;
-                  return builder.values(values).returning();
-                },
-              }),
+              values: (values: Parameters<typeof builder.values>[0]) => {
+                const insert = builder.values(values);
+                return {
+                  onConflictDoNothing: (config: Parameters<typeof insert.onConflictDoNothing>[0]) => ({
+                    returning: async () => {
+                      arrivals += 1;
+                      if (arrivals === 2) release();
+                      await bothArrived;
+                      return insert.onConflictDoNothing(config).returning();
+                    },
+                  }),
+                };
+              },
             };
           };
         }
@@ -1036,7 +1047,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
         arguments: { body: `${"x".repeat(600)}${tail}` },
       },
     }));
-    const svc = toolAccessPolicyService(racingDb);
+    const svc = toolAccessPolicyService(wrap(db));
     const decisions = await Promise.all(inputs.map((input) => svc.decide(input)));
     const recorded = await Promise.all(inputs.map((input, index) => svc.recordInvocation(input, decisions[index]!)));
     expect(recorded.map((entry) => entry.replayed)).toEqual([false, false]);

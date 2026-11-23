@@ -209,6 +209,10 @@ including its approval, dispatch and outcome state, lives at that key; there
 is no separate outcome copy to synchronize. If another call owns the legacy
 key, a distinct call uses its full `side_effect:v2:` key.
 
+Recording holds a transaction-scoped advisory lock for the full identity
+across both possible storage keys. Releasing a legacy key cannot let two
+retries of one full identity dispatch through different keys.
+
 This needs no column or migration. During mixed-version operation or rollback,
 the pre-change binary finds the legacy row instead of dispatching again.
 It retains its old truncated-argument replay behavior, including null failure
@@ -217,6 +221,11 @@ reports in-progress calls as HTTP 409. An unmarked earlier-build row belonging
 to the same caller and run remains ambiguous: the new binary returns HTTP 409
 without replay or dispatch. Distinct full arguments remain distinct on new
 binaries even when their legacy hashes collide.
+
+If a pre-dispatch denial expires, its legacy row remains in place while a
+successful retry can be recorded at the v2 key. After rollback, the old
+binary can return that stale denial even for identical arguments. This
+response does not prove that the successful retry did not execute.
 
 Failures can expire after five minutes only before dispatch, without a human
 approval decision. A call that might have reached its tool, including a landed

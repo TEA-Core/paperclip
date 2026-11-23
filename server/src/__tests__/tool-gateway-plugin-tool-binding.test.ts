@@ -1,4 +1,5 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -1006,47 +1007,21 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     });
     const secret = "sk-cccccccccccccccccccc";
     // The string a digest-in-a-string scheme would hash in the secret's place.
-    const digestText = `[REDACTED:${sha256Hex(`tool-argument-redacted:${JSON.stringify(secret)}`)}]`;
+    const digestText = `<redacted:${sha256Hex(`tool-argument-redacted:${JSON.stringify(secret)}`)}>`;
 
+    // Occupy the shared marker-redacted legacy slot so this call uses its
+    // full v2 identity, as it does after another distinct secret-bearing call.
+    await call("sk-dddddddddddddddddddd");
     await call(secret);
     await call(digestText);
 
-    expect(counter.attempts).toBe(2);
-    expect(await db.select().from(toolInvocations)).toHaveLength(2);
+    expect(counter.attempts).toBe(3);
+    expect(await db.select().from(toolInvocations)).toHaveLength(3);
   });
 
   it("records two concurrent first calls with one key once; the loser gets an explicit in-progress answer, never a null result", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
-    let arrivals = 0;
-    let release!: () => void;
-    const bothArrived = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    // Hold each invocation insert until both calls have looked up the key and
-    // reached their insert, so the two inserts race on the unique key.
-    const racingDb = new Proxy(db, {
-      get(target, prop) {
-        if (prop === "insert") {
-          return (table: Parameters<typeof target.insert>[0]) => {
-            const builder = target.insert(table);
-            if (table !== toolInvocations) return builder;
-            return {
-              values: (values: Parameters<typeof builder.values>[0]) => ({
-                returning: async () => {
-                  arrivals += 1;
-                  if (arrivals === 2) release();
-                  await bothArrived;
-                  return builder.values(values).returning();
-                },
-              }),
-            };
-          };
-        }
-        const value: unknown = Reflect.get(target, prop, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
     // The winner's tool call stays in flight until the loser has answered.
     let finishDispatch!: () => void;
     const dispatchMayFinish = new Promise<void>((resolve) => {
@@ -1057,7 +1032,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       await dispatchMayFinish;
       return base.executeTool(tool, parameters, runContext);
     });
-    const gateway = createToolGatewayService(racingDb, { pluginToolDispatcher: dispatcher });
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
     const call = () => gateway.executePluginTool({
       actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
       tool: "a.b:wiki_append_log",
@@ -1381,6 +1356,119 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
 
     await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 6 * 60_000) });
     await expect(call()).resolves.toMatchObject({ pluginId: "plugin-a" });
+    expect(counter.attempts).toBe(1);
+  });
+
+  it("refuses a duplicate plugin write while its human approval is pending", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await db.insert(toolPolicies).values({
+      companyId: company.id, name: "Ask before appending",
+      policyType: "require_approval", selectors: { toolName: "a.b:wiki_append_log" },
+    });
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: dispatcher, toolActionSigningSecret: "pending-approval-proof",
+    });
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log", parameters: { path: "p", content: "needs approval" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+    expect((await rejectionOf(gateway.executePluginTool(input))).reasonCode).toBe("approval_required");
+    await expect(gateway.executePluginTool(input)).rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(toolActionRequests)).toHaveLength(1);
+    expect(counter.attempts).toBe(0);
+  });
+
+  it("dispatches one full identity when an expiring different approval releases its legacy key mid-retry", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    const [ask] = await db.insert(toolPolicies).values({
+      companyId: company.id, name: "Ask before appending",
+      policyType: "require_approval", selectors: { toolName: "a.b:wiki_append_log" },
+    }).returning();
+    const { dispatcher, counter } = countingDispatcher();
+    const options = { pluginToolDispatcher: dispatcher, toolActionSigningSecret: "legacy-release-proof" };
+    const input = (tail: string) => ({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log", parameters: { path: "p", content: `${"x".repeat(600)}${tail}` },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+    const gateway = createToolGatewayService(db, options);
+    expect((await rejectionOf(gateway.executePluginTool(input("old")))).reasonCode).toBe("approval_required");
+    const [approvalRow] = await db.select().from(toolInvocations);
+    const legacyKey = legacySideEffectKeyFor(approvalRow!, sha256Hex(stableStringify({
+      path: "p", content: `${"x".repeat(500)}...[truncated]`,
+    })));
+    await db.delete(toolPolicies).where(eq(toolPolicies.id, ask!.id));
+    await allowBothPluginTools(db, company.id);
+
+    let captured!: () => void, release!: () => void, lockAttempted!: () => void;
+    const legacyCaptured = new Promise<void>((resolve) => { captured = resolve; });
+    const mayContinue = new Promise<void>((resolve) => { release = resolve; });
+    const secondAtLock = new Promise<void>((resolve) => { lockAttempted = resolve; });
+    let held = false;
+    const watchQuery = (query: object): object => new Proxy(query, {
+      get(target, prop) {
+        const value: unknown = Reflect.get(target, prop, target);
+        if (prop === "then" && typeof value === "function") {
+          return (resolve: (rows: unknown[]) => unknown, reject: (error: unknown) => unknown) => {
+            const params = (target as { toSQL(): { params: unknown[] } }).toSQL().params;
+            return Promise.resolve(target as PromiseLike<unknown[]>).then(async (rows) => {
+              if (!held && params.includes(legacyKey)) {
+                held = true;
+                captured();
+                await mayContinue;
+              }
+              return rows;
+            }).then(resolve, reject);
+          };
+        }
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          const next: unknown = Reflect.apply(value, target, args);
+          return next && typeof next === "object" ? watchQuery(next) : next;
+        };
+      },
+    });
+    type Transaction = Parameters<Parameters<TestDb["transaction"]>[0]>[0];
+    const wrap = (target: TestDb, first: boolean): TestDb => new Proxy(target, {
+      get(target, prop) {
+        if (prop === "transaction") {
+          return (callback: (tx: Transaction) => Promise<unknown>) => target.transaction(
+            (tx) => callback(wrap(tx as unknown as TestDb, first) as unknown as Transaction),
+          );
+        }
+        if (prop === "select" && first) {
+          return (...args: unknown[]) => watchQuery(Reflect.apply(target.select, target, args));
+        }
+        if (prop === "execute" && !first) {
+          return (...args: Parameters<TestDb["execute"]>) => {
+            if (typeof args[0] !== "string" && new PgDialect().sqlToQuery(args[0] as SQL).sql.includes("pg_advisory_xact_lock")) {
+              lockAttempted();
+            }
+            return target.execute(...args);
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const first = createToolGatewayService(wrap(db, true), options).executePluginTool(input("new"));
+    await Promise.race([legacyCaptured, first.then(() => { throw new Error("Legacy read was not held"); })]);
+    // The gateway's approval-expiry path releases exactly this key.
+    await db.update(toolInvocations).set({ idempotencyKey: null }).where(eq(toolInvocations.id, approvalRow!.id));
+    const second = createToolGatewayService(wrap(db, false), options).executePluginTool(input("new"));
+    // On the buggy head the second call completes at the now-free legacy key.
+    // With the fix it waits for the first call's full-identity transaction lock.
+    await Promise.race([secondAtLock, second.then(() => {}, () => {})]);
+    release();
+    const outcomes = await Promise.allSettled([first, second]);
+    for (const outcome of outcomes) {
+      if (outcome.status === "fulfilled") expect(outcome.value).toMatchObject({ pluginId: "plugin-a" });
+      else expect(outcome.reason).toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_in_progress" } });
+    }
+    expect(counter.attempts).toBe(1);
+    await expect(gateway.executePluginTool(input("new"))).resolves.toMatchObject({ pluginId: "plugin-a" });
     expect(counter.attempts).toBe(1);
   });
 
