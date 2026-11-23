@@ -74,8 +74,12 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 // (`resolveLinkedPullRequestsWithState`), which runs on every done transition.
 // Without it the guard throws and the route answers 500 instead of the
 // authorization status under test.
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
-  where: mockDbSelectWhere,
+// The landing-debt probe reads activity_log; these fixtures have no debt rows.
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((table?: unknown) => ({
+  where: (...args: unknown[]) =>
+    (table as Record<symbol, unknown> | undefined)?.[Symbol.for("drizzle:Name")] === "activity_log"
+      ? Promise.resolve([])
+      : (mockDbSelectWhere as (...a: unknown[]) => unknown)(...args),
   innerJoin: () => ({ where: () => Promise.resolve([]) }),
 })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
@@ -404,8 +408,11 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.rejectInteraction.mockResolvedValue(null);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({
-      where: mockDbSelectWhere,
+    mockDbSelectFrom.mockImplementation((table?: unknown) => ({
+      where: (...args: unknown[]) =>
+        (table as Record<symbol, unknown> | undefined)?.[Symbol.for("drizzle:Name")] === "activity_log"
+          ? dbChainNode([])
+          : (mockDbSelectWhere as (...a: unknown[]) => unknown)(...args),
       // See the hoisted default above: the fork's merge-arming done-transition
       // guard joins external_object_mentions to external_objects, and the GET
       // read path also chains three innerJoins (listIssueLinkedCases).
