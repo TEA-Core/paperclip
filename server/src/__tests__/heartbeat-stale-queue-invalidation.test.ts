@@ -999,6 +999,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       params.includes(fixture.interactionId));
 
     await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    await faultedHeartbeat.drainActiveRunExecutions();
     await waitForCondition(async () => {
       const run = await readRunState(ordinary.runId);
       return run?.status !== "queued" && run?.status !== "running";
@@ -1675,6 +1676,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       };
 
       await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
       await waitForCondition(async () => {
         const [run, wakeup] = await Promise.all([
           db.select({ status: heartbeatRuns.status })
@@ -2739,48 +2741,64 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       wakeReason: "issue_assigned",
     });
 
-    await heartbeat.resumeQueuedRuns();
+    // Observe the initial handoff before its completed run can trigger an
+    // independent review-path recovery. Then await that execution, not a clock.
+    // The project's ES2023 compiler library does not expose Promise.withResolvers.
+    let finishReviewer!: () => void;
+    const reviewerMayFinish = new Promise<void>((resolve) => { finishReviewer = resolve; });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await reviewerMayFinish;
+      return execute();
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
 
-    const handedOff = await waitForCondition(async () => {
-      const rows = await db
-        .select({ id: heartbeatRuns.id })
+      const handedOff = await waitForCondition(async () => {
+        const rows = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, participantAgentId));
+        return rows.length > 0;
+      }, 10_000);
+      expect(handedOff).toBe(true);
+
+      const staleRun = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(staleRun?.status).toBe("cancelled");
+      expect(staleRun?.errorCode).toBe("issue_review_participant_changed");
+
+      const handoffRuns = await db
+        .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.agentId, participantAgentId));
-      return rows.length > 0;
-    }, 10_000);
-    expect(handedOff).toBe(true);
+      expect(handoffRuns).toHaveLength(1);
+      expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
+        issueId,
+        staleRunHandoffFromRunId: runId,
+        staleRunHandoffErrorCode: "issue_review_participant_changed",
+        staleRunHandoffHops: 1,
+      });
+      finishReviewer();
+      await heartbeat.drainActiveRunExecutions();
 
-    const staleRun = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    expect(staleRun?.status).toBe("cancelled");
-    expect(staleRun?.errorCode).toBe("issue_review_participant_changed");
-
-    const handoffRuns = await db
-      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(handoffRuns).toHaveLength(1);
-    expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
-      issueId,
-      staleRunHandoffFromRunId: runId,
-      staleRunHandoffErrorCode: "issue_review_participant_changed",
-      staleRunHandoffHops: 1,
-    });
-
-    // evaluateQueuedRunStaleness already exempts the current review participant
-    // from the assignee check, so the handoff run is dispatchable, not re-cancelled.
-    const reached = await waitForCondition(async () => {
-      const row = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "succeeded";
-    }, 10_000);
-    expect(reached).toBe(true);
+      // evaluateQueuedRunStaleness already exempts the current review participant
+      // from the assignee check, so the handoff run is dispatchable, not re-cancelled.
+      const reached = await waitForCondition(async () => {
+        const row = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
+          .then((rows) => rows[0] ?? null);
+        return row?.status === "succeeded";
+      }, 10_000);
+      expect(reached).toBe(true);
+    } finally {
+      finishReviewer();
+    }
   });
 
   it("does not enqueue a handoff when a stale cancellation promises no wake", async () => {

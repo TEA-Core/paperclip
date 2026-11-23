@@ -235,10 +235,11 @@ the child. The host holds no authenticated run for that call, so a claimed
 agent and run pair is not proof. Task acceptance never copies a stored
 interaction's run/agent pair into the child's `originRunId`, including pending
 pre-upgrade rows. The interaction retains its source attribution.
-The typed issue update API rejects `originRunId`, including its company-scoped
-wrapper. Creation provenance is set only at creation; updates can clear it on
-reassignment but cannot declare a new origin through that API. Public create,
-child-create, and PATCH bodies reject the field as an unknown key.
+The issue update service rejects any caller-supplied `originRunId` at runtime
+with `400 issue_origin_run_id_immutable`, including through its company-scoped
+wrapper. The typed API also forbids the field. Creation provenance is set only
+at creation; reassignment clears it internally. Public create, child-create,
+and PATCH bodies reject the field as an unknown key.
 An agent API key cannot release an adopted
 author hold by naming its run in a header; that release requires the
 authenticated author run or board authority. Other activity actions keep their

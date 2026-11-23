@@ -356,6 +356,41 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
   });
 
+  it("creates plugin task suggestions without importing a supplied run's issue scope", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const parentId = randomUUID();
+    const otherIssueId = randomUUID();
+    const otherRunId = randomUUID();
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Suggestion parent", status: "todo" },
+      { id: otherIssueId, companyId, title: "Other task", status: "todo", assigneeAgentId: agentId },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId, companyId, agentId, status: "running",
+      invocationSource: "assignment", contextSnapshot: { issueId: otherIssueId },
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const interaction = await services.issues.createInteraction({
+      companyId, issueId: parentId, authorAgentId: agentId,
+      interaction: {
+        kind: "suggest_tasks", continuationPolicy: "wake_assignee",
+        sourceRunId: otherRunId,
+        payload: { version: 1, tasks: [{ clientKey: "child", title: "Suggested child", assigneeAgentId: agentId }] },
+      },
+    });
+    const [stored] = await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interaction.id));
+    expect(stored).toMatchObject({ issueId: parentId, status: "pending", sourceRunId: null });
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id: parentId, companyId, projectId: null, goalId: null, status: "todo" },
+      interaction.id, {}, { userId: "local-board" },
+    );
+    const childId = accepted.createdIssues[0]!.id;
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    expect(child).toMatchObject({ parentId, assigneeAgentId: agentId, originRunId: null });
+    expect(await findLiveIssueExecutionHolder(db, companyId, childId)).toBeNull();
+  });
+
   it.each(["new", "legacy"] as const)("does not store a %s plugin interaction sourceRunId as the child's origin proof", async (provenance) => {
     const { companyId } = await seedCompanyAndAgent();
     const victimAgentId = randomUUID();

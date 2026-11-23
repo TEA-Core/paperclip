@@ -12022,6 +12022,11 @@ export function issueService(
       postCommitActions?: IssuePostCommitAction[],
       options: { bindRuntimeSharedWorkspace?: boolean } = {},
     ) => {
+      if (Object.hasOwn(data, "originRunId")) {
+        throw badRequest("originRunId can only be set when an issue is created", {
+          code: "issue_origin_run_id_immutable",
+        });
+      }
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
         postCommitActivityPublications ?? ownedActivityPublications;
@@ -12239,14 +12244,11 @@ export function issueService(
         issueData.assigneeAgentId !== undefined
           ? issueData.assigneeAgentId
           : existing.assigneeAgentId;
-      // A reassignment drops the creation proof: a later self-assign by a run
-      // proves itself through its assignee-change activity row instead. An
-      // originRunId explicitly supplied in this same patch wins over the
-      // drop: it is a declared field, not the stale stored proof.
+      // A reassignment drops the creation proof. A later self-assign proves
+      // itself through its assignee-change activity row instead.
       if (
         issueData.assigneeAgentId !== undefined &&
-        issueData.assigneeAgentId !== existing.assigneeAgentId &&
-        issueData.originRunId === undefined
+        issueData.assigneeAgentId !== existing.assigneeAgentId
       ) {
         patch.originRunId = null;
       }

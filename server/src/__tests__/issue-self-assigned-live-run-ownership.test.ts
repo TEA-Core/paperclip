@@ -6,7 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   activityLog,
   agentApiKeys,
@@ -362,6 +362,33 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, writerAgentId), eq(heartbeatRuns.status, "running")));
     expect(running.map((row) => row.id)).toEqual([writerRunId]);
+  });
+
+  it("a chatty author with an old start still occupies the only dispatch slot (M24b)", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const authoredIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+    const startedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns).set({ startedAt, createdAt: startedAt, lastOutputAt: new Date() })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    await db.insert(issues).values([
+      { id: authoredIssueId, companyId, title: "Active authored card", status: "todo", assigneeAgentId: writerAgentId, originRunId: writerRunId },
+      { id: otherIssueId, companyId, title: "Other queued card", status: "todo", assigneeAgentId: writerAgentId },
+    ]);
+    const woken = await heartbeat.wakeup(writerAgentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: otherIssueId },
+      contextSnapshot: { issueId: otherIssueId, source: "issue.update" },
+      requestedByActorType: "user", requestedByActorId: "local-board",
+    });
+    expect(woken?.status).toBe("queued");
+    await heartbeat.drainActiveRunExecutions();
+    const otherRuns = await otherRunsForCard(otherIssueId, writerAgentId, writerRunId);
+    expect(otherRuns.map((row) => row.status)).toEqual(["queued"]);
+    const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, writerAgentId), eq(heartbeatRuns.status, "running")));
+    expect(running.map((row) => row.id)).toEqual([writerRunId]);
+    expect((await cardRow(otherIssueId)).executionRunId).toBeNull();
   });
 
   it("a silent author of a done card still occupies the only slot", async () => {
@@ -1264,6 +1291,36 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
   });
+
+  it.each(["direct", "company"] as const)(
+    "%s service update rejects caller-supplied origin provenance at runtime",
+    async (surface) => {
+      const { companyId, writerAgentId, writerRunId, issueId } = await seedForgedHeaderCard();
+      const service = issueService(db);
+      expectTypeOf<Parameters<typeof service.update>[1]["originRunId"]>().toBeUndefined();
+      expectTypeOf<Parameters<typeof service.updateForCompany>[2]["originRunId"]>().toBeUndefined();
+      // Deliberately model an untyped in-process caller, not a validated HTTP body.
+      const patch = {
+        title: "Uncommitted service title",
+        assigneeAgentId: writerAgentId,
+        originRunId: writerRunId,
+      } as unknown as Parameters<typeof service.update>[1];
+      const update = surface === "direct"
+        ? service.update(issueId, patch)
+        : service.updateForCompany(issueId, companyId, patch);
+      await expect(update).rejects.toMatchObject({
+        status: 400,
+        details: { code: "issue_origin_run_id_immutable" },
+      });
+      expect(await cardRow(issueId)).toMatchObject({
+        title: "Forged header card",
+        assigneeAgentId: null,
+        originRunId: null,
+        executionRunId: null,
+      });
+      expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+    },
+  );
 
   it.each([
     ["board", "create"],
