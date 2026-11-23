@@ -231,6 +231,37 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     };
   }
 
+  it("refuses native completion review acceptance while legacy landing debt is unpaid", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Native review debt");
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "test",
+      action: "issue.delivery_requirement_reclassified",
+      entityType: "issue",
+      entityId: issueId,
+      details: { landingCheckOwed: true },
+    });
+    const created = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Approve completion?",
+        target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" },
+      },
+    }, { userId: "local-board" });
+
+    await expect(interactionsSvc.acceptInteraction({ id: issueId, companyId }, created.id, {}, {
+      userId: "local-board",
+    })).rejects.toMatchObject({ status: 409 });
+
+    await expect(interactionsSvc.getById(created.id)).resolves.toMatchObject({ status: "pending" });
+    const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(row?.status).toBe("in_review");
+  });
+
   it("persists and answers a canonical-only mixed question form", async () => {
     const { companyId, issueId } = await seedSourceQuestionFixture({});
     const questionSet = {

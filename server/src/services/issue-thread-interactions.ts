@@ -22,6 +22,7 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   authUsers,
   companySecretProposals,
@@ -100,6 +101,7 @@ import {
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { unpaidLandingDebt } from "./done-transition-guard.js";
 import { authorizationService } from "./authorization.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { resolveDeploymentMode } from "../config-file.js";
@@ -2314,6 +2316,21 @@ export function issueThreadInteractionService(
               ),
             ),
           )).limit(1);
+        // Native acceptance carries no landing proof or documented-close basis, so
+        // it cannot close past unpaid landing debt. Throwing rolls back the acceptance.
+        if (otherPending.length === 0 && issueContext.status === "in_review") {
+          const [debt] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+            eq(activityLog.companyId, issueContext.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueContext.id),
+            unpaidLandingDebt(),
+          )).limit(1);
+          if (debt) {
+            throw conflict("Issue has unpaid landing debt; close it through the done transition with landing proof.", {
+              code: "done_transition_missing_delivery", issueId: issueContext.id,
+            });
+          }
+        }
         // Each explicit reviewer must be able to answer independently. Completing
         // on the first answer would cancel the other pending decisions.
         const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await issueService(db).update(
