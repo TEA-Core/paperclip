@@ -2579,13 +2579,16 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       board();
       expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
       await flip(issueId);
+      // A real status transition qualifies for the legacy cutoff, but cannot settle explicit debt.
       await db.insert(activityLog).values({
         companyId, actorType: "user", actorId: "local-board", action: "issue.updated", entityType: "issue",
-        entityId: issueId, details: { status: "done" }, createdAt: new Date(Date.now() + 1_000),
+        entityId: issueId, details: { status: "done", _previous: { status: "todo" } }, createdAt: new Date(Date.now() + 1_000),
       });
       mockGetByName.mockResolvedValue(null);
       const refused = await patch(issueId, { status: "done" });
       expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
