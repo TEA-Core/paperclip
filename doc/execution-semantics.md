@@ -762,8 +762,9 @@ the comment's source-recency update.
 Attention projection treats uppercase legacy UUIDs as the same identity without
 rewriting consent. A candidate with live blockers remains discoverable, but its
 board form explains the blocker that prevents terminal-only admission.
-Stale execution-pointer cleanup and healthy-child blocker repair recheck the
-source-action gate under the source lock. Healthy-child repair also preserves an
+Stale execution-pointer cleanup retains the source lock and pointer compare-and-set
+checks without suppressing unrelated source maintenance. Healthy-child blocker
+repair rechecks the source-action gate under the source lock and preserves an
 operator's terminal source close that won that lock. Active typed parks prevent
 automatic stale-review carrier archival; ordinary unparked cleanup and review-stage
 archival rules are unchanged.
