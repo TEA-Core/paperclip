@@ -87,4 +87,11 @@ describe("card evidence parser", () => {
     expect(detectEvidence({ noRepositoryLanding: { ...proof, note: "PR #12" } }, "machine")?.arm).toBe("change-request");
     expect(detectEvidence({ noRepositoryLanding: "records" }, "machine")?.arm).toBe("key");
   });
+
+  it("treats stringified empty values like parsed ones and refuses truncated tokens", () => {
+    expect(detectEvidence('{"workspaceId":[]}', "machine")).toBeNull();
+    expect(detectEvidence('{"workspaceId":null}', "machine")).toBeNull();
+    expect(detectEvidence('{"workspaceId":"abc"}', "machine")?.arm).toBe("key");
+    expect(detectEvidence('{"workspaceId":"null', "machine")?.arm).toBe("key");
+  });
 });

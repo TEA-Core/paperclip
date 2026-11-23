@@ -202,13 +202,25 @@ function benignMachineValue(key: string, value: unknown): boolean {
 }
 
 function lexicalKeyFinding(text: string): EvidenceFinding | null {
-  const pattern = /([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*["']?([^\s,}\]"']*)/g;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      return detectEvidence(parsed, "machine");
+    } catch {
+      // Not complete JSON; scan lexically below.
+    }
+  }
+  const pattern = /([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]\s*(["']?)(\[\]|\{\}|[^\s,}\]"']*)/g;
   for (const match of text.matchAll(pattern)) {
     const key = match[1] ?? "";
-    if (!evidenceKey(key) || benignMachineValue(key, match[2] ?? "")) continue;
-    const value = match[2] ?? "";
-    const atEnd = match.index !== undefined && match.index + match[0].length >= text.trimEnd().length;
-    if (!provablyEmpty(value) || (atEnd && value === "")) return finding("a workspace or repository key", "key");
+    const value = match[3] ?? "";
+    if (!evidenceKey(key) || benignMachineValue(key, value)) continue;
+    const end = (match.index ?? 0) + match[0].length;
+    const quote = match[2] ?? "";
+    const complete = quote === "" ? true : text[end] === quote;
+    const atEnd = end >= text.trimEnd().length;
+    if (!complete || !provablyEmpty(value) || (atEnd && value === "")) return finding("a workspace or repository key", "key");
   }
   if (/"([A-Za-z][A-Za-z0-9_-]*)"\s*:\s*"?\s*$/.test(text)) {
     const key = text.match(/"([A-Za-z][A-Za-z0-9_-]*)"\s*:\s*"?\s*$/)?.[1] ?? "";
