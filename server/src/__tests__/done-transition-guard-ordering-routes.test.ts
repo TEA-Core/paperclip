@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2153,6 +2153,33 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
     });
 
+    it("does not settle legacy debt through a repeated done PATCH", async () => {
+      const { issueId, companyId } = await seedIssue("LEGACYREPEAT");
+      board();
+      // Pre-marker legacy state: done without a recorded verified close.
+      await db.update(issues).set({ status: "done", deliveryRequirement: "record_only" })
+        .where(eq(issues.id, issueId));
+      await db.insert(activityLog).values({
+        companyId, actorType: "user", actorId: "cloud-user-1",
+        action: "issue.delivery_requirement_reclassified", entityType: "issue", entityId: issueId,
+        details: { landingCheckOwed: true }, createdAt: new Date("2020-01-01"),
+      });
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      const [audit] = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated"),
+      ));
+      expect(audit?.details?.status).toBe("done");
+      expect((audit?.details?._previous as Record<string, unknown> | undefined)?.status).toBeUndefined();
+      const now = new Date();
+      const candidates = selectLandingCandidates(await buildDiscoveryQuery(db, new Date(0), now), new Date(0), now);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      const close = await patch(issueId, { status: "done" });
+      expect(close.status, JSON.stringify(close.body)).toBe(409);
+      expect(close.body.code).toBe("done_transition_missing_delivery");
+      expect(candidates.map((row) => row.issue.id)).toContain(issueId);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+    });
+
     it("keeps a legacy flip-back settled after verified landing, backstop discovery, and reopen/reclose", async () => {
       const { issueId } = await seedIssue("LEGACY");
       board();
@@ -2256,7 +2283,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
 
     it.each(
       (["ahead-zero", "merged-pr"] as const).flatMap((mode) =>
-        (["unchanged", "moved", "unavailable"] as const).map((change) => [mode, change] as const)),
+        (["unchanged", "moved", "unavailable", "expired"] as const).map((change) => [mode, change] as const)),
     )("rechecks the verified remote delivery head at close (%s, %s)", async (mode, change) => {
       const { issueId, branchName, defaultRef, repoUrl } = await seedIssue("HEADRACE");
       const head = "a".repeat(40);
@@ -2265,10 +2292,14 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       board();
       await flip(issueId);
       landing();
+      const deadline = new AbortController();
+      const timeout = change === "expired" ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal) : null;
       const fetch = vi.spyOn(githubFetch, "ghFetch").mockImplementation(async (url) => {
         if (url.includes("/commits/")) {
           if (measured) lockedLookups++;
           if (measured && change === "unavailable") throw new Error("head lookup unavailable");
+          // A response completing at expiry must not leave an accepted head behind.
+          if (measured && change === "expired") deadline.abort(new Error("head deadline expired"));
           return new Response(JSON.stringify({ sha: measured && change === "moved" ? "b".repeat(40) : head }), { status: 200 });
         }
         return new Response(JSON.stringify(
@@ -2296,10 +2327,103 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         else expect(response.body.code).toBe("done_transition_missing_delivery");
       } finally {
         fetch.mockRestore();
+        timeout?.mockRestore();
       }
     });
 
-    it.each(["unchanged", "moved", "unavailable"] as const)("rechecks the verified local carrier head at close (%s)", async (change) => {
+    it("refuses close when the shared deadline expires during App credential resolution", async () => {
+      const { issueId } = await seedIssue("AUTHDEADLINE");
+      board();
+      await flip(issueId);
+      landing();
+      const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+      const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+      let measured = false;
+      let reached = false;
+      let rejectPending: ((reason: Error) => void) | undefined;
+      let response: { status: number; body: { code?: string } } | undefined;
+      mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+        const result = await realEvaluateGuardRef.current!(...args);
+        measured = result.landingVerified === true;
+        return result;
+      });
+      mockGetByName.mockImplementation(async (_company, name) =>
+        name === "GITHUB_APP_PRIVATE_KEY" ? (measured ? { id: "app-key" } : null) : { id: "pat" });
+      mockResolveSecretValue.mockImplementation(async (_company, id) => id === "app-key" ? pem : "test-token");
+      const deadline = new AbortController();
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        if (!String(url).endsWith("/app/installations")) throw new Error(`Unexpected App request: ${url}`);
+        reached = true;
+        return new Promise<Response>((_resolve, reject) => {
+          rejectPending = reject;
+          if (init?.signal?.aborted) reject(init.signal.reason);
+          else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      });
+      const closing = patch(issueId, { status: "done" }).then((value) => { response = value; });
+      try {
+        await vi.waitFor(() => expect(reached).toBe(true));
+        deadline.abort(new Error("close deadline expired"));
+        await vi.waitFor(() => expect(response?.status).toBe(409));
+        expect(response?.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        rejectPending?.(new Error("test cleanup"));
+        await closing;
+        fetch.mockRestore();
+        timeout.mockRestore();
+      }
+    });
+
+    it.each(["search", "detail", "compare"] as const)("refuses close when the carrier deadline expires during %s", async (stage) => {
+      const { issueId, executionWorkspaceId, defaultRef } = await seedIssue("CARRIERDEADLINE");
+      await db.update(executionWorkspaces).set({ branchName: "shared-carrier" })
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      board();
+      await flip(issueId);
+      landing(1);
+      const carrierHead = "c".repeat(40);
+      const deadline = new AbortController();
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      let reached = false;
+      let rejectPending: ((reason: Error) => void) | undefined;
+      let response: { status: number; body: { code?: string } } | undefined;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const search = url.includes("/search/issues");
+        const detail = url.endsWith("/pulls/404");
+        const compare = url.includes(`/compare/${carrierHead}...`);
+        if ((stage === "search" && search) || (stage === "detail" && detail) || (stage === "compare" && compare)) {
+          reached = true;
+          return new Promise<Response>((_resolve, reject) => {
+            rejectPending = reject;
+            if (init?.signal?.aborted) reject(init.signal.reason);
+            else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          });
+        }
+        return new Response(JSON.stringify(
+          search ? { total_count: 1, items: [{ number: 404 }] } :
+            detail ? { merged: true, base: { ref: defaultRef }, head: { sha: carrierHead } } :
+              url.includes("/compare/") ? { ahead_by: compare ? 0 : 1 } : [],
+        ), { status: 200 });
+      });
+      const closing = patch(issueId, { status: "done" }).then((value) => { response = value; });
+      try {
+        await vi.waitFor(() => expect(reached).toBe(true));
+        deadline.abort(new Error("carrier deadline expired"));
+        await vi.waitFor(() => expect(response?.status).toBe(409));
+        expect(response?.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        rejectPending?.(new Error("test cleanup"));
+        await closing;
+        timeout.mockRestore();
+      }
+    });
+
+    it.each(["unchanged", "moved", "unavailable", "detached-before", "detached-after", "detached-matching"] as const)("rechecks the verified local carrier head at close (%s)", async (change) => {
       const { issueId, identifier, executionWorkspaceId, repoUrl } = await seedIssue("LOCALRACE");
       const cwd = mkdtempSync(join(tmpdir(), "landing-head-race-"));
       const git = (...args: string[]) => execFileSync("git", args, {
@@ -2313,6 +2437,12 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         git("checkout", "-qb", "shared-carrier");
         git("commit", "--allow-empty", "-qm", `Implement ${identifier}`);
         const head = git("rev-parse", "HEAD");
+        const advanceBranchBehindDetachedHead = () => {
+          git("commit", "--allow-empty", "-qm", `Undelivered later work for ${identifier}`);
+          git("checkout", "--detach", head);
+        };
+        if (change === "detached-before") advanceBranchBehindDetachedHead();
+        if (change === "detached-matching") git("checkout", "--detach", head);
         await db.update(executionWorkspaces).set({
           cwd, providerRef: cwd, branchName: "shared-carrier", baseRef: "main",
         }).where(eq(executionWorkspaces.id, executionWorkspaceId));
@@ -2327,11 +2457,12 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
           const result = await realEvaluateGuardRef.current!(...args);
           if (result.landingVerified && change === "moved") git("commit", "--allow-empty", "-qm", "Undelivered later work");
+          if (result.landingVerified && change === "detached-after") advanceBranchBehindDetachedHead();
           if (result.landingVerified && change === "unavailable") rmSync(cwd, { recursive: true, force: true });
           return result;
         });
         const response = await patch(issueId, { status: "done" });
-        const accepted = change === "unchanged";
+        const accepted = change === "unchanged" || change === "detached-matching";
         expect(response.status, JSON.stringify(response.body)).toBe(accepted ? 200 : 409);
         expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe(accepted ? "done" : "todo");
         const debt = (await debtRows(issueId))[0]?.details;
@@ -2359,7 +2490,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       const localHead = vi.spyOn(hardenedGit, "runHardenedGit").mockImplementation((args, options) => {
         // Attribution still uses real Git. A later local-head failure forces the
         // remote fallback at both carrier call sites, including the compare-404 catch.
-        if (args.length === 4 && args[1] === cwd && args[2] === "rev-parse" && args[3] === "HEAD") {
+        if (args[1] === cwd && args[2] === "show-ref" && args[5] === `refs/heads/${branch}`) {
           return Promise.reject(new Error("local head unavailable"));
         }
         return runGit(args, options);

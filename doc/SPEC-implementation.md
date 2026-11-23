@@ -287,16 +287,22 @@ branch binding is locked and checked before discharge. Merged-PR evidence must
 cover the checked delivery head; an older merge on the same branch is insufficient.
 Every positive debt-bearing proof records its immutable delivery head and source.
 Before discharge, the close transaction rechecks that same remote or worktree
-head under the issue/workspace locks, with a 15-second probe bound; mismatch or
-lookup failure refuses the close. The discharged marker retains the head and
-repository/base/branch evidence. Database locks do not freeze external Git refs.
+branch head under the issue/workspace locks; a detached checkout's HEAD is not
+the branch proof. GitHub App credential requests and the remote head lookup share
+one 15-second deadline. Local branch probes are bounded to 15 seconds.
+Mismatch, expiry, or lookup failure refuses the close. The discharged marker
+retains the head and repository/base/branch evidence. Database locks do not freeze
+external Git refs. Carrier search, PR-detail requests, and content comparisons
+also share one 15-second deadline.
 Reopening and status-version changes never waive unpaid debt. The landing backstop
 includes debt-bearing record-only cards without expiring the obligation.
 A legacy reclassification row without a disposition, older than the issue's latest
 accepted done transition, is settled history: it is ignored on read, never
-rewritten. A later close audit cannot settle explicit outstanding debt. A
-debt-bearing issue with no probe-able repository/branch or merged PR is refused
-fail-closed; the refusal names the exits (verify landing, or cancel).
+rewritten. The close audit must record a non-done `_previous.status`; a repeated
+done write is not a transition and cannot settle legacy debt. A later close audit
+cannot settle explicit outstanding debt. A debt-bearing issue with no probe-able
+repository/branch or merged PR is refused fail-closed; the refusal names the exits
+(verify landing, or cancel).
 An unavailable or malformed carrier-head lookup remains unverified and produces
 the same HTTP 409 delivery refusal, including auth errors and rejected requests;
 it must not escape as HTTP 500 or authorize a close.

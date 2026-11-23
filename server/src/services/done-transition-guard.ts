@@ -303,6 +303,7 @@ export function unpaidLandingDebt() {
         AND done_close.entity_id = ${activityLog.entityId}
         AND done_close.action = 'issue.updated'
         AND done_close.details->>'status' = 'done'
+        AND done_close.details->'_previous'->>'status' <> 'done'
         AND done_close.created_at > ${activityLog.createdAt}
     ))`,
   );
@@ -360,19 +361,18 @@ export async function prepareLandingDebtClose(
       // this close boundary; bound the I/O while holding the issue/workspace locks.
       let currentHead: string | null = null;
       try {
-        if (proof.source === "worktree" && binding.worktreePath) {
-          currentHead = (await runHardenedGit(["-C", binding.worktreePath, "rev-parse", "HEAD"], {
-            cwd: "/", timeoutMs: GITHUB_BASE_COMPARE_TIMEOUT_MS,
-          })).trim().toLowerCase();
+        if (proof.source === "worktree" && binding.worktreePath && binding.branch) {
+          currentHead = await localDeliveryHead(binding.worktreePath, binding.branch);
         } else if (proof.source === "remote" && binding.branch) {
           const parsed = parseRepoUrl(binding.repoUrl);
-          const { token } = await resolveGitHubToken(tx, issue.companyId);
+          const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
+          const { token } = await resolveGitHubToken(tx, issue.companyId, signal);
           if (parsed && token) currentHead = await resolveGitHubRefHeadSha(
-            parsed.hostname, parsed.owner, parsed.repo, binding.branch, token,
-            AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+            parsed.hostname, parsed.owner, parsed.repo, binding.branch, token, signal,
           );
+          signal.throwIfAborted();
         }
-      } catch { /* Missing, failed, and timed-out rechecks cannot discharge debt. */ }
+      } catch { currentHead = null; /* Missing, failed, and timed-out rechecks cannot discharge debt. */ }
       if (currentHead !== proof.head) throw conflict("Delivery head changed or could not be verified; retry the landing check.", {
         code: "done_transition_missing_delivery", issueId: issue.id,
       });
@@ -682,22 +682,27 @@ async function githubMergedPrCountForIdentifier(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
+  const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
   try {
-    const response = await ghFetch(url, { headers });
+    const response = await ghFetch(url, { headers, signal });
     if (!response.ok) return null;
     const body = await response.json().catch(() => null);
+    signal.throwIfAborted();
     const total = (body as Record<string, unknown> | null)?.total_count;
     if (expectedHead === undefined) return typeof total === "number" ? total : null;
     if (!Array.isArray(body?.items)) return null;
     for (const item of body.items) {
       if (!Number.isSafeInteger(item?.number)) continue;
-      const response = await ghFetch(`${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${item.number}`, { headers });
+      const response = await ghFetch(`${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${item.number}`, { headers, signal });
       if (!response.ok) return null;
       const pr = await response.json();
+      signal.throwIfAborted();
       if (!pr?.merged || !pr.head?.sha || pr.base?.ref !== defaultRef?.replace(/^origin\//, "")) continue;
       // The carrier may have a different branch and may have been squash-merged.
       // Its pre-merge head must contain the checked delivery, not just its identifier.
-      if (await githubCompareAheadBy(hostname, owner, repo, pr.head.sha, expectedHead!, token) === 0) return 1;
+      const ahead = await githubCompareAheadBy(hostname, owner, repo, pr.head.sha, expectedHead!, token, signal);
+      signal.throwIfAborted();
+      if (ahead === 0) return 1;
     }
     return 0;
   } catch {
@@ -705,11 +710,18 @@ async function githubMergedPrCountForIdentifier(
   }
 }
 
+async function localDeliveryHead(worktreePath: string, branch: string): Promise<string | null> {
+  const head = (await runHardenedGit(["-C", worktreePath, "show-ref", "--verify", "--hash", `refs/heads/${branch}`], {
+    cwd: "/", timeoutMs: GITHUB_BASE_COMPARE_TIMEOUT_MS,
+  })).trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(head) ? head : null;
+}
+
 async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRepository, token: string): Promise<LandingHeadProof | null> {
-  if (ctx.worktreePath) {
+  if (ctx.worktreePath && ctx.branch) {
     try {
-      const head = (await runGit(["rev-parse", "HEAD"], ctx.worktreePath)).trim();
-      if (/^[0-9a-f]{40}$/i.test(head)) return { head: head.toLowerCase(), source: "worktree" };
+      const head = await localDeliveryHead(ctx.worktreePath, ctx.branch);
+      if (head) return { head, source: "worktree" };
     } catch { /* The remote branch can still provide the delivery head. */ }
   }
   try {
