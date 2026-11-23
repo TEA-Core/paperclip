@@ -307,6 +307,9 @@ repository/branch or merged PR is refused fail-closed; the refusal names the exi
 An unavailable or malformed carrier-head lookup remains unverified and produces
 the same HTTP 409 delivery refusal, including auth errors and rejected requests;
 it must not escape as HTTP 500 or authorize a close.
+Native `native_completion_review` acceptance carries no landing proof, so it
+refuses (HTTP 409 `done_transition_missing_delivery`, acceptance rolled back)
+when it would close an issue with unpaid landing debt.
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 An owing reclassification also writes a system-owned
