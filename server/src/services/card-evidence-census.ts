@@ -212,8 +212,13 @@ function selects(
   for (const column of table.columns) {
     const key = sql.raw(`x.${ident(column.name)}`);
     if (column.card) {
-      if (column.array) direct.push(sql`strpos(to_jsonb(${key})::text, ${card.id}) > 0`);
-      else {
+      if (column.array) {
+        direct.push(sql`strpos(to_jsonb(${key})::text, ${card.id}) > 0`);
+        otherCards.push(sql`exists (
+          select 1 from issues peer where strpos(to_jsonb(${key})::text, peer.id::text) > 0
+            and peer.id <> ${card.id} and peer.company_id = ${card.companyId}
+        )`);
+      } else {
         direct.push(sql`${key}::text = ${card.id}`);
         // A run can touch several cards. Rows owned by another existing card
         // must not leak that card's repository work into this one's proof.

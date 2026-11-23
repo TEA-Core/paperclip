@@ -47,7 +47,7 @@ const FORGE_DOMAINS = [
 
 const FORGE_LABEL = /^(git|gitlab|github|gerrit|gitea|gogs|forgejo|bitbucket|stash|scm|hg|svn|phabricator|code|cgit|gitweb)\d*$/;
 const REVIEW_LABEL = /^reviews?\d*$/;
-const REVIEW_CHANGE_PATH = /^\/(?:\d+|q)(?:[/?#]|$)/;
+const REVIEW_CHANGE_PATH = /^\/(?:\d+(?:[/?#]|$)|q\/[^/?#])/;
 const REVIEW_CHANGE_HASH = /^#\/c\//;
 const FORGE_PATH = /\/(pulls?|pull-requests?|pullrequests?|merge_requests|merge-requests|changes|commits?|tree|blob|compare|branches|tags|releases|_git)(\/|$)|\/c\/.+\/\+\/\d+|\/\+\/\d+|\.git(\/|$|[?#])|\/-\/(commit|tree|blob|merge_requests)/i;
 const TAIL = String.raw`\s*(?:(?:no\.?|number|num\.?|id)\s*)?[:#!№]?\s*[#!]?\s*\d+`;
