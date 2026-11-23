@@ -65,6 +65,14 @@ Delivery-only attribution applies the same canonical URL anchor at preflight,
 decision attachment and owner publication. It cannot reinterpret an older
 receipt as a same-numbered pull request in another repository.
 
+Historical attribution scope is not reusable across providers, repositories or
+ancestors. A collision at the existing company/child/PR/head key refuses and
+preserves the old row. This can block an otherwise matching scope move; wider
+storage design is deferred to a follow-up, with no index or migration change.
+Recorded non-cancelled obligations also survive parent detachment and protect
+both child and carrier-ancestor deletion. Unverifiable ancestry blocks the owner
+instead of silently removing required approval.
+
 Canonical URL matching remains exact. A casing-only change to the control-plane
 repository spelling can refuse an otherwise valid attribution. This is a known
 fail-closed canonicalization limitation; this change does not add normalization.

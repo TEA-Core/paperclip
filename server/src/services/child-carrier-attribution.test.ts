@@ -28,6 +28,7 @@ import {
   classifyAncestorCarrierHead,
   recordChildCarrierDecision,
   resolveChildCarrierDecisionHead,
+  type ChildCarrierResolution,
 } from "./child-carrier-attribution.js";
 import { publishApprovalStatus, resolveApprovalDecisionHead } from "./merge-arming.js";
 import { issueService } from "./issues.js";
@@ -523,17 +524,21 @@ describePg("child carrier attribution", () => {
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
-  it("ignores a removed descendant without invalidating its historical approved attribution", async () => {
+  it("keeps a detached descendant's governed obligation until its work is cancelled", async () => {
     const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
     const decisionId = await approveChild(childId);
     await recordChildCarrierDecision(db, companyId, childId);
-    await db.update(issues).set({ parentId: null }).where(eq(issues.id, childId));
+    await issueService(db).update(childId, { parentId: null });
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    const [row] = await db.select().from(issueChildCarrierAttributions);
+    expect(row).toMatchObject({ state: "current", childDecisionId: decisionId, ancestorIssueId: ownerId });
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
       owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
     })).toBeNull();
-    const [row] = await db.select().from(issueChildCarrierAttributions);
-    expect(row).toMatchObject({ state: "current", childDecisionId: decisionId, ancestorIssueId: ownerId });
   });
 
   it("still blocks the owner when the live head ref differs only by case", async () => {
@@ -563,23 +568,12 @@ describePg("child carrier attribution", () => {
   it("does not attach or honor an approval after the carrier claim is deleted", async () => {
     const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
-    const [decision] = await db.insert(issueExecutionDecisions).values({
-      id: randomUUID(),
-      companyId,
-      issueId: childId,
-      stageId: randomUUID(),
-      stageType: "approval",
-      outcome: "approved",
-      body: "approved",
-    }).returning();
-    await db.update(issues).set({
-      executionState: {
-        lastDecisionId: decision!.id,
-        lastDecisionOutcome: "approved",
-        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
-        delivery: { prNumber: 77, branch: CHILD_BRANCH },
-      },
-    }).where(eq(issues.id, childId));
+    const decisionId = await approveChild(childId);
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    const state = { ...child!.executionState! };
+    const claim = state.childCarrierClaim;
+    delete state.childCarrierClaim;
+    await db.update(issues).set({ executionState: state }).where(eq(issues.id, childId));
     await recordChildCarrierDecision(db, companyId, childId);
     const [row] = await db.select().from(issueChildCarrierAttributions);
     expect(row?.childDecisionId).toBeNull();
@@ -590,45 +584,45 @@ describePg("child carrier attribution", () => {
       headSha: HEAD,
       headRef: CARRIER_BRANCH,
     })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+
+    await db.update(issues).set({ executionState: { ...state, childCarrierClaim: claim } }).where(eq(issues.id, childId));
+    await recordChildCarrierDecision(db, companyId, childId);
+    const [attached] = await db.select().from(issueChildCarrierAttributions);
+    expect(attached!.childDecisionId).toBe(decisionId);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
   });
 
   it("refuses a mismatched claim head and clears approval when the commit proof changes", async () => {
-    const { childId } = await seedPair();
-    await db.update(issues).set({
-      executionState: { childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD } },
-    }).where(eq(issues.id, childId));
+    const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
-    const [decision] = await db.insert(issueExecutionDecisions).values({
-      id: randomUUID(),
-      companyId,
-      issueId: childId,
-      stageId: randomUUID(),
-      stageType: "approval",
-      outcome: "approved",
-      body: "approved",
-    }).returning();
-    await db.update(issues).set({
-      executionState: {
-        lastDecisionId: decision!.id,
-        lastDecisionOutcome: "approved",
-        approvalStatus: { finalDelivery: { decisionId: decision!.id, owner: OWNER, repo: REPO, number: 653, headSha: HEAD } },
-        childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "d".repeat(40) },
+    const decisionId = await approveChild(childId);
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    const state = child!.executionState!;
+    await db.update(issues).set({ executionState: {
+      ...state, childCarrierClaim: {
+        prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "d".repeat(40),
       },
-    }).where(eq(issues.id, childId));
+    } }).where(eq(issues.id, childId));
     await recordChildCarrierDecision(db, companyId, childId);
     const [unbound] = await db.select().from(issueChildCarrierAttributions);
-    expect(unbound?.childDecisionId).toBeNull();
+    expect(unbound!.childDecisionId).toBeNull();
+    await db.update(issues).set({ executionState: state }).where(eq(issues.id, childId));
+    await recordChildCarrierDecision(db, companyId, childId);
+    const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    expect((await db.select().from(issueChildCarrierAttributions))[0]!.childDecisionId).toBe(decisionId);
 
-    await db.update(issueChildCarrierAttributions).set({ childDecisionId: decision!.id });
     childCarrierCommits.enumerate = async () => ({ ok: true, shas: [COMMIT, "e".repeat(40)] });
-    await resolveChildCarrierDecisionHead(db, companyId, childId);
-    await db.update(issues).set({
-      executionState: { childCarrierClaim: { prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: HEAD } },
-    }).where(eq(issues.id, childId));
-    await resolveChildCarrierDecisionHead(db, companyId, childId);
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    // A new verified request records the changed proof, never the old approval.
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
     const [refreshed] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.state, "current"));
-    expect(refreshed?.childDecisionId).toBeNull();
-    expect(refreshed?.commitShas).toEqual([COMMIT, "e".repeat(40)].sort());
+    expect(refreshed!.childDecisionId).toBeNull();
+    expect(refreshed!.commitShas).toEqual([COMMIT, "e".repeat(40)].sort());
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
   });
 
   it("does not let another repository, a failed enumeration, or a departed child decide the owner gate", async () => {
@@ -671,7 +665,7 @@ describePg("child carrier attribution", () => {
       number: 653,
       headSha: HEAD,
       headRef: CARRIER_BRANCH,
-    })).toBeNull();
+    })).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
 
     const otherPr = await carrierArmBlock(db, companyId, childId, {
       owner: OWNER,
@@ -735,8 +729,12 @@ describePg("child carrier attribution", () => {
     const replacement = [COMMIT, "b".repeat(40)];
     // Pause only the final attachment UPDATE, after its reads. The competing
     // writer changes real persisted proof before the original predicate executes.
-    const racingDb = new Proxy(db, {
+    const interception: ProxyHandler<Db> = {
       get(target, key, receiver) {
+        if (key === "transaction") {
+          return (callback: (tx: Db) => Promise<unknown>) =>
+            target.transaction((tx) => callback(new Proxy(tx as unknown as Db, interception)));
+        }
         if (key !== "update") return Reflect.get(target, key, receiver);
         return (...args: Parameters<Db["update"]>) => {
           const query = target.update(...args);
@@ -759,7 +757,8 @@ describePg("child carrier attribution", () => {
           });
         };
       },
-    });
+    };
+    const racingDb = new Proxy(db, interception);
     await recordChildCarrierDecision(racingDb, companyId, childId);
     const [row] = await db.select().from(issueChildCarrierAttributions);
     expect(row?.commitShas).toEqual(replacement);
@@ -854,44 +853,33 @@ describePg("child carrier attribution", () => {
   });
 
   it.each(["current", "invalidated"] as const)("does not let a stale %s refresh overwrite a newly approved proof", async (state) => {
-    const { childId } = await seedPair();
+    const { ownerId, childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
-    const decisionId = await approveChild(childId);
-    await db.update(issueChildCarrierAttributions).set({ state, childDecisionId: null });
-    let writes = 0;
+    await approveChild(childId);
+    await recordChildCarrierDecision(db, companyId, childId);
+    await db.update(issueChildCarrierAttributions).set({ state });
     const replacement = [COMMIT, "b".repeat(40)];
-    const racingDb = new Proxy(db, { get(target, key, receiver) {
-      if (key !== "update") return Reflect.get(target, key, receiver);
-      return (...args: Parameters<Db["update"]>) => {
-        const query = target.update(...args);
-        return new Proxy(query, { get(builder, property, builderReceiver) {
-          if (property !== "set") return Reflect.get(builder, property, builderReceiver);
-          return (values: Parameters<typeof query.set>[0]) => {
-            const filtered = query.set(values);
-            return new Proxy(filtered, { get(setter, clause, setterReceiver) {
-              if (clause !== "where") return Reflect.get(setter, clause, setterReceiver);
-              return (...conditions: Parameters<typeof filtered.where>) => {
-                const run = async (returning?: Parameters<typeof filtered.returning>) => {
-                  if (++writes === 2) await db.update(issueChildCarrierAttributions).set({
-                    state: "current", commitShas: replacement, childDecisionId: decisionId,
-                  });
-                  const pending = filtered.where(...conditions);
-                  return returning ? pending.returning(...returning) : pending;
-                };
-                return {
-                  then: (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) => run().then(resolve, reject),
-                  returning: (...fields: Parameters<typeof filtered.returning>) => run(fields),
-                };
-              };
-            } });
-          };
-        } });
-      };
-    } });
-    expect((await resolveChildCarrierDecisionHead(racingDb, companyId, childId)).kind).toBe("unresolvable");
+    let decisionId: string | undefined;
+    childCarrierCommits.enumerate = async () => {
+      childCarrierCommits.enumerate = async () => ({ ok: true, shas: replacement });
+      if (state === "current") {
+        expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+      }
+      expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+      decisionId = await approveChild(childId);
+      await recordChildCarrierDecision(db, companyId, childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+        owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+      })).toBeNull();
+      return { ok: true, shas: [COMMIT] };
+    };
+    expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
     const [row] = await db.select().from(issueChildCarrierAttributions);
-    expect(row?.commitShas).toEqual(replacement);
-    expect(row?.childDecisionId).toBe(decisionId);
+    expect(row!.commitShas).toEqual(replacement);
+    expect(row!.childDecisionId).toBe(decisionId);
+    expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, {
+      owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH,
+    })).toBeNull();
   });
 
   it.each(["invalidated", "pending", "changed commits"])("refuses owner publication when remote enumeration outlives a proof becoming %s", async (change) => {
@@ -1059,14 +1047,9 @@ describePg("child carrier attribution", () => {
     expect(await db.select().from(issueChildCarrierAttributions)).toEqual([]);
   });
 
-  it.each(["claim head", "stored head", "commits"])("does not invalidate newer approved proof after a stale %s read", async (reason) => {
+  it.each(["stored head", "commits"])("does not invalidate newer approved proof after a stale %s read", async (reason) => {
     const { childId } = await seedPair();
     await resolveChildCarrierDecisionHead(db, companyId, childId);
-    if (reason === "claim head") {
-      await db.update(issues).set({ executionState: { childCarrierClaim: {
-        prNumber: 653, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`, headSha: "d".repeat(40),
-      } } }).where(eq(issues.id, childId));
-    }
     if (reason === "stored head") {
       github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr({
         head: { ref: CARRIER_BRANCH, sha: "d".repeat(40), repo: { full_name: `${OWNER}/${REPO}` } },
@@ -1224,6 +1207,204 @@ describePg("child carrier attribution", () => {
       lastDecisionId: intermediate!.id, lastDecisionOutcome: "approved", childCarrierClaim: claim,
     } }).where(eq(issues.id, childId));
     expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, pr)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+  });
+
+  describe("governed proof identity and stale writers", () => {
+    const target = { owner: OWNER, repo: REPO, number: 653, headSha: HEAD, headRef: CARRIER_BRANCH };
+
+    function afterInitialChildSnapshot(afterRead: () => Promise<void>): Db {
+      let read = false;
+      return new Proxy(db, { get(base, key, receiver) {
+        if (key !== "select") return Reflect.get(base, key, receiver);
+        return (...args: Parameters<Db["select"]>) => {
+          const selected = base.select(...args);
+          const fields = args[0] as Record<string, unknown> | undefined;
+          if (!fields || !("identifier" in fields) || !("executionState" in fields)) return selected;
+          return new Proxy(selected, { get(selection, member, selectionReceiver) {
+            if (member !== "from") return Reflect.get(selection, member, selectionReceiver);
+            return (...tables: Parameters<typeof selected.from>) => {
+              const query = selection.from(...tables);
+              if (tables[0] !== issues) return query;
+              return new Proxy(query, { get(builder, method, builderReceiver) {
+                if (method !== "then") return Reflect.get(builder, method, builderReceiver);
+                return (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+                  query.then(async (rows) => {
+                    if (!read) { read = true; await afterRead(); }
+                    return rows;
+                  }).then(resolve, reject);
+              } });
+            };
+          } });
+        };
+      } });
+    }
+
+    it.each([
+      ["repository owner", "current"], ["repository owner", "invalidated"],
+      ["repository", "current"], ["repository", "invalidated"],
+      ["ancestor", "current"], ["ancestor", "invalidated"],
+    ] as const)("preserves historical %s identity on a %s proof collision", async (field, state) => {
+      const { ownerId, childId } = await seedPair();
+      const first = await resolveChildCarrierDecisionHead(db, companyId, childId);
+      expect(first.kind).toBe("resolved");
+      expect(await resolveChildCarrierDecisionHead(db, companyId, childId)).toEqual(first);
+      if (state === "invalidated") {
+        await db.update(issueChildCarrierAttributions).set({ state, invalidatedAt: new Date() });
+      }
+      const before = await db.select().from(issueChildCarrierAttributions);
+      if (field === "ancestor") {
+        const [owner] = await db.select().from(issues).where(eq(issues.id, ownerId));
+        const nextOwner = randomUUID();
+        await db.insert(issues).values({
+          id: nextOwner, companyId, projectId: owner!.projectId, title: "Replacement carrier owner",
+          status: "in_review", identifier: "SUP-22865",
+        });
+        await db.update(executionWorkspaces).set({ branchName: "retired-carrier" })
+          .where(eq(executionWorkspaces.sourceIssueId, ownerId));
+        const [workspace] = await db.insert(executionWorkspaces).values({
+          companyId, projectId: owner!.projectId!, sourceIssueId: nextOwner,
+          mode: "isolated_workspace", strategyType: "git_worktree", name: "replacement carrier",
+          status: "active", branchName: CARRIER_BRANCH, repoUrl: `https://github.com/${OWNER}/${REPO}`,
+        }).returning();
+        await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, nextOwner));
+        await issueService(db).update(childId, { parentId: nextOwner });
+      } else {
+        const owner = field === "repository owner" ? "other-owner" : OWNER;
+        const repo = field === "repository" ? "other-repository" : REPO;
+        await db.update(executionWorkspaces).set({ repoUrl: `https://github.com/${owner}/${repo}` })
+          .where(eq(executionWorkspaces.companyId, companyId));
+        await db.update(issues).set({ executionState: { childCarrierClaim: {
+          prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${owner}/${repo}/pull/653`,
+        } } }).where(eq(issues.id, childId));
+        github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr({
+          head: { ref: CARRIER_BRANCH, sha: HEAD, repo: { full_name: `${owner}/${repo}` } },
+        }) }));
+      }
+      expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+      expect(await db.select().from(issueChildCarrierAttributions)).toEqual(before);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBe(CHILD_CARRIER_OWNER_GATE_SKIP);
+    });
+
+    it.each([
+      ["current", "in_review"], ["invalidated", "in_review"],
+      ["current", "cancelled"], ["invalidated", "cancelled"],
+    ] as const)("refuses ancestor deletion with %s proof even when the owner is %s", async (state, ownerStatus) => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      if (state === "invalidated") await db.update(issueChildCarrierAttributions).set({ state, invalidatedAt: new Date() });
+      await issueService(db).update(childId, { parentId: null });
+      await db.update(issues).set({ status: ownerStatus }).where(eq(issues.id, ownerId));
+      await expect(issueService(db).remove(ownerId)).rejects.toMatchObject({ status: 409 });
+      expect(await db.select().from(issues).where(eq(issues.id, ownerId))).toHaveLength(1);
+      expect(await db.select().from(issueChildCarrierAttributions)).toHaveLength(1);
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
+      expect(await issueService(db).remove(ownerId)).toMatchObject({ id: ownerId });
+    });
+
+    it.each(["head", "commit set", "identical proof"] as const)("does not let a stale enumerator replace a newer approved %s", async (field) => {
+      const { ownerId, childId } = await seedPair();
+      const olderHead = field === "head" ? "d".repeat(40) : HEAD;
+      const newerShas = field === "commit set" ? [COMMIT, "b".repeat(40)] : [COMMIT];
+      await db.update(issues).set({ executionState: { childCarrierClaim: {
+        prNumber: 653, headSha: olderHead, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`,
+      } } }).where(eq(issues.id, childId));
+      github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr({
+        head: { ref: CARRIER_BRANCH, sha: olderHead, repo: { full_name: `${OWNER}/${REPO}` } },
+      }) }));
+      let entered!: () => void;
+      let resume!: () => void;
+      const enumerating = new Promise<void>((resolve) => { entered = resolve; });
+      const released = new Promise<void>((resolve) => { resume = resolve; });
+      let first = true;
+      childCarrierCommits.enumerate = async () => {
+        if (first) { first = false; entered(); await released; return { ok: true, shas: [COMMIT] }; }
+        return { ok: true, shas: newerShas };
+      };
+      const older = resolveChildCarrierDecisionHead(db, companyId, childId);
+      await enumerating;
+      let newerDecision: string;
+      let refused!: ChildCarrierResolution;
+      try {
+        github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr() }));
+        await db.update(issues).set({ executionState: { childCarrierClaim: {
+          prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`,
+        } } }).where(eq(issues.id, childId));
+        expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+        newerDecision = await approveChild(childId);
+        await recordChildCarrierDecision(db, companyId, childId);
+        expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      } finally {
+        resume();
+        refused = await older;
+      }
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      expect(refused.kind).toBe(field === "identical proof" ? "resolved" : "unresolvable");
+      const [current] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.state, "current"));
+      expect(current).toMatchObject({ headSha: HEAD, commitShas: newerShas, childDecisionId: newerDecision! });
+    });
+
+    it("refuses an older claim without invalidating the already approved live head", async () => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      const decisionId = await approveChild(childId);
+      await recordChildCarrierDecision(db, companyId, childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+      await db.update(issues).set({ executionState: {
+        ...child!.executionState, childCarrierClaim: {
+          prNumber: 653, headSha: "d".repeat(40), prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`,
+        },
+      } }).where(eq(issues.id, childId));
+      const refused = await resolveChildCarrierDecisionHead(db, companyId, childId);
+      expect(refused.kind).toBe("unresolvable");
+      const [current] = await db.select().from(issueChildCarrierAttributions);
+      expect(current).toMatchObject({ state: "current", headSha: HEAD, childDecisionId: decisionId });
+      await db.update(issues).set({ executionState: child!.executionState }).where(eq(issues.id, childId));
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+    });
+
+    it("does not invalidate proof installed while an older provider read is in flight", async () => {
+      const { ownerId, childId } = await seedPair();
+      const olderHead = "d".repeat(40);
+      await db.update(issues).set({ executionState: { childCarrierClaim: {
+        prNumber: 653, headSha: olderHead, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`,
+      } } }).where(eq(issues.id, childId));
+      let newerDecision: string | undefined;
+      github.mockImplementationOnce(async () => {
+        github.mockImplementation(async () => ({ ok: true, status: 200, json: async () => livePr() }));
+        await db.update(issues).set({ executionState: { childCarrierClaim: {
+          prNumber: 653, headSha: HEAD, prUrl: `https://github.com/${OWNER}/${REPO}/pull/653`,
+        } } }).where(eq(issues.id, childId));
+        expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("resolved");
+        newerDecision = await approveChild(childId);
+        await recordChildCarrierDecision(db, companyId, childId);
+        expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+        return { ok: true, status: 200, json: async () => livePr({
+          head: { ref: CARRIER_BRANCH, sha: olderHead, repo: { full_name: `${OWNER}/${REPO}` } },
+        }) };
+      });
+      expect((await resolveChildCarrierDecisionHead(db, companyId, childId)).kind).toBe("unresolvable");
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      const [current] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.state, "current"));
+      expect(current).toMatchObject({ headSha: HEAD, childDecisionId: newerDecision });
+    });
+
+    it("does not let an older attachment replace a newer current decision", async () => {
+      const { ownerId, childId } = await seedPair();
+      await resolveChildCarrierDecisionHead(db, companyId, childId);
+      await approveChild(childId);
+      await recordChildCarrierDecision(db, companyId, childId);
+      let newerDecision: string | undefined;
+      const stale = afterInitialChildSnapshot(async () => {
+        newerDecision = await approveChild(childId);
+        await recordChildCarrierDecision(db, companyId, childId);
+        expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      });
+      await recordChildCarrierDecision(stale, companyId, childId);
+      expect(await carrierOwnerChildAttributionBlock(db, companyId, ownerId, target)).toBeNull();
+      const [current] = await db.select().from(issueChildCarrierAttributions);
+      expect(current!.childDecisionId).toBe(newerDecision);
+    });
   });
 
   describe("independent owner authority boundaries", () => {

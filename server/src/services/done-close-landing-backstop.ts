@@ -1308,6 +1308,13 @@ export function createDoneCloseLandingBackstopService(
           }
         }
       }
+      // Carrier authority is an owner-controlled wait, never a manual-merge remedy.
+      if (await childCarrierStampBlock(db, issue.companyId, {
+        owner: pr.owner, repo: pr.repo, number: pr.number, headRef: pr.headRefName,
+      }, issue.id)) {
+        counts.deferred += 1;
+        continue;
+      }
 
       // SUP-15953: a candidate inside the widened re-enqueue window but outside
       // the landing-verdict window gets NO verdict yet — including escalation —

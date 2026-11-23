@@ -120,19 +120,36 @@ Every supported comparison must prove its complete count, unique commits and
 pinned tip; the PR-commits API's capped list is not used as complete proof.
 
 A non-cancelled child with any recorded carrier attribution cannot be physically
-deleted through the issue service; deletion returns HTTP 409. This includes
-invalidated proof, which does not establish that the work is no longer required.
+deleted through the issue service; deletion returns HTTP 409. The same guard
+protects a carrier ancestor whose deletion would cascade a non-cancelled child's
+attribution, even when the ancestor itself is cancelled. Both current and
+invalidated proof are retained: invalidation does not retire the contribution.
 The deletion transaction locks the issue before checking attribution, so a
 concurrent proof insertion cannot pass the check and then be erased by a cascade.
 An operator may cancel a child only when its work is no longer required; ordinary
-reference restrictions still apply to subsequent deletion. No schema or
-attribution history is removed to bypass a required child approval.
+reference restrictions still apply to subsequent deletion. No attribution
+history is removed to bypass required child approval.
 
-Removing a child's parent does not invalidate its stored attribution. The owner
-gate checks current descendants and ignores a historical attribution whose child
-is no longer its descendant, even if that row still says `current`. The stored
-state alone does not prove current ancestry. Automatic cleanup or reparenting
-recovery is not part of this change.
+Clearing a child's parent does not retire its governed obligation. The existing
+owner predicate retains recorded non-cancelled children even when they are no
+longer current descendants. Unverifiable ancestry refuses publication and arming;
+the stored `current` state is not fresh ancestry proof. Restoring the ancestry
+allows normal verification again. Automatic reparenting recovery is not added.
+
+The historical key remains company, child, pull-request number and head SHA.
+An existing row's provider, repository and ancestor scope cannot be overwritten.
+A colliding scope change refuses and preserves the historical row and decision.
+This is an availability limit: an otherwise matching repository or ancestor move
+cannot create a second history row at the same key. Wider storage design is
+deferred to a follow-up; no index or migration is changed.
+
+Proof writes compare the observed row or observed absence against the current
+row under a short issue-row write lock. A stale enumerator cannot replace a
+newer proof; an identical concurrent proof remains idempotent. A stale claim
+does not invalidate a proof for the verified live head. Decision attachment
+re-reads the current child decision and complete certificate under the write
+lock, so an older callback cannot replace a newer attachment. These local
+conditional writes do not make GitHub and the database atomic.
 
 Status publication checks attribution before each write attempt and after a
 confirmed or possibly accepted write. A changed child decision voids the possible
@@ -145,6 +162,9 @@ refusal or terminal write failure. A deterministic rejection with no possible
 earlier write needs no compensating status.
 The approval actuator and landing backstop check attribution before each enable
 attempt and after an accepted enable. Direct-merge retries recheck authority too.
+An owner-controlled child-carrier refusal stays deferred in the landing backstop.
+It does not enter generic failed-reenqueue escalation, reopen the child as
+blocked, or ask the board to merge its carrier manually.
 The enable attempt's deadline covers the authority callback and provider request
 together. If validation finishes after that deadline, it cannot send a late
 enable mutation. The default worst-case bound includes callbacks and retry

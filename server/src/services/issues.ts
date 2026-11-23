@@ -13106,21 +13106,29 @@ export function issueService(db: Db) {
         if (!lockedIssue) return null;
         // The issue lock serializes this check with attribution FK insertion.
         // Invalidating proof does not make its child contribution disposable.
-        if (lockedIssue.status !== "cancelled") {
-          const [attribution] = await tx
-            .select({ id: issueChildCarrierAttributions.id })
-            .from(issueChildCarrierAttributions)
-            .where(and(
-              eq(issueChildCarrierAttributions.companyId, lockedIssue.companyId),
-              eq(issueChildCarrierAttributions.childIssueId, id),
-            ))
-            .limit(1);
-          if (attribution) {
-            throw conflict(
-              "Issue has recorded carrier attribution and cannot be deleted. Cancel it first only if its work is no longer required.",
-              { code: "issue_carrier_attribution_delete_refused" },
-            );
-          }
+        const [attribution] = await tx
+          .select({ id: issueChildCarrierAttributions.id })
+          .from(issueChildCarrierAttributions)
+          .where(and(
+            eq(issueChildCarrierAttributions.companyId, lockedIssue.companyId),
+            or(
+              lockedIssue.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
+              and(
+                eq(issueChildCarrierAttributions.ancestorIssueId, id),
+                sql`EXISTS (
+                  SELECT 1 FROM ${issues}
+                  WHERE ${issues.id} = ${issueChildCarrierAttributions.childIssueId}
+                    AND ${issues.companyId} = ${lockedIssue.companyId} AND ${issues.status} <> 'cancelled'
+                )`,
+              ),
+            ),
+          ))
+          .limit(1);
+        if (attribution) {
+          throw conflict(
+            "Issue is referenced by a non-cancelled child's carrier attribution and cannot be deleted. Cancel the child only if its work is no longer required.",
+            { code: "issue_carrier_attribution_delete_refused" },
+          );
         }
 
         const attachmentAssetIds = await tx

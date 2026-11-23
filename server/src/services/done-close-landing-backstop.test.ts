@@ -245,6 +245,11 @@ function makeDb(state: DbState) {
           }),
         };
       }
+      if ("childIssueId" in cols && !("ancestorIssueId" in cols)) {
+        return { from: () => ({ where: () => Promise.resolve(
+          (state.childCarrierRows ?? []).filter((row) => row.ancestorIssueId === (state.sweptIssueId ?? ISSUE)),
+        ) }) };
+      }
       if ("ancestorIssueId" in cols && "childIssueId" in cols) {
         return { from: () => ({ where: () => Promise.resolve(state.childCarrierRows ?? []) }) };
       }
@@ -1783,6 +1788,11 @@ describe("createDoneCloseLandingBackstopService", () => {
         const result = await service.sweep();
         expect(result.reenqueued).toBe(0);
         expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+        expect(result.deferred).toBe(1);
+        expect(result.escalated).toBe(0);
+        expect(result.unarmable).toEqual([]);
+        expect(mockUpdate).not.toHaveBeenCalled();
+        expect(mockAddComment).not.toHaveBeenCalled();
       });
 
       it("does not arm when the PR head moved between the authorization and the arm", async () => {
