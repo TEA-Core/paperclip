@@ -94,7 +94,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { runRecoverySweepIssue as runIsolatedRecoverySweepIssue, type RecoverySweepName } from "../../lib/recovery-sweep-isolation.js";
-import { hasBoardParkedRecoveryAction, isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "../recovery-carrier-park-state.js";
+import { isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "../recovery-carrier-park-state.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -5869,8 +5869,7 @@ export function recoveryService(
     agentInvokability?: AgentInvokability | null;
     boardEscalation?: boolean;
   }) {
-    if (await hasBoardParkedRecoveryAction(db, input.issue.companyId, input.issue.id) ||
-        await isAutomaticRecoverySuppressedByPauseHold(db, input.issue.companyId, input.issue.id, treeControlSvc)) return null;
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, input.issue.companyId, input.issue.id, treeControlSvc)) return null;
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -5905,6 +5904,7 @@ export function recoveryService(
       agentInvokability: input.agentInvokability,
       boardEscalation: input.boardEscalation,
     });
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, routedAction.id)) return null;
     // Recheck the stage and assignee under the issue-row lock and write through
     // the same transaction. A concurrent transition into review cannot be
     // displaced by the earlier sweep snapshot.
@@ -5914,7 +5914,7 @@ export function recoveryService(
         .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
         .for("update").limit(1);
       if (!current) return null;
-      if (await hasBoardParkedRecoveryAction(txDb, current.companyId, current.id)) return null;
+      if (await isRecoveryActionBoardParked(txDb, current.companyId, routedAction.id)) return null;
       const pendingState = parseIssueExecutionState(current.executionState);
       const pendingParticipant = pendingState?.currentParticipant;
       // The board may have restored this participant while the stale quota

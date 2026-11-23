@@ -33,14 +33,6 @@ export async function isRecoveryActionBoardParked(db: Db, companyId: string, act
 }
 
 
-export async function hasBoardParkedRecoveryAction(db: Db, companyId: string, sourceIssueId: string) {
-  const [action] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
-    inArray(issueRecoveryActions.status, ["active", "escalated"]),
-    sql`not (${recoveryActionNotBoardParked(companyId, sql`${issueRecoveryActions.id}`)})`,
-  )).limit(1);
-  return Boolean(action);
-}
 /** Consent and its direct blocker facts share one statement, including caller-owned transactions. */
 export async function readRecoveryCarrierParkSnapshot(db: Db, companyId: string, carrierIds: string[]) {
   const parks = new Map<string, RecoveryCarrierParkSummary>();
