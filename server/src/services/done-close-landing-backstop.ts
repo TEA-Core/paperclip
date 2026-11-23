@@ -5,6 +5,7 @@ import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
+import { childCarrierStampBlock } from "./child-carrier-attribution.js";
 import {
   createAuthorityGuard,
   openArmRecord,
@@ -1307,6 +1308,13 @@ export function createDoneCloseLandingBackstopService(
           }
         }
       }
+      // Carrier authority is an owner-controlled wait, never a manual-merge remedy.
+      if (await childCarrierStampBlock(db, issue.companyId, {
+        owner: pr.owner, repo: pr.repo, number: pr.number, headRef: pr.headRefName,
+      }, issue.id)) {
+        counts.deferred += 1;
+        continue;
+      }
 
       // SUP-15953: a candidate inside the widened re-enqueue window but outside
       // the landing-verdict window gets NO verdict yet — including escalation —
@@ -1650,6 +1658,9 @@ export function createDoneCloseLandingBackstopService(
     // The card's authority, captured just before the final read of the head and the approval: a decision
     // reversed, a certificate removed or a reviewer terminated after this point is a difference.
     const guard = await createAuthorityGuard(db, companyId, issueId, { headSha: authorizedHeadSha });
+    const authorityChanged = async () => (await guard.stillHolds()) ?? await childCarrierStampBlock(db, companyId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, headSha: authorizedHeadSha, headRef: pr.headRefName,
+    }, issueId);
     const again = await reauthorize();
     if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
       logger.info(
@@ -1658,6 +1669,7 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
+    if (await authorityChanged()) return false;
     // The take-back record goes on the card BEFORE the enable call (an arm GitHub accepts is then covered even if this
     // process dies right after); nothing is armed when it cannot be written.
     const armRecord = await openArmRecord(db, companyId, issueId, pr, `${pr.owner}/${pr.repo}#${pr.number}`, nodeId, authorizedHeadSha, guard);
@@ -1669,13 +1681,13 @@ export function createDoneCloseLandingBackstopService(
     const result = await enableAutoMerge(tokenResult.token, nodeId, {
       expectedHeadOid: authorizedHeadSha,
       // Before the first attempt and before every retry.
-      beforeAttempt: () => guard.stillHolds(),
+      beforeAttempt: authorityChanged,
     });
     await armRecord.settleEnable(result);
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it.
       // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
-      const changed = await guard.stillHolds().catch((error) =>
+      const changed = await authorityChanged().catch((error) =>
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changed) {
         const disabled = await disableAutoMerge(tokenResult.token, nodeId);
@@ -1693,6 +1705,13 @@ export function createDoneCloseLandingBackstopService(
       await armRecord.forget();
     }
     if (!result.success) {
+      if (result.mayHaveApplied) {
+        logger.warn(
+          { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
+          "done-close backstop: re-enqueue unconfirmed; the take-back record is retained",
+        );
+        return false;
+      }
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
         "done-close backstop: re-enqueue failed",

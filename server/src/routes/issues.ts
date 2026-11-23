@@ -4957,7 +4957,10 @@ export function issueRoutes(
       approvalStatus: {
         ...prior, approvedHeadSha: verdict.headSha,
         ...(decisionId
-          ? { finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId } }
+          ? { finalDelivery: {
+            ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId,
+            ...(verdict.childCarrierProof ? { childCarrierProof: verdict.childCarrierProof } : {}),
+          } }
           : {}),
       },
     };
@@ -5833,7 +5836,7 @@ export function issueRoutes(
       // thread comment (a coalesced remedy comment must not erase the write's own
       // trace) and whether or not this door persists the comment.
       await writeDoneTransitionRefusedAuditLog(db, issue, {
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         httpStatus: 422,
         reason: tierResult.reason,
         decisionCarried,
@@ -20891,7 +20894,11 @@ export function issueRoutes(
               headSha: requestedDeliveryIdentity.headSha,
               claimedAt: new Date().toISOString(),
             },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
           };
+          delete updateFields.executionState.delivery;
         } else {
           const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
           delete withoutClaim.childCarrierClaim;
@@ -21069,7 +21076,7 @@ export function issueRoutes(
         }
       } else {
         updateFields.executionState = {
-          ...existingExecutionState,
+          ...(updateFields.executionState ?? existingExecutionState),
           reviewRequest,
         };
       }
