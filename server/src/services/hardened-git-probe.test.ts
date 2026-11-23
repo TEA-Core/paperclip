@@ -220,12 +220,12 @@ describe("hardened git runner (SUP-22880)", () => {
 
   it("gives each process only the time left on a shared deadline, so spent time is not given back", async () => {
     const repo = plainRepo("repo");
-    const deadline = { at: Date.now() + 60_000, expired: false };
+    const deadline = { at: performance.now() + 60_000, expired: false };
     const args = ["-C", repo, "rev-parse", "--is-inside-work-tree"];
     expect((await runHardenedGit(args, { cwd: "/", deadline })).trim()).toBe("true");
     expect(deadline.expired).toBe(false);
 
-    deadline.at = Date.now() - 1;
+    deadline.at = performance.now() - 1;
     await expect(runHardenedGit(args, { cwd: "/", deadline }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
     expect(deadline.expired).toBe(true);
@@ -236,7 +236,7 @@ describe("hardened git runner (SUP-22880)", () => {
     const fifo = path.join(root, "blocking-include");
     execFileSync("mkfifo", [fifo]);
     git(repo, "config", "include.path", fifo);
-    const deadline = { at: Date.now() + 500, expired: false };
+    const deadline = { at: performance.now() + 500, expired: false };
     await expect(runHardenedGit(["-C", repo, "config", "--list"], { cwd: "/", deadline }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
     expect(deadline.expired).toBe(true);
