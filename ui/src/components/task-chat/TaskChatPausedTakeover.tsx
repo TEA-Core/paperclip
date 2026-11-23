@@ -41,7 +41,7 @@ export function TaskChatPausedTakeover({
           </h2>
           <p className="text-sm text-muted-foreground">
             {carrierPark
-              ? `${carrierPark.reason} Automatic recovery is stopped. Manual board release only; release does not repair or re-arm the source action.`
+              ? `${carrierPark.reason} Automatic recovery is stopped. Manual board release only; release does not itself repair or re-arm the source action.`
               : subtree ? "Resume this subtree to send a message." : "Resume this task to send a message."}
           </p>
         </div>

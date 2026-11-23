@@ -592,56 +592,41 @@ export function issueTreeControlService(db: Db) {
     if (activePauseHolds.length === 0) return null;
 
     const holdByRootIssueId = new Map<string, typeof activePauseHolds[number]>();
-    let hasTypedPark = false;
+    const typedHoldByRootIssueId = new Map<string, typeof activePauseHolds[number]>();
     for (const hold of activePauseHolds) {
-      if (hold.recoveryCarrierPark) hasTypedPark = true;
-      const existing = holdByRootIssueId.get(hold.rootIssueId);
-      if (!existing?.recoveryCarrierPark || hold.recoveryCarrierPark) {
-        holdByRootIssueId.set(hold.rootIssueId, hold);
+      if (hold.recoveryCarrierPark) typedHoldByRootIssueId.set(hold.rootIssueId, hold);
+      else holdByRootIssueId.set(hold.rootIssueId, hold);
+    }
+    let effectiveHold: typeof activePauseHolds[number] | null = null;
+
+    if (typedHoldByRootIssueId.size > 0) {
+      const ancestors = await db.execute<{ id: string }>(sql`
+        with recursive ancestors(id, parent_id) as (
+          select ${issues.id}, ${issues.parentId} from ${issues}
+            where ${issues.id} = ${issueId} and ${issues.companyId} = ${companyId}
+          union
+          select parent.id, parent.parent_id from ${issues} parent
+            inner join ancestors child on parent.id = child.parent_id
+            where parent.company_id = ${companyId}
+        )
+        select id from ancestors
+      `);
+      for (const ancestor of ancestors) {
+        effectiveHold = typedHoldByRootIssueId.get(ancestor.id) ?? null;
+        if (effectiveHold) break;
       }
     }
-    let currentIssueId: string | null = issueId;
-    const visited = new Set<string>();
-    let effectiveHold: typeof activePauseHolds[number] | null = null;
-    let ancestorParents: Map<string, string | null> | undefined;
 
-    while (
-      currentIssueId
-      && !visited.has(currentIssueId)
-      && (hasTypedPark || visited.size < MAX_PAUSE_HOLD_ANCESTOR_DEPTH)
-    ) {
-      visited.add(currentIssueId);
-      const hold = holdByRootIssueId.get(currentIssueId);
-      if (hold) {
-        if (visited.size <= MAX_PAUSE_HOLD_ANCESTOR_DEPTH) effectiveHold ??= hold;
-        // A descendant's ordinary pause cannot weaken an ancestor's typed stop.
-        // Keep the legacy ordinary budget/fallback; a typed park has no depth cutoff.
-        if (hold.recoveryCarrierPark || !hasTypedPark) {
+    if (!effectiveHold) {
+      let currentIssueId: string | null = issueId;
+      const visited = new Set<string>();
+      while (currentIssueId && !visited.has(currentIssueId) && visited.size < MAX_PAUSE_HOLD_ANCESTOR_DEPTH) {
+        visited.add(currentIssueId);
+        const hold = holdByRootIssueId.get(currentIssueId);
+        if (hold) {
           effectiveHold = hold;
           break;
         }
-      }
-
-      if (hasTypedPark) {
-        if (!ancestorParents) {
-          // UNION bounds legacy cycles without copying a growing path for each
-          // ancestor. Keep the root fast path above and batch the remaining walk.
-          const parents = await db.execute<{ id: string; parentId: string | null }>(sql`
-            with recursive ancestors(id, parent_id) as (
-              select ${issues.id}, ${issues.parentId} from ${issues}
-                where ${issues.id} = ${currentIssueId} and ${issues.companyId} = ${companyId}
-              union
-              select parent.id, parent.parent_id from ${issues} parent
-                inner join ancestors child on parent.id = child.parent_id
-                where parent.company_id = ${companyId}
-            )
-            select id, parent_id as "parentId" from ancestors
-          `);
-          ancestorParents = new Map();
-          for (const parent of parents) ancestorParents.set(parent.id, parent.parentId);
-        }
-        currentIssueId = ancestorParents.get(currentIssueId) ?? null;
-      } else {
         const parent: { parentId: string | null } | null = await db
           .select({ parentId: issues.parentId })
           .from(issues)

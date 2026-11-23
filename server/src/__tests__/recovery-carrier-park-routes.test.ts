@@ -145,13 +145,13 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     };
   }
 
-  async function protectSourceRows(f: Fixture) {
+  async function protectSourceRows(f: Fixture, { source = true } = {}) {
     // Sequences survive transaction rollback, including a sweep's caught error.
     const counter = `park_write_attempts_${f.actionId.replaceAll("-", "")}`;
     await db.execute(sql.raw(`create sequence ${counter}`));
     await db.execute(sql`create or replace function reject_park_source_write() returns trigger language plpgsql as $$ begin perform nextval(TG_ARGV[0]); raise exception 'protected park row written'; end $$`);
     await db.execute(sql.raw(`create trigger protect_action_${f.actionId.replaceAll("-", "")} before update or delete on issue_recovery_actions for each row when (old.id = '${f.actionId}') execute function reject_park_source_write('${counter}')`));
-    await db.execute(sql.raw(`create trigger protect_source_${f.sourceId.replaceAll("-", "")} before update or delete on issues for each row when (old.id = '${f.sourceId}') execute function reject_park_source_write('${counter}')`));
+    if (source) await db.execute(sql.raw(`create trigger protect_source_${f.sourceId.replaceAll("-", "")} before update or delete on issues for each row when (old.id = '${f.sourceId}') execute function reject_park_source_write('${counter}')`));
     return async () => expect((await db.execute(sql.raw(`select is_called from ${counter}`)))[0].is_called).toBe(false);
   }
 
@@ -472,7 +472,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(receipts.filter(row => row.action === "issue.recovery_carrier_parked")).toHaveLength(1);
   });
 
-  it("does not assign or wake a source when a park commits before the orphan sweep acquires its row lock", async () => {
+  it("lets the unrelated orphan sweep run on a source whose action is parked, leaving the action untouched", async () => {
     const f = await fixture();
     await db.update(agents).set({ capabilities: "Implements repository changes" }).where(eq(agents.id, f.agentId));
     await db.update(issues).set({ createdByAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
@@ -480,7 +480,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await db.insert(issues).values({ id: dependentId, companyId: f.companyId, title: "Other dependent work", status: "blocked", assigneeUserId: "park-operator" });
     await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.sourceId, relatedIssueId: dependentId, type: "blocks" });
     const before = await snapshot(f);
-    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
     const { parkPid, acceptance, barrier, releaseBarrier } = await blockParkAdmission(f);
     const wakes: string[] = [];
     const recovery = recoveryService(db, { enqueueWakeup: async agentId => { wakes.push(agentId); return null; } });
@@ -494,8 +494,9 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }
     expect((await acceptance).status).toBe(201);
     await assertNoProtectedWrites();
-    expect(await snapshot(f)).toEqual(before);
-    expect(wakes).toEqual([]);
+    const after = await snapshot(f);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.cards.map(card => card.id)).toEqual(before.cards.map(card => card.id));
   }, 30_000);
 
   it("serializes board resolution behind park admission's source lock", async () => {
@@ -543,16 +544,18 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
-  it("keeps automatic stale-lock cleanup from rewriting a parked action's source", async () => {
+  it("lets unrelated stale-lock cleanup run on a parked source without writing its action", async () => {
     const f = await fixture();
     const [terminal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "succeeded", contextSnapshot: { issueId: f.sourceId } }).returning();
     await db.update(issues).set({ executionRunId: terminal!.id }).where(eq(issues.id, f.sourceId));
     const before = await snapshot(f);
-    const assertNoProtectedWrites = await protectSourceRows(f);
+    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
     expect((await park(f)).status).toBe(201);
     await recoveryService(db, { enqueueWakeup: async () => { throw new Error("Park must not wake"); } }).sweepStaleIssueLocks();
-    expect(await snapshot(f)).toEqual(before);
+    const after = await snapshot(f);
+    expect(after.actions).toEqual(before.actions);
+    expect(after.source[0]!.executionRunId).toBeNull();
     await assertNoProtectedWrites();
   });
 
@@ -738,7 +741,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await attention(f)).toMatchObject({ state: "needs_attention" });
   }, 30_000);
 
-  it.each(["blocked", "backlog"] as const)("keeps released %s source recovery stopped until independent board authority", async sourceStatus => {
+  it.each(["blocked", "backlog"] as const)("lifts the gate after release for %s source: sweeps run without writing the exhausted action", async sourceStatus => {
     const f = await fixture();
     await db.update(issues).set({ status: sourceStatus, assigneeAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
     // Release restores ordinary carrier attention; isolate that independent lane
@@ -752,27 +755,15 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect((await request(app(f.companyId))
       .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
       .send({ recoveryActionId: f.actionId, reason: "Carrier release is not source repair authority" })).status).toBe(200);
-    // Exercise both monitorable sources and the legacy missing-carrier successor path.
-    if (sourceStatus === "backlog") await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
     const before = await snapshot(f);
-    const assertNoProtectedWrites = await protectSourceRows(f);
-    const assertNoAdmission = await protectWakeAdmission(f);
+    const assertNoProtectedWrites = await protectSourceRows(f, { source: false });
     for (let tick = 0; tick < 2; tick++) {
       const recovery = recoveryService(db, { enqueueWakeup: async () => { throw new Error("Released source must not wake"); } });
       await recovery.reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
       await recovery.reconcileBlockedWithoutBlockers({ companyId: f.companyId });
     }
     await assertNoProtectedWrites();
-    const action = await issueRecoveryActionService(db).upsertSourceScoped({
-      companyId: f.companyId, sourceIssueId: f.sourceId, cause: "different-failure", fingerprint: "different-failure",
-      kind: "blocked_without_blockers", nextAction: "Automatic retry", supersedeOnIdentityChange: true,
-    });
-    expect(action.id).toBe(f.actionId);
-    expect(await heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
-      payload: { recoveryActionId: f.actionId } })).toBeNull();
-    expect(await snapshot(f)).toEqual(before);
-    await assertNoProtectedWrites();
-    await assertNoAdmission();
+    expect((await snapshot(f)).actions).toEqual(before.actions);
   });
 
   it.each([false, true])("serializes action-only wake admission with a winning park (coalescing=%s)", async coalescing => {
@@ -955,12 +946,9 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it.each(["canonical", "legacy uppercase"])("protects released UUID identity with %s stored binding", async stored => {
+  it.each(["canonical", "legacy uppercase"])("protects active UUID identity with %s stored binding", async stored => {
     const f = await fixture(), parked = await park(f);
     expect(parked.status).toBe(201);
-    expect((await request(app(f.companyId))
-      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
-      .send({ recoveryActionId: f.actionId, reason: "No automatic source repair authorized" })).status).toBe(200);
     if (stored === "legacy uppercase") {
       await db.update(issueTreeHolds).set({ recoveryCarrierPark: {
         ...parked.body.hold.recoveryCarrierPark, recoveryActionId: f.actionId.toUpperCase(),
@@ -1198,12 +1186,12 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     }
   }, 15_000);
 
-  it("rechecks a park winning the source lock before stale pointer cleanup can write", async () => {
+  it("lets stale pointer cleanup proceed after a park wins the source lock, without writing the action", async () => {
     const f = await fixture();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       invocationSource: "assignment", status: "succeeded", contextSnapshot: { issueId: f.sourceId } }).returning();
     await db.update(issues).set({ checkoutRunId: run.id, executionRunId: run.id }).where(eq(issues.id, f.sourceId));
-    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f, { source: false });
     let release!: () => void;
     const released = new Promise<void>(resolve => { release = resolve; });
     let markReady!: (pid: number) => void;
@@ -1224,8 +1212,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       await waitForBlockedPid(parkPid);
       release();
       expect((await acceptance).status).toBe(201);
-      expect(await sweep).toMatchObject({ cleared: 0 });
-      expect(await snapshot(f)).toEqual(before);
+      expect(await sweep).toMatchObject({ cleared: 1 });
+      expect((await snapshot(f)).actions).toEqual(before.actions);
       await assertNoProtectedWrites();
     } finally {
       release();
@@ -1411,13 +1399,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it.each([false, true])("keeps healthy-child repair exact while repairing an ordinary same-company source, released %s", async released => {
+  it("keeps healthy-child repair exact while repairing an ordinary same-company source", async () => {
     const f = await fixture(), ordinary = await fixture(f.companyId);
     const parked = await park(f);
     expect(parked.status).toBe(201);
-    if (released) expect((await request(app(f.companyId))
-      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${parked.body.hold.id}/release`)
-      .send({ recoveryActionId: f.actionId, reason: "Carrier release does not authorize automatic source repair" })).status).toBe(200);
     const protectedChild = randomUUID(), ordinaryChild = randomUUID();
     await db.insert(issues).values([
       { id: protectedChild, companyId: f.companyId, title: "Human-owned parked source child",
@@ -1912,13 +1897,10 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
-  it.each(["active source", "released source", "descendant"] as const)("reaches ordinary blocked work beyond100protected %s candidates", async scope => {
+  it.each(["active source", "descendant"] as const)("reaches ordinary blocked work beyond100protected %s candidates", async scope => {
     const f = await fixture(), ordinaryId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
     const accepted = await park(f);
     expect(accepted.status).toBe(201);
-    if (scope === "released source") expect((await request(app(f.companyId))
-      .post(`/api/issues/${f.carrierId}/recovery-carrier-park/${accepted.body.hold.id}/release`)
-      .send({ recoveryActionId: f.actionId, reason: "Source fence survives this release" })).status).toBe(200);
     const old = new Date("2026-01-01T00:00:00Z");
     const copies = Array.from({ length: 100 }, (_, index) => ({
       sourceId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,

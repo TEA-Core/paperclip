@@ -15,19 +15,17 @@ export function recoveryActionIdentityMatches(saved: SQL, actionId: string | SQL
   return sql`translate(lower(${saved}), '{}-', '') = translate(lower((${actionId})::text), '{}-', '')`;
 }
 
-/** Release ends the carrier hold, not automatic source denial. Only independent board resolution uses activeOnly. */
-export function recoveryActionNotBoardParked(companyId: string | SQL, actionId: string | SQL, activeOnly = false) {
+/** The gate applies only while the acceptance is active; board release lifts it. */
+export function recoveryActionNotBoardParked(companyId: string | SQL, actionId: string | SQL) {
   return sql`not exists (select 1 from ${issueTreeHolds}
-    where ${issueTreeHolds.companyId} = ${companyId} and ${activeOnly
-      ? sql`${issueTreeHolds.status} = 'active'`
-      : sql`${issueTreeHolds.status} in ('active', 'released')`}
+    where ${issueTreeHolds.companyId} = ${companyId} and ${issueTreeHolds.status} = 'active'
       and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.recoveryCarrierPark} is not null
       and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, actionId)})`;
 }
 
 export async function isRecoveryActionBoardParked(db: Db, companyId: string, actionId: string) {
   const [row] = await db.select({ id: issueTreeHolds.id }).from(issueTreeHolds).where(and(
-    eq(issueTreeHolds.companyId, companyId), sql`${issueTreeHolds.status} in ('active', 'released')`, eq(issueTreeHolds.mode, "pause"),
+    eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"),
     isNotNull(issueTreeHolds.recoveryCarrierPark),
     recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, actionId),
   )).limit(1);

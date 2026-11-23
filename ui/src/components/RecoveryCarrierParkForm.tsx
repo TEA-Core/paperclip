@@ -24,7 +24,7 @@ export function RecoveryCarrierParkForm({ candidate, onPark, pending = false, er
       <Button variant="outline" size="sm" onClick={() => setOpen(!open)} aria-expanded={open}>Park recovery carrier</Button>
       {open ? (
         <form className="flex flex-col gap-3" onSubmit={event => { event.preventDefault(); if (parsed.success) onPark(parsed.data); }}>
-          <p className="text-sm text-muted-foreground">Keep the source recovery escalated and intentionally unresolved. Board release removes only the carrier hold; automatic recovery of this source action stays denied. Source repair requires independent board authority. Parking does not approve delivery or repair.</p>
+          <p className="text-sm text-muted-foreground">Keep the source recovery escalated and intentionally unresolved. Board release removes the carrier hold and the automatic-recovery gate on this action; release itself does not repair or re-arm the source action. Parking does not approve delivery or repair.</p>
           <p className="text-xs font-mono text-muted-foreground">Source: {candidate.sourceIssueId} · Recovery action: {candidate.recoveryActionId}</p>
           <Label htmlFor={`${id}-decision`}>Historical board decision</Label>
           <select id={`${id}-decision`} className="rounded-md border border-input bg-background p-2 text-base" value={decisionId} onChange={event => setDecisionId(event.target.value)} disabled={pending} required>

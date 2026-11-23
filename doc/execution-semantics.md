@@ -743,7 +743,8 @@ still counts as active admission work even if its diagnostic snapshot failed.
 
 Blocked-recovery candidate selection excludes the current typed paused subtree
 and sources with an exact protected active/escalated action before applying
-its bounded ordinary-work limit. The source fence includes released parks.
+its bounded ordinary-work limit. The fence applies only while the park is
+active; board release lifts it.
 This is not a bare-source or global exhausted-action exemption; locked per-issue
 checks still handle parks accepted after candidate selection.
 
@@ -756,7 +757,10 @@ Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/relea
 retires the acceptance and releases this hold. It checks the bound action's UUID
 identity regardless of letter case, audits atomically and repeats idempotently.
 It changes no source/action row, starts no work, and does not approve a review
-stage or authorize repair.
+stage or authorize repair. The park gate refuses only automated supersession,
+re-mint, upsert and monitor/carrier re-arm of the exact bound action while the
+acceptance is active; unrelated source sweeps (stranded, stale-lock, orphan)
+keep running, and release lifts the gate.
 Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
 sentinel blocker or consent backfill exists. Rollback retains the pause and audit
 evidence; it must not release holds or revive source recovery as cleanup.

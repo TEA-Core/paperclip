@@ -1628,8 +1628,6 @@ export function recoveryService(
     run: () => Promise<void>,
   ) {
     return runIsolatedRecoverySweepIssue(issue, sweep, async () => {
-      const [row] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, issue.id));
-      if (row && await hasBoardParkedRecoveryAction(db, row.companyId, issue.id)) return;
       await run();
     });
   }
@@ -3188,7 +3186,6 @@ export function recoveryService(
           .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
           .for("update").limit(1);
         if (!current) return null;
-        if (await hasBoardParkedRecoveryAction(txDb, current.companyId, current.id)) return null;
         if (current.assigneeAgentId || current.assigneeUserId) return null;
         if (
           current.executionWorkspaceId
@@ -9641,8 +9638,7 @@ export function recoveryService(
         const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
           eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
         )).for("update");
-        const runner = tx as unknown as Db; // Recheck consent while retaining the source lock.
-        if (!source || await hasBoardParkedRecoveryAction(runner, issue.companyId, issue.id)) return null;
+        if (!source) return null;
         return tx
           .update(issues)
           .set({
