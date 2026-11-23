@@ -72,11 +72,14 @@ export class GitHubBranchNotFoundError extends Error {
   }
 }
 
+const DECISION_ONLY_NO_REPOSITORY_DELIVERABLE = "decision-only-no-repository-deliverable";
+
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
   "control-plane-operation-no-deliverable",
+  DECISION_ONLY_NO_REPOSITORY_DELIVERABLE,
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -112,6 +115,7 @@ const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
 // SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
 export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
+const TIER_0_PREFIX = "Closed at Tier 0 (decision-only):";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -134,6 +138,7 @@ export const TIER1_FORM =
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+const TIER0_FORM = '"Closed at Tier 0 (decision-only): <reason>"';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -315,7 +320,7 @@ interface DoneTier2CloseAuditDetails {
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
-  tier: "tier1" | "tier2" | null;
+  tier: "tier0" | "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
   tier2Audit?: DoneTier2CloseAuditDetails;
@@ -331,7 +336,11 @@ export interface DoneTierDeclarationResult {
   // Set when the refusal carries its own route error code. A door that maps every
   // refused declaration to done_transition_missing_tier_declaration uses this one
   // instead when it is set.
-  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE | "done_transition_record_only_probe_contradiction";
+}
+
+interface DoneTierDeclarationOptions {
+  allowTier0DecisionOnly?: boolean;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -710,7 +719,10 @@ export async function writeDoneTransitionRefusedAuditLog(
   issue: { id: string; companyId: string; identifier: string | null },
   details:
     | {
-        code: "done_transition_missing_tier_declaration";
+        code:
+          | "done_transition_missing_tier_declaration"
+          | typeof DONE_TRANSITION_TIER_CONFLICT_CODE
+          | "done_transition_record_only_probe_contradiction";
         httpStatus: 422;
         reason: string;
         decisionCarried: boolean;
@@ -1141,6 +1153,28 @@ type Tier1Parse =
   | { kind: "not_at_line_start"; offendingLine: string }
   | { kind: "missing_suffix" }
   | { kind: "absent" };
+
+type Tier0Parse =
+  | { kind: "matched"; reason: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "absent" };
+
+function parseTier0Declaration(body: string): Tier0Parse {
+  const lines = body.split(/\r?\n/);
+  let notAtLineStart: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_0_PREFIX)) {
+      return { kind: "matched", reason: trimmed.slice(TIER_0_PREFIX.length).trim() };
+    }
+    if (notAtLineStart === null && trimmed.includes(TIER_0_PREFIX)) {
+      notAtLineStart = trimmed;
+    }
+  }
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
+}
 
 function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
@@ -1959,6 +1993,47 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
   "i",
 );
 
+// Named, token-anchored contradictions in the record-only declaration's trailing
+// predicate/result only. This is a bounded denylist, NOT natural-language verdict
+// inference: command/target text and unrelated comment prose are not evidence.
+// Numeric markers capture one COMPLETE signed decimal token (integer, fraction,
+// or exponent form) and judge its numeric value, so `scanned=0.5` is not zero and
+// `failed=0.0` / `exit -0` are zero. Keep these eight names and forms synchronized
+// with the done-close documentation.
+const DECIMAL = String.raw`([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w]|\.\d)`;
+// Exact decimal zero test on the token text (no Number() coercion, which underflows
+// `1e-400` to 0): zero iff the mantissa has no nonzero digit, whatever the exponent.
+const DECIMAL_ZERO_RE = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?$/i;
+const isZeroDecimal = (token: string) => DECIMAL_ZERO_RE.test(token);
+const isPositiveDecimal = (token: string) => !token.startsWith("-") && !isZeroDecimal(token);
+const numericMarker = (name: string, label: string, test: (token: string) => boolean) => {
+  const re = new RegExp(String.raw`\b${label}${DECIMAL}`, "gi");
+  return {
+    name,
+    matches: (text: string) => {
+      for (const m of text.matchAll(re)) {
+        if (test(m[1])) return true;
+      }
+      return false;
+    },
+  };
+};
+const phraseMarker = (name: string, pattern: RegExp) => ({
+  name,
+  matches: (text: string) => pattern.test(text),
+});
+const RECORD_ONLY_PASS_CONTRADICTIONS = [
+  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("failed_positive", "failed=", isPositiveDecimal),
+  numericMarker("scanned_zero", "scanned=", isZeroDecimal),
+  phraseMarker("non_clean", /\bnon-clean\b/i),
+  // Literal scan-failure contexts only; bare expected-negative "failed closed" stays valid.
+  phraseMarker("failed_closed", /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i),
+  phraseMarker("refused", /\bREFUSED\b/),
+  phraseMarker("partial_failure", /\bpartial[ \t]+failure\b/i),
+] as const;
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -2138,6 +2213,24 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
+  for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
+    if (marker.matches(predicateResult!)) {
+      const remedy =
+        "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
+        `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+      return {
+        ...refuseTier2(
+          `record-only close Tier 2 result: pass contradicts failed probe evidence (${marker.name}); ` +
+          remedy,
+        ),
+        code: "done_transition_record_only_probe_contradiction",
+        remedy,
+      };
+    }
+  }
+  // Every accepting door persists this audit as issue.done_transition_tier2_close
+  // in the terminal write's transaction. tierForm=record-only counts this class;
+  // contradictions above never mint a green row or an accepted-failure event.
   return acceptTier2(evidence.trim(), sameRun, {
     probeCommand: probeCommand!.trim(),
     probeTarget: observedTarget!.trim(),
@@ -3251,6 +3344,7 @@ export async function evaluateDoneTierDeclaration(
   // closing run or it refuses — an agent can otherwise drop the run id header
   // and skip the closing-run lifetime gate entirely.
   closingAgentId: string | null = null,
+  options: DoneTierDeclarationOptions = {},
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -3270,6 +3364,46 @@ export async function evaluateDoneTierDeclaration(
   const tier1Forms = `${TIER1_FORM}${noRepositoryTier1FormSuffix(issue)}`;
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
+    if (options.allowTier0DecisionOnly) {
+      const tier0 = parseTier0Declaration(accompanyingComment);
+      if (tier0.kind === "matched") {
+        if (tier0.reason.length === 0) {
+          return {
+            allowed: false,
+            reason: `Tier 0 decision-only declaration found but <reason> is empty. Use: ${TIER0_FORM}`,
+            tier: null,
+            skipped: false,
+            skipReason: null,
+          };
+        }
+        return {
+          allowed: true,
+          reason: `Tier 0 decision-only declaration found: ${tier0.reason.slice(0, 200)}`,
+          tier: "tier0",
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      if (tier0.kind === "not_at_line_start") {
+        return {
+          allowed: false,
+          reason:
+            "A Tier 0 decision-only declaration was found but it does not begin its own line — the guard " +
+            "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+            `Offending line: "${tier0.offendingLine.slice(0, 200)}". Accepted form: ${TIER0_FORM}.`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: false,
+        reason: `Decision-only close requires ${TIER0_FORM}.`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
       const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
@@ -3361,6 +3495,35 @@ export async function evaluateDoneTierDeclaration(
         `Accepted forms: ${tier2Forms}` +
         ` or ${tier1Forms}` +
         ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  if (options.allowTier0DecisionOnly) {
+    const tier0 = parseTier0Declaration(sameRunComment.body);
+    if (tier0.kind === "matched") {
+      if (tier0.reason.length === 0) {
+        return {
+          allowed: false,
+          reason: `Tier 0 decision-only declaration found in same-run comment but <reason> is empty. Use: ${TIER0_FORM}`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: true,
+        reason: `Tier 0 decision-only declaration found in same-run comment: ${tier0.reason.slice(0, 200)}`,
+        tier: "tier0",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: false,
+      reason: `Decision-only close requires ${TIER0_FORM}.`,
       tier: null,
       skipped: false,
       skipReason: null,
@@ -3832,7 +3995,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       code:
         | "done_transition_missing_delivery"
         | "done_transition_missing_tier_declaration"
-        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+        | NonNullable<DoneTierDeclarationResult["code"]>;
       reason: string;
     }
 > {

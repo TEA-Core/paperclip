@@ -1,3 +1,4 @@
+import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -218,6 +219,11 @@ import {
 import { redactIssueCommentBody } from "../services/issues.js";
 import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
+import {
+  carrierArmBlock,
+  classifyAncestorCarrierHead,
+  recordChildCarrierDecision,
+} from "../services/child-carrier-attribution.js";
 import {
   armMergeOnApproval,
   parseRepoUrl,
@@ -4545,12 +4551,16 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
-  const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
+  });
+  const svc = issueService(db, {
+    onExecutionLockCleared: async ({ run, issueId }) => {
+      await heartbeat.releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId);
+    },
   });
   const commentWasCreatedByAssigneeRun = async (
     comment: { companyId: string; createdByRunId?: string | null },
@@ -4952,7 +4962,10 @@ export function issueRoutes(
       approvalStatus: {
         ...prior, approvedHeadSha: verdict.headSha,
         ...(decisionId
-          ? { finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId } }
+          ? { finalDelivery: {
+            ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId,
+            ...(verdict.childCarrierProof ? { childCarrierProof: verdict.childCarrierProof } : {}),
+          } }
           : {}),
       },
     };
@@ -4995,6 +5008,11 @@ export function issueRoutes(
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
+    try {
+      await recordChildCarrierDecision(db, issue.companyId, issue.id);
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "child carrier decision was not attached; stamp and arm still follow the attribution row");
+    }
     // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
     // invoke this hook after the transaction commits, so the decision row and
     // completedStageIds are already durable — the predicate is evaluable here.
@@ -5321,12 +5339,25 @@ export function issueRoutes(
         // `errored` outcome so the miss is diagnosable from GET /api/issues/{id} alone.
         let armingOutcome: ArmingOutcome | { kind: "errored"; message: string };
         try {
-          // Bound to the head the stamp was just published on, when the publisher named one: GitHub then
-          // refuses to enable auto-merge if the PR has moved on since.
-          armingOutcome = await armMergeOnApproval(
-            db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr,
-            /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "") ? { expectedHeadOid: statusOutcome.headSha as string } : {},
+          const armBlock = await carrierArmBlock(
+            db,
+            issue.companyId,
+            issue.id,
+            statusOutcome.certifiedPr
+              ? {
+                  owner: statusOutcome.certifiedPr.owner,
+                  repo: statusOutcome.certifiedPr.repo,
+                  number: statusOutcome.certifiedPr.number,
+                  headSha: statusOutcome.headSha ?? null,
+                }
+              : null,
           );
+          armingOutcome = armBlock
+            ? { kind: "skipped", message: armBlock }
+            : await armMergeOnApproval(
+                db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr,
+                /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "") ? { expectedHeadOid: statusOutcome.headSha as string } : {},
+              );
         } catch (armingErr) {
           logger.warn({ err: armingErr, issueId: issue.id }, "armMergeOnApproval threw; recording errored outcome");
           armingOutcome = {
@@ -5763,6 +5794,7 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
+      { allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable" },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5789,6 +5821,9 @@ export function issueRoutes(
       const tier2CommentForm = issue.deliveryRequirement === "record_only"
         ? TIER2_RECORD_ONLY_FORM
         : TIER2_FORM;
+      const tier0Alternative = override?.disposition === "decision-only-no-repository-deliverable"
+        ? ` or "Closed at Tier 0 (decision-only): <reason>"`
+        : "";
       const remedy = tierResult.remedy ?? (input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${structuredForms}` +
@@ -5797,6 +5832,7 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${structuredForms}` +
@@ -5805,12 +5841,13 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`);
       // SUP-24298: one refusal row per refused write, written before the deduped
       // thread comment (a coalesced remedy comment must not erase the write's own
       // trace) and whether or not this door persists the comment.
       await writeDoneTransitionRefusedAuditLog(db, issue, {
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         httpStatus: 422,
         reason: tierResult.reason,
         decisionCarried,
@@ -8440,6 +8477,20 @@ export function issueRoutes(
     // every assignee write surface, in every status — ahead of the
     // in_progress early return that previously let it write until close.
     if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return false;
+    if (
+      issue.status === "in_review" &&
+      issue.executionRunId &&
+      issue.executionRunId !== req.actor.runId
+    ) {
+      const holder = await heartbeat.getRun(issue.executionRunId);
+      if (holder?.status === "running" && holder.agentId !== actorAgentId) {
+        throw conflict("Issue run ownership conflict", {
+          issueId: issue.id,
+          executionRunId: holder.id,
+          actorRunId: req.actor.runId ?? null,
+        });
+      }
+    }
     if (issue.status !== "in_progress") {
       return true;
     }
@@ -10130,12 +10181,37 @@ export function issueRoutes(
 
   async function resolveActiveIssueRun(issue: {
     id: string;
+    companyId?: string | null;
     assigneeAgentId: string | null;
     executionRunId?: string | null;
+    checkoutRunId?: string | null;
   }) {
     let runToInterrupt = issue.executionRunId
       ? await heartbeat.getRun(issue.executionRunId)
       : null;
+
+    // An issue-less author run adopted through the SUP-20121 stamp is not the
+    // card's own run: the adoption stamps both pointers, but the run is only
+    // interruptible here when it is not the card's recorded author, or when
+    // a server-recorded context names this card. Authorship is the recorded
+    // origin/activity proof, never the pointer alone: a null or empty
+    // context says nothing either way, and a checked-out run that did not
+    // author the card keeps the base interrupt behavior.
+    if (runToInterrupt) {
+      const contextSnapshot = runToInterrupt.contextSnapshot;
+      const stampedIssueId =
+        contextSnapshot && typeof contextSnapshot === "object" &&
+        typeof (contextSnapshot as Record<string, unknown>).issueId === "string"
+          ? ((contextSnapshot as Record<string, unknown>).issueId as string)
+          : null;
+      if (
+        stampedIssueId !== issue.id &&
+        issue.companyId &&
+        (await runIsIssueAuthor(db, issue.companyId, issue.id, runToInterrupt.id))
+      ) {
+        runToInterrupt = null;
+      }
+    }
 
     if (
       (!runToInterrupt || runToInterrupt.status !== "running") &&
@@ -12705,6 +12781,7 @@ export function issueRoutes(
     try {
       outcome = await publishHeadBoundRelease(rdb, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
+        issueId: existing.id,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
         abandon: scope ? ctx.cancelScope : undefined,
       });
@@ -12933,6 +13010,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const decisionId = randomUUID();
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [];
 
     type BoardDecisionTransactionResult = {
       updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
@@ -13095,6 +13173,7 @@ export function issueRoutes(
           } as Parameters<typeof svc.update>[1],
           tx,
           postCommitActivityPublications,
+          postCommitIssueActions,
         );
         if (!updated) return null;
 
@@ -13180,6 +13259,7 @@ export function issueRoutes(
     }
 
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    await flushIssuePostCommitActions(postCommitIssueActions);
 
     // SUP-15805 CR-1: the board decision is a real stage transition. Enqueue the
     // same execution-stage wake the PATCH path would, so an approved-next-stage
@@ -17718,7 +17798,11 @@ export function issueRoutes(
         projectId: createAssignmentScope.projectId,
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
-        originRunId: createBody.originRunId ?? actor.runId,
+        // originRunId is ownership proof: only an authenticated agent run
+        // (an agent JWT is minted for one run) may stamp it. A board request
+        // or an agent API key can only claim a run through an unauthenticated
+        // header, which is never copied into originRunId.
+        originRunId: createBody.originRunId ?? (actor.actorType === "agent" && actor.actorSource === "agent_jwt" ? actor.runId : null),
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
         ...(sourceTrust ? { sourceTrust } : {}),
@@ -20957,24 +21041,53 @@ export function issueRoutes(
           });
           return;
         }
-        updateFields.executionState = {
-          ...currentExecState,
-          delivery: {
-            ...requestedDeliveryIdentity,
-            kind: "as05_bound_pr",
-            cardBranch: branchOwnership.branch,
-            sourceIssueId: existing.id,
-            recordedByRunId: actor.runId,
-            recordedAt: new Date().toISOString(),
-          },
-          // R20: the structured head of this review round, compared by the
-          // review-stall trigger against the head the last bounce rejected.
-          // Written only for a policy that names a stall arbiter, so a policy
-          // without one keeps its persisted state unchanged.
-          ...(nextExecutionPolicy?.stallEscalation
-            ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
-            : {}),
-        };
+        const carrierClass = exact.pr.headRefName
+          ? await classifyAncestorCarrierHead(db, existing.companyId, existing.id, exact.pr.headRefName)
+          : "absent";
+        if (carrierClass === "many") {
+          res.status(422).json({
+            error: "deliveryIdentity bound PR matches more than one ancestor carrier",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              reason: "multiple ancestor carrier candidates",
+            },
+          });
+          return;
+        }
+        if (carrierClass === "one") {
+          updateFields.executionState = {
+            ...currentExecState,
+            childCarrierClaim: {
+              prNumber: requestedDeliveryIdentity.prNumber,
+              prUrl: requestedDeliveryIdentity.prUrl,
+              headSha: requestedDeliveryIdentity.headSha,
+              claimedAt: new Date().toISOString(),
+            },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
+          };
+          delete updateFields.executionState.delivery;
+        } else {
+          const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+          delete withoutClaim.childCarrierClaim;
+          updateFields.executionState = {
+            ...withoutClaim,
+            delivery: {
+              ...requestedDeliveryIdentity,
+              kind: "as05_bound_pr",
+              cardBranch: branchOwnership.branch,
+              sourceIssueId: existing.id,
+              recordedByRunId: actor.runId,
+              recordedAt: new Date().toISOString(),
+            },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
+          };
+        }
         // deliveryIdentityWorkspaceBranchWrite stays false: a bound-PR record
         // names its card branch explicitly (cardBranch), so the generic
         // project-primary branch-write carve-out never applies.
@@ -21012,8 +21125,10 @@ export function issueRoutes(
           });
           return;
         }
+        const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+        delete withoutClaim.childCarrierClaim;
         updateFields.executionState = {
-          ...currentExecState,
+          ...withoutClaim,
           delivery: {
             ...requestedDeliveryIdentity,
             recordedByRunId: actor.runId,
@@ -21132,7 +21247,7 @@ export function issueRoutes(
         }
       } else {
         updateFields.executionState = {
-          ...existingExecutionState,
+          ...(updateFields.executionState ?? existingExecutionState),
           reviewRequest,
         };
       }
@@ -21543,6 +21658,9 @@ export function issueRoutes(
       // a replacement run that takes ownership during the final delivery
       // preflight is not cancelled, and a checkout-only binding never
       // borrows cancellation authority.
+      // SUP-20121: an adopted issue-less author is never interrupted this
+      // way either: the recorded authorship proof spares it, mirroring
+      // resolveActiveIssueRun, with no exception here.
       const linkedRunIds = [existing.executionRunId].filter(
         (runId): runId is string => typeof runId === "string" && runId.length > 0,
       );
@@ -21566,7 +21684,10 @@ export function issueRoutes(
             actor.runId !== null &&
             linkedRun.id === actor.runId &&
             linkedIssueId === existing.id;
-          if (!isIssuingRunStageHandoff) {
+          const isAdoptedAuthor =
+            linkedIssueId !== existing.id &&
+            (await runIsIssueAuthor(db, existing.companyId, existing.id, linkedRun.id));
+          if (!isIssuingRunStageHandoff && !isAdoptedAuthor) {
             pendingReassignmentStopRunId = linkedRun.id;
           }
           break;
@@ -22765,6 +22886,19 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
     await flushIssuePostCommitActions(postCommitIssueActions);
+    // A transactional update that cleared the execution lock without the
+    // post-commit list (a comment-joined status change) still promotes the
+    // held wake here, once the route transaction has committed.
+    if (existing.executionRunId && !issue.executionRunId) {
+      try {
+        const clearedRun = await heartbeat.getRun(existing.executionRunId);
+        if (clearedRun) {
+          await heartbeat.releaseIssueExecutionAndPromote(clearedRun, { suppressImmediateRecovery: true }, issue.id);
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id, runId: existing.executionRunId }, "failed to promote wakes after a transactional lock clear");
+      }
+    }
 
     if (transition.droppedStageIds?.length) {
       void logActivity(db, {
@@ -24358,6 +24492,22 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!existing) return;
+    if (req.actor.type === "agent" && req.actor.source !== "agent_jwt") {
+      const heldRunId = existing.executionRunId ?? existing.checkoutRunId;
+      if (heldRunId) {
+        const holder = await heartbeat.getRun(heldRunId);
+        const holderIssueId = typeof holder?.contextSnapshot?.issueId === "string"
+          ? holder.contextSnapshot.issueId.trim()
+          : null;
+        if (
+          holder?.status === "running" &&
+          !holderIssueId &&
+          await runIsIssueAuthor(db, existing.companyId, existing.id, heldRunId)
+        ) {
+          throw forbidden("An authenticated author run is required to release an adopted hold");
+        }
+      }
+    }
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const actorRunId = await requireAgentRunId(req, res, { checkoutRunId: existing.checkoutRunId });
     if (req.actor.type === "agent" && !actorRunId) return;
