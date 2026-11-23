@@ -128,14 +128,17 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     return { companyId, issuePrefix, writerAgentId, peerAgentId, writerRunId };
   }
 
-  function appFor(actor: Express.Request["actor"]) {
+  function appFor(
+    actor: Express.Request["actor"],
+    options: Parameters<typeof issueRoutes>[2] = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = actor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1], {}));
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1], options));
     app.use(errorHandler);
     return app;
   }
@@ -177,15 +180,22 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
 
   /** The author is the holder: no second run, every wake for the card waits behind it. */
   async function expectAuthorKeepsCard(issueId: string, agentId: string, authorRunId: string) {
+    let originalWakeIds: string[] = [];
     await vi.waitFor(
       async () => {
         const wakes = await wakesForCard(issueId, agentId);
         expect(wakes.length).toBeGreaterThan(0);
         expect(wakes.map((wake) => wake.status)).toEqual(wakes.map(() => "deferred_issue_execution"));
+        originalWakeIds = wakes.map((wake) => wake.id);
       },
       { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
     );
     await sleep(WAKE_SETTLE_MS);
+    const settledWakes = await wakesForCard(issueId, agentId);
+    for (const wakeId of originalWakeIds) {
+      expect(settledWakes.find((wake) => wake.id === wakeId))
+        .toMatchObject({ status: "deferred_issue_execution" });
+    }
     expect(await otherRunsForCard(issueId, agentId, authorRunId)).toEqual([]);
     expect((await cardRow(issueId)).executionRunId).toBe(authorRunId);
   }
@@ -316,6 +326,9 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
       .where(eq(heartbeatRuns.id, writerRunId));
     runningProcesses.delete(writerRunId);
+    await db.update(agents).set({
+      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+    }).where(eq(agents.id, writerAgentId));
 
     const result = await heartbeat.sweepStaleIssueLocks({ now: new Date() });
     expect(result.cleared).toBeGreaterThan(0);
@@ -323,7 +336,8 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(successors).toHaveLength(1);
     // The lapsed author is still status=running. It must not keep the only
     // slot, or the promoted successor stays queued behind it.
-    expect(successors[0]?.status).not.toBe("queued");
+    await heartbeat.drainActiveRunExecutions();
+    expect(await heartbeat.getRun(successors[0]!.id)).toMatchObject({ status: "succeeded", exitCode: 0 });
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId)))[0]?.status).toBe("running");
   });
 
@@ -585,13 +599,15 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(peerWakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
   });
 
-  it("does not make a run scoped to another issue the owner of a card it assigns to itself", async () => {
+  it.each(["issueId", "paperclipIssue.id"])("does not make a run scoped through %s to another issue the owner of a card it assigns to itself", async (scope) => {
     // SUP-16052: a run launched for one issue cannot hold another, so the
     // assignment still dispatches the card's own run.
     const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
     const otherIssueId = randomUUID();
     await db.update(heartbeatRuns)
-      .set({ contextSnapshot: { issueId: otherIssueId, wakeReason: "issue_assigned" } })
+      .set({ contextSnapshot: scope === "issueId"
+        ? { issueId: otherIssueId, wakeReason: "issue_assigned" }
+        : { paperclipIssue: { id: otherIssueId }, wakeReason: "issue_assigned" } })
       .where(eq(heartbeatRuns.id, writerRunId));
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -616,6 +632,13 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
     );
     expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+  });
+
+  it("keeps an author whose legacy nested issue scope matches its card", async () => {
+    const { companyId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running", stampLock: false });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { paperclipIssue: { id: issueId } } })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toMatchObject({ runId: writerRunId });
   });
 
   it("still starts a run once the self-assigning run has finished", async () => {
@@ -782,6 +805,84 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     });
     return { ...seeded, issueId, wakeId };
   }
+
+  it("a board decision promotes the original held wake after committing the cleared lock", async () => {
+    const { companyId, writerAgentId, writerRunId, peerAgentId, issueId, wakeId } =
+      await seedHeldCard({ authorStatus: "succeeded" });
+    runningProcesses.delete(writerRunId);
+    const firstStageId = randomUUID();
+    const secondStageId = randomUUID();
+    const participant = { type: "agent", agentId: writerAgentId, userId: null };
+    await db.update(issues).set({
+      status: "in_review",
+      deliveryRequirement: "record_only",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { id: firstStageId, type: "review", approvalsNeeded: 1, participants: [participant] },
+          { id: secondStageId, type: "approval", approvalsNeeded: 1, participants: [participant] },
+        ],
+        returnAssigneeAgentId: peerAgentId,
+      },
+      executionState: {
+        status: "pending", currentStageId: firstStageId, currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: participant,
+        returnAssignee: { type: "agent", agentId: peerAgentId, userId: null },
+        completedStageIds: [], changesRequestedCount: 0,
+        reviewRequest: null, lastDecisionId: null, lastDecisionOutcome: null, monitor: null,
+      },
+    }).where(eq(issues.id, issueId));
+    const originalFlag = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+    process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+    try {
+      const board = appFor(boardActor(companyId), {
+        // An independent stage notification failure must not strand an existing
+        // comment wake whose execution lock this decision already cleared.
+        executionStageWakeupEnqueue: async () => { throw new Error("stage notification unavailable"); },
+      });
+      const response = await request(board)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: "Advance to approval." });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(await cardRow(issueId)).toMatchObject({
+        executionState: { currentStageId: secondStageId },
+      });
+      await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+    } finally {
+      if (originalFlag === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = originalFlag;
+    }
+  });
+
+  it("a locked reassignment invalidates origin proof despite an earlier echo-assignee read", async () => {
+    const { companyId, issuePrefix, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Interleaved assignment", status: "todo",
+      assigneeAgentId: writerAgentId, issueNumber: 1, identifier: `${issuePrefix}-1`,
+    });
+    const realTransaction = db.transaction.bind(db);
+    let interleaved = false;
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((async (work, config) => {
+      if (!interleaved) {
+        interleaved = true;
+        // Model a legacy/import writer committing after the service pre-read.
+        // No service result is mocked: PostgreSQL supplies the locked receipt.
+        await db.update(issues).set({ assigneeAgentId: peerAgentId, originRunId: writerRunId })
+          .where(eq(issues.id, issueId));
+      }
+      return realTransaction(work, config);
+    }) as typeof db.transaction);
+    try {
+      await issueService(db).update(issueId, { assigneeAgentId: writerAgentId });
+      expect(interleaved).toBe(true);
+      expect(await cardRow(issueId)).toMatchObject({ assigneeAgentId: writerAgentId, originRunId: null });
+      expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+    } finally {
+      transaction.mockRestore();
+    }
+  });
 
   it("the stale-lock sweep promotes the held wake when it clears the lock", async () => {
     const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
@@ -1631,29 +1732,52 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       .send({ body: "Board follow-up." });
     expect(comment.status, JSON.stringify(comment.body)).toBe(201);
     await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+    await db.execute(sql`CREATE TABLE test_comment_lock_transitions (
+      transition_order bigint GENERATED ALWAYS AS IDENTITY, run_id uuid
+    )`);
+    await db.execute(sql`CREATE FUNCTION test_capture_comment_lock_transition()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        INSERT INTO test_comment_lock_transitions (run_id) VALUES (NEW.execution_run_id);
+        RETURN NEW;
+      END;
+      $$`);
+    await db.execute(sql`CREATE TRIGGER test_capture_comment_lock_transition
+      AFTER UPDATE OF execution_run_id ON issues FOR EACH ROW
+      WHEN (OLD.execution_run_id IS DISTINCT FROM NEW.execution_run_id)
+      EXECUTE FUNCTION test_capture_comment_lock_transition()`);
+    try {
+      const patch = await request(writer).patch(`/api/issues/${issueId}`).send({ status: "todo", comment: "Parking this card." });
+      expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+      // Observe the real clear followed by promotion's restoration, not a
+      // timestamp refresh by the request's earlier ownership check.
+      await vi.waitFor(
+        async () => {
+          expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+          const transitions = Array.from(await db.execute(sql`
+            SELECT run_id FROM test_comment_lock_transitions ORDER BY transition_order
+          `));
+          expect(transitions.map((row) => row.run_id)).toEqual([null, writerRunId]);
+        },
+        { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+      );
 
-    const patch = await request(writer).patch(`/api/issues/${issueId}`).send({ status: "todo", comment: "Parking this card." });
-    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
-    // The clear promotes through the post-commit list: while the author is
-    // fresh it re-holds, so the stamp is restored rather than the wake lost.
-    await vi.waitFor(
-      async () => {
-        expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
-      },
-      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
-    );
-
-    // After the author goes silent past the bound, the sweep lapses the stamp
-    // and promotes the wake instead of stranding it.
-    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
-    await db.update(heartbeatRuns)
-      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
-      .where(eq(heartbeatRuns.id, writerRunId));
-    const swept = await heartbeat.sweepStaleIssueLocks();
-    expect(swept.cleared).toBe(1);
-    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
-    const wakes = await wakesForCard(issueId, writerAgentId);
-    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+      // After the author goes silent past the bound, the sweep lapses the stamp
+      // and promotes the wake instead of stranding it.
+      const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      await db.update(heartbeatRuns)
+        .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+        .where(eq(heartbeatRuns.id, writerRunId));
+      const swept = await heartbeat.sweepStaleIssueLocks();
+      expect(swept.cleared).toBe(1);
+      expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+      const wakes = await wakesForCard(issueId, writerAgentId);
+      expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    } finally {
+      await db.execute(sql`DROP TRIGGER test_capture_comment_lock_transition ON issues`);
+      await db.execute(sql`DROP FUNCTION test_capture_comment_lock_transition()`);
+      await db.execute(sql`DROP TABLE test_comment_lock_transitions`);
+    }
   });
 
   it("a board reassign does not cancel the adopted issue-less author run", async () => {

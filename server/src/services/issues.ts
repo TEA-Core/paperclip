@@ -12244,14 +12244,6 @@ export function issueService(
         issueData.assigneeAgentId !== undefined
           ? issueData.assigneeAgentId
           : existing.assigneeAgentId;
-      // A reassignment drops the creation proof. A later self-assign proves
-      // itself through its assignee-change activity row instead.
-      if (
-        issueData.assigneeAgentId !== undefined &&
-        issueData.assigneeAgentId !== existing.assigneeAgentId
-      ) {
-        patch.originRunId = null;
-      }
       const nextAssigneeUserId =
         issueData.assigneeUserId !== undefined
           ? issueData.assigneeUserId
@@ -12538,6 +12530,14 @@ export function issueService(
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Invalidate creation proof against the assignee this write locks.
+        // A pre-lock echo can still change an interleaved writer's assignee.
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          issueData.assigneeAgentId !== receiptExisting.assigneeAgentId
+        ) {
+          patch.originRunId = null;
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

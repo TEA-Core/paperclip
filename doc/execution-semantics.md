@@ -238,8 +238,13 @@ pre-upgrade rows. The interaction retains its source attribution.
 The issue update service rejects any caller-supplied `originRunId` at runtime
 with `400 issue_origin_run_id_immutable`, including through its company-scoped
 wrapper. The typed API also forbids the field. Creation provenance is set only
-at creation; reassignment clears it internally. Public create, child-create,
+at creation; reassignment compares against the row-locked assignee and clears
+it internally. Public create, child-create,
 and PATCH bodies reject the field as an unknown key.
+The adopted-holder predicate also checks legacy `paperclipIssue.id`: an absent
+or matching nested ID remains eligible; a nested ID naming another card does not.
+Transactional board-stage decisions collect and flush lock-clear actions after
+commit, independently of the separate stage notification.
 An agent API key cannot release an adopted
 author hold by naming its run in a header; that release requires the
 authenticated author run or board authority. Other activity actions keep their
