@@ -983,7 +983,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
       toolName: row.toolName,
       argumentsHash: row.argumentsHash,
     })).digest("hex")}`;
-    await db.update(toolInvocations).set({ idempotencyKey: legacyKey }).where(eq(toolInvocations.id, row.id));
+    await db.update(toolInvocations).set({ idempotencyKey: legacyKey, argumentsSummary: null }).where(eq(toolInvocations.id, row.id));
 
     const otherInput = inputFor(other.id);
     const otherCall = await toolAccessPolicyService(db).recordInvocation(otherInput, await toolAccessPolicyService(db).decide(otherInput));
@@ -993,6 +993,61 @@ describeEmbeddedPostgres("tool access policy service", () => {
     // The owner's own retry still meets its earlier-build row: refused, not run.
     await expect(toolAccessPolicyService(db).recordInvocation(ownerInput, await toolAccessPolicyService(db).decide(ownerInput)))
       .rejects.toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_replay_ambiguous" } });
+  });
+
+  it("records concurrent distinct full arguments that share one legacy key, then replays each own outcome", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection } = await createTool(db, company.id);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id, principalType: "agent", principalId: agent.id,
+      permissionKey: "tools:use", scope: { toolName: "send_email" },
+    });
+    let arrivals = 0;
+    let release!: () => void;
+    const bothArrived = new Promise<void>((resolve) => { release = resolve; });
+    const racingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "insert") {
+          return (table: Parameters<typeof target.insert>[0]) => {
+            const builder = target.insert(table);
+            if (table !== toolInvocations) return builder;
+            return {
+              values: (values: Parameters<typeof builder.values>[0]) => ({
+                returning: async () => {
+                  arrivals += 1;
+                  if (arrivals === 2) release();
+                  await bothArrived;
+                  return builder.values(values).returning();
+                },
+              }),
+            };
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const inputs = ["first", "second"].map((tail) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connection.id, toolName: "send_email", sideEffecting: true,
+        arguments: { body: `${"x".repeat(600)}${tail}` },
+      },
+    }));
+    const svc = toolAccessPolicyService(racingDb);
+    const decisions = await Promise.all(inputs.map((input) => svc.decide(input)));
+    const recorded = await Promise.all(inputs.map((input, index) => svc.recordInvocation(input, decisions[index]!)));
+    expect(recorded.map((entry) => entry.replayed)).toEqual([false, false]);
+    expect(recorded[0]!.invocation.id).not.toBe(recorded[1]!.invocation.id);
+    for (const [index, entry] of recorded.entries()) {
+      await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() })
+        .where(eq(toolInvocations.id, entry.invocation.id));
+      const replay = await svc.recordInvocation(inputs[index]!, decisions[index]!);
+      expect(replay.replayed).toBe(true);
+      expect(replay.invocation.id).toBe(entry.invocation.id);
+    }
   });
 
   it("enforces rate-limit policies before explicit grants", async () => {

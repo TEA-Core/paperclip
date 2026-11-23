@@ -1730,6 +1730,25 @@ export function toolAccessPolicyService(db: Db) {
     return existing;
   }
 
+  function ownsInvocation(ctx: ToolAccessContext, invocation: typeof toolInvocations.$inferSelect) {
+    return invocation.actorType === ctx.actorType && invocation.actorId === ctx.actorId
+      && invocation.agentId === ctx.agentId && invocation.runId === ctx.heartbeatRunId;
+  }
+
+  function replayLegacyInvocation(ctx: ToolAccessContext, invocation: typeof toolInvocations.$inferSelect, key: string) {
+    if (!ownsInvocation(ctx, invocation) || failureReplayExpired(invocation)) return null;
+    const marker = isRecord(invocation.argumentsSummary) ? invocation.argumentsSummary.sideEffectReplayKey : null;
+    if (typeof marker === "string") {
+      // This build owns the summary marker. A legacy-hash collision is not an
+      // exact retry: it gets its own v2 row, while old builds retain base replay.
+      return marker === key ? replayRecorded(invocation) : null;
+    }
+    throw conflict(
+      "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
+      { reasonCode: "tool_invocation_replay_ambiguous", invocationId: invocation.id },
+    );
+  }
+
   /**
    * A stored row is replayed only once it has an outcome. A row still pending,
    * authorized or executing has none yet, so the caller gets 409 in-progress
@@ -1773,29 +1792,22 @@ export function toolAccessPolicyService(db: Db) {
         if (winner) return replayRecorded(winner);
       }
     }
-    if (derivedKey) {
-      // Only an earlier build writes the unversioned key, over the
-      // display-truncated, marker-redacted hash. No stored fact on such a row
-      // proves which arguments it recorded (a longer list, a longer string, a
-      // different secret or an extra "__proto__" key all map onto these), so a
-      // live row is neither replayed (another call's outcome) nor re-executed
-      // (a true retry would repeat the side effect). The unversioned key does
-      // not name a principal, so only this caller's own row in this run counts;
-      // another principal's row is not this call. The key is run-scoped, so
-      // this ends with the runs an earlier build served.
+    const legacyKey = derivedKey ? sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy") : null;
+    let storageKey = idempotencyKey;
+    if (legacyKey) {
       const [legacy] = await db.select().from(toolInvocations).where(and(
         eq(toolInvocations.companyId, ctx.companyId),
-        eq(toolInvocations.idempotencyKey, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy")),
-        eq(toolInvocations.actorType, ctx.actorType),
-        eq(toolInvocations.actorId, ctx.actorId),
-        ctx.agentId === null ? isNull(toolInvocations.agentId) : eq(toolInvocations.agentId, ctx.agentId),
-        ctx.heartbeatRunId === null ? isNull(toolInvocations.runId) : eq(toolInvocations.runId, ctx.heartbeatRunId),
+        eq(toolInvocations.idempotencyKey, legacyKey),
       ));
-      if (legacy && !failureReplayExpired(legacy)) {
-        throw conflict(
-          "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
-          { reasonCode: "tool_invocation_replay_ambiguous", invocationId: legacy.id },
-        );
+      if (legacy) {
+        const replay = replayLegacyInvocation(ctx, legacy, idempotencyKey!);
+        if (replay) return replay;
+      } else {
+        // Keep the actual invocation under the key old binaries read. Its
+        // server-owned JSONB marker identifies the full arguments for new
+        // binaries, with no schema change or unsynchronized shadow outcome.
+        // If that legacy key is occupied, use the principal-scoped full key.
+        storageKey = legacyKey;
       }
     }
     const status = accessDecision.decision === "allow"
@@ -1805,11 +1817,10 @@ export function toolAccessPolicyService(db: Db) {
         : accessDecision.decision === "rate_limited"
           ? "rate_limited"
           : "denied";
-    let inserted: Array<typeof toolInvocations.$inferSelect>;
-    try {
-      inserted = await db.insert(toolInvocations).values({
+    const argumentsSummary = derivedKey ? { ...redaction.summary, sideEffectReplayKey: idempotencyKey } : redaction.summary;
+    const insertInvocation = (key: string | null) => db.insert(toolInvocations).values({
         companyId: ctx.companyId,
-        idempotencyKey,
+        idempotencyKey: key,
         actorType: ctx.actorType,
         actorId: ctx.actorId,
         agentId: ctx.agentId,
@@ -1826,7 +1837,7 @@ export function toolAccessPolicyService(db: Db) {
         riskLevel: ctx.riskLevel,
         toolName: ctx.toolName,
         argumentsHash,
-        argumentsSummary: redaction.summary,
+        argumentsSummary,
         policyDecision: accessDecision.decision,
         matchedPolicyIds: accessDecision.matchedPolicyIds,
         approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
@@ -1835,17 +1846,35 @@ export function toolAccessPolicyService(db: Db) {
         errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
         completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
       }).returning();
+    let invocation: typeof toolInvocations.$inferSelect;
+    try {
+      [invocation] = await insertInvocation(storageKey);
     } catch (error) {
-      // Two first calls with one key both missed the lookup above; the loser
-      // gets the winner's row (owner-checked) on the same terms as any retry:
-      // replayed once it has an outcome, 409 in-progress until then.
-      const winner = idempotencyKey && isIdempotencyKeyConflict(error)
-        ? await callerInvocationByIdempotencyKey(ctx, idempotencyKey)
-        : null;
-      if (winner) return replayRecorded(winner);
-      throw error;
+      if (!isIdempotencyKeyConflict(error) || !idempotencyKey) throw error;
+      if (storageKey === legacyKey) {
+        // Another new or old binary reserved the legacy key first. Re-read
+        // its durable marker and owner, never a timestamp or a process cache.
+        const [winner] = await db.select().from(toolInvocations).where(and(
+          eq(toolInvocations.companyId, ctx.companyId),
+          eq(toolInvocations.idempotencyKey, legacyKey!),
+        ));
+        if (!winner) throw error;
+        const replay = replayLegacyInvocation(ctx, winner, idempotencyKey);
+        if (replay) return replay;
+        try {
+          [invocation] = await insertInvocation(idempotencyKey);
+        } catch (fallbackError) {
+          if (!isIdempotencyKeyConflict(fallbackError)) throw fallbackError;
+          const fullKeyWinner = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
+          if (!fullKeyWinner) throw fallbackError;
+          return replayRecorded(fullKeyWinner);
+        }
+      } else {
+        const winner = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
+        if (!winner) throw error;
+        return replayRecorded(winner);
+      }
     }
-    const [invocation] = inserted;
     let actionRequest = null;
     if (accessDecision.decision === "require_approval") {
       [actionRequest] = await db.insert(toolActionRequests).values({

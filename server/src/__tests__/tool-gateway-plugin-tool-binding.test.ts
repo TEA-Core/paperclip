@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -863,6 +863,64 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(new Set(invocations.map((row) => row.runId))).toEqual(new Set([run.id, otherRun!.id]));
   });
 
+  it.each(["mixed-version", "rollback", "landed-failure"] as const)(
+    "keeps a new call visible to an earlier build during %s without dispatching twice",
+    async (scenario) => {
+      const { company, agent, run } = await createAgentFixture(db, {});
+      await allowBothPluginTools(db, company.id);
+      const base = twoPluginDispatcher();
+      const { dispatcher, counter } = countingDispatcher(async (tool, parameters, context) => {
+        if (scenario === "landed-failure") throw new Error("Effect landed, response lost");
+        return base.executeTool(tool, parameters, context);
+      });
+      const input = {
+        actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+        tool: "a.b:wiki_append_log",
+        parameters: { path: "log/index.md", content: `entry ${"x".repeat(1200)}` },
+        runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+      };
+      const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+      const first = await gateway.executePluginTool(input).catch((error: unknown) => error);
+      const [row] = await db.select().from(toolInvocations);
+      const legacyHash = sha256Hex(stableStringify({
+        path: input.parameters.path,
+        content: `${input.parameters.content.slice(0, 500)}...[truncated]`,
+      }));
+      // Earlier builds look up company + unversioned key before dispatch.
+      // Exercise that exact database lookup, ignoring the new JSONB marker.
+      // A miss reaches the tool again, even if the first effect already landed.
+      const oldRetry = async () => {
+        const [stored] = await db.select().from(toolInvocations).where(and(
+          eq(toolInvocations.companyId, company.id),
+          eq(toolInvocations.idempotencyKey, legacySideEffectKeyFor(row!, legacyHash)),
+        ));
+        if (!stored) return dispatcher.executeTool(input.tool, input.parameters, input.runContext);
+        return stored;
+      };
+      const oldOutcome = await oldRetry().catch((error: unknown) => error);
+      expect(counter.attempts).toBe(1);
+      expect(oldOutcome).toMatchObject({
+        id: row!.id,
+        status: scenario === "landed-failure" ? "failed" : "succeeded",
+      });
+      if (scenario === "landed-failure") {
+        expect(row!.startedAt).not.toBeNull();
+        // A restart and an arbitrarily old terminal failure must not release it.
+        await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 60 * 60_000) });
+      }
+      // Returning to the new binary (including after rollback) still finds the
+      // full-argument identity, not an ambiguous earlier-build row.
+      const restarted = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+      if (scenario === "landed-failure") {
+        expect(first).toMatchObject({ message: "Effect landed, response lost" });
+        await expect(restarted.executePluginTool(input)).rejects.toMatchObject({ status: 502 });
+      } else {
+        await expect(restarted.executePluginTool(input)).resolves.toEqual(first);
+      }
+      expect(counter.attempts).toBe(1);
+    },
+  );
+
   it("refuses, rather than re-executes, a same-run retry whose record an earlier build wrote under the truncated-hash key", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
@@ -889,7 +947,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(legacyHash).not.toBe(row!.argumentsHash);
     await db
       .update(toolInvocations)
-      .set({ idempotencyKey: legacySideEffectKeyFor(row!, legacyHash), argumentsHash: legacyHash, createdAt: new Date() })
+      .set({ idempotencyKey: legacySideEffectKeyFor(row!, legacyHash), argumentsHash: legacyHash, argumentsSummary: null, createdAt: new Date() })
       .where(eq(toolInvocations.id, row!.id));
 
     const retryError = await rejectionOf(gateway.executePluginTool(input));
@@ -925,7 +983,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     }));
     await db
       .update(toolInvocations)
-      .set({ idempotencyKey: legacySideEffectKeyFor(row!, truncatedHash), argumentsHash: truncatedHash })
+      .set({ idempotencyKey: legacySideEffectKeyFor(row!, truncatedHash), argumentsHash: truncatedHash, argumentsSummary: null })
       .where(eq(toolInvocations.id, row!.id));
 
     const refused = await rejectionOf(call(50));

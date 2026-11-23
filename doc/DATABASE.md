@@ -194,6 +194,29 @@ completed lookups and the separate liveness backfill are not replayed. Projectio
 callers that use a transaction retain single-attempt reads. The opt-in is only
 for a pooled database handle outside a transaction.
 
+### Tool invocation replay compatibility
+
+The tool gateway hashes full arguments for derived side-effect replay keys.
+New invocations reserve the unversioned legacy key when it is free and store
+their full, principal-scoped identity in the server-owned
+`arguments_summary.sideEffectReplayKey` JSONB field. The actual invocation,
+including its approval, dispatch and outcome state, lives at that key; there
+is no separate outcome copy to synchronize. If another call owns the legacy
+key, a distinct call uses its full `side_effect:v2:` key.
+
+This needs no column or migration. During mixed-version operation or rollback,
+the pre-change binary finds the legacy row instead of dispatching again.
+It retains its old truncated-argument replay behavior, including null failure
+replays. The new binary checks the marker and principal before replay and
+reports in-progress calls as HTTP 409. An unmarked earlier-build row belonging
+to the same caller and run remains ambiguous: the new binary returns HTTP 409
+without replay or dispatch. Distinct full arguments remain distinct on new
+binaries even when their legacy hashes collide.
+
+Failures can expire after five minutes only before dispatch, without a human
+approval decision. A call that might have reached its tool, including a landed
+effect followed by a failure, never expires into automatic dispatch.
+
 ## Execution identity row locks
 
 Identity initialization, credential acquisition, and steering reconciliation lock
