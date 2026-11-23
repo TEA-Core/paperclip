@@ -1561,6 +1561,38 @@ function mergeSkippedStageIds(
   return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
 }
 
+/** String stage ids in a transition patch's `skippedStageIds`. Other shapes contribute none. */
+export function skippedStageIdsFromExecutionState(executionState: unknown): string[] {
+  if (executionState == null || typeof executionState !== "object" || Array.isArray(executionState)) {
+    return [];
+  }
+  if (!("skippedStageIds" in executionState)) return [];
+  const raw = executionState.skippedStageIds;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((id): id is string => typeof id === "string");
+}
+
+/**
+ * Guard view of a same-request auto-skip. Only skipped ids on the transition
+ * patch are merged. A stored live seat stays, so a later mechanism still names
+ * the pre-patch participant. A patch with no skipped ids does not borrow ids
+ * from the stored row.
+ */
+export function executionStateWithSameRequestSkips(
+  storedState: unknown,
+  patchState: unknown,
+): unknown {
+  const skipped = skippedStageIdsFromExecutionState(patchState);
+  if (skipped.length === 0) return storedState;
+  if (storedState == null || typeof storedState !== "object" || Array.isArray(storedState)) {
+    return patchState;
+  }
+  return {
+    ...(storedState as Record<string, unknown>),
+    skippedStageIds: Array.from(new Set([...skippedStageIdsFromExecutionState(storedState), ...skipped])),
+  };
+}
+
 /**
  * R20 review-stall bookkeeping carried onto a rebuilt state. The delivered head
  * survives a stage change (the next stage reviews the same delivery); the
