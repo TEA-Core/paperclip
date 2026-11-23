@@ -1753,6 +1753,9 @@ export function toolAccessPolicyService(db: Db) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
     const { ctx, redaction } = loaded;
+    // UUID lookups accept uppercase spelling, but both key hashing and legacy
+    // receipt ownership must use the stored run's canonical spelling.
+    ctx.heartbeatRunId = ctx.heartbeatRunId?.toLowerCase() ?? null;
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
     const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
     // Derived keys are server-generated and name their owner; a caller key in

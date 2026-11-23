@@ -864,6 +864,70 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(new Set(invocations.map((row) => row.runId))).toEqual(new Set([run.id, otherRun!.id]));
   });
 
+  it("replays one stored run UUID regardless of caller spelling when the actor has no run header", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const call = (runId: string) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: null },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId, projectId: "" },
+    });
+
+    const first = await call(run.id);
+    expect(await call(run.id.toUpperCase())).toEqual(first);
+    expect(counter.attempts).toBe(1);
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]!.runId).toBe(run.id);
+  });
+
+  it("replays a caller's explicit key across changed arguments and later runs, but not across principals or companies", async () => {
+    const { company, agent, issue, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const [laterRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: agent.id, invocationSource: "assignment",
+      status: "running", contextSnapshot: { issueId: issue.id },
+    }).returning();
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: company.id, name: "Other caller", role: "engineer",
+      adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+    }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: otherAgent!.id, invocationSource: "assignment",
+      status: "running", contextSnapshot: {},
+    }).returning();
+    const foreign = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, foreign.company.id);
+    const { dispatcher, counter } = countingDispatcher(async (_tool, parameters) => ({
+      pluginId: "plugin-a", toolName: "wiki_append_log", result: { data: parameters },
+    }));
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const call = async (companyId: string, agentId: string, runId: string, content: string) => {
+      const session = await gateway.createSession({ companyId, agentId, runId });
+      return gateway.executeTool({
+        sessionToken: session.token,
+        tool: "a.b:wiki_append_log",
+        parameters: { path: "log/index.md", content },
+        idempotencyKey: "explicit-call",
+      });
+    };
+
+    const first = await call(company.id, agent.id, run.id, "first");
+    for (const [runId, content] of [[run.id, "changed"], [laterRun!.id, "later"]]) {
+      const replay = await call(company.id, agent.id, runId!, content!);
+      expect(replay).toMatchObject({ status: "replayed", invocationId: first.invocationId, result: first.result });
+    }
+    await expect(call(company.id, otherAgent!.id, otherRun!.id, "foreign principal"))
+      .rejects.toMatchObject({ status: 409, details: { reasonCode: "idempotency_key_conflict" } });
+    const separate = await call(foreign.company.id, foreign.agent.id, foreign.run.id, "other company");
+    expect(separate).not.toEqual(first);
+    expect(counter.attempts).toBe(2);
+    expect(await db.select().from(toolInvocations)).toHaveLength(2);
+  });
+
   it.each(["mixed-version", "rollback", "landed-failure"] as const)(
     "keeps a new call visible to an earlier build during %s without dispatching twice",
     async (scenario) => {

@@ -209,6 +209,15 @@ including its approval, dispatch and outcome state, lives at that key; there
 is no separate outcome copy to synchronize. If another call owns the legacy
 key, a distinct call uses its full `side_effect:v2:` key.
 
+Run UUIDs are lowercased when building the invocation's derived replay
+identity and checking its legacy receipt, so uppercase spelling of the same
+stored run does not dispatch another call.
+
+Caller-supplied keys have a different contract: within a company, the same
+principal replays its stored outcome even with changed arguments or from a
+later run. They are not argument- or run-scoped. Another principal gets HTTP
+409 `idempotency_key_conflict`; another company has a separate key namespace.
+
 Recording holds a transaction-scoped advisory lock for the full identity
 across both possible storage keys. Releasing a legacy key cannot let two
 retries of one full identity dispatch through different keys.
