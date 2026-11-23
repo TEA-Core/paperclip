@@ -9952,7 +9952,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(await reclassifiedRows(issueId)).toEqual([]);
   });
 
-  it("audits a record_only reclassification without a close, and leaves the later plain close unchanged", async () => {
+  it("audits a record_only reclassification without a close, and refuses the later plain close while landing debt remains", async () => {
     const { issueId, identifier } = await seedCard("repository_delivery");
 
     const flip = await request(app)
@@ -9971,17 +9971,21 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     const comments = await systemCommentsFor(issueId);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("Delivery requirement reclassified");
-    expect(comments[0]).toContain("from `repository_delivery` to `record_only` by user `cloud-user-1`");
+    expect(comments[0]).toContain("changed from `repository_delivery` to `record_only` by user `cloud-user-1`");
 
-    // The two-request path stays open: the later close takes the record-only skip.
+    // The two-request path is closed: the debt survives the relabel, no probe-able
+    // repository exists here, and the refusal names the exit.
     const close = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Close after the earlier reclassification." });
-    expect(close.status, JSON.stringify(close.body)).toBe(200);
-    expect(await storedCard(issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
+    expect(close.status, JSON.stringify(close.body)).toBe(409);
+    expect(close.body.code).toBe("done_transition_missing_delivery");
+    expect(close.body.details.remedy).toContain("probe-able repository and branch or a merged PR");
+    expect(close.body.details.remedy).toContain("cancel the issue");
+    expect((await storedCard(issueId)).status).not.toBe("done");
     const rows = activityFor(issueId);
-    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
-    expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+
     expect(await reclassifiedRows(issueId)).toHaveLength(1);
   });
 
@@ -10061,7 +10065,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(reclassified).toHaveLength(1);
     expect(reclassified[0]).toMatchObject({ landingCheckOwed: false });
     const comments = await systemCommentsFor(issueId);
-    expect(comments[0]).toContain("The issue was already closed");
+    expect(comments[0]).toContain("creates no new landing debt");
   });
 
   it("writes no reclassification audit when the stored value is already record_only or the requested value is not record_only", async () => {
