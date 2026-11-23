@@ -841,6 +841,8 @@ export interface IssueExecutionState {
    * enumerated-unknown pattern as `approvalStatus`.
    */
   delivery?: unknown;
+  /** Untrusted delivery claim; only a governed attribution can certify it. */
+  childCarrierClaim?: unknown;
 }
 
 export interface IssueExecutionDecision {

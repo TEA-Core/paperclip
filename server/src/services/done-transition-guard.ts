@@ -331,7 +331,7 @@ export interface DoneTierDeclarationResult {
   // Set when the refusal carries its own route error code. A door that maps every
   // refused declaration to done_transition_missing_tier_declaration uses this one
   // instead when it is set.
-  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE | "done_transition_record_only_probe_contradiction";
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -710,7 +710,10 @@ export async function writeDoneTransitionRefusedAuditLog(
   issue: { id: string; companyId: string; identifier: string | null },
   details:
     | {
-        code: "done_transition_missing_tier_declaration";
+        code:
+          | "done_transition_missing_tier_declaration"
+          | typeof DONE_TRANSITION_TIER_CONFLICT_CODE
+          | "done_transition_record_only_probe_contradiction";
         httpStatus: 422;
         reason: string;
         decisionCarried: boolean;
@@ -1959,6 +1962,47 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
   "i",
 );
 
+// Named, token-anchored contradictions in the record-only declaration's trailing
+// predicate/result only. This is a bounded denylist, NOT natural-language verdict
+// inference: command/target text and unrelated comment prose are not evidence.
+// Numeric markers capture one COMPLETE signed decimal token (integer, fraction,
+// or exponent form) and judge its numeric value, so `scanned=0.5` is not zero and
+// `failed=0.0` / `exit -0` are zero. Keep these eight names and forms synchronized
+// with the done-close documentation.
+const DECIMAL = String.raw`([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w]|\.\d)`;
+// Exact decimal zero test on the token text (no Number() coercion, which underflows
+// `1e-400` to 0): zero iff the mantissa has no nonzero digit, whatever the exponent.
+const DECIMAL_ZERO_RE = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?$/i;
+const isZeroDecimal = (token: string) => DECIMAL_ZERO_RE.test(token);
+const isPositiveDecimal = (token: string) => !token.startsWith("-") && !isZeroDecimal(token);
+const numericMarker = (name: string, label: string, test: (token: string) => boolean) => {
+  const re = new RegExp(String.raw`\b${label}${DECIMAL}`, "gi");
+  return {
+    name,
+    matches: (text: string) => {
+      for (const m of text.matchAll(re)) {
+        if (test(m[1])) return true;
+      }
+      return false;
+    },
+  };
+};
+const phraseMarker = (name: string, pattern: RegExp) => ({
+  name,
+  matches: (text: string) => pattern.test(text),
+});
+const RECORD_ONLY_PASS_CONTRADICTIONS = [
+  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("failed_positive", "failed=", isPositiveDecimal),
+  numericMarker("scanned_zero", "scanned=", isZeroDecimal),
+  phraseMarker("non_clean", /\bnon-clean\b/i),
+  // Literal scan-failure contexts only; bare expected-negative "failed closed" stays valid.
+  phraseMarker("failed_closed", /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i),
+  phraseMarker("refused", /\bREFUSED\b/),
+  phraseMarker("partial_failure", /\bpartial[ \t]+failure\b/i),
+] as const;
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -2138,6 +2182,24 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
+  for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
+    if (marker.matches(predicateResult!)) {
+      const remedy =
+        "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
+        `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+      return {
+        ...refuseTier2(
+          `record-only close Tier 2 result: pass contradicts failed probe evidence (${marker.name}); ` +
+          remedy,
+        ),
+        code: "done_transition_record_only_probe_contradiction",
+        remedy,
+      };
+    }
+  }
+  // Every accepting door persists this audit as issue.done_transition_tier2_close
+  // in the terminal write's transaction. tierForm=record-only counts this class;
+  // contradictions above never mint a green row or an accepted-failure event.
   return acceptTier2(evidence.trim(), sameRun, {
     probeCommand: probeCommand!.trim(),
     probeTarget: observedTarget!.trim(),
@@ -3812,18 +3874,27 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
 }): Promise<
-  | { allowed: true; closeComment: string | null; doneTierSkipAudit: null }
+  | {
+      allowed: true;
+      closeComment: string | null;
+      doneTierSkipAudit: null;
+      // SUP-23925: the tier close rows are returned, not written. The backstop
+      // caller persists them on the SAME transaction as its terminal write, so
+      // a refused or raced sweep close can never leave an orphan close row.
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+    }
   | {
       allowed: true;
       closeComment: string | null;
       doneTierSkipAudit: Parameters<typeof logActivity>[1];
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
     }
   | {
       allowed: false;
       code:
         | "done_transition_missing_delivery"
         | "done_transition_missing_tier_declaration"
-        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
+        | NonNullable<DoneTierDeclarationResult["code"]>;
       reason: string;
     }
 > {
@@ -3852,20 +3923,51 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         reason: tierResult.reason,
       };
     }
+    // SUP-23925: the tier close rows are deferred to the caller's close
+    // transaction (they used to be fire-and-forget writes here, before and
+    // outside it, so a caller whose close later refused or lost the race left
+    // an orphan close row on a card that never wrote status→done).
+    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
-      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier1_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+        },
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
-        ...tierResult.tier2Audit,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+          ...tierResult.tier2Audit,
+        },
       });
     }
-    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits };
   }
   return {
     allowed: true,
@@ -3888,6 +3990,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         systemBackstopActor: actorId,
       },
     },
+    closeRowAudits: [],
   };
 }
 

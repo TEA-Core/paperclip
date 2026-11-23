@@ -47,10 +47,10 @@ A card-bound PR that cannot get a stamp through the normal path (a receipt that 
 - The target is the PR in the card's verified delivery identity (`executionState.delivery`: project repo, control-plane delivery branch, PR number and URL). A PR that is only cited on the card is never a target; a card with no verified binding answers 409 before any GitHub access. The PR must be open, not a draft, still on the bound branch, and `headSha` must be its live head. A different or stale head, or a moved branch, answers 409 with no write. Agent actors and board members who are not owner/admin are refused before any GitHub access.
 - The default route releases a card only when the card has a completed approving ladder where `headSha` equals either `approvalStatus.publishedHeadSha` or `approvalStatus.approvedHeadSha` (both are heads the card's own review decided), or a certified delivery (`approvalStatus.finalDelivery`) for this PR at `headSha`, provided the decision the certificate names (`decisionId`) was itself an eligible approval under the decider rules below (the certificate is not exempt from them: a certificate minted by an author, an unattributed decision, or a decider who has since left does not release). "Completed approving ladder" is the one the head-approval route (`approve-head`) requires: the card is `done`, the last decision is `approved`, the execution policy has at least one stage and every stage is completed, and the stage decisions pass `evaluateStageIntegrity` (a completed stage with no decision, a skipped stage and a stage decided by the return assignee all fail it). On top of that, for every stage in the policy the LATEST decision must be an approval, must be attributed to someone, and must not be by any of the people who authored the work (the return assignee, the delivery author and the creator agent, taken together, not only the one the integrity check resolves). A rejecting, unattributed or shadowed history fails, and so does a policy stage that is not an object. A cancelled card, a card with neither a completed ladder nor a valid certificate for this PR at this head (never approved, an empty or missing policy, an incomplete ladder, or a ladder whose decisions fail the integrity check; a valid certificate whose decision is an eligible approval releases on its own, without a completed ladder), a certification for another head and a ladder approved on another head all answer 409 before any GitHub access. The audit rows carry `basis` (`certified_delivery` or `approved_ladder`).
 - A card with a pending `post_merge` stage is not done, so its ladder cannot be a completed one: the default route's ladder basis requires a done card and every stage completed, as the board ruled, and does not narrow that to pre-merge stages. Such a card is released on its certified delivery (the review's `finalDelivery`, no done status needed) when it has one, or through the override route. The stamp itself (`paperclip/approved` from the normal path) is not held back by `post_merge` stages; that is `ladderIsTerminallyApproved`'s job and is unchanged.
-- Eligibility and target are resolved again inside the publication lock, right before the status write and again before each retry. A card that was cancelled, whose approving decision was reversed, or whose delivery binding was retargeted after the first read is refused (`eligibility-changed`) with no write, so the old target is never released. The re-check runs on the lock's own database connection, so a release never needs a second pool connection while it holds the lock; releases of one head cannot deadlock the pool, whatever its size. The already-approved answer re-reads the live PR after its status lookup and is not given when the head moved.
+- Eligibility and target are resolved again inside the publication lock, right before the status write and again before each retry. A cancellation, reversed approving decision or retargeted delivery detected before any write is refused (`eligibility-changed`) with no write. If an earlier attempt may have written a success, a later authority refusal instead voids that possible success and reports `stale`, with the compensation result. The old target is not confirmed as released. The re-check runs on the lock's own database connection, so a release never needs a second pool connection while it holds the lock; releases of one head cannot deadlock the pool, whatever its size. The already-approved answer re-reads the live PR after its status lookup and is not given when the head moved.
 - `POST /api/issues/:issueId/merge-arming/release-override` with `{ "headSha": "<40-character live SHA>", "overrideReason": "<written reason, at least 10 characters>" }` is the only way to release those cards. The default route does not accept `overrideReason` (400), so the default call cannot reach it. It has the same board-owner/admin check, delivery binding, certified-PR pin, live-PR checks, control-plane App credential, head binding and serialization, and publishes the same `paperclip/approved` status (its description reads `released by <actor> for <sha>: override: <reason>`). It writes its own audit rows: `issue.merge_release_override_requested` before the GitHub write, then `issue.merge_release_override` or `issue.merge_release_override_outcome`, with `basis: override`. It widens what an owner/admin key can release; the audit rows are accountability after the fact, not a prevention.
 - Idempotent: a head whose newest `paperclip/approved` is a success created by the control plane answers 200 `already_approved` with no second status write, unless that success is a release this card never confirmed (see "Only a confirmed release is consumed" below), in which case a new, confirmed one is written; and only after the live PR has been read and found open, non-draft, on the bound branch and at `headSha`. Releases of one head are serialized (a Postgres advisory lock per company, repo and head), so two simultaneous requests write one status: the second answers `already_approved`. A success from any other creator, or a newer non-success, does not count: the release is published and logged as normal. The intent is recorded as `issue.merge_release_requested` before anything is written to GitHub (if that insert fails, nothing is published). The outcome follows: `issue.merge_release` for a fresh write, `issue.merge_release_outcome` (with `outcome` and `message`) for a refusal, a failure or an already-approved answer. If only the outcome insert fails (held, cancelled or timed out), the status is still out and confirmed, so the answer stays 200 `released` (or the outcome it was) with `auditRecorded: false`, never 409: a 409 would tell the caller nothing was released when the head is in fact released. The error is logged and the intent row names who released which head. The response always carries `auditRecorded` (the 32 held outcome-audit cells of the abandoned-operation matrix all answer 200 `released`, `auditRecorded: false`, and write no late audit row).
-- The status is keyed by SHA, so a push after the release gets no stamp; release the new head. The live PR is re-read immediately before the write (after the status read) and again before each retry of a transient write failure, and a head that has moved is refused with no write. GitHub has no compare-and-swap on a commit status, so a push landing between that last read and the POST can still leave one status on the old SHA; it never covers the new head. The head is read once more after the write, and a head that moved is answered 409 with outcome `stale` (audited as an outcome row, not as a release), never as 200 `released`; the success status that was written to the old head is then set to `failure` (if that second write fails, the message says so). The final check is full liveness, not only the SHA: a PR that was closed, drafted or moved off its branch right after the write is `stale` too. The one exception is a PR that was merged at exactly the released head on the bound branch: auto-merge was waiting on this status, so the release took effect, and it is confirmed and answered `released` with no failure status. A PR merged at a different head or on a different branch is `stale` like the rest. A PR that is already merged, closed or drafted before the write is still refused. Only the old head is written to: the new head never received this release, and a failure written there could revoke a genuine approval on it, so it is left alone. If that re-read itself fails, the answer is 409 with outcome `failed` (`status:failed:post_write_pr_read:`), saying the status WAS written but the head could not be confirmed; it is audited as an outcome row, never as a release. A throwing prerequisite (secret lookup, token resolver) is recorded as a `failed` outcome row tied to the intent row (`intentId`). The status carries no `target_url`.
+- The status is keyed by SHA, so a push after the release gets no stamp; release the new head. The live PR is re-read immediately before the write (after the status read) and again before each retry of a transient write failure, and a head that has moved is refused with no new success write. If an earlier attempt may have applied, a failure status voids that possible success on the old head. GitHub has no compare-and-swap on a commit status, so a push landing between that last read and the POST can still leave one status on the old SHA; it never covers the new head. The head is read once more after the write, and a head that moved is answered 409 with outcome `stale` (audited as an outcome row, not as a release), never as 200 `released`; the success status that was written to the old head is then set to `failure` (if that second write fails, the message says so). The final check is full liveness, not only the SHA: a PR that was closed, drafted or moved off its branch right after the write is `stale` too. The one exception is a PR that was merged at exactly the released head on the bound branch: auto-merge was waiting on this status, so the release took effect, and it is confirmed and answered `released` with no failure status. A PR merged at a different head or on a different branch is `stale` like the rest. A PR that is already merged, closed or drafted before the write is still refused. Only the old head is written to: the new head never received this release, and a failure written there could revoke a genuine approval on it, so it is left alone. If that re-read itself fails, the answer is 409 with outcome `failed` (`status:failed:post_write_pr_read:`), saying the status WAS written but the head could not be confirmed; it is audited as an outcome row, never as a release. A throwing prerequisite (secret lookup, token resolver) is recorded as a `failed` outcome row tied to the intent row (`intentId`). The status carries no `target_url`.
 - The release keeps the card's certified boundary: if the card has a certified final delivery (`approvalStatus.finalDelivery`), the bound PR must be that PR, otherwise the route answers 409 and reads nothing from GitHub.
 - A board release does not authorise a re-arm. The approval-status reconciler and the done-close landing backstop (the other consumer that enables auto-merge from a `paperclip/approved` success) both ignore a release-described success unless the card has a certified final delivery for that same repository, PR and head AND the release was confirmed (next bullet), so a release cannot turn into an auto-merge for an uncertified card. The backstop also reads the approval strictly: only the newest `paperclip/approved` status counts (a later failure revokes an earlier success, including the compensating failure above), and it must have been written by the control plane, so a forged ordinary success does not stand in for a certificate.
 - Only a confirmed release is consumed, and only a confirmed release is accepted by CI. The publisher records `approvalStatus.releaseConfirmation` (`owner`, `repo`, `number`, `headSha` and `statusId`, GitHub's id of the status it wrote) as the very last database write of a release, on the lock's own connection, after the live head was re-read, the card's eligibility was re-checked once more after the write, and both still held. The reconciler and the backstop accept a release-described success only when its id equals that `statusId` and the record's repository, PR and head equal the card's certified delivery and the live head. A release whose confirmation is unknown therefore has no record and is never consumed: a status write that timed out or lost its answer, a head that could not be re-read, a card whose eligibility changed while the write was in flight, a status whose id GitHub did not return, a failed void, a process that died mid-release, and a second release status written by a duplicate whose answer was lost (a different id). The CI check cannot read the database, so the control plane tells it on GitHub: after the confirmation is committed it writes a second status, `paperclip/release-confirmed`, with the description `confirms status <id>`, as the same `tea-core[bot]` creator. The script reads every status field with a placeholder for an empty value (so an empty or null creator cannot shift a later column, such as a numeric description, into the creator-id slot, and a missing creator is never trusted), and `scripts/ci/check-paperclip-approved.sh` accepts a release-described success (description starting `released by `) only when such a marker, from the control-plane creator, names that very status id; without it the success is reported `UNCONFIRMED RELEASE` and treated as not approved, so a success that was voided, never confirmed or whose confirmation never committed is not an approval for CI either. This holds with `PAPERCLIP_CARD_WAIVER_RETIRED` OFF (the shipped default) as well, because a release success can land after the control plane answered that the release failed and no producer can stop an HTTP request that lands late, so the marker is the only thing that says the control plane saw its release in time and the unknown state fails closed. The description `released by ` is written only by the release route, so every other status is judged exactly as the fold's script judges it (the OFF comparison against the fold's script shows no other difference); the switch gates only the waiver refusal, the board-release log line and the denial hint. The marker is written only after the commit (never before), so a failed or abandoned release never has one; if the marker write fails the release answers `released` with a message saying CI does not accept it yet, and the next release call (which answers `already_approved`) or the reconciler's sweep re-writes it, idempotently; the reconciler looks for the marker on the statuses list and applies the same creator check CI does, so a status of that name from anyone else neither counts as the marker nor suppresses the repair. `paperclip/release-confirmed` is read by the script and is not a required check.
@@ -62,6 +62,122 @@ A card-bound PR that cannot get a stamp through the normal path (a receipt that 
 - A "release-assurance seat" has no server identity today, so the route is board-only. A seat that needs it acts through the board token.
 
 The head decision is durable before the external status write. If GitHub accepts the status but storing publication state subsequently fails, the API reports the failure and the decision audit remains; a database rollback must not erase the authorization for an already-written status. The `issue.approval_head_decision` row records the authorizer, not that publication applied: a refused publication (for example `delivery-receipt-missing` or a moved head) is visible only in the 409 response, and no publish-outcome audit record exists yet.
+
+## Child-owned carrier delivery
+
+A self-sourced child can record delivery on one strict ancestor's carrier PR.
+The control plane verifies the exact GitHub.com repository, branch, PR, head and
+complete child commit set. HTTPS and SSH repository URLs must name that exact
+host. The attribution record is not a delivery receipt or publication authority.
+
+The child's decision attaches only to the proof it read: a concurrent change to
+the PR, branch, head, ancestor or commit set leaves the replacement proof pending.
+Refresh, invalidation and reactivation compare-and-set the complete stored proof
+before changing it or preserving its decision. The control-plane final-delivery certificate binds
+that decision to the same repository, PR, head, attribution row, ancestor, carrier
+branch and exact child commit set. Moving a claim or refreshing the proof cannot
+move an older approval to a different set. A delivery-only binding must also
+match the live carrier branch. The untrusted claim survives stage transitions;
+it is not authority. Callers cannot supply the certificate through issue or
+plugin patches. Child approval never publishes `paperclip/approved` or arms the
+carrier, and the carrier must remain open and unmerged through final preflight.
+
+The owner's attribution decision must match the child's current approved
+`lastDecisionId` and protected final-delivery certificate. A cleared or superseded
+current proof refuses. An intermediate approval cannot revive a revoked final
+approval from the child's history.
+
+Decision attachment runs after the child approval commits. A new eligible
+terminal certificate can replace an older attached decision only for the same
+complete proof and through the existing full-row snapshot comparison-and-set.
+If attachment fails, `childDecisionId` stays unset or references the older
+decision, and blocks the carrier owner. This is a known fail-closed availability
+residual. The publication reconciler does not retry this attachment. Existing
+operator/reconciliation recovery paths are unchanged; this change adds no
+automatic attachment-recovery consumer.
+
+The carrier owner's separate gate requires every contributing child to have a
+current, complete approved proof. A completely enumerated, disjoint child branch
+does not contribute. Partial or unreadable enumeration always refuses, including
+HTTP 404 for a deleted branch, regardless of whether the descendant is `done`
+or its recorded own PR was merged. A past merge does not prove that later child
+work is absent from the carrier. A finished child with a deleted branch therefore
+blocks the carrier owner until an operator re-creates the actual branch ref so
+its complete contribution can be enumerated, or cancels the child if its work is
+no longer required. Cancellation is not approval of a required contribution.
+Automatic deleted-branch admission would require authoritative provenance and a
+separately authorized work item; it is not implemented here. The live carrier
+branch must match even when a caller does not provide a branch.
+Recorded obligation identities are consulted before workspace classification.
+Unlinking or changing a workspace cannot hide a recorded contribution. Complete
+current approval proof is read again after remote enumeration and scoped to the
+target repository. All carrier and child comparisons in one owner gate use a
+single pinned base SHA and immutable head SHAs, including small comparisons.
+Each comparison supports
+up to 20 pages of 100 commits (2,000 commits). A larger complete comparison is
+unsupported and refuses, just as truncated or inconsistent data refuses.
+Every supported comparison must prove its complete count, unique commits and
+pinned tip; the PR-commits API's capped list is not used as complete proof.
+
+A non-cancelled child with any recorded carrier attribution cannot be physically
+deleted through the issue service; deletion returns HTTP 409. The same guard
+protects a carrier ancestor whose deletion would cascade a non-cancelled child's
+attribution, even when the ancestor itself is cancelled. Both current and
+invalidated proof are retained: invalidation does not retire the contribution.
+The deletion transaction locks the issue before checking attribution, so a
+concurrent proof insertion cannot pass the check and then be erased by a cascade.
+An operator may cancel a child only when its work is no longer required; ordinary
+reference restrictions still apply to subsequent deletion. No attribution
+history is removed to bypass required child approval.
+
+Clearing a child's parent does not retire its governed obligation. The existing
+owner predicate retains recorded non-cancelled children even when they are no
+longer current descendants. Unverifiable ancestry refuses publication and arming;
+the stored `current` state is not fresh ancestry proof. Restoring the ancestry
+allows normal verification again. Automatic reparenting recovery is not added.
+
+The historical key remains company, child, pull-request number and head SHA.
+An existing row's provider, repository and ancestor scope cannot be overwritten.
+A colliding scope change refuses and preserves the historical row and decision.
+This is an availability limit: an otherwise matching repository or ancestor move
+cannot create a second history row at the same key. Wider storage design is
+deferred to a follow-up; no index or migration is changed.
+
+Proof writes compare the observed row or observed absence against the current
+row under a short issue-row write lock. A stale enumerator cannot replace a
+newer proof; an identical concurrent proof remains idempotent. A stale claim
+does not invalidate a proof for the verified live head. Decision attachment
+re-reads the current child decision and complete certificate under the write
+lock, so an older callback cannot replace a newer attachment. These local
+conditional writes do not make GitHub and the database atomic.
+
+Status publication checks attribution before each write attempt and after a
+confirmed or possibly accepted write. A changed child decision voids the possible
+success with a failure status; an unconfirmed void is reported as a failure,
+never as publication.
+Head-bound release applies the same post-write gate before recording its confirmation.
+A transient status-write failure can hide an accepted success. Head-bound release
+retains that uncertainty across retries and voids it before a later authority
+refusal or terminal write failure. A deterministic rejection with no possible
+earlier write needs no compensating status.
+The approval actuator and landing backstop check attribution before each enable
+attempt and after an accepted enable. Direct-merge retries recheck authority too.
+An owner-controlled child-carrier refusal stays deferred in the landing backstop.
+It does not enter generic failed-reenqueue escalation, reopen the child as
+blocked, or ask the board to merge its carrier manually.
+The enable attempt's deadline covers the authority callback and provider request
+together. If validation finishes after that deadline, it cannot send a late
+enable mutation. The default worst-case bound includes callbacks and retry
+back-off and stays below the existing in-flight arm-record grace period.
+A new block takes an arm back through the existing disarm/fence recovery path.
+A lost response or transient enable failure retains the take-back record even
+when a later retry refuses on changed authority. The outcome stays unconfirmed;
+it does not claim that nothing was armed.
+GitHub has no atomic comparison with the instance database: a merge inside the
+in-flight window cannot be undone, and a failed take-back retains the pending
+disarm record rather than claiming success. These are bounded fresh checks and
+compensation, not a shared database/provider lock or atomic transaction.
+
 
 ## Override label and the reconciler
 

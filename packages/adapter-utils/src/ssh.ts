@@ -10,6 +10,7 @@ import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   PROJECT_REPOSITORIES_DIR,
+  PROJECT_REPOSITORIES_EXCLUDE_LINE,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -1146,7 +1147,7 @@ async function transportGitWorkspaceToSsh(input: {
 }
 
 async function excludeProjectRepositoriesOnSsh(spec: SshConnectionConfig, remoteDir: string): Promise<void> {
-  const pattern = `/${PROJECT_REPOSITORIES_DIR}/`;
+  const pattern = PROJECT_REPOSITORIES_EXCLUDE_LINE;
   const excludeFile = path.posix.join(remoteDir, ".git", "info", "exclude");
   await runSshScript(
     spec,

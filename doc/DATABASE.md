@@ -117,6 +117,11 @@ If your hosted database requires transaction-pooling-only connections (pgbouncer
 
 The head-release deadline (`POST /issues/:id/merge-arming/release`, `/release-override`) runs each request on its own dedicated connection. On a direct or session-mode connection the deadline ends that session on the server, which cancels the statement or lock wait, rolls back the transaction and frees its locks. With `DATABASE_PREPARED_STATEMENTS=false` (a transaction-mode pooler: startup parameters are rejected and no client maps to one backend) the connection is tracked instead: at the deadline every statement the request started is cancelled with the driver's cancel request and the connection is destroyed, which needs the pooler to forward cancel requests, and the server-side `statement_timeout`/`lock_timeout` are not applied. Board-key authentication of these requests uses its own cancellable connection; the browser-session lookup runs on the session library's pool and is abandoned, not cancelled. See `docs/approval-reconciliation.md`.
 
+All release checks inside the publication transaction, including the child-carrier
+stamp gate, must use that transaction's connection. The request client has one
+connection. A check on its parent client would wait for the connection that the
+publication transaction already holds.
+
 ### Client tuning (optional)
 
 All of these are optional; when unset, the driver defaults apply and behavior is unchanged — typical self-hosted setups need none of them:
@@ -567,6 +572,20 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+## Execution ownership reads
+
+The card read (`GET /issues/:id`) and recovery checks decide whether a previous
+legacy run still owns an issue. The query matches a run to an issue by its native
+binding (`native_issue_id`), which takes precedence, or, only when that binding is
+absent, by `context_snapshot->>'issueId'`. It is written as two arms,
+`native_issue_id = $uuid` or `native_issue_id is null and context_snapshot->>'issueId' = $text`,
+so the existing company native issue contract index and the `context_snapshot`
+issue expression index can both serve it. A `coalesce(native_issue_id::text, ...)`
+expression has no index and reads every terminal run of the company. A saved or
+requested text id becomes a uuid only in canonical lowercase spelling, so a
+malformed id matches nothing and never raises a cast error. The ownership read
+selects only the process identity it probes. No migration or index is involved.
 
 ## Agent file persistence and legacy revisions
 
