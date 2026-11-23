@@ -10,7 +10,7 @@ import {
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 
 export const CHILD_CARRIER_ATTRIBUTION_ACTOR_ID = "system:child-carrier-attribution";
 
@@ -483,7 +483,7 @@ async function writeCurrent(
         writtenByActorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
         provenance: { source: "control-plane-verification", headSha: input.headSha },
       }).returning({ id: issueChildCarrierAttributions.id });
-      await logActivity(tx, {
+      await logActivityInTransaction(tx, {
         companyId: input.companyId,
         actorType: "system",
         actorId: CHILD_CARRIER_ATTRIBUTION_ACTOR_ID,
