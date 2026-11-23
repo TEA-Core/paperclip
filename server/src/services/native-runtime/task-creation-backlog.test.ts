@@ -5,6 +5,8 @@ import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from 
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
+import * as liveEvents from "../live-events.js";
+import { setPluginEventBus } from "../activity-log.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("runner backlog task creation", () => {
@@ -64,5 +66,26 @@ describe("runner backlog task creation", () => {
     await expect(f.authority.execute({ tool: "create_task", callId: "invalid", arguments: { idempotencyKey: "invalid", title: "Invalid", status } })).rejects.toThrow();
     expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(1);
     expect(f.enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the child description out of published issue.created payloads", async () => {
+    const f = await fixture(false);
+    const sentinel = `SENTINEL-${randomUUID()}`;
+    const live = vi.spyOn(liveEvents, "publishLiveEvent");
+    const emit = vi.fn();
+    setPluginEventBus({ emit } as never);
+    try {
+      const receipt = await f.authority.execute({ tool: "create_task", callId: "desc", arguments: { idempotencyKey: "desc", title: "Described", description: sentinel } }) as { task: { id: string } };
+      const [task] = await db.select().from(issues).where(eq(issues.id, receipt.task.id));
+      expect(task!.description).toBe(sentinel);
+      expect(live).toHaveBeenCalled();
+      expect(JSON.stringify(live.mock.calls)).not.toContain(sentinel);
+      expect(JSON.stringify(emit.mock.calls)).not.toContain(sentinel);
+      const [event] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, task!.id), eq(activityLog.action, "issue.created")));
+      expect(JSON.stringify(event!.details)).not.toContain(sentinel);
+    } finally {
+      live.mockRestore();
+      setPluginEventBus(null as never);
+    }
   });
 });

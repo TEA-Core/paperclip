@@ -1085,9 +1085,7 @@ export class PaperclipRunnerToolAuthority {
           agentId: this.binding.agentId, runId: this.binding.runId, issueId: child.id,
           action: "issue.created", entityType: "issue", entityId: child.id,
           details: { identifier: child.identifier, title: child.title, parentId: child.parentId,
-            assigneeAgentId: child.assigneeAgentId, status: childStatus, source: "paperclip_runner_protocol",
-            projectId: child.projectId ?? null, projectWorkspaceId: child.projectWorkspaceId ?? null,
-            description: child.description ?? null },
+            assigneeAgentId: child.assigneeAgentId, status: childStatus, source: "paperclip_runner_protocol" },
         });
         publication = activity.publication;
       }

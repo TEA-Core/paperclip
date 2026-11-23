@@ -296,9 +296,12 @@ export async function scanCardEvidence(
     const selected = await db.execute(sql`
       select tbl, row_key,
         case when row_bytes > ${VALUE_BYTES}
-          or sum(row_bytes) over (order by tbl, row_key rows unbounded preceding) > ${remaining}
+          or sum(case when fresh then row_bytes else 0 end) over (order by tbl, row_key rows unbounded preceding) > ${remaining}
           then null else row end as row
-      from (${sql.join(queries, sql` union all `)}) u
+      from (
+        select u.*, not ((u.tbl || ':' || u.row_key) in (select jsonb_array_elements_text(${JSON.stringify([...state.seen])}::jsonb))) as fresh
+        from (${sql.join(queries, sql` union all `)}) u
+      ) w
     `) as unknown as Array<{ tbl: string; row_key: string; row: Row | null }>;
     const counts = new Map<string, number>();
     const uuids = new Set<string>();
