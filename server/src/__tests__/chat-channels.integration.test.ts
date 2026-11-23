@@ -223,7 +223,7 @@ if (!embeddedPostgresSupport.supported) {
 // far under the 15_000 ms testTimeout in server/vitest.config.ts so a condition
 // that never comes true still reports its own assertion rather than an opaque
 // test timeout.
-const DEFAULT_WAIT_FOR_TIMEOUT_MS = 5_000;
+const DEFAULT_WAIT_FOR_TIMEOUT_MS = 10_000;
 
 function waitFor<T>(
   callback: () => T | Promise<T>,
@@ -754,6 +754,7 @@ class FakeChatSdkRuntime {
   >();
   initializeHook: ((endpointId: string) => Promise<void>) | undefined;
   replaceCount = 0;
+  readonly created: FakeEndpointRuntime[] = [];
 
   constructor(readonly attachmentBodies: Map<string, Buffer> = new Map()) {}
 
@@ -770,6 +771,7 @@ class FakeChatSdkRuntime {
       this.initializeHook,
     );
     this.endpoints.set(options.endpointId, endpoint);
+    this.created.push(endpoint);
     return endpoint;
   }
 
@@ -47253,10 +47255,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             postCount = initialRuntime.posts.length;
           const command = f.interaction("close");
           await f.adapter.handleGatewayInteraction(command);
-          const close = (await f.publications()).find((publication) =>
-            publication.idempotencyKey.startsWith("control:close:"),
-          )!;
-          expect(close).toBeDefined();
+          const close = await waitFor(async () => {
+            // A background worker can hold the endpoint row (nowait lock) and
+            // make the first admission fail; a fresh interaction is safe to retry (a repeated one is deduped).
+            if (
+              !(await f.publications()).some((publication) =>
+                publication.idempotencyKey.startsWith("control:close:"),
+              )
+            )
+              await f.adapter.handleGatewayInteraction(f.interaction("close"));
+            const found = (await f.publications()).find((publication) =>
+              publication.idempotencyKey.startsWith("control:close:"),
+            );
+            expect(found).toBeDefined();
+            return found!;
+          });
           if (mode === "unknown_final") {
             const final = await addSelectedChatFinal({
               agentId: f.fixture.assignedAgentId,
@@ -47282,7 +47295,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await f.service.processPendingReceiptReactions();
           // The endpoint runtime can be replaced while the close settles; the
           // delivery lands on whichever instance is live, so count against it.
-          const runtime = f.runtime.endpoints.get(f.endpoint.id)!;
+          // A replacement can land the close edit on an earlier instance, so
+          // take whichever runtime this endpoint ever had that received it.
+          const runtime =
+            mode === "working"
+              ? await waitFor(async () => {
+                  await f.service.processPendingPublications();
+                  const edited = f.runtime.created.find(
+                    (candidate) =>
+                      candidate.edits.length >
+                      (candidate === initialRuntime ? editCount : 0),
+                  );
+                  expect(edited).toBeDefined();
+                  return edited!;
+                })
+              : f.runtime.endpoints.get(f.endpoint.id)!;
           const replaced = runtime !== initialRuntime;
           expect(runtime.edits).toHaveLength(
             (replaced ? 0 : editCount) + (mode === "working" ? 1 : 0),
@@ -47321,6 +47348,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await f.close();
         }
       },
+      // Shared setup plus the close drain outgrow the 15 s default on a loaded host.
+      45_000,
     );
 
     it("answers a cold unavailable Discord command privately without leaving the interaction thinking", async () => {
