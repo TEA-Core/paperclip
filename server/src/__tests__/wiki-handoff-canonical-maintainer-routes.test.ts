@@ -417,10 +417,19 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body.status).toBe(status);
       expect(res.body.assigneeAgentId).toBe(maintainer.id);
+      const expectsWake = status !== "backlog" && status !== "done" && status !== "cancelled";
+      if (expectsWake) {
+        // The route may await dependency readiness before registering its
+        // fire-and-forget wake, which the heartbeat drain cannot observe yet.
+        await expect.poll(
+          () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, maintainer.id)),
+          { timeout: 10_000 },
+        ).not.toEqual([]);
+      }
       await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, maintainer.id));
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, maintainer.id));
-      if (status === "backlog" || status === "done" || status === "cancelled") {
+      if (!expectsWake) {
         expect(wakes).toEqual([]);
         expect(runs).toEqual([]);
       } else {
@@ -631,29 +640,65 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
     }
   }, 30_000);
 
-  it("adopts the canonical Wiki Maintainer on the emitter field-repair PATCH", async () => {
-    const { company, maintainer } = await seedWikiCompany("maintainer");
-    const [project] = await db.insert(projects).values({
-      companyId: company.id,
-      name: "Weekly reports",
-    }).returning();
-    const stub = await seedUnassignedHandoff(company.id);
-
-    const res = await request(createApp(db, { ...boardActor(company.id), isInstanceAdmin: false }))
-      .patch(`/api/issues/${stub.id}`)
-      .send({
-        description: "Weekly report handoff pointer",
+  it.each(["operator", "reporter", "board-created", "other-agent-created"] as const)(
+    "handles the exact backlog four-field repair for %s",
+    async (source) => {
+      const { company, maintainer, intruder, emitter } = await seedWikiCompany("maintainer");
+      const [project] = await db.insert(projects).values({
+        companyId: company.id,
+        name: "Weekly reports",
+      }).returning();
+      const stub = await seedUnassignedHandoff(company.id);
+      const runId = source === "reporter" ? randomUUID() : undefined;
+      const refused = source === "board-created" || source === "other-agent-created";
+      await db.update(issues).set({
+        title: "[PPC ER] Weekly Report - 2026-11-21 - handoff to Wiki Maintainer",
         projectId: project!.id,
-        executionPolicy: userReviewPolicy(),
         deliveryRequirement: "record_only",
-      });
+        createdByAgentId: source === "board-created" ? null : source === "other-agent-created" ? intruder.id : emitter.id,
+        createdByUserId: source === "board-created" ? REVIEWER_USER_ID : null,
+        ...(runId ? { originRunId: runId } : {}),
+      }).where(eq(issues.id, stub.id));
+      if (runId) {
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: company.id,
+          agentId: emitter.id,
+          status: "running",
+          startedAt: new Date(),
+          contextSnapshot: { issueId: stub.id },
+        });
+      }
+      const actor: Express.Request["actor"] = runId
+        ? { type: "agent", agentId: emitter.id, companyId: company.id, source: "agent_key", runId }
+        : { ...boardActor(company.id), isInstanceAdmin: false };
+      const patch = request(createApp(db, actor)).patch(`/api/issues/${stub.id}`);
+      if (runId) patch.set("X-Paperclip-Run-Id", runId);
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    const stored = await readAssignee(stub.id);
-    expect(stored?.assigneeAgentId).toBe(maintainer.id);
-    expect(stored?.assigneeUserId).toBeNull();
-    expect(stored?.status).toBe("backlog");
-  });
+      try {
+        const res = await patch.send({
+          description: "Weekly report handoff pointer",
+          projectId: project!.id,
+          executionPolicy: userReviewPolicy(),
+          deliveryRequirement: "record_only",
+        });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(refused ? 422 : 200);
+        expect(await readAssignee(stub.id)).toMatchObject({
+          assigneeAgentId: refused ? null : maintainer.id,
+          assigneeUserId: null,
+          status: "backlog",
+        });
+        const [stored] = await db.select({ description: issues.description }).from(issues).where(eq(issues.id, stub.id));
+        expect(stored?.description).toBe(refused ? stub.description : "Weekly report handoff pointer");
+        if (refused) expect(res.body.details).toMatchObject({ reason: "wiki_handoff_unassigned" });
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id))).toEqual([]);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, maintainer.id))).toEqual([]);
+      } finally {
+        if (runId) await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+      }
+    },
+  );
 
   it("does not adopt the maintainer on a status-carrying field write", async () => {
     const { company } = await seedWikiCompany("maintainer");
