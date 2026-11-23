@@ -736,8 +736,8 @@ cancellation, attempt/evidence refresh, supersession, replacement action, monito
 or wake is authorized. Repeated identical acceptance returns the same hold.
 While the acceptance is active, the exact-action binding gates automatic action
 upserts and source recovery re-arm, including exhaustion drain; board release
-lifts that gate but is not new source repair authority. Independent authorized board resolution remains
-separate. This is not a general source-task pause.
+lifts that gate but is not new source repair authority. Independent authorized
+board resolution remains separate. This is not a general source-task pause.
 The active company/action binding is unique; unbound or released holds do not
 occupy that slot.
 New bindings store the database's canonical source, action, decision, assignee
