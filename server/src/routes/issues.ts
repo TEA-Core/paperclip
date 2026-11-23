@@ -5794,6 +5794,7 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
+      { allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable" },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5820,6 +5821,9 @@ export function issueRoutes(
       const tier2CommentForm = issue.deliveryRequirement === "record_only"
         ? TIER2_RECORD_ONLY_FORM
         : TIER2_FORM;
+      const tier0Alternative = override?.disposition === "decision-only-no-repository-deliverable"
+        ? ` or "Closed at Tier 0 (decision-only): <reason>"`
+        : "";
       const remedy = tierResult.remedy ?? (input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${structuredForms}` +
@@ -5828,6 +5832,7 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${structuredForms}` +
@@ -5836,6 +5841,7 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`);
       // SUP-24298: one refusal row per refused write, written before the deduped
       // thread comment (a coalesced remedy comment must not erase the write's own
