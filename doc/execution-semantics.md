@@ -188,7 +188,7 @@ The active-lock lifecycle is part of the checkout contract:
 - checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
 - the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
 - the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
-- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership. A current typed review or approval participant can take over an adopted issue-less author's stamp; it cannot displace a normal issue-scoped worker.
 - external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
@@ -204,6 +204,68 @@ from the claiming run. A board or user claim, a claim for a different agent, an
 assignment that does not set `in_progress`, and a claim from a run scoped to a
 different issue still wake the assignee.
 
+A `running` run whose context names no issue also owns a card it created
+(`originRunId`) or reassigned to its own agent (its `issue.updated` activity
+records an `assigneeAgentId` change to that agent; a write that only names the
+current assignee is not proof), as long as that agent is still the assignee and
+the run has not been silent for 90 minutes. Every
+execution gate treats that run as the card's live holder: a wake for the same
+agent on the card (assignment, monitor, comment, stage, recovery) is held behind
+it instead of starting a second run, the run is stamped as the card's execution
+holder, a queued run for the card is not claimed, and checkout by another run is
+refused. A held wake is never merged into that run, because merging would scope
+the run to the card. Held wakes on open cards are promoted when the run finishes,
+including wakes on cards whose lock a status write cleared while the run was
+live, and when the silent-run hard-stop, stale-lock sweep, checkout self-heal,
+issue release, or admin force-release clears the lock. A promotion-only visit
+does not reopen a `done` or `cancelled` card. The stale-lock sweep also visits
+already-unlocked open cards with held wakes and promotes eligible work once no
+live holder remains. The stale-lock sweep
+also lapses a stamped hold whose issue-less author has produced no output for
+90 minutes while a wake is held behind it or a successor run for the card is
+already queued; a run with recent output never lapses there, and the lapse
+never touches a run whose context names a card.
+Only an authenticated run claim is recorded on an `issue.updated` activity
+row or as a card's `originRunId`: an agent JWT is minted for one run, while a
+board request or an agent API key can only claim a run through an
+unauthenticated header, which is never copied into either proof. A plugin
+call never stores a supplied run as `originRunId`. A plugin interaction
+drops a supplied `sourceRunId`, so accepting it does not copy that run onto
+the child. The host holds no authenticated run for that call, so a claimed
+agent and run pair is not proof. Task acceptance never copies a stored
+interaction's run/agent pair into the child's `originRunId`, including pending
+pre-upgrade rows. The interaction retains its source attribution.
+The issue update service rejects any caller-supplied `originRunId` at runtime
+with `400 issue_origin_run_id_immutable`, including through its company-scoped
+wrapper. The typed API also forbids the field. Creation provenance is set only
+at creation; reassignment compares against the row-locked assignee and clears
+it internally. Public create, child-create,
+and PATCH bodies reject the field as an unknown key.
+The adopted-holder predicate also checks legacy `paperclipIssue.id`: an absent
+or matching nested ID remains eligible; a nested ID naming another card does not.
+Transactional board-stage decisions collect and flush lock-clear actions after
+commit, independently of the separate stage notification.
+An agent API key cannot release an adopted
+author hold by naming its run in a header; that release requires the
+authenticated author run or board authority. Other activity actions keep their
+attribution. A reassignment drops `originRunId`. A later
+self-assign proves itself only through the latest assignee-change row, not
+an older row that names the same assignee. An adopted stamp
+never makes the issue-less author the card's interruptible run, including
+when its recorded context is null or names no issue; a checked-out run that
+did not author the card remains interruptible. A reassignment also drops an
+adopted author's stamped hold, so the new assignee's wakes are not held
+behind the previous author. A wake for the current review or approval
+participant of a different agent does not wait behind an adopted issue-less
+author. Native reviewers still require their authenticated, current review
+assignment and committer wake. The claim takes the execution stamp under the
+issue row lock without cancelling the author's unrelated run. While the
+reviewer holds the card, the old author's PATCH and checkout are refused.
+A same-agent wake still waits behind its live author. Wakes after the run has
+finished use the normal admission gates. A
+run whose context names a different issue does not own the cards it creates or
+assigns.
+
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
@@ -218,7 +280,10 @@ returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
 Under the issue row lock, a non-terminal assignee change retains a running
 holder identified by the issue's existing execution or checkout binding. It
 clears checkout permission but preserves execution admission across the saved
-update, a delayed cancellation and a failed cancellation. A request header alone
+update, a delayed cancellation and a failed cancellation. The one exception
+is an adopted issue-less author: its stamped hold ends at the reassignment,
+because the stamp proves authorship for the previous assignee, not work on
+this card. A request header alone
 grants neither cancellation nor a hold. If only a legacy issue-context binding
 remains, admission recovers it by company and issue, not by the new assignee.
 
