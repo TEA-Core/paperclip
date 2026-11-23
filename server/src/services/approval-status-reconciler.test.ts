@@ -3342,8 +3342,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.authorType).toBe("system");
     });
 
-    it("returns each re-arm slot refused by a current child-only attribution", async () => {
-      const issueId = await insertIssue();
+    it.each([0, 1, 2])("returns each re-arm slot refused by a current child-only attribution after %s prior attempts", async (priorAttempts) => {
+      const issueId = await insertIssue({ executionState: approvedState({
+        approvalStatus: {
+          publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+          armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts, at: APPROVED_AT },
+        },
+      }) });
       await insertDecision(issueId);
       await insertMention(issueId);
       const ancestorId = await insertIssue({ identifier: "SUP-900", status: "backlog", executionState: {} });
@@ -3365,7 +3370,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(summary.rearmDetails[0]).toContain("child-carrier-attribution");
         const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
         expect(row!.executionState?.approvalStatus).toMatchObject({
-          armReattempt: { headSha: NEW_HEAD, attempts: 0 },
+          armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts },
           armOutcome: { kind: "skipped" },
         });
       }
@@ -3375,7 +3380,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.rearmDetails[0]).toContain("armed:");
       expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toHaveLength(1);
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
-      expect(row!.executionState?.approvalStatus).toMatchObject({ armReattempt: { headSha: NEW_HEAD, attempts: 1 } });
+      expect(row!.executionState?.approvalStatus).toMatchObject({ armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts + 1 } });
     });
 
     const RELEASE_STATUS = {
@@ -3881,6 +3886,52 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
       expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
       expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+    });
+
+    it("returns the reserved re-arm slot when child attribution appears only after backfill publication", async () => {
+      const issueId = await insertIssue({ executionState: approvedState({
+        approvalStatus: {
+          approvedHeadSha: null, publishedHeadSha: null,
+          publishSkipped: { reason: "status:skipped:head_unresolvable: pr_error: HTTP 500", headSha: null, at: APPROVED_AT },
+        },
+      }) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      const ancestorId = await insertIssue({ identifier: "SUP-900", status: "backlog", executionState: {} });
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_SAME_HEAD_BODY },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+      const provider = mockGhFetch.getMockImplementation()!;
+      let pullReads = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === PR_URL && ++pullReads === 3) {
+          await db.insert(issueChildCarrierAttributions).values({
+            companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+            owner: "tea-core", repo: "paperclip", pullRequestNumber: 42,
+            branchName: "some-branch-name", headSha: NEW_HEAD, commitShas: [NEW_HEAD],
+            writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+          });
+        }
+        return provider(url, init);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.backfilled).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.rearmDetails[0]).toContain("child-carrier-attribution");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState?.approvalStatus).toMatchObject({
+        publishedHeadSha: NEW_HEAD,
+        armOutcome: { kind: "skipped" },
+        armReattempt: { headSha: NEW_HEAD, attempts: 0 },
+      });
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toEqual([]);
     });
 
     it("a force-push that lands between scan and the arm-boundary re-check suppresses the re-arm (finding: stale-live-head-authorization-race)", async () => {

@@ -57,6 +57,7 @@ import {
   executionWorkspaces,
   issueApprovals,
   issueAttachments,
+  issueChildCarrierAttributions,
   issueCreateIdempotencyKeys,
   issueInboxArchives,
   issueLabels,
@@ -13097,6 +13098,31 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        const [lockedIssue] = await tx
+          .select({ companyId: issues.companyId, status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update");
+        if (!lockedIssue) return null;
+        // The issue lock serializes this check with attribution FK insertion.
+        // Invalidating proof does not make its child contribution disposable.
+        if (lockedIssue.status !== "cancelled") {
+          const [attribution] = await tx
+            .select({ id: issueChildCarrierAttributions.id })
+            .from(issueChildCarrierAttributions)
+            .where(and(
+              eq(issueChildCarrierAttributions.companyId, lockedIssue.companyId),
+              eq(issueChildCarrierAttributions.childIssueId, id),
+            ))
+            .limit(1);
+          if (attribution) {
+            throw conflict(
+              "Issue has recorded carrier attribution and cannot be deleted. Cancel it first only if its work is no longer required.",
+              { code: "issue_carrier_attribution_delete_refused" },
+            );
+          }
+        }
+
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)

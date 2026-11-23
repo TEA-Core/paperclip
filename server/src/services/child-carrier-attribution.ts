@@ -1,5 +1,5 @@
 import { isUniqueViolation } from "../db-errors.js";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -776,22 +776,45 @@ export async function carrierOwnerChildAttributionBlock(
   ownerIssueId: string,
   pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null },
 ): Promise<string | null> {
-  const owner = await readChildWorkspace(db, companyId, ownerIssueId);
-  if (!owner) return null;
-  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) return null;
-  if (pr.owner.toLowerCase() !== owner.repo.owner.toLowerCase() || pr.repo.toLowerCase() !== owner.repo.repo.toLowerCase()) {
-    return null;
-  }
   const descendants = await descendantIds(db, companyId, ownerIssueId);
   if (descendants.length === 0) return null;
+  // Recorded obligations survive mutable workspace metadata. This is only an
+  // applicability fence; complete current proof is read again after enumeration.
+  const recorded = await db
+    .select({ childIssueId: issueChildCarrierAttributions.childIssueId })
+    .from(issueChildCarrierAttributions)
+    .where(and(
+      eq(issueChildCarrierAttributions.companyId, companyId),
+      eq(issueChildCarrierAttributions.ancestorIssueId, ownerIssueId),
+      eq(issueChildCarrierAttributions.provider, "github"),
+      eq(issueChildCarrierAttributions.owner, pr.owner.toLowerCase()),
+      eq(issueChildCarrierAttributions.repo, pr.repo.toLowerCase()),
+      eq(issueChildCarrierAttributions.pullRequestNumber, pr.number),
+      inArray(issueChildCarrierAttributions.childIssueId, descendants.map(({ id }) => id)),
+    ));
+  const recordedScopeRefusal = recorded.length > 0 ? CHILD_CARRIER_OWNER_GATE_SKIP : null;
+  const owner = await readChildWorkspace(db, companyId, ownerIssueId);
+  if (!owner) return recordedScopeRefusal;
+  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) return recordedScopeRefusal;
+  if (pr.owner.toLowerCase() !== owner.repo.owner.toLowerCase() || pr.repo.toLowerCase() !== owner.repo.repo.toLowerCase()) {
+    return recordedScopeRefusal;
+  }
+  const recordedChildIds = new Set<string>();
+  for (const row of recorded) recordedChildIds.add(row.childIssueId);
   const sameRepo = [];
   for (const descendant of descendants) {
     const card = await readChildWorkspace(db, companyId, descendant.id);
-    if (!card) continue;
+    if (!card) {
+      if (recordedChildIds.has(descendant.id)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      continue;
+    }
     if (
       card.repo.owner.toLowerCase() !== owner.repo.owner.toLowerCase()
       || card.repo.repo.toLowerCase() !== owner.repo.repo.toLowerCase()
-    ) continue;
+    ) {
+      if (recordedChildIds.has(descendant.id)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      continue;
+    }
     sameRepo.push({ descendant, card });
   }
   if (sameRepo.length === 0) return null;

@@ -108,7 +108,9 @@ no longer required. Cancellation is not approval of a required contribution.
 Automatic deleted-branch admission would require authoritative provenance and a
 separately authorized work item; it is not implemented here. The live carrier
 branch must match even when a caller does not provide a branch.
-Required attribution rows are read after remote enumeration and scoped to the
+Recorded obligation identities are consulted before workspace classification.
+Unlinking or changing a workspace cannot hide a recorded contribution. Complete
+current approval proof is read again after remote enumeration and scoped to the
 target repository. All carrier and child comparisons in one owner gate use a
 single pinned base SHA and immutable head SHAs, including small comparisons.
 Each comparison supports
@@ -116,6 +118,15 @@ up to 20 pages of 100 commits (2,000 commits). A larger complete comparison is
 unsupported and refuses, just as truncated or inconsistent data refuses.
 Every supported comparison must prove its complete count, unique commits and
 pinned tip; the PR-commits API's capped list is not used as complete proof.
+
+A non-cancelled child with any recorded carrier attribution cannot be physically
+deleted through the issue service; deletion returns HTTP 409. This includes
+invalidated proof, which does not establish that the work is no longer required.
+The deletion transaction locks the issue before checking attribution, so a
+concurrent proof insertion cannot pass the check and then be erased by a cascade.
+An operator may cancel a child only when its work is no longer required; ordinary
+reference restrictions still apply to subsequent deletion. No schema or
+attribution history is removed to bypass a required child approval.
 
 Removing a child's parent does not invalidate its stored attribution. The owner
 gate checks current descendants and ignores a historical attribution whose child
