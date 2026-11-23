@@ -738,7 +738,7 @@ const ACTIVE_EXECUTION_RUN: WakeAdmissionActiveExecutionRun = {
   id: "active-run-1",
   agentId: "execution-agent",
   status: "running",
-  contextSnapshot: { taskKey: "issue-1" },
+  contextSnapshot: { issueId: "issue-1", taskKey: "issue-1" },
 };
 
 // The scope is opaque to the use case; the fakes below never inspect it.
@@ -1107,6 +1107,27 @@ describe("admitWakeBehindIssueExecution", () => {
 
     expect(result.kind).toBe("coalesced");
     expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["names no issue", { wakeReason: "heartbeat_timer" }],
+    ["names another issue", { issueId: "issue-2" }],
+  ])("holds the wake behind a same-agent run whose context %s instead of merging into it", async (_label, contextSnapshot) => {
+    // SUP-20121: merging would rewrite the holder's issue scope; the wake is
+    // deferred and can still join an existing deferred wake for the issue.
+    const writer = createFakeAdmissionWriter();
+    const reader = createFakeAdmissionReader();
+    const helpers = createFakeAdmissionHelpers();
+    const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers });
+
+    const result = await admit(SCOPE, admissionInput({
+      activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, contextSnapshot },
+    }));
+
+    expect(result).toEqual({ kind: "deferred" });
+    expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+    expect(reader.findExistingDeferredWake).toHaveBeenCalledTimes(1);
+    expect(writer.insertNewDeferredWake).toHaveBeenCalledTimes(1);
   });
 
   it("merges into the existing deferred wake when the policy returns a merge target", async () => {
