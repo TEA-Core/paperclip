@@ -285,6 +285,11 @@ the issue-row lock and discharges it only in the transaction that accepts a clos
 with positive repository landing evidence. The proof's repository, base, and
 branch binding is locked and checked before discharge. Merged-PR evidence must
 cover the checked delivery head; an older merge on the same branch is insufficient.
+Every positive debt-bearing proof records its immutable delivery head and source.
+Before discharge, the close transaction rechecks that same remote or worktree
+head under the issue/workspace locks, with a 15-second probe bound; mismatch or
+lookup failure refuses the close. The discharged marker retains the head and
+repository/base/branch evidence. Database locks do not freeze external Git refs.
 Reopening and status-version changes never waive unpaid debt. The landing backstop
 includes debt-bearing record-only cards without expiring the obligation.
 A legacy reclassification row without a disposition, older than the issue's latest

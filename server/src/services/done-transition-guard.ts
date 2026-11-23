@@ -229,12 +229,19 @@ export function renderDoneTierDeclaration(
  */
 export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
 
+interface LandingHeadProof {
+  head: string;
+  source: "remote" | "worktree";
+}
+
 export interface DoneTransitionGuardResult {
   allowed: boolean;
   /** Positive repository evidence, never a waiver or an unmeasured fail-open. */
   landingVerified?: boolean;
   /** Repository binding actually used by the positive landing probe. */
   landingContext?: IssueRepoContext;
+  /** Immutable head used by the positive proof, rechecked at the close write. */
+  landingProof?: LandingHeadProof;
   reason: string;
   aheadBy: number | null;
   branch: string | null;
@@ -340,15 +347,41 @@ export async function prepareLandingDebtClose(
         .where(and(eq(executionWorkspaces.id, locked.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
         .for("share") : [];
       const binding = result.landingContext;
-      if (!workspace || !binding || closeStatusVersion === undefined ||
+      const proof = result.landingProof;
+      if (!workspace || !binding || !proof || closeStatusVersion === undefined ||
         workspace.repoUrl !== binding.repoUrl || workspace.baseRef !== binding.defaultRef ||
-        workspace.branchName !== binding.branch) throw conflict("Repository binding changed; retry the landing check.", {
+        workspace.branchName !== binding.branch ||
+        (proof.source === "worktree" && (workspace.providerRef ?? workspace.cwd) !== binding.worktreePath)) {
+        throw conflict("Repository binding changed; retry the landing check.", {
+          code: "done_transition_missing_delivery", issueId: issue.id,
+        });
+      }
+      // A database lock cannot freeze Git. Re-measure the same head source at
+      // this close boundary; bound the I/O while holding the issue/workspace locks.
+      let currentHead: string | null = null;
+      try {
+        if (proof.source === "worktree" && binding.worktreePath) {
+          currentHead = (await runHardenedGit(["-C", binding.worktreePath, "rev-parse", "HEAD"], {
+            cwd: "/", timeoutMs: GITHUB_BASE_COMPARE_TIMEOUT_MS,
+          })).trim().toLowerCase();
+        } else if (proof.source === "remote" && binding.branch) {
+          const parsed = parseRepoUrl(binding.repoUrl);
+          const { token } = await resolveGitHubToken(tx, issue.companyId);
+          if (parsed && token) currentHead = await resolveGitHubRefHeadSha(
+            parsed.hostname, parsed.owner, parsed.repo, binding.branch, token,
+            AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+          );
+        }
+      } catch { /* Missing, failed, and timed-out rechecks cannot discharge debt. */ }
+      if (currentHead !== proof.head) throw conflict("Delivery head changed or could not be verified; retry the landing check.", {
         code: "done_transition_missing_delivery", issueId: issue.id,
       });
       await tx.update(activityLog).set({
         details: sql`${activityLog.details} || jsonb_build_object(
           'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
-          'closeStatusVersion', ${closeStatusVersion}::int)`,
+          'closeStatusVersion', ${closeStatusVersion}::int,
+          'landingProof', jsonb_build_object('head', ${proof.head}::text, 'source', ${proof.source}::text,
+            'repoUrl', ${binding.repoUrl}::text, 'baseRef', ${binding.defaultRef}::text, 'branch', ${binding.branch}::text))`,
       }).where(debtWhere);
     },
   };
@@ -531,6 +564,7 @@ async function resolveGitHubRefHeadSha(
   repo: string,
   ref: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`;
@@ -540,7 +574,7 @@ async function resolveGitHubRefHeadSha(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
-  const response = await ghFetch(url, { headers });
+  const response = await ghFetch(url, { headers, signal });
   if (response.status === 404 || (await isNoCommitFoundResponse(response))) return null;
   if (response.status === 401 || response.status === 403) {
     throw new GitHubAuthError(response.status, `GitHub commits API returned ${response.status}`);
@@ -671,16 +705,17 @@ async function githubMergedPrCountForIdentifier(
   }
 }
 
-async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRepository, token: string) {
+async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRepository, token: string): Promise<LandingHeadProof | null> {
   if (ctx.worktreePath) {
     try {
       const head = (await runGit(["rev-parse", "HEAD"], ctx.worktreePath)).trim();
-      if (/^[0-9a-f]{40}$/i.test(head)) return head;
+      if (/^[0-9a-f]{40}$/i.test(head)) return { head: head.toLowerCase(), source: "worktree" };
     } catch { /* The remote branch can still provide the delivery head. */ }
   }
   try {
     // Await here so rejected lookups, including non-Error throws, stay unverified.
-    return ctx.branch ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
+    const head = ctx.branch ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
+    return head ? { head, source: "remote" } : null;
   } catch {
     return null;
   }
@@ -5723,6 +5758,7 @@ async function evaluateDoneTransitionGuardCore(
         // work that is already merged and live. A merged PR naming the identifier
         // is positive evidence of landing — fail open on it. An unmeasurable probe
         // also fails open: never block on a signal we could not measure (SUP-13199).
+        const deliveryHead = landingDebtOwed && issue.identifier ? await carrierDeliveryHead(ctx, parsed, token) : undefined;
         const mergedPrCount = issue.identifier
           ? await githubMergedPrCountForIdentifier(
               parsed.hostname,
@@ -5730,7 +5766,7 @@ async function evaluateDoneTransitionGuardCore(
               parsed.repo,
               issue.identifier,
               token,
-              landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined,
+              landingDebtOwed ? deliveryHead?.head ?? null : undefined,
               ctx.defaultRef,
             )
           : null;
@@ -5749,6 +5785,7 @@ async function evaluateDoneTransitionGuardCore(
               `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
             ),
             landingVerified: true,
+            landingProof: deliveryHead ?? undefined,
           };
         }
         if (decisionCarried) {
@@ -5836,9 +5873,24 @@ async function evaluateDoneTransitionGuardCore(
   }
 
   if (aheadBy === 0) {
+    let landingProof: LandingHeadProof | undefined;
+    if (landingDebtOwed) {
+      try {
+        const head = await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, branch, token);
+        // The first compare used a moving branch name. Bind the proof to this
+        // immutable head before allowing the finalizer to accept it.
+        if (!head || await githubCompareAheadBy(parsed.hostname, parsed.owner, parsed.repo, ctx.defaultRef, head, token) !== 0) {
+          return fallback("The current delivery head is not verified on the base; retry the landing check");
+        }
+        landingProof = { head, source: "remote" };
+      } catch {
+        return fallback("The current delivery head could not be verified; retry the landing check");
+      }
+    }
     return {
       allowed: true,
       landingVerified: true,
+      landingProof,
       reason: `Branch ${branch} is not ahead of ${ctx.defaultRef}`,
       aheadBy: 0,
       branch,
@@ -5915,13 +5967,14 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
+    const deliveryHead = landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined;
     const mergedPrCount = await githubMergedPrCountForIdentifier(
       parsed.hostname,
       parsed.owner,
       parsed.repo,
       identifier,
       token,
-      landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined,
+      landingDebtOwed ? deliveryHead?.head ?? null : undefined,
       ctx.defaultRef,
     );
 
@@ -5929,6 +5982,7 @@ async function evaluateDoneTransitionGuardCore(
       return {
         allowed: true,
         landingVerified: true,
+        landingProof: deliveryHead ?? undefined,
         reason:
           `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch), ` +
           `but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference${mergedPrCount === 1 ? "s" : ""} ${identifier} (carrier delivery); transition allowed`,
@@ -6025,12 +6079,13 @@ async function evaluateDoneTransitionGuardCore(
   }
 
   let hasMergedPr: boolean;
+  let deliveryHead: string | null | undefined;
   try {
-    const head = landingDebtOwed
+    deliveryHead = landingDebtOwed
       ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, branch, token)
       : undefined;
-    hasMergedPr = head !== null && (await githubBranchHasMergedPr(
-      parsed.hostname, parsed.owner, parsed.repo, branch, token, head, ctx.defaultRef,
+    hasMergedPr = deliveryHead !== null && (await githubBranchHasMergedPr(
+      parsed.hostname, parsed.owner, parsed.repo, branch, token, deliveryHead, ctx.defaultRef,
     )).hasMergedPr;
   } catch (err) {
     if (err instanceof GitHubAuthError) {
@@ -6051,6 +6106,7 @@ async function evaluateDoneTransitionGuardCore(
     return {
       allowed: true,
       landingVerified: true,
+      landingProof: deliveryHead ? { head: deliveryHead, source: "remote" } : undefined,
       reason: `Branch ${branch} has a merged PR; transition allowed`,
       aheadBy,
       branch,

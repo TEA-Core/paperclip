@@ -2216,6 +2216,134 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(matches ? "discharged" : "outstanding");
     });
 
+    it("does not substitute a project default for an unmeasured null execution base", async () => {
+      const { issueId, executionWorkspaceId, projectWorkspaceId, projectId, repoUrl, defaultRef } = await seedIssue("NULLBASE");
+      await db.update(issues).set({ projectId, projectWorkspaceId }).where(eq(issues.id, issueId));
+      await db.update(projectWorkspaces).set({ repoUrl, defaultRef }).where(eq(projectWorkspaces.id, projectWorkspaceId));
+      await db.update(executionWorkspaces).set({ baseRef: null }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      board();
+      await flip(issueId);
+      landing();
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      await db.update(executionWorkspaces).set({ baseRef: defaultRef }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+    });
+
+    it("does not certify a later head using an earlier moving-branch compare", async () => {
+      const { issueId } = await seedIssue("PINNED");
+      const head = "b".repeat(40);
+      board();
+      await flip(issueId);
+      landing();
+      const fetch = vi.spyOn(githubFetch, "ghFetch").mockImplementation(async (url) => new Response(JSON.stringify(
+        url.includes("/commits/") ? { sha: head } :
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) ? 1 : 0 } : [],
+      ), { status: 200 }));
+      try {
+        const response = await patch(issueId, { status: "done" });
+        expect(response.status).toBe(409);
+        expect(response.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+
+    it.each(
+      (["ahead-zero", "merged-pr"] as const).flatMap((mode) =>
+        (["unchanged", "moved", "unavailable"] as const).map((change) => [mode, change] as const)),
+    )("rechecks the verified remote delivery head at close (%s, %s)", async (mode, change) => {
+      const { issueId, branchName, defaultRef, repoUrl } = await seedIssue("HEADRACE");
+      const head = "a".repeat(40);
+      let measured = false;
+      let lockedLookups = 0;
+      board();
+      await flip(issueId);
+      landing();
+      const fetch = vi.spyOn(githubFetch, "ghFetch").mockImplementation(async (url) => {
+        if (url.includes("/commits/")) {
+          if (measured) lockedLookups++;
+          if (measured && change === "unavailable") throw new Error("head lookup unavailable");
+          return new Response(JSON.stringify({ sha: measured && change === "moved" ? "b".repeat(40) : head }), { status: 200 });
+        }
+        return new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: mode === "ahead-zero" ? 0 : 1 } :
+            url.includes("state=closed") ? [{ merged: true, number: 404, base: { ref: defaultRef }, head: { sha: head } }] : [],
+        ), { status: 200 });
+      });
+      mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+        const result = await realEvaluateGuardRef.current!(...args);
+        measured = result.landingVerified === true;
+        return result;
+      });
+      try {
+        const response = await patch(issueId, { status: "done" });
+        const accepted = change === "unchanged";
+        expect(response.status, JSON.stringify(response.body)).toBe(accepted ? 200 : 409);
+        expect(lockedLookups).toBeGreaterThan(0);
+        const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(stored?.status).toBe(accepted ? "done" : "todo");
+        const debt = (await debtRows(issueId))[0]?.details;
+        expect(debt?.landingDebtDisposition).toBe(accepted ? "discharged" : "outstanding");
+        if (accepted) expect(debt?.landingProof).toEqual({
+          head, source: "remote", repoUrl, baseRef: defaultRef, branch: branchName,
+        });
+        else expect(response.body.code).toBe("done_transition_missing_delivery");
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+
+    it.each(["unchanged", "moved", "unavailable"] as const)("rechecks the verified local carrier head at close (%s)", async (change) => {
+      const { issueId, identifier, executionWorkspaceId, repoUrl } = await seedIssue("LOCALRACE");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-head-race-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        git("commit", "--allow-empty", "-qm", "base");
+        git("checkout", "-qb", "shared-carrier");
+        git("commit", "--allow-empty", "-qm", `Implement ${identifier}`);
+        const head = git("rev-parse", "HEAD");
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: "shared-carrier", baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) ? 0 : 1 } :
+            url.includes("/search/issues") ? { total_count: 1, items: [{ number: 404 }] } :
+              url.endsWith("/pulls/404") ? { merged: true, base: { ref: "main" }, head: { sha: head } } : [],
+        ), { status: 200 }));
+        mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+          const result = await realEvaluateGuardRef.current!(...args);
+          if (result.landingVerified && change === "moved") git("commit", "--allow-empty", "-qm", "Undelivered later work");
+          if (result.landingVerified && change === "unavailable") rmSync(cwd, { recursive: true, force: true });
+          return result;
+        });
+        const response = await patch(issueId, { status: "done" });
+        const accepted = change === "unchanged";
+        expect(response.status, JSON.stringify(response.body)).toBe(accepted ? 200 : 409);
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe(accepted ? "done" : "todo");
+        const debt = (await debtRows(issueId))[0]?.details;
+        expect(debt?.landingDebtDisposition).toBe(accepted ? "discharged" : "outstanding");
+        if (accepted) expect(debt?.landingProof).toEqual({
+          head, source: "worktree", repoUrl, baseRef: "main", branch: "shared-carrier",
+        });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
     it.each(
       (["shared", "absent", "own"] as const).flatMap((path) =>
         ([401, 403, 500, 502, "network", "non-Error", "malformed JSON", "missing SHA"] as const)
