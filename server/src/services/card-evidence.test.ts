@@ -94,4 +94,28 @@ describe("card evidence parser", () => {
     expect(detectEvidence('{"workspaceId":"abc"}', "machine")?.arm).toBe("key");
     expect(detectEvidence('{"workspaceId":"null', "machine")?.arm).toBe("key");
   });
+
+  it("keeps projected totals neutral and still refuses project bindings", () => {
+    expect(detectEvidence({ projectedTotal: 42 }, "machine")).toBeNull();
+    expect(detectEvidence('{"projectedTotal":42}', "machine")).toBeNull();
+    for (const key of ["projectId", "project_id", "projectid", "projectWorkspaceId", "project"]) {
+      expect(detectEvidence({ [key]: "abc" }, "machine")?.arm, key).toBe("key");
+    }
+  });
+
+  it("keeps generic tag and release paths on unknown hosts neutral in every text path", () => {
+    for (const text of ["https://example.org/library/tags/retention", "see /library/tags/retention", "https://example.org/docs/releases/notes"]) {
+      expect(detectEvidence(text, "prose"), text).toBeNull();
+      expect(detectEvidence(text, "machine"), text).toBeNull();
+    }
+    expect(detectEvidence("https://example.org/owner/repo/tags/v1", "prose")?.arm).toBe("forge-path");
+    expect(detectEvidence("https://example.org/owner/repo/commit/abc", "prose")?.arm).toBe("forge-path");
+  });
+
+  it("parses complete raw machine JSON before escapes are normalised", () => {
+    const parsed = { note: 'said "hi"', "workspace id": "abc" };
+    expect(detectEvidence(parsed, "machine")?.arm).toBe("key");
+    expect(detectEvidence(JSON.stringify(parsed), "machine")?.arm).toBe("key");
+    expect(detectEvidence(JSON.stringify({ note: 'said "hi"', "workspace id": null }), "machine")).toBeNull();
+  });
 });

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -2778,6 +2778,8 @@ export interface NoRepositoryLandingWorktreeMeasurement {
 export interface NoRepositoryLandingNoWorkspaceMeasurement {
   proof: "never_had_execution_workspace";
   ruling: NoRepositoryLandingRuling;
+  /** Whether issue.created recorded project, project workspace and description, or the check rested on the current null pointers. */
+  creationSnapshot?: "recorded" | "not_recorded";
 }
 
 export type NoRepositoryLandingMeasurement =
@@ -2795,7 +2797,7 @@ const NO_WORKSPACE_HISTORY_RECORDS = [
   "execution_workspaces, workspace_operations, environment_leases, workspace_runtime_services, execution_workspace_runtime_leases, tool_runtime_slots (any row tied to the issue)",
   "issue_work_products (only artifact or document, no project or workspace, no repository reference)",
   "heartbeat_runs linked by native_issue_id or whose context names the issue by id or identifier (no project, workspace, repository, branch, worktree or pull request key in context, result_json, usage_json, stdout/stderr excerpts or error), and native_run_results.result_json of the issue",
-  "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference, and issue.created records projectId, projectWorkspaceId and description)",
+  "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference, and issue.created records projectId, projectWorkspaceId and description, or, where it does not, the issue's current null project and workspace pointers stand in for the creation snapshot; the creationSnapshot field says which)",
   "issue_comments (none deleted, no repository reference)",
   "documents of the issue (every revision, no repository reference)",
   "issue title and description (current and every recorded change)",
@@ -2828,6 +2830,7 @@ export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLanding
       projectId: null,
       projectWorkspaceId: null,
       executionWorkspaceId: null,
+      creationSnapshot: measurement.creationSnapshot ?? "not_recorded",
       checkedRecords: [...NO_WORKSPACE_HISTORY_RECORDS],
     };
   }
@@ -2894,7 +2897,7 @@ type NoRepositoryLandingRecord = Omit<
 type NoRepositoryLandingRead =
   | NoRepositoryLandingRefusal
   | { ok: true; proof: "isolated_worktree"; record: NoRepositoryLandingRecord }
-  | { ok: true; proof: "never_had_execution_workspace"; ruling: NoRepositoryLandingRuling };
+  | { ok: true; proof: "never_had_execution_workspace"; ruling: NoRepositoryLandingRuling; creationSnapshot: "recorded" | "not_recorded" };
 
 const NO_WORKSPACE_REFUSAL_REASON = "requires this issue's own execution workspace.";
 
@@ -2931,7 +2934,7 @@ function jsonRepositoryReference(value: unknown): string | null {
 }
 
 
-function namesWorkspace(value: unknown, _evidenceColumn = false): boolean {
+function namesWorkspace(value: unknown): boolean {
   return detectEvidence(value, "machine")?.arm === "key";
 }
 
@@ -2963,6 +2966,7 @@ const NO_WORKSPACE_ALLOWED_ACTIVITY_ACTIONS: ReadonlySet<string> = new Set([
   "issue.successful_run_handoff_required",
   "issue.workspace_preflight_blocked",
   "issue.done_transition_no_repository_landing_verified",
+  "issue.done_transition_exclusion_below_threshold",
 ]);
 
 // The fields an `issue.updated` row may record as changed. Any other changed
@@ -3054,6 +3058,28 @@ function activityRowRefusal(action: string, details: unknown): NoRepositoryLandi
  * a kind the allow-list does not name, or text that cannot be read in full,
  * refuses.
  */
+function creationSnapshotComplete(details: unknown): boolean {
+  if (details === null || typeof details !== "object" || Array.isArray(details)) return false;
+  const record = details as Record<string, unknown>;
+  return Object.hasOwn(record, "projectId") && Object.hasOwn(record, "projectWorkspaceId") && Object.hasOwn(record, "description");
+}
+
+async function creationSnapshotState(db: Db, issue: { id: string; companyId: string }): Promise<"recorded" | "not_recorded"> {
+  const rows = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issue.id),
+      eq(activityLog.action, "issue.created"),
+    ));
+  return rows.length > 0 && rows.every((row) => creationSnapshotComplete(row.details)) ? "recorded" : "not_recorded";
+}
+
+const NO_WORKSPACE_EVENT_ROW_LIMIT = 2000;
+const NO_WORKSPACE_EVENT_BYTE_LIMIT = 32 * 1024 * 1024;
+
 async function noWorkspaceHistoryRefusal(
   db: Db,
   issue: { id: string; companyId: string; identifier: string },
@@ -3079,15 +3105,33 @@ async function noWorkspaceHistoryRefusal(
         eq(heartbeatRuns.companyId, issue.companyId),
         or(
           eq(heartbeatRuns.nativeIssueId, issue.id),
-          sql`strpos(${heartbeatRuns.contextSnapshot}::text, ${issue.id}) > 0`,
-          sql`jsonb_path_exists(${heartbeatRuns.contextSnapshot}, 'strict $.** ? (@ == $ref)', jsonb_build_object('ref', ${issue.identifier}::text))`,
+          and(
+            isNull(heartbeatRuns.nativeIssueId),
+            or(
+              sql`strpos(${heartbeatRuns.contextSnapshot}::text, ${issue.id}) > 0`,
+              sql`jsonb_path_exists(${heartbeatRuns.contextSnapshot}, 'strict $.** ? (@ == $ref)', jsonb_build_object('ref', ${issue.identifier}::text))`,
+            ),
+          ),
         ),
       ),
     );
   const runIds = runs.map((run) => run.id);
+  const eventScope = and(eq(heartbeatRunEvents.companyId, issue.companyId), inArray(heartbeatRunEvents.runId, runIds));
+  if (runIds.length > 0) {
+    const [eventSize] = await db
+      .select({
+        rows: sql<number>`count(*)::int`,
+        bytes: sql<number>`coalesce(sum(octet_length(to_jsonb(${heartbeatRunEvents})::text)), 0)::float8`,
+      })
+      .from(heartbeatRunEvents)
+      .where(eventScope);
+    if ((eventSize?.rows ?? 0) > NO_WORKSPACE_EVENT_ROW_LIMIT || (eventSize?.bytes ?? 0) > NO_WORKSPACE_EVENT_BYTE_LIMIT) {
+      return noRepositoryRefusal("cannot be declared on an issue whose run events exceed the scan size budget.");
+    }
+  }
   const events = runIds.length === 0
     ? []
-    : await db.select().from(heartbeatRunEvents).where(inArray(heartbeatRunEvents.runId, runIds));
+    : await db.select().from(heartbeatRunEvents).where(eventScope).limit(NO_WORKSPACE_EVENT_ROW_LIMIT);
   const receipts = await db
     .select()
     .from(issueDeliveryReceipts)
@@ -3099,7 +3143,7 @@ async function noWorkspaceHistoryRefusal(
     .where(and(eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.issueId, issue.id)));
   const surfaces: unknown[] = [...runs, ...events, ...receipts, ...nativeResults];
   if (issueRow) surfaces.push({ billingCode: issueRow.billingCode, executionPolicy: issueRow.executionPolicy });
-  if (surfaces.some((surface) => namesWorkspace(surface, true) || jsonRepositoryReference(surface) !== null)) {
+  if (surfaces.some((surface) => detectEvidence(surface, "machine") !== null)) {
     return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
   }
 
@@ -3118,13 +3162,8 @@ async function noWorkspaceHistoryRefusal(
     if (refusal) return refusal;
   }
   const created = activity.filter((row) => row.action === "issue.created");
-  const snapshotComplete = (details: unknown) => {
-    if (details === null || typeof details !== "object" || Array.isArray(details)) return false;
-    const record = details as Record<string, unknown>;
-    return Object.hasOwn(record, "projectId") && Object.hasOwn(record, "projectWorkspaceId") && Object.hasOwn(record, "description");
-  };
   const projectAbsentNow = issueRow?.projectId == null && issueRow?.projectWorkspaceId == null;
-  if (!projectAbsentNow && (created.length === 0 || created.some((row) => !snapshotComplete(row.details)))) {
+  if (!projectAbsentNow && (created.length === 0 || created.some((row) => !creationSnapshotComplete(row.details)))) {
     return noRepositoryRefusal(
       "cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.",
     );
@@ -3400,7 +3439,12 @@ async function readNoRepositoryLandingRecord(
     if (!ruling.ok) return ruling;
     const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
     if (linkedWork) return linkedWork;
-    return { ok: true, proof: "never_had_execution_workspace", ruling: ruling.ruling };
+    return {
+      ok: true,
+      proof: "never_had_execution_workspace",
+      ruling: ruling.ruling,
+      creationSnapshot: await creationSnapshotState(db, issue),
+    };
   }
 
   const workspace = await db
@@ -3558,7 +3602,7 @@ async function verifyNoRepositoryLanding(
   const read = await readNoRepositoryLandingRecord(db, issue, closingActor);
   if (!read.ok) return read;
   if (read.proof === "never_had_execution_workspace") {
-    return { ok: true, measurement: { proof: read.proof, ruling: read.ruling } };
+    return { ok: true, measurement: { proof: read.proof, ruling: read.ruling, creationSnapshot: read.creationSnapshot } };
   }
   const { record } = read;
   const { token } = await resolveGitHubToken(db, issue.companyId);
@@ -3657,6 +3701,8 @@ export interface NoRepositoryLandingCloseRequest {
   requestedExecutionWorkspaceId: unknown;
   requestedProjectWorkspaceId: unknown;
   requestedProjectId: unknown;
+  requestedTitle?: unknown;
+  requestedDescription?: unknown;
 }
 
 // Neither the classification nor the workspace binding the proof rests on may
@@ -3689,6 +3735,14 @@ function closeRequestRefusal(
     request.requestedProjectId !== (issue.projectId ?? null)
   ) {
     return noRepositoryRefusal("cannot ride a request that changes the issue's project.");
+  }
+  if (workspaceId === null) {
+    for (const text of [request.requestedTitle, request.requestedDescription]) {
+      const reference = typeof text === "string" ? repositoryReference(text) : null;
+      if (reference) {
+        return noRepositoryRefusal(`cannot ride a request whose title or description cites repository work (${reference}).`);
+      }
+    }
   }
   return null;
 }

@@ -2151,6 +2151,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         projectId: null,
         projectWorkspaceId: null,
         executionWorkspaceId: null,
+        creationSnapshot: "recorded",
         checkedRecords: expect.arrayContaining([
           "external_object_mentions (none)",
           "issue_comments (none deleted, no repository reference)",
@@ -2244,10 +2245,160 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       });
     }
 
-    it("closes a never-had card whose missing creation snapshot is derived from a still-null project", async () => {
+    it("closes a never-had card whose missing creation snapshot is derived from a still-null project, and audits the path used", async () => {
       const fixture = await seedAdmissible({ omitCreationSnapshot: true });
       const res = await close(fixture.identifier);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const verified = await activityRows(fixture.issueId, "issue.done_transition_no_repository_landing_verified");
+      expect(verified[0]!.details).toMatchObject({ creationSnapshot: "not_recorded" });
+    });
+
+    it("refuses a close request whose own description cites repository work and closes with a clean one", async () => {
+      const cited = await seedAdmissible();
+      const refused = await request(app).patch(`/api/issues/${cited.identifier}`).send({
+        status: "done", doneTier: NO_REPOSITORY_DONE_TIER,
+        description: "Landed in https://github.com/TEA-Core/records/pull/12",
+      });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(await statusOf(cited.issueId)).toBe("in_progress");
+      const titled = await seedAdmissible();
+      const titleRefused = await request(app).patch(`/api/issues/${titled.identifier}`).send({
+        status: "done", doneTier: NO_REPOSITORY_DONE_TIER, title: "Fix in PR #12",
+      });
+      expect(titleRefused.status, JSON.stringify(titleRefused.body)).toBe(422);
+      expect(await statusOf(titled.issueId)).toBe("in_progress");
+      const clean = await seedAdmissible();
+      const closed = await request(app).patch(`/api/issues/${clean.identifier}`).send({
+        status: "done", doneTier: NO_REPOSITORY_DONE_TIER, description: "Decision only.",
+      });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+    });
+
+    it("lets the guard's own exclusion audit row stand but still scans its details", async () => {
+      const clean = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: clean.companyId, actorType: "system", actorId: "done_transition_guard",
+        action: "issue.done_transition_exclusion_below_threshold", entityType: "issue", entityId: clean.issueId,
+        details: { reason: "carve_out_below_threshold", ladderedChildCount: 1, excludedChildIdentifiers: [], source: "done_transition_guard" },
+      });
+      expect((await close(clean.identifier)).status).toBe(200);
+      const cited = await seedAdmissible();
+      await db.insert(activityLog).values({
+        companyId: cited.companyId, actorType: "system", actorId: "done_transition_guard",
+        action: "issue.done_transition_exclusion_below_threshold", entityType: "issue", entityId: cited.issueId,
+        details: { reason: "carve_out_below_threshold", repoUrl: "https://github.com/TEA-Core/records" },
+      });
+      expect((await close(cited.identifier)).status).toBe(422);
+    });
+
+    it("keeps machine traces and projected totals neutral and does not let a peer-owned run block the card", async () => {
+      const traced = await seedAdmissible();
+      await insertNativeRun(traced, { contextSnapshot: { traceId: "3f9c1e0a25b8c4d2", projectedTotal: 42 } });
+      { const r = await close(traced.identifier); expect(r.status, JSON.stringify(r.body)).toBe(200); }
+
+      const peerOwned = await seedAdmissible();
+      const [peer] = await db.insert(issues).values({ companyId: peerOwned.companyId, title: "Peer", status: "in_progress" }).returning({ id: issues.id });
+      await insertNativeRun(peerOwned, {
+        nativeIssueId: peer!.id,
+        contextSnapshot: { issueId: peerOwned.issueId, executionWorkspaceId: randomUUID(), repoUrl: "https://github.com/TEA-Core/records" },
+      });
+      { const r = await close(peerOwned.identifier); expect(r.status, JSON.stringify(r.body)).toBe(200); }
+
+      const own = await seedAdmissible();
+      await insertNativeRun(own, { nativeIssueId: null, contextSnapshot: { issueId: own.issueId, repoUrl: "https://github.com/TEA-Core/records" } });
+      expect((await close(own.identifier)).status).toBe(422);
+    });
+
+    it("scopes run events to the company and refuses an event flood before reading it", async () => {
+      const other = await seedNoWorkspace();
+      const fixture = await seedAdmissible();
+      const runId = await insertNativeRun(fixture, {});
+      await db.insert(heartbeatRunEvents).values({
+        companyId: other.companyId, runId, agentId: other.closerAgentId, seq: 1, eventType: "log",
+        message: "pushed https://github.com/TEA-Core/records/pull/12",
+      });
+      expect((await close(fixture.identifier)).status).toBe(200);
+
+      const flooded = await seedAdmissible();
+      const floodRun = await insertNativeRun(flooded, {});
+      await db.execute(sql`insert into heartbeat_run_events (company_id, run_id, agent_id, seq, event_type, message)
+        select ${flooded.companyId}, ${floodRun}, ${flooded.closerAgentId}, g, 'log', 'tick' from generate_series(1, 2001) g`);
+      const refused = await close(flooded.identifier);
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(await statusOf(flooded.issueId)).toBe("in_progress");
+    });
+
+    it("renders quoted reserved and mixed-case catalog tables, and scans them when attributed", async () => {
+      try {
+        await db.execute(sql`create table "Census Mixed" (company_id uuid, issue_id uuid, "order" text)`);
+        const clean = await seedAdmissible();
+        await db.execute(sql`insert into "Census Mixed" values (${clean.companyId}, ${clean.issueId}, 'Decision only.')`);
+        expect((await close(clean.identifier)).status).toBe(200);
+        const cited = await seedAdmissible();
+        await db.execute(sql`insert into "Census Mixed" values (${cited.companyId}, ${cited.issueId}, 'https://github.com/TEA-Core/records/pull/12')`);
+        expect((await close(cited.identifier)).status).toBe(422);
+      } finally {
+        await db.execute(sql`drop table if exists "Census Mixed"`);
+      }
+    });
+
+    it("looks up 22,000 identities without exceeding the parameter limit and still finds a real project", async () => {
+      try {
+        await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, note text)`);
+        const clean = await seedAdmissible();
+        await db.execute(sql`insert into task_census_probe
+          select ${clean.companyId}, ${clean.issueId}, string_agg(gen_random_uuid()::text, ' ') from generate_series(1, 22000)`);
+        const ok = await close(clean.identifier);
+        expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+        const hit = await seedAdmissible();
+        const projectId = await insertProject(hit.companyId);
+        await db.execute(sql`insert into task_census_probe
+          select ${hit.companyId}, ${hit.issueId}, string_agg(u, ' ') from (
+            select gen_random_uuid()::text as u from generate_series(1, 21999) union all select ${projectId}::text) t`);
+        expect((await close(hit.identifier)).status).toBe(422);
+      } finally {
+        await db.execute(sql`drop table if exists task_census_probe`);
+      }
+    });
+
+    it("lets explicit peer ownership beat soft and activity references, and keeps own matches", async () => {
+      try {
+        await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, scope_key text, note text)`);
+        const citation = "https://github.com/TEA-Core/records/pull/12";
+        const soft = await seedAdmissible();
+        const [peer] = await db.insert(issues).values({ companyId: soft.companyId, title: "Peer", status: "in_progress" }).returning({ id: issues.id });
+        await db.execute(sql`insert into task_census_probe values (${soft.companyId}, ${peer!.id}, ${soft.issueId}, ${citation})`);
+        expect((await close(soft.identifier)).status).toBe(200);
+        const own = await seedAdmissible();
+        const [peer2] = await db.insert(issues).values({ companyId: own.companyId, title: "Peer", status: "in_progress" }).returning({ id: issues.id });
+        await db.execute(sql`insert into task_census_probe values (${own.companyId}, ${own.issueId}, ${peer2!.id}, ${citation})`);
+        expect((await close(own.identifier)).status).toBe(422);
+
+        const activity = await seedAdmissible();
+        const [peer3] = await db.insert(issues).values({ companyId: activity.companyId, title: "Peer", status: "in_progress" }).returning({ id: issues.id });
+        const runId = await insertNativeRun(activity, {});
+        await db.insert(activityLog).values({
+          companyId: activity.companyId, actorType: "agent", actorId: activity.closerAgentId, agentId: activity.closerAgentId,
+          runId, action: "issue.updated", entityType: "issue", entityId: peer3!.id,
+          details: { note: citation },
+        });
+        expect((await close(activity.identifier)).status).toBe(200);
+      } finally {
+        await db.execute(sql`drop table if exists task_census_probe`);
+      }
+    });
+
+    it("refuses an oversized attributed row instead of transferring it", async () => {
+      try {
+        await db.execute(sql`create table task_census_probe (company_id uuid, issue_id uuid, note text)`);
+        const fixture = await seedAdmissible();
+        await db.execute(sql`insert into task_census_probe values (${fixture.companyId}, ${fixture.issueId}, repeat('a', 2097152))`);
+        const res = await close(fixture.identifier);
+        expect(res.status, JSON.stringify(res.body)).toBe(422);
+        expect(JSON.stringify(res.body)).toContain("scan size budget");
+      } finally {
+        await db.execute(sql`drop table if exists task_census_probe`);
+      }
     });
 
     it("closes a parentless card whose issue.created_without_parent row sits beside a complete creation snapshot", async () => {
@@ -2324,7 +2475,6 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       "refuses the schema-census admission: %s",
       async (shape) => {
         const fixture = await seedAdmissible();
-        const census = await import("../services/card-evidence-census.js");
         try {
           if (shape === "run-reference") {
             const runId = await insertNativeRun(fixture, {});
@@ -2353,13 +2503,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
               metadata: { version: 1, sections: [], authorizationReason: "https://github.com/TEA-Core/records/pull/12" },
             });
           }
-          census.resetEvidenceCatalogForTests();
           const result = await close(fixture.identifier);
           expect(result.status, `${shape}: ${JSON.stringify(result.body)}`).toBe(422);
           expect(await statusOf(fixture.issueId)).toBe("in_progress");
         } finally {
           await db.execute(sql`drop table if exists task_census_probe`);
-          census.resetEvidenceCatalogForTests();
         }
       },
     );
@@ -2369,7 +2517,6 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       "run-array", "propagated-run", "numeric-column", "identity-value", "other-card-on-run", "null-opaque",
     ] as const)("applies catalog attribution and drift controls: %s", async (shape) => {
       const fixture = await seedAdmissible();
-      const census = await import("../services/card-evidence-census.js");
       const citation = "https://github.com/TEA-Core/records/pull/12";
       try {
         if (shape === "indexed-json" || shape === "nested-indexed-json") {
@@ -2445,7 +2592,6 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
             ${shape === "clean" ? "Decision only." : citation}
           )`);
         }
-        census.resetEvidenceCatalogForTests();
         currentActor = fixture.actor;
         const result = await close(fixture.identifier);
         const allowed = ["clean", "other-card", "other-company", "old-actor", "other-card-on-run", "null-opaque"].includes(shape);
@@ -2454,24 +2600,20 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       } finally {
         await db.execute(sql`drop table if exists task_census_probe`);
         await db.execute(sql`drop table if exists task_census_links`);
-        census.resetEvidenceCatalogForTests();
       }
     });
 
     it("scans a newly added document column instead of exempting dedicated document reads", async () => {
       const fixture = await seedAdmissible();
-      const census = await import("../services/card-evidence-census.js");
       try {
         await db.execute(sql`alter table documents add column census_extra text`);
         await db.execute(sql`update documents set census_extra = 'https://github.com/TEA-Core/records/pull/12'
           where id = ${fixture.rulingId}`);
-        census.resetEvidenceCatalogForTests();
         const result = await close(fixture.identifier);
         expect(result.status, JSON.stringify(result.body)).toBe(422);
         expect(await statusOf(fixture.issueId)).toBe("in_progress");
       } finally {
         await db.execute(sql`alter table documents drop column census_extra`);
-        census.resetEvidenceCatalogForTests();
       }
     });
 

@@ -8,7 +8,6 @@ import { detectEvidence, evidenceSurface } from "./card-evidence.js";
  * reference (a child card) is not this card's evidence.
  */
 const PEER_REF_COLUMNS = new Set(["issues.parent_id"]);
-const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 const ROW_LIMIT = 200;
 
 export interface CensusHit {
@@ -43,11 +42,9 @@ const MAX_ROUNDS = 4;
 const VALUE_BYTES = 1024 * 1024;
 const CARD_BYTES = 32 * VALUE_BYTES;
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-let catalogPromise: Promise<EvidenceTable[]> | null = null;
 
 function ident(value: string): string {
-  if (!IDENTIFIER.test(value)) throw new Error("Unsupported evidence catalog identifier");
-  return value;
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 async function loadCatalog(db: Db): Promise<EvidenceTable[]> {
@@ -79,8 +76,8 @@ async function loadCatalog(db: Db): Promise<EvidenceTable[]> {
   }>;
   const tables = new Map<string, EvidenceTable>();
   for (const row of rows) {
-    const name = ident(row.tbl);
-    const key = ident(row.col);
+    const name = row.tbl;
+    const key = row.col;
     let table = tables.get(name);
     if (!table) {
       table = { name, columns: [], company: false, times: [], expressions: [] };
@@ -125,17 +122,6 @@ async function loadCatalog(db: Db): Promise<EvidenceTable[]> {
     if (table && !table.expressions.includes(row.expression)) table.expressions.push(row.expression);
   }
   return [...tables.values()];
-}
-
-function catalog(db: Db) {
-  if (!catalogPromise) {
-    const loading = loadCatalog(db);
-    catalogPromise = loading;
-    loading.catch(() => {
-      if (catalogPromise === loading) catalogPromise = null;
-    });
-  }
-  return catalogPromise;
 }
 
 interface ScanState {
@@ -188,13 +174,17 @@ function scanRecord(table: EvidenceTable, row: Row, state: ScanState, uuids: Set
   return null;
 }
 
+function valueList(values: string[]): Statement {
+  return sql`select jsonb_array_elements_text(${JSON.stringify(values)}::jsonb)`;
+}
+
 function oneOf(expression: Statement, values: string[]): Statement {
-  return sql`${expression} in (${sql.join(values.map((value) => sql`${value}`), sql`, `)})`;
+  return sql`${expression} in (${valueList(values)})`;
 }
 
 function reference(key: Statement, column: ValueColumn, values: string[]): Statement {
   return column.array
-    ? sql`(${sql.join(values.map((value) => sql`strpos(to_jsonb(${key})::text, ${value}) > 0`), sql` or `)})`
+    ? sql`exists (select 1 from (${valueList(values)}) v(value) where strpos(to_jsonb(${key})::text, v.value) > 0)`
     : oneOf(sql`${key}::text`, values);
 }
 
@@ -207,6 +197,7 @@ function selects(
 ): Statement | null {
   const direct: Statement[] = [];
   const indirect: Statement[] = [];
+  const soft: Statement[] = [];
   const otherCards: Statement[] = [];
   const identities = [card.id, card.identifier];
   for (const column of table.columns) {
@@ -228,13 +219,21 @@ function selects(
         )`);
       }
     }
-    if (column.soft) direct.push(oneOf(sql`${key}::text`, identities));
+    if (column.soft) soft.push(oneOf(sql`${key}::text`, identities));
     if (column.document && documents.length) direct.push(reference(key, column, documents));
     if (column.run && runs.length) indirect.push(reference(key, column, runs));
   }
   if (table.name === "heartbeat_runs" && runs.length) indirect.push(oneOf(sql`x.id::text`, runs));
   if (table.name === "documents" && documents.length) direct.push(oneOf(sql`x.id::text`, documents));
-  for (const expression of table.expressions) direct.push(oneOf(sql`(${sql.raw(expression)})::text`, identities));
+  const entityType = table.columns.find((column) => column.name === "entity_type");
+  const entityId = table.columns.find((column) => column.name === "entity_id");
+  if (entityType && entityId) {
+    otherCards.push(sql`(x.entity_type::text = 'issue' and exists (
+      select 1 from issues peer where peer.id::text = x.entity_id::text
+        and peer.id <> ${card.id} and peer.company_id = ${card.companyId}
+    ))`);
+  }
+  for (const expression of table.expressions) soft.push(oneOf(sql`(${sql.raw(expression)})::text`, identities));
   if (actors.length) {
     const actorColumns = table.columns.filter((column) => column.agent);
     if (actorColumns.length) {
@@ -248,9 +247,10 @@ function selects(
     }
   }
   const predicates = [...direct];
-  if (indirect.length) {
+  const attributed = [...soft, ...indirect];
+  if (attributed.length) {
     const precedence = otherCards.length ? sql` and not (${sql.join(otherCards, sql` or `)})` : sql``;
-    predicates.push(sql`((${sql.join(indirect, sql` or `)})${precedence})`);
+    predicates.push(sql`((${sql.join(attributed, sql` or `)})${precedence})`);
   }
   if (!predicates.length) return null;
   const company = table.company ? sql` and x.company_id = ${card.companyId}` : sql``;
@@ -275,7 +275,7 @@ export async function scanCardEvidence(
   card: { id: string; companyId: string; identifier: string; createdAt: Date },
   seedRunIds: readonly string[] = [],
 ): Promise<CensusHit | null> {
-  const tables = await catalog(db);
+  const tables = await loadCatalog(db);
   const byName = new Map(tables.map((table) => [table.name, table]));
   const state: ScanState = { runs: new Set(seedRunIds), agents: new Set(), documents: new Set(), seen: new Set(), checkedUuids: new Set(), bytes: 0 };
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
@@ -288,10 +288,18 @@ export async function scanCardEvidence(
       const predicate = selects(table, card, runs, actors, documents);
       if (!predicate) continue;
       queries.push(sql`(select ${table.name}::text as tbl,
-        x.tableoid::text || ':' || x.ctid::text as row_key, to_jsonb(x) as row
-        from ${sql.raw(ident(table.name))} x where ${predicate} limit ${ROW_LIMIT + 1})`);
+        x.tableoid::text || ':' || x.ctid::text as row_key, to_jsonb(x) as row,
+        octet_length(to_jsonb(x)::text) as row_bytes
+        from public.${sql.raw(ident(table.name))} x where ${predicate} limit ${ROW_LIMIT + 1})`);
     }
-    const selected = await db.execute(sql.join(queries, sql` union all `)) as unknown as Array<{ tbl: string; row_key: string; row: Row }>;
+    const remaining = Math.max(0, CARD_BYTES - state.bytes);
+    const selected = await db.execute(sql`
+      select tbl, row_key,
+        case when row_bytes > ${VALUE_BYTES}
+          or sum(row_bytes) over (order by tbl, row_key rows unbounded preceding) > ${remaining}
+          then null else row end as row
+      from (${sql.join(queries, sql` union all `)}) u
+    `) as unknown as Array<{ tbl: string; row_key: string; row: Row | null }>;
     const counts = new Map<string, number>();
     const uuids = new Set<string>();
     for (const selectedRow of selected) {
@@ -301,6 +309,7 @@ export async function scanCardEvidence(
       const identity = `${selectedRow.tbl}:${selectedRow.row_key}`;
       if (state.seen.has(identity)) continue;
       state.seen.add(identity);
+      if (selectedRow.row === null) return { table: selectedRow.tbl, column: "", label: "evidence exceeds the scan size budget" };
       const table = byName.get(selectedRow.tbl)!;
       const hit = scanRecord(table, selectedRow.row, state, uuids);
       if (hit) return hit;
@@ -309,8 +318,4 @@ export async function scanCardEvidence(
     if (size === state.runs.size + state.agents.size + state.documents.size) return null;
   }
   return { table: "attributed evidence", column: "", label: "attribution exceeds the scan round budget" };
-}
-
-export function resetEvidenceCatalogForTests() {
-  catalogPromise = null;
 }

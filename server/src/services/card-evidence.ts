@@ -49,7 +49,7 @@ const FORGE_LABEL = /^(git|gitlab|github|gerrit|gitea|gogs|forgejo|bitbucket|sta
 const REVIEW_LABEL = /^reviews?\d*$/;
 const REVIEW_CHANGE_PATH = /^\/(?:\d+(?:[/?#]|$)|q\/[^/?#])/;
 const REVIEW_CHANGE_HASH = /^#\/c\//;
-const FORGE_PATH = /\/(pulls?|pull-requests?|pullrequests?|merge_requests|merge-requests|changes|commits?|tree|blob|compare|branches|tags|releases|_git)(\/|$)|\/c\/.+\/\+\/\d+|\/\+\/\d+|\.git(\/|$|[?#])|\/-\/(commit|tree|blob|merge_requests)/i;
+const FORGE_PATH = /\/(pulls?|pull-requests?|pullrequests?|merge_requests|merge-requests|commits?|tree|blob|compare|_git)(\/|$)|(?:\/[^\/\s?#]+){2}\/(?:changes|branches|tags|releases)(?:\/|$)|\/c\/.+\/\+\/\d+|\/\+\/\d+|\.git(\/|$|[?#])|\/-\/(commit|tree|blob|merge_requests)/i;
 const TAIL = String.raw`\s*(?:(?:no\.?|number|num\.?|id)\s*)?[:#!№]?\s*[#!]?\s*\d+`;
 const CHANGE_REQUEST_LONG = new RegExp(String.raw`(?<![\p{L}\p{N}_])(?:pull[\s_-]*requests?|merge[\s_-]*requests?)` + TAIL, "iu");
 const CHANGE_REQUEST_ABBR = new RegExp(String.raw`(?<![\p{L}\p{N}_])(?:PR|MR)` + TAIL, "u");
@@ -61,9 +61,9 @@ const UUID_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/
 const SHA_PROSE = /(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i;
 const SHA_CUE = /(?:commit|sha|rev|HEAD|merged|pushed|cherry-pick).{0,24}(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])/i;
 const SHA_BARE_40 = /(?<![\w-])[0-9a-f]{40}(?![\w-])/i;
-const KEY_CONTAINS = ["workspace", "worktree", "repository", "branch", "pullrequest", "mergerequest", "commit", "project"];
+const KEY_CONTAINS = ["workspace", "worktree", "repository", "branch", "pullrequest", "mergerequest", "commit"];
 const KEY_EXACT: Record<string, true> = {
-  pr: true, mr: true, sha: true, ref: true, baseref: true, headref: true, headsha: true, repo: true, repos: true,
+  pr: true, mr: true, sha: true, ref: true, projectid: true, projectids: true, baseref: true, headref: true, headsha: true, repo: true, repos: true,
 };
 const PROSE_COLUMNS = new Set([
   "issues.title",
@@ -171,7 +171,7 @@ export function evidenceKey(key: string): boolean {
   // The abbreviation is a field-name word, not the start of "report".
   // Preserve compact spellings of the usual reference fields as well.
   if (/repo(?:id|url|path|name|root|dir|ref|slug|branch)$/.test(normalized)) return true;
-  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).some((word) => word === "repo" || word === "repos");
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).some((word) => word === "repo" || word === "repos" || word === "project" || word === "projects");
 }
 
 function provablyEmpty(value: unknown): boolean {
@@ -229,7 +229,22 @@ function lexicalKeyFinding(text: string): EvidenceFinding | null {
   return null;
 }
 
+function completeJson(text: string): { parsed: unknown } | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+  try {
+    return { parsed: JSON.parse(trimmed) };
+  } catch {
+    return null;
+  }
+}
+
 function textFinding(text: string, surface: EvidenceSurface): EvidenceFinding | null {
+  const json = surface === "machine" ? completeJson(text) : null;
+  if (json) {
+    const found = detectEvidence(json.parsed, "machine");
+    if (found) return found;
+  }
   const normalized = normalizeEvidenceText(text);
   for (const match of normalized.matchAll(URL_IN_TEXT)) {
     const cited = urlCitation(match[0] ?? "");
@@ -250,10 +265,10 @@ function textFinding(text: string, surface: EvidenceSurface): EvidenceFinding | 
   }
   if (REPOSITORY_REFERENCE.test(normalized)) return finding("a repository issue or pull request reference", "repository-reference");
   if (GIT_REF.test(normalized)) return finding("a Git ref", "git-ref");
-  if (FORGE_PATH.test(normalized)) return finding("a repository path", "forge-path");
+  if (FORGE_PATH.test(normalized.replace(URL_IN_TEXT, " "))) return finding("a repository path", "forge-path");
   const sha = shaFinding(normalized, surface);
   if (sha) return sha;
-  return surface === "machine" ? lexicalKeyFinding(normalized) : null;
+  return surface === "machine" && !json ? lexicalKeyFinding(normalized) : null;
 }
 
 export function detectEvidence(value: unknown, surface: EvidenceSurface): EvidenceFinding | null {
