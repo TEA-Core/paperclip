@@ -408,19 +408,26 @@ async function resolveTokenSecretFailSoft(
 export async function resolveGitHubToken(
   db: Db,
   companyId: string,
+  signal?: AbortSignal,
 ): Promise<GitHubTokenResult> {
+  signal?.throwIfAborted();
   const secrets = secretService(db);
 
-  const appResult = await resolveAppInstallationToken(companyId, secrets);
+  const appResult = await resolveAppInstallationToken(
+    companyId, secrets, undefined, undefined, undefined, DEFAULT_GITHUB_APP, undefined, signal,
+  );
+  signal?.throwIfAborted();
   if (appResult) return appResult;
 
   for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
     const secret = await secrets.getByName(companyId, secretName);
+    signal?.throwIfAborted();
     if (!secret) continue;
     const token = await resolveTokenSecretFailSoft(secrets, companyId, secret.id, "latest", {
       scope: "company",
       secretName,
     });
+    signal?.throwIfAborted();
     const trimmed = token?.trim();
     if (trimmed) return { token: trimmed, scope: "company", secretName };
   }

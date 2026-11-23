@@ -4092,7 +4092,9 @@ export function issueThreadInteractionService(
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
             originIdentityContextId: interaction.sourceIdentityContextId ?? null,
-            originRunId: interaction.sourceRunId ?? null,
+            // Stored source attribution is not authenticated run proof: legacy
+            // plugin interactions could supply both the run and creating agent.
+            originRunId: null,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.userId ?? null,
           } as Parameters<ReturnType<typeof issueService>["createChild"]>[1]);

@@ -3397,7 +3397,18 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
             throw new TypeError("boom");
           }],
         ] as Array<[string, Fault]>)("rethrows %s from the audit insert so the dispatch fails without an orphan card", async (_label, fault) => {
-          const { routine, svc } = await seedFixture();
+          const { companyId, routine, svc } = await seedFixture();
+          const owingIssueId = randomUUID();
+          await db.insert(issues).values({
+            id: owingIssueId, companyId, title: "Existing landing obligation",
+            status: "todo", deliveryRequirement: "record_only",
+          });
+          const debtId = randomUUID();
+          await db.insert(activityLog).values({
+            id: debtId, companyId, actorType: "system", actorId: "landing-debt",
+            action: "issue.repository_landing_debt", entityType: "issue", entityId: owingIssueId,
+            details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" },
+          });
           injectFault(1, fault);
 
           const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
@@ -3405,6 +3416,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
           expect(run.status).toBe("failed");
           expect(run.linkedIssueId).toBeNull();
           expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id))).toEqual([]);
+          expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.id, owingIssueId)))
+            .toEqual([{ id: owingIssueId }]);
+          expect((await db.select().from(activityLog).where(eq(activityLog.id, debtId)))[0]?.details)
+            .toEqual({ landingCheckOwed: true, landingDebtDisposition: "outstanding" });
         });
 
         it("rethrows a lost connection from the caller-run lookup instead of continuing on a dead transaction", async () => {

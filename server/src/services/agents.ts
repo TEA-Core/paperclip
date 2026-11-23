@@ -1096,6 +1096,8 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        // Tombstoning retains every historical row, including landing debt,
+        // without deleting the agent/run FK targets or detaching their identity.
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         // Decision-table actor rows carry check constraints tying the 'agent'
         // actor type to a non-null agent FK. Re-label this agent's rows as

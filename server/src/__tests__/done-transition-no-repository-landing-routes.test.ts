@@ -1429,7 +1429,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(rowUnlockedDuringCompare.every(Boolean), JSON.stringify(rowUnlockedDuringCompare)).toBe(true);
   });
 
-  it("completes twelve concurrent no-repository closes, more than the database pool holds", async () => {
+  it.each(["stable clock", "forward clock adjustment"] as const)("completes twelve concurrent no-repository closes, more than the database pool holds (%s)", async (clockMode) => {
     const fixtures: SeededIssue[] = [];
     for (let index = 0; index < 12; index += 1) {
       const fixture = await seed();
@@ -1445,17 +1445,32 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         : new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
     });
 
-    const responses = await Promise.all(
-      fixtures.map((fixture) =>
-        request(app)
-          .patch(`/api/issues/${fixture.identifier}`)
-          .set("x-test-actor", JSON.stringify(fixture.actor))
-          .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER }),
-      ),
-    );
-
-    expect(responses.map((res) => res.status)).toEqual(fixtures.map(() => 200));
-    for (const fixture of fixtures) expect(await statusOf(fixture.issueId)).toBe("done");
+    const realNow = Date.now;
+    let offset = 0;
+    const clock = clockMode === "forward clock adjustment"
+      ? vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset) : null;
+    if (clock) {
+      mockRecheckRecordedWorktree.mockImplementation((input: Parameters<typeof recheckRecordedWorktree>[0]) => {
+        const check = realRecheckRecordedWorktreeRef.current!(input);
+        // Advance wall time after the budget starts, while filesystem work awaits.
+        offset += 60_000;
+        return check;
+      });
+    }
+    try {
+      const responses = await Promise.all(
+        fixtures.map((fixture) =>
+          request(app)
+            .patch(`/api/issues/${fixture.identifier}`)
+            .set("x-test-actor", JSON.stringify(fixture.actor))
+            .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER }),
+        ),
+      );
+      expect(responses.map((res) => res.status), JSON.stringify(responses.map((res) => res.body))).toEqual(fixtures.map(() => 200));
+      for (const fixture of fixtures) expect(await statusOf(fixture.issueId)).toBe("done");
+    } finally {
+      clock?.mockRestore();
+    }
   }, 120_000);
 
   it("lets exactly one of twelve concurrent closes of one issue through; the rest refuse at the compare-and-set", async () => {

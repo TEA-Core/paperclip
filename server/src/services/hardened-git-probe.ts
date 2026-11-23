@@ -158,7 +158,7 @@ function inheritedGitEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * One wall-clock budget shared by every Git process and file copy of a
+ * One monotonic budget shared by every Git process and file copy of a
  * check: each step gets only the time left, and `expired` records that the
  * budget ran out (rather than a step failing for another reason).
  */
@@ -168,12 +168,12 @@ export interface ProbeDeadline {
 }
 
 function remainingBudget(deadline: ProbeDeadline): number {
-  const remaining = deadline.at - Date.now();
+  const remaining = deadline.at - performance.now();
   if (remaining <= 0) {
     deadline.expired = true;
     throw new HardenedGitError("timeout", "the shared deadline passed");
   }
-  return remaining;
+  return Math.ceil(remaining); // AbortSignal.timeout requires whole milliseconds.
 }
 
 export interface HardenedGitOptions {
@@ -1028,7 +1028,7 @@ export async function recheckRecordedWorktree(input: {
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
   const budgetMs = input.budgetMs ?? IN_TRANSACTION_RECHECK_BUDGET_MS;
-  const deadline: ProbeDeadline = { at: Date.now() + budgetMs, expired: false };
+  const deadline: ProbeDeadline = { at: performance.now() + budgetMs, expired: false };
   const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, {
     cwd: path.dirname(input.commonDir),
     deadline,

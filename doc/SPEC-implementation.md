@@ -277,6 +277,45 @@ retain their titles and default to no generation request.
 - `cancelled_at` timestamptz null
 - `hidden_at` timestamptz null
 
+Repository landing debt survives a change from `repository_delivery` to
+`record_only` while an issue is open. The reclassification activity row records
+`landingCheckOwed` and an outstanding/discharged disposition. Every existing-issue
+done door, including automatic reconciliation backstops, rechecks that debt under
+the issue-row lock and discharges it only in the transaction that accepts a close
+with positive repository landing evidence. The proof's repository, base, and
+branch binding is locked and checked before discharge. Merged-PR evidence must
+cover the checked delivery head; an older merge on the same branch is insufficient.
+Every positive debt-bearing proof records its immutable delivery head and source.
+Before discharge, the close transaction rechecks that same remote or worktree
+branch head under the issue/workspace locks; a detached checkout's HEAD is not
+the branch proof. GitHub App credential requests and the remote head lookup share
+one 15-second deadline. Local branch probes are bounded to 15 seconds.
+Mismatch, expiry, or lookup failure refuses the close. The discharged marker
+retains the head and repository/base/branch evidence. Database locks do not freeze
+external Git refs. Carrier search, PR-detail requests, and content comparisons
+also share one 15-second deadline.
+Reopening and status-version changes never waive unpaid debt. The landing backstop
+includes debt-bearing record-only cards without expiring the obligation.
+A legacy reclassification row without a disposition, older than the issue's latest
+accepted done transition, is settled history: it is ignored on read, never
+rewritten. The close audit must record a non-done `_previous.status`; a repeated
+done write is not a transition and cannot settle legacy debt. A later close audit
+cannot settle explicit outstanding debt. A debt-bearing issue with no probe-able
+repository/branch or merged PR is refused fail-closed; the refusal names the exits
+(verify landing, or cancel).
+An unavailable or malformed carrier-head lookup remains unverified and produces
+the same HTTP 409 delivery refusal, including auth errors and rejected requests;
+it must not escape as HTTP 500 or authorize a close.
+Board tier-form bypass and delivery overrides cannot discharge this debt;
+genuine record-only cards without debt retain their existing close behavior.
+An owing reclassification also writes a system-owned
+`issue.repository_landing_debt` marker linked to its source audit ID, without
+agent/run foreign keys. A missing source event cannot make that outstanding marker
+debt-free. Agent cleanup detaches actor/run foreign keys rather than deleting
+landing-debt or accepted-done audit evidence. Company deletion removes the owing
+issue and its evidence in one transaction. No-repository close rechecks use a
+monotonic 15-second budget, so wall-clock adjustments do not cause false timeouts.
+
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
 the approving decision to its certified pull request and head, including when
 the decision comes from a final-stage escalation. Publish outcomes retain this
