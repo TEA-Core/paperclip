@@ -47216,7 +47216,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             })
             .returning();
           await f.service.processPendingPublications();
-          const runtime = f.runtime.endpoints.get(f.endpoint.id)!;
+          const initialRuntime = f.runtime.endpoints.get(f.endpoint.id)!;
           const progressMessageId = await waitFor(async () => {
             await f.service.processPendingPublications();
             const [published] = await db
@@ -47249,8 +47249,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               .where(eq(chatPublications.id, progress.id));
           // Count before admission: another publication worker may settle the
           // close while the command handler is still returning its response.
-          const editCount = runtime.edits.length,
-            postCount = runtime.posts.length;
+          const editCount = initialRuntime.edits.length,
+            postCount = initialRuntime.posts.length;
           const command = f.interaction("close");
           await f.adapter.handleGatewayInteraction(command);
           const close = (await f.publications()).find((publication) =>
@@ -47280,11 +47280,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(published?.state).toBe("published");
           });
           await f.service.processPendingReceiptReactions();
+          // The endpoint runtime can be replaced while the close settles; the
+          // delivery lands on whichever instance is live, so count against it.
+          const runtime = f.runtime.endpoints.get(f.endpoint.id)!;
+          const replaced = runtime !== initialRuntime;
           expect(runtime.edits).toHaveLength(
-            editCount + (mode === "working" ? 1 : 0),
+            (replaced ? 0 : editCount) + (mode === "working" ? 1 : 0),
           );
           expect(runtime.posts).toHaveLength(
-            postCount + (mode === "working" ? 0 : 1),
+            (replaced ? 0 : postCount) + (mode === "working" ? 0 : 1),
           );
           if (mode === "working") {
             expect(runtime.edits.at(-1)).toMatchObject({
@@ -47311,7 +47315,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await f.adapter.handleGatewayInteraction(command);
           await f.service.processPendingPublications();
           expect(runtime.edits).toHaveLength(
-            editCount + (mode === "working" ? 1 : 0),
+            (replaced ? 0 : editCount) + (mode === "working" ? 1 : 0),
           );
         } finally {
           await f.close();
