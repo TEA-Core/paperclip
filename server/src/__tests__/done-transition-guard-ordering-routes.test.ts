@@ -6,7 +6,7 @@ import { join } from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, asc, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -1917,7 +1917,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     };
     const debtRows = (id: string) => db.select().from(activityLog).where(and(
       eq(activityLog.entityId, id), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
-    ));
+    )).orderBy(asc(activityLog.createdAt));
     const patch = (id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
     async function flip(id: string) {
       const response = await patch(id, { deliveryRequirement: "record_only" });
