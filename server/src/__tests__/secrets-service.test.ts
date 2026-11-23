@@ -29,6 +29,7 @@ import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provid
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { SecretProviderClientError } from "../secrets/types.js";
 import { secretService } from "../services/secrets.js";
+import { resolveGitHubToken } from "../services/github-credential.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -925,6 +926,54 @@ describeEmbeddedPostgres("secretService", () => {
     if (outcomes[0]?.status === "rejected") throw outcomes[0].reason;
     await expect(rotateCall).rejects.toThrow(/no longer exists/);
   });
+
+  it.each(["GITHUB_APP_PRIVATE_KEY", "GITHUB_TOKEN"])(
+    "cancels the %s provider lookup with the shared landing deadline",
+    async (name) => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const vault = await svc.createProviderConfig(companyId, {
+        provider: "aws_secrets_manager", displayName: "Deadline fixture",
+        config: { region: "us-east-1", namespace: "deadline-fixture" },
+      });
+      vi.spyOn(awsSecretsManagerProvider, "createSecret").mockResolvedValue({
+        material: {
+          scheme: "aws_secrets_manager_v1", secretId: "deadline-fixture-key",
+          source: "external_reference", versionId: null,
+        },
+        externalRef: "deadline-fixture-key", providerVersionRef: null,
+        valueSha256: "fixture", fingerprintSha256: "fixture",
+      });
+      await svc.create(companyId, {
+        name, provider: "aws_secrets_manager", providerConfigId: vault.id, value: "synthetic-key",
+      });
+      vi.stubEnv("AWS_ACCESS_KEY_ID", "synthetic-deadline-access-key");
+      vi.stubEnv("AWS_SECRET_ACCESS_KEY", "synthetic-deadline-secret-key");
+      const entered = deferred<AbortSignal>();
+      const response = deferred<Response>();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+        const signal = init!.signal!;
+        signal.addEventListener("abort", () => response.reject(signal.reason), { once: true });
+        entered.resolve(signal);
+        return response.promise;
+      });
+      const deadline = new AbortController();
+      const failure = new Error("shared landing deadline expired");
+      const lookup = resolveGitHubToken(db, companyId, deadline.signal);
+      // Observe the rejection immediately so failure cleanup cannot leak it.
+      const outcome = lookup.then((value) => ({ value }), (error: unknown) => ({ error }));
+      try {
+        const providerSignal = await entered.promise;
+        deadline.abort(failure);
+        expect(providerSignal.aborted).toBe(true);
+        expect(await outcome).toEqual({ error: failure });
+      } finally {
+        response.reject(failure);
+        await outcome;
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it("serializes an aws_secrets_manager secret create against a concurrent account-home mutation lock holder", async () => {
     // A plain string value can equal a Codex account-home path regardless of

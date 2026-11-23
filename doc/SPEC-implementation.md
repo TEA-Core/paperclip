@@ -288,8 +288,9 @@ cover the checked delivery head; an older merge on the same branch is insufficie
 Every positive debt-bearing proof records its immutable delivery head and source.
 Before discharge, the close transaction rechecks that same remote or worktree
 branch head under the issue/workspace locks; a detached checkout's HEAD is not
-the branch proof. GitHub App credential requests and the remote head lookup share
-one 15-second deadline. Local branch probes are bounded to 15 seconds.
+branch proof. GitHub credential requests, including secret-provider value
+lookups, and the remote head lookup share one 15-second abort signal. Local
+branch probes are bounded to 15 seconds.
 Mismatch, expiry, or lookup failure refuses the close. The discharged marker
 retains the head and repository/base/branch evidence. Database locks do not freeze
 external Git refs. Carrier search, PR-detail requests, and content comparisons

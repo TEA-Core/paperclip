@@ -21,6 +21,7 @@ import {
   issueExecutionDecisions,
   issueRecoveryActions,
   issueWorkProducts,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -43,6 +44,8 @@ import * as githubFetch from "../services/github-fetch.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
+import { reapStrandedSummaryGenerationIssues, SUMMARIZER_AGENT_ID } from "../services/execution-control-reconciliation.js";
+import { createMergedOperatorMergeCardSweepService } from "../services/merged-operator-merge-cards.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1952,6 +1955,102 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(response.status, JSON.stringify(response.body)).toBe(200);
     }
 
+    async function rejectTerminalUpdate(issueId: string, mode: "throw" | "refuse" | "commit") {
+      // Sequence increments survive rollback, proving the failure happened
+      // AFTER a real discharge, not at an earlier guard refusal.
+      await db.execute(sql`create sequence test_debt_close_attempt`);
+      await db.execute(sql`create function test_refuse_terminal_update() returns trigger language plpgsql as $$
+        begin
+          if not exists (select 1 from activity_log where entity_id = NEW.id::text
+            and details->>'landingDebtDisposition' = 'discharged') then
+            raise exception 'close did not reach the discharge';
+          end if;
+          perform nextval('test_debt_close_attempt');
+          ${sql.raw(mode === "refuse" ? "return null;" : "raise exception 'injected terminal update failure';")}
+        end $$`);
+      const trigger = mode === "commit"
+        ? "create constraint trigger test_refuse_terminal_update after update on issues deferrable initially deferred"
+        : "create trigger test_refuse_terminal_update before update on issues";
+      await db.execute(sql`${sql.raw(trigger)}
+        for each row when (NEW.id = ${sql.raw(`'${issueId}'::uuid`)} and NEW.status = 'done')
+        execute function test_refuse_terminal_update()`);
+      return async () => {
+        await db.execute(sql`drop trigger test_refuse_terminal_update on issues`);
+        await db.execute(sql`drop function test_refuse_terminal_update()`);
+        await db.execute(sql`drop sequence test_debt_close_attempt`);
+      };
+    }
+
+    async function expectAttemptedDischargeRolledBack(issueId: string) {
+      expect(await db.execute(sql`select is_called from test_debt_close_attempt`)).toMatchObject([{ is_called: true }]);
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(rows.filter((row) => row.details?.landingDebtDisposition === "discharged")).toEqual([]);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).not.toBe("done");
+    }
+
+    it.each(["summary", "operator"] as const)(
+      "rolls landing debt back when the %s sweep terminal update throws or refuses",
+      async (door) => {
+        // The operator sweep constructs a transaction-scoped issue service.
+        // Restore this file's shared seam before later routes reuse it.
+        const poolAddComment = realAddCommentRef.current!;
+        onTestFinished(() => {
+          realAddCommentRef.current = poolAddComment;
+          mockAddComment.mockImplementation(poolAddComment);
+        });
+        const { issueId, companyId } = await seedIssue("SWEEPROLLBACK");
+        board();
+        await flip(issueId);
+        if (door === "summary") {
+          await db.insert(agents).values({
+            id: SUMMARIZER_AGENT_ID, companyId, name: "Summarizer", adapterType: "claude_local", status: "idle",
+          });
+          await db.update(issues).set({ assigneeAgentId: SUMMARIZER_AGENT_ID, status: "in_progress" })
+            .where(eq(issues.id, issueId));
+        } else {
+          await db.update(issues).set({
+            assigneeAgentId: null, assigneeUserId: "local-board",
+            description: "Merge-gate: TEA-Core/paperclip#404\n",
+          }).where(eq(issues.id, issueId));
+          const dependentId = randomUUID();
+          await db.insert(issues).values({
+            id: dependentId, companyId, title: "Waiting on operator merge",
+            status: "blocked", assigneeUserId: "local-board",
+          });
+          await db.insert(issueRelations).values({
+            companyId, issueId, relatedIssueId: dependentId, type: "blocks",
+          });
+        }
+        const sweep = door === "summary"
+          ? () => reapStrandedSummaryGenerationIssues(db).then((result) => result.terminalized)
+          : () => createMergedOperatorMergeCardSweepService(db, {
+            resolvePullRequest: async () => ({
+              state: "merged", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+              mergedAt: "2026-08-29T00:11:06Z",
+            }),
+          }).sweepMergedOperatorMergeCards().then((result) => result.closed);
+        landing();
+        for (const mode of ["throw", "refuse"] as const) {
+          // The summary settle window reads both issue and audit timestamps.
+          const past = new Date(Date.now() - 20 * 60_000);
+          await db.update(issues).set({ updatedAt: past }).where(eq(issues.id, issueId));
+          await db.update(activityLog).set({ createdAt: past }).where(eq(activityLog.entityId, issueId));
+          await db.update(issueComments).set({ createdAt: past }).where(eq(issueComments.issueId, issueId));
+          const removeFailure = await rejectTerminalUpdate(issueId, mode);
+          try {
+            expect(await sweep()).toBe(0);
+            await expectAttemptedDischargeRolledBack(issueId);
+          } finally {
+            await removeFailure();
+          }
+        }
+        expect(await sweep()).toBe(1);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("done");
+      },
+    );
+
     it.each(["agentId", "runId"] as const)("preserves unassigned issue debt through the agent-delete route (%s linkage)", async (link) => {
       const { companyId, issueId, agentId } = await seedIssue("DELETE");
       board();
@@ -2117,6 +2216,17 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         expect(refused.status, JSON.stringify(refused.body)).toBe(409);
         expect(refused.body.code).toBe("done_transition_missing_delivery");
         expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        // These doors finalize after the status write. Refuse COMMIT after
+        // their discharge, proving that neither change survives independently.
+        landing();
+        const removeFailure = await rejectTerminalUpdate(issueId, "commit");
+        try {
+          const failed = await close();
+          expect(failed.status, JSON.stringify(failed.body)).toBe(500);
+          await expectAttemptedDischargeRolledBack(issueId);
+        } finally {
+          await removeFailure();
+        }
         const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
         expect(stored?.status).not.toBe("done");
         // The same door succeeds once real repository compare evidence exists.
@@ -2618,6 +2728,16 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(refused.body.code).toBe("done_transition_missing_delivery");
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      landing();
+      const accepted = await patch(issueId, { status: "done" });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+      expect((await debtRows(issueId))[0]?.details).toMatchObject({
+        landingDebtDisposition: "discharged",
+        landingProof: {
+          head: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+          source: "remote",
+        },
+      });
     });
 
     it("names the exit when landing cannot be verified", async () => {

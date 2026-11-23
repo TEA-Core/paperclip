@@ -262,7 +262,7 @@ export async function resolveAppInstallationToken(
       companyId,
       secret.id,
       "latest",
-      accessContext ? { accessContext } : undefined,
+      accessContext || signal ? { ...(accessContext ? { accessContext } : {}), ...(signal ? { signal } : {}) } : undefined,
     );
   } catch {
     logger.warn(
@@ -393,9 +393,10 @@ async function resolveTokenSecretFailSoft(
   secretId: string,
   version: SecretVersionSelector,
   arm: { scope: GitHubTokenScope; secretName: string; projectId?: string },
+  signal?: AbortSignal,
 ): Promise<string | null> {
   try {
-    return await secrets.resolveSecretValue(companyId, secretId, version);
+    return await secrets.resolveSecretValue(companyId, secretId, version, signal ? { signal } : undefined);
   } catch (err) {
     logger.warn(
       { companyId, ...arm, error: err instanceof Error ? err.message : "unknown" },
@@ -426,7 +427,7 @@ export async function resolveGitHubToken(
     const token = await resolveTokenSecretFailSoft(secrets, companyId, secret.id, "latest", {
       scope: "company",
       secretName,
-    });
+    }, signal);
     signal?.throwIfAborted();
     const trimmed = token?.trim();
     if (trimmed) return { token: trimmed, scope: "company", secretName };

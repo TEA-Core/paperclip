@@ -47145,42 +47145,51 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             }),
             trigger: "subscribed_message",
           });
-          const [sourceDelivery] = await db
-            .select({ id: chatDeliveries.id, state: chatDeliveries.state })
-            .from(chatDeliveries)
-            .where(
-              and(
-                eq(chatDeliveries.endpointId, f.endpoint.id),
-                sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${sourceMessageId}`,
-              ),
-            );
-          expect(sourceDelivery?.state).toBe("processed");
-          await expect(
-            db
-              .select({ status: chatActions.status })
-              .from(chatActions)
+          const sourceDelivery = await waitFor(async () => {
+            await f.service.processPendingDeliveries();
+            const [delivery] = await db
+              .select({ id: chatDeliveries.id, state: chatDeliveries.state })
+              .from(chatDeliveries)
               .where(
                 and(
-                  eq(chatActions.endpointId, f.endpoint.id),
-                  eq(chatActions.deliveryId, sourceDelivery!.id),
-                  eq(chatActions.kind, "inbound_wakeup"),
+                  eq(chatDeliveries.endpointId, f.endpoint.id),
+                  sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${sourceMessageId}`,
                 ),
-              ),
-          ).resolves.toEqual([{ status: "processed" }]);
-          await expect(
-            db
-              .select({ status: chatActions.status })
-              .from(chatActions)
-              .where(
-                and(
-                  eq(chatActions.endpointId, f.endpoint.id),
-                  eq(
-                    chatActions.providerActionId,
-                    `receipt_reaction:${sourceDelivery!.id}`,
+              );
+            expect(delivery?.state).toBe("processed");
+            return delivery!;
+          });
+          await waitFor(async () => {
+            await expect(
+              db
+                .select({ status: chatActions.status })
+                .from(chatActions)
+                .where(
+                  and(
+                    eq(chatActions.endpointId, f.endpoint.id),
+                    eq(chatActions.deliveryId, sourceDelivery.id),
+                    eq(chatActions.kind, "inbound_wakeup"),
                   ),
                 ),
-              ),
-          ).resolves.toEqual([{ status: "processed" }]);
+            ).resolves.toEqual([{ status: "processed" }]);
+          });
+          await waitFor(async () => {
+            await f.service.processPendingReceiptReactions();
+            await expect(
+              db
+                .select({ status: chatActions.status })
+                .from(chatActions)
+                .where(
+                  and(
+                    eq(chatActions.endpointId, f.endpoint.id),
+                    eq(
+                      chatActions.providerActionId,
+                      `receipt_reaction:${sourceDelivery.id}`,
+                    ),
+                  ),
+                ),
+            ).resolves.toEqual([{ status: "processed" }]);
+          });
           const runId = randomUUID();
           await db.insert(heartbeatRuns).values({
             id: runId,
@@ -47208,11 +47217,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             .returning();
           await f.service.processPendingPublications();
           const runtime = f.runtime.endpoints.get(f.endpoint.id)!;
-          const progressMessageId = await db
-            .select({ id: chatPublications.providerMessageId })
-            .from(chatPublications)
-            .where(eq(chatPublications.id, progress.id))
-            .then((rows) => rows[0]!.id!);
+          const progressMessageId = await waitFor(async () => {
+            await f.service.processPendingPublications();
+            const [published] = await db
+              .select({ id: chatPublications.providerMessageId, state: chatPublications.state })
+              .from(chatPublications)
+              .where(eq(chatPublications.id, progress.id));
+            expect(published?.state).toBe("published");
+            expect(published?.id).toEqual(expect.any(String));
+            return published!.id!;
+          });
           if (mode === "final") {
             await addSelectedChatFinal({
               agentId: f.fixture.assignedAgentId,
@@ -47233,6 +47247,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                 },
               })
               .where(eq(chatPublications.id, progress.id));
+          // Count before admission: another publication worker may settle the
+          // close while the command handler is still returning its response.
+          const editCount = runtime.edits.length,
+            postCount = runtime.posts.length;
           const command = f.interaction("close");
           await f.adapter.handleGatewayInteraction(command);
           const close = (await f.publications()).find((publication) =>
@@ -47255,9 +47273,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               })
               .where(eq(chatPublications.commentId, final.id));
           }
-          const editCount = runtime.edits.length,
-            postCount = runtime.posts.length;
           await f.service.processPendingPublications();
+          await waitFor(async () => {
+            const [published] = await db.select({ state: chatPublications.state })
+              .from(chatPublications).where(eq(chatPublications.id, close.id));
+            expect(published?.state).toBe("published");
+          });
           await f.service.processPendingReceiptReactions();
           expect(runtime.edits).toHaveLength(
             editCount + (mode === "working" ? 1 : 0),
