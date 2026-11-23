@@ -1992,6 +1992,9 @@ export const requestConfirmationPayloadSchema = z.object({
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
   adoptionCarrier: requestConfirmationAdoptionCarrierSchema.nullable().optional(),
+  // Explicit close authority: an eligible human acceptance also closes the
+  // issue. Never inferred from prompt, label, or title text.
+  closeIssueOnAccept: z.boolean().optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
