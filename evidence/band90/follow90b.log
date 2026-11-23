@@ -1,0 +1,16 @@
+SUP-25007 status= todo dr= repository_delivery assignee= 17569bb8-810f-4d1b-9669-f1285480762c created= 2026-11-22T07:47:08.822Z
+   run  d051c75c 2026-11-22T16:11:55.730Z 2026-11-22T17:29:38.222Z
+   run  d051c75c 2026-11-22T06:57:25.531Z 2026-11-22T08:06:41.106Z
+SUP-22919 status= blocked title= Architecture review: record-only sweep Tier 2 close guard requires nonexistent merge delivery
+   body head: work-type:architecture-review |  | Root issue: [SUP-22918](/SUP/issues/SUP-22918) |  | Symptom signature: record-only-tier2-close-requires-merge-commit |  | Finding: The record-only hourly sweep card has `deliveryRequirement: record_only` and `executionPolicy.stages=[]`; its entire deliverable is the live sweep record. The mandated Tier 2 close was refused twice on [SUP-22918](/SUP/issues/SUP-22918): first for missing machine-checkable probe shape, then after supplying the structured Tier 2 declaration because `merge_commit_unrecorded`. This card class intentionally has no repository delivery or linked PR, so requiring a recorded delivery merge commit makes the mandated close impossible. |  | Chain depth: 1 |  | Prior attempt diff: | - Attempt 1 used the required inline Tier 2 literal but omitted the structured probe shape; server returned `422 done_transition_missing_tier_declaration`. | - Attempt 2 supplied `
+SUP-25027 status= blocked assignee= e75502a7-952d-4895-93df-6a2b524a804b blockedTransitionAt= 2026-11-22T17:34:42.347Z
+   status in_progress -> blocked 2026-11-22T17:34:42.539Z agent
+   status in_review -> in_progress 2026-11-22T17:30:31.686Z agent
+   status in_progress -> in_review 2026-11-22T17:19:16.099Z agent
+   last comment by agent : ## Workspace Ready |  | - Strategy: `git_worktree` | - Branch: `SUP-25027-arch-review-sup-24214-post-flip-deliveryrequirement-erases-landing-check-deployed-request-scoped-fix-bypassed-` | - CWD: `/paperclip/instances/default/projects/7ea96510-11a7-43b6-ac5e-10d395fbb469/86aa3f31-ce0d-42f8-98e9-02154f9be6a9/Trading-Signal-Platform/.paperclip/worktrees/SUP-25027-arch-review-sup-24214-post-flip-deliveryrequi
+SUP-25026 cited_sha_resolved 2026-11-22T17:23:15.307Z results: [{"sha": "00827af5f55a66b98939aa77f2d1111111111111", "reason": "ambiguous_repository_scope", "status": "unverifiable", "probedRepos": [{"repo": "Trading-Signal-Platform", "owner": "TEA-Core", "hostname": "github.com"}]}]
+SUP-25040 cited_sha_resolved 2026-11-23T01:04:30.158Z results: [{"sha": "00827af5f55a66b98939aa77d2fe1c222d16e601", "reason": "ambiguous_repository_scope", "status": "unverifiable", "probedRepos": [{"repo": "Trading-Signal-Platform", "owner": "TEA-Core", "hostname": "github.com"}]}]
+issue.done_transition_ladder_refused last 24h rows=72 per-card(top)={'2755ef7c': 72}
+issue.done_transition_ladder_refusal_repeated last 24h rows=24 per-card(top)={'2755ef7c': 24}
+cleanup_failed rows last 2h: 0 (single page tail<500 = True )
+feed oldest row=2026-11-23T00:35:06.815Z rows~30500 pages=60 retention_h=1.2

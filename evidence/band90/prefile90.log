@@ -1,0 +1,9 @@
+SUP-25027 status blocked unblockDescriptor {"owner": {"agentId": "e75502a7-952d-4895-93df-6a2b524a804b"}, "action": "Resolve interaction 576eb08f-0226-4f33-826d-f7a1db222569 with the sanctioned review-only disposition for SUP-25027."}
+  blockers unresolved: {"state": "needs_attention", "reason": "attention_required", "computed": true, "unresolvedBlockerCount": 1, "explicitBlockerCount": 0, "childBlockerCount": 1, "coveredBlockerCount": 0, "stalledBlockerCount": 0, "attentionBlockerCount": 1, "pendingFinalizeBlockerIssueIds": [], "sampleBlockerIdentifier": "SUP-25028", "sampleStalledBlockerIdentifier": null, "blockingTreeLive": false, "directBlockerIssueId": "be2e088e-8553-4e3d-a03f-76e30ea26cbd", "terminalBlockerIssueId": "be2e088e-8553-4e3d-a03f-76e30ea26cbd", "terminalBlocker": {"id": "be2e088e-8553-4e3d-a03f-76e30ea26cbd", "identifier": "SUP-25028", "title": "Preserve repository landing debt across record_only reclassification and every close door"}}
+collision band#90 titled issues: NONE
+  recent: 2026-11-23T01:41:12.226Z SUP-25042 in_progress Stamp: fix(server): refuse record-only Tier 2 pass declarations that contradict 
+  recent: 2026-11-23T01:39:10.134Z SUP-25041 done Stamp: fix(mcp-ingest): bound Decrypt HTML tag-strip scans to linear time (4365)
+  recent: 2026-11-23T01:00:26.029Z SUP-25040 done Merge-arming backstop sweep (hourly) - SUP-11580
+  recent: 2026-11-23T00:00:25.996Z SUP-25039 done Merge-arming backstop sweep (hourly) - SUP-11580
+  recent: 2026-11-22T23:00:25.989Z SUP-25037 done Merge-arming backstop sweep (hourly) - SUP-11580
+  recent: 2026-11-22T22:00:25.946Z SUP-25036 done Merge-arming backstop sweep (hourly) - SUP-11580

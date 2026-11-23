@@ -1,0 +1,7 @@
+board_stage_override rows since 2026-11-22T16:18:57.006Z: 2 on 2 cards
+   SUP-25042: override_rows=1 closed=no tier_rows=NONE
+   SUP-25041: override_rows=1 closed=no tier_rows=NONE
+cleanup_failed control 72h: rows=0 newest=none oldest=none
+cleanup_failed control 168h: rows=500 newest=2026-11-18T09:15:56.649Z oldest=2026-11-18T05:59:28.145Z
+cleanup_failed last 24h rows=0 (tail<500=True)
+ladder card: SUP-22839 blocked Retry corrected Trading Signal Platform header summary

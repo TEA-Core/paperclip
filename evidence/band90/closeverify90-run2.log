@@ -1,0 +1,15 @@
+PASS C1 feed close-write population close-writes=10 distinct cards=10 pages=1 (offset paging, short-page termination)
+PASS C2 hard SUP-25031 run-correlated decl at -0.04s
+PASS C2 hard SUP-25037 run-correlated decl at -0.02s
+PASS C2a SUP-25025 clean close tier=['done_transition_tier2_close']
+PASS C2 hard SUP-25026 run-correlated decl at -0.03s
+PASS C2 hard SUP-25029 run-correlated decl at -0.05s
+PASS C2 hard SUP-25030 run-correlated decl at -0.03s
+PASS C2 hard SUP-25039 run-correlated decl at -0.03s
+PASS C2 hard SUP-25036 run-correlated decl at -0.03s
+PASS C2 hard SUP-25040 run-correlated decl at -0.11s
+PASS C2 hard SUP-25035 run-correlated decl at -0.02s
+PASS C2b hard count == 9 SUP-25026,SUP-25029,SUP-25030,SUP-25031,SUP-25035,SUP-25036,SUP-25037,SUP-25039,SUP-25040
+PASS C3 band #90 card present SUP-25044
+PASS C4 serving commit == audited commit= (empty tolerated if /health omits; serve90 verified at 01:35Z)
+CONTROLS: 14/14 pass -> ALL PASS

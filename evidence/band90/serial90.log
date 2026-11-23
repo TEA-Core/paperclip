@@ -1,0 +1,19 @@
+freshest-window size: 50
+freshest-window span (createdAt): 2026-11-21T19:00:25.383Z .. 2026-11-23T01:39:10.134Z
+non-probe `wake audit #N` claimants in window (0): []
+targeted-probe cards consuming window slots (5): ['SUP-25025', 'SUP-25011', 'SUP-25008', 'SUP-24993', 'SUP-24983']
+serial: underivable  (no in-window non-probe `wake audit #N` claimant) -> no census card may be minted
+SUP-24929: status=in_review completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=repository_delivery title=doctrine(ghost-pass-audit): Bug 8 serial rule is a one-way latch — no 
+SUP-24727: status=done completedAt=2026-11-19T14:21:43.710Z assigneeUser=None dr=record_only title=writer-Auditor 2026-11-19 wake audit #79 — PASS: 0 ghost-PASS of 6 clo
+SUP-24950: status=in_review completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=record_only title=writer-Auditor 2026-11-21 — closes through a board stage override emit
+SUP-24983: status=in_progress completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=repository_delivery title=writer-Auditor 2026-11-21 targeted probe (band #86) — 0 ghost-PASS of 
+SUP-24984: status=todo completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=repository_delivery title=writer-Auditor 2026-11-21 — the hourly merge-arming backstop evaluated
+SUP-25007: status=todo completedAt=None assigneeUser=None dr=repository_delivery title=writer-Auditor 2026-11-22 — an accepted record-only Tier-2 close rests
+SUP-25002: status=in_review completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=repository_delivery title=SUP-25001 sweep record: missing check-run App credential
+SUP-24994: status=todo completedAt=None assigneeUser=yuoJHg46O2i22rvDncrPSbBK0iUdakvZ dr=repository_delivery title=writer-Auditor 2026-11-22 — HTTP 403 field-write refusals write no act
+SUP-24136: status=in_progress completedAt=None assigneeUser=None dr=repository_delivery title=101 done_transition_ladder_refused rows in 27 minutes with runId=null 
+SUP-22919: status=blocked completedAt=None assigneeUser=None dr=record_only title=Architecture review: record-only sweep Tier 2 close guard requires non
+SUP-22839: status=blocked completedAt=None assigneeUser=None dr=record_only title=Retry corrected Trading Signal Platform header summary
+SUP-23801: status=todo completedAt=None assigneeUser=None dr=repository_delivery title=Repair terminal-approval reassignment cancellation after commit
+done-cards closed after CHAIN_EDGE 2026-11-19T14:07:20.178Z: 293 (newest=2026-11-23T01:04:30.180Z oldest=2026-11-19T19:58:25.784Z)
+done-cards closed after LAST_PROBE_EDGE 2026-11-22T07:03:47.346Z: 23 (newest=2026-11-23T01:04:30.180Z oldest=2026-11-22T15:23:50.069Z)

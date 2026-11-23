@@ -1,0 +1,34 @@
+SUP-25026 decl 6d099f28 author=agent:4ba1bf2b run=yes
+   exit codes seen: ['1', '2'] | scanned=['0'] failed=['4'] | len=2012
+   result:pass=True hard_machine_failure=True
+   LINE: - `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` at 2026-11-22T17:20:19Z failed closed: `SUMMARY: repos=4 scanned=0 failed=4 matched=0 armed=0 reported=0 bounded=0 unevaluated=0 flagged=0 needs_rebase=0 armed_unenq
+   LINE: - Fresh sanctioned hand-vet at 17:22:34Z: `--vet=1255 --repo=TEA-Core/paperclip` returned `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`, exit 1. No override or arm.
+   LINE: Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/paperclip` target PR #1255 head 00827af and TEA-Core/paperclip merge queue fold/tea-patches-v2026.722.0 
+SUP-25029 decl 071fbd63 author=agent:4ba1bf2b run=yes
+   exit codes seen: ['2'] | scanned=['0'] failed=[] | len=777
+   result:pass=True hard_machine_failure=True
+   LINE: Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform, TEA-Core/paperclip-agent-tools, TEA-Core/paperclip, TEA-Core/paperclip-smart-router
+SUP-25030 decl 9d4af635 author=agent:4ba1bf2b run=yes
+   exit codes seen: [] | scanned=[] failed=[] | len=668
+   result:pass=True hard_machine_failure=False
+SUP-25031 decl f0d7f61b author=agent:4ba1bf2b run=yes
+   exit codes seen: [] | scanned=[] failed=[] | len=571
+   result:pass=True hard_machine_failure=False
+SUP-25035 decl f83c8918 author=agent:4ba1bf2b run=yes
+   exit codes seen: ['2'] | scanned=[] failed=[] | len=670
+   result:pass=True hard_machine_failure=True
+   LINE: Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target GitHub merge queues, commit-status checks, and unenqueued-green-pr-alarm.yml observed 2026-11-22T21:02:29Z-2026-11-22
+SUP-25036 decl 4b0b220b author=agent:4ba1bf2b run=yes
+   exit codes seen: ['1', '2'] | scanned=['4'] failed=['0'] | len=2206
+   result:pass=True hard_machine_failure=True
+   LINE: - Primary scan `node scripts/ci/unenqueued-green-pr-scan.mjs --arm`: local scan exit 2 because check-run App token unavailable; no local PR evaluations. It reported an existing auto-merge on TEA-Core/paperclip #1255, arm
+   LINE: - Step-5 vet: `node scripts/ci/unenqueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/paperclip` exit 1; `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`. No arm was attempted. Other PR ref
+   LINE: Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core merge queues (TSP main, paperclip-agent-tools main, paperclip fold/tea-patches-v2026.722.0) and unenqueued-g
+SUP-25037 decl ac8d3a97 author=agent:4ba1bf2b run=yes
+   exit codes seen: ['2'] | scanned=[] failed=['0'] | len=605
+   result:pass=True hard_machine_failure=True
+   LINE: Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core repositories plus unenqueued-green-pr-alarm workflow and TEA-Core/paperclip merge queue for PR #1255 base fo
+SUP-25040 decl 98dfc7e1 author=agent:4ba1bf2b run=yes
+   exit codes seen: ['2'] | scanned=['0'] failed=[] | len=1641
+   result:pass=True hard_machine_failure=True
+   LINE: - Scan: `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` exit 2; 4 repos failed check-run token resolution (`check-run App token unavailable: set GH_CI_ONLY_TOKEN or GH_TOKEN`), `scanned=0`, `matched=0`, `armed=0`, `

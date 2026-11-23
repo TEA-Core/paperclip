@@ -1,0 +1,14 @@
+default_branch(TEA-Core/paperclip) resolved live = fold/tea-patches-v2026.722.0
+candidate server pids: [(8, 'exe=UNREADABLE argv0=node')]
+pid=8 lstart_pre=Sat Nov 21 16:04:59 2026 lstart_post=Sat Nov 21 16:04:59 2026 stable=True etime=1-09:35:58
+GET /api/health -> HTTP 200 commit=96bc536e42a8f74ebc7e78150df57711418826ce version=2026.428.0+3486.git.96bc536e4
+disk authoritative stamp /app/server/dist/build-info.json commit=96bc536e42a8f74ebc7e78150df57711418826ce mtime=2026-11-21 09:39:01.000000000 +0000 full={'commit': '96bc536e42a8f74ebc7e78150df57711418826ce'}
+identity model: SINGLE (disk == health)
+fold/tea-patches-v2026.722.0 tip=96bc536e42a8f74ebc7e78150df57711418826ce 
+serving..fold/tea-patches-v2026.722.0: {"ahead":0,"behind":0,"status":"identical"}
+  01b298eb3fde #1174 write tier close rows on the terminal write (merge commit): in_default=True(behind_by=0) in_serving=True(behind_by=0) -> DEPLOYED
+  4c1e4e0e5238 #1253 self-referential retry lineage (merge commit): in_default=True(behind_by=0) in_serving=True(behind_by=0) -> DEPLOYED
+  01e1f57640db #1254 drain detached stage wakes (merge commit): in_default=True(behind_by=0) in_serving=True(behind_by=0) -> DEPLOYED
+  d36c8d379bc5 #1245 one instruction consent per write request (merge commit): in_default=True(behind_by=0) in_serving=True(behind_by=0) -> DEPLOYED
+
+DONE

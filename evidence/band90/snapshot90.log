@@ -1,0 +1,91 @@
+band lower edge (probe #89 discharge, exclusive): 2026-11-22T16:18:57.006Z
+band upper edge (inclusive snapshot): 2026-11-23T01:41:25.022Z
+feed rows=35 pages=1 | issues-route pages=1 | close_writes_band=10 band_cards=10 popA_cards=10
+|B-A|=0 |A-B|=0 cancelled_with_completedAt_in_band=0 (of 1521 cancelled rows, paged 4x limit=500, tail=21<500 — SUP-21321 termination proof)
+snapshot frozen -> band90.json (N=10); 0 closes after snapshot uncovered
+band activity vocabulary: 14 distinct names on 10 cards
+DISCOVERY (close/guard-shaped, not classified): none
+action-name controls (same endpoint+action, window stepped 72 h / 7 d / 30 d):
+       0 in-band  issue.board_stage_override  control newest=2026-11-23T01:39:51.113Z window=72 h pages=1 PASS
+       0 in-band  issue.done_close_landing_confirmed  control newest=2026-11-21T21:07:31.855Z window=72 h pages=1 PASS
+       0 in-band  issue.done_close_landing_escalated  control newest=2026-11-13T19:25:57.770Z window=720 h pages=3 PASS
+       0 in-band  issue.done_close_landing_reenqueued  control newest=2026-11-19T23:01:19.750Z window=168 h pages=2 PASS
+       0 in-band  issue.done_missing_approval_stage_refused  control newest=2026-11-21T07:40:15.275Z window=72 h pages=1 PASS
+       0 in-band  issue.done_tier_declaration_skipped  control newest=2026-11-22T15:45:12.279Z window=72 h pages=1 PASS
+       3 in-band  issue.done_transition_cited_sha_resolved  PASS (observed in band)
+       0 in-band  issue.done_transition_guard_note  control newest=2026-11-21T14:43:34.122Z window=72 h pages=1 PASS
+      10 in-band  issue.done_transition_guard_skipped  PASS (observed in band)
+       0 in-band  issue.done_transition_ladder_recovered_from_decisions  control newest=2026-11-20T15:36:53.634Z window=72 h pages=1 PASS
+       0 in-band  issue.done_transition_ladder_refusal_repeated  control newest=2026-11-23T01:31:49.770Z window=72 h pages=1 PASS
+       0 in-band  issue.done_transition_ladder_refused  control newest=2026-11-23T01:31:34.840Z window=72 h pages=1 PASS
+       0 in-band  issue.done_transition_override  control newest=2026-11-20T20:36:10.643Z window=72 h pages=1 PASS
+       4 in-band  issue.done_transition_refused  PASS (observed in band)
+       0 in-band  issue.done_transition_tier1_close  control newest=2026-11-21T14:46:05.405Z window=72 h pages=1 PASS
+      10 in-band  issue.done_transition_tier2_close  PASS (observed in band)
+       1 in-band  issue.merge_arming_refused_on_close  PASS (observed in band)
+selector control (thread read covers close write +/-5 s): PASS
+creation-row completeness: 0/10 band cards have no issue.created (finding, not a control): []
+    TRUTH-CONTRADICTION SUP-25026 2026-11-22T17:23:15.384Z result-token=pass decl-comment=6d099f28-40c1-4fd7-95f3-b3978a19cb86
+        [failed closed] ...ep record - `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` at 2026-11-22T17:20:19Z failed closed: `SUMMARY: repos=4 scanned=0 failed=4 matched=0 armed=0 reported=0 bounded=0 unevaluated=
+        [scanned=0] ...nqueued-green-pr-scan.mjs --arm` at 2026-11-22T17:20:19Z failed closed: `SUMMARY: repos=4 scanned=0 failed=4 matched=0 armed=0 reported=0 bounded=0 unevaluated=0 flagged=0 needs_rebase=0 ar
+        [exit 2] ...rmed_unenqueued=1 armed_unenqueued_details=TEA-Core/paperclip#1255@2026-11-20T19:05:04Z`; exit 2. All repos failed because the check-run token `GH_CI_ONLY_TOKEN` or `GH_TOKEN` is unavail
+        [REFUSED] ...and-vet at 17:22:34Z: `--vet=1255 --repo=TEA-Core/paperclip` returned `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`, exit 1. No override or arm. - Alarm w
+    TRUTH-CONTRADICTION SUP-25029 2026-11-22T18:04:34.069Z result-token=pass decl-comment=071fbd63-9d1c-4854-87f3-73b2322ee624
+        [exit 2] ...026-11-22T18:03:06Z result: pass all three queues had totalCount 0 before and after; scan exit 2, failed all four repos on missing check-run App token, scanned=0, matched=0, arm actions=
+        [scanned=0] ...nt 0 before and after; scan exit 2, failed all four repos on missing check-run App token, scanned=0, matched=0, arm actions=0 (armed=0); alarm latest run success at 2026-11-22T17:11:19Z; PR
+    TRUTH-CONTRADICTION SUP-25030 2026-11-22T19:05:11.694Z result-token=pass decl-comment=9d4af635-ab05-4c00-a129-5e94d03e8ff3
+        [refused] ...rned 0 entries before and after; alarm run #45053942775 completed success; sweep armed=0; refused PR #1255 for missing `paperclip/approved` status. Sweep record is the deliverable; the sc
+    TRUTH-CONTRADICTION SUP-25031 2026-11-22T20:05:58.332Z result-token=pass decl-comment=f0d7f61b-cbdd-48e6-807b-9d35505c017b
+        [failed closed] ...entries on the three candidate queues; alarm workflow run #45059249729 was success; scan failed closed on missing check-run App token for all 4 repositories, armed=0; existing unenqueued PR #1
+    TRUTH-CONTRADICTION SUP-25035 2026-11-22T21:04:43.071Z result-token=pass decl-comment=f83c8918-3ae4-4276-8792-a031364b485d
+        [failed closed] ...hes-v2026.722.0 (smart-router has no queue); alarm latest run success; scan attempted but failed closed (exit 2; missing check-run App token), armed=0, sanctioned vet refused paperclip #1255 fo
+        [exit 2] ...(smart-router has no queue); alarm latest run success; scan attempted but failed closed (exit 2; missing check-run App token), armed=0, sanctioned vet refused paperclip #1255 for missin
+        [refused] ...ttempted but failed closed (exit 2; missing check-run App token), armed=0, sanctioned vet refused paperclip #1255 for missing paperclip/approved. Full record is in the preceding comment.
+    TRUTH-CONTRADICTION SUP-25036 2026-11-22T22:04:52.882Z result-token=pass decl-comment=4b0b220b-c546-4945-8144-2472fb600bd6
+        [exit 2] ...entries. - Primary scan `node scripts/ci/unenqueued-green-pr-scan.mjs --arm`: local scan exit 2 because check-run App token unavailable; no local PR evaluations. It reported an existing
+        [exit 1] ...vet: `node scripts/ci/unenqueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/paperclip` exit 1; `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`. No arm w
+        [REFUSED] ...ueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/paperclip` exit 1; `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`. No arm was attempted. Other PR refusa
+        [exit 2] ...result: pass three pre/post queue censuses unchanged and alarm run success; primary scan exit 2 due to missing check-run App token, arm count armed=0; pre-existing paperclip #1255 auto-
+    TRUTH-CONTRADICTION SUP-25037 2026-11-22T23:04:14.967Z result-token=pass decl-comment=ac8d3a97-a183-414a-a24d-6788d7bb316f
+        [exit 2] ...026-11-22T23:03:54Z result: pass live queue/API and alarm evidence captured; primary scan exit 2 (four check-run App token failures), armed=0, no step-5 overrides; alarm run 45076347935
+    TRUTH-CONTRADICTION SUP-25040 2026-11-23T01:04:30.519Z result-token=pass decl-comment=98dfc7e1-e0ea-4645-a3ad-f13369381b2c
+        [exit 2] ...rd — 2026-11-23 01:00Z fire - Scan: `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` exit 2; 4 repos failed check-run token resolution (`check-run App token unavailable: set GH_CI_O
+        [scanned=0] ...token resolution (`check-run App token unavailable: set GH_CI_ONLY_TOKEN or GH_TOKEN`), `scanned=0`, `matched=0`, `armed=0`, `reported=0`, `unevaluated=0`. Confirmed auto-merge-armed but u
+        [refused] ...10Z, after the scan. No arm was attempted because scan failed and the sanctioned hand-vet refused it. - Step 5: `node scripts/ci/unenqueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/pa
+        [REFUSED] .../unenqueued-green-pr-scan.mjs --vet=1255 --repo=TEA-Core/paperclip` → `HAND-VET PR #1255: REFUSED missing paperclip/approved status on head 00827af`; no override, no arm. - `unenqueued-gr
+declaration result-tokens in band: {'pass': 10}
+buckets: {'declared-close-timed': 10} | max |decl->close| = 0.97 s (bound 900 s)
+    SUP-25026 2026-11-22T17:23:15.384Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.03s | result-token=pass contradicted=True
+        flags: {'refused': '1x:done_transition_missing_tier_decla', 'cited_sha': 'unverifiable', 'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25025 2026-11-22T17:29:44.921Z actor=agent declared-close-timed | tier2 by agent:44953859 run-correlated d=-0.97s | result-token=pass contradicted=False
+        flags: {'refused': '3x:done_transition_missing_tier_decla', 'merge_arm_refused': '1x:status:skipped:head_unresolvable: no-pr:', 'cited_sha': 'resolved', 'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25029 2026-11-22T18:04:34.069Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.05s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25030 2026-11-22T19:05:11.694Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.03s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25031 2026-11-22T20:05:58.332Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.04s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25035 2026-11-22T21:04:43.071Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.02s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25036 2026-11-22T22:04:52.882Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.03s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25037 2026-11-22T23:04:14.967Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.02s | result-token=pass contradicted=True
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25039 2026-11-23T00:04:20.375Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.03s | result-token=pass contradicted=False
+        flags: {'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+    SUP-25040 2026-11-23T01:04:30.519Z actor=agent declared-close-timed | tier2 by agent:4ba1bf2b run-correlated d=-0.11s | result-token=pass contradicted=True
+        flags: {'cited_sha': 'unverifiable', 'tier_rows': 'done_transition_guard_skipped,done_transition_tier2_close'}
+control C (declaration-removal) SUP-25026 -> GHOST-PASS-declaration-absent (PASS)
+control D (time-shift +3h) SUP-25026 -> GHOST-PASS-reused-from-thread (nearest decl -10800s outside window) (PASS)
+control E: no override row in band (N/A) — override bucket empty by measurement
+control F (synthetic override injection) SUP-25026 -> overridden-by-guard (PASS)
+control G (synthetic stage-override injection) flags ABSENT->PRESENT (PASS)
+control H (synthetic contradiction injection) SUP-25026 token=pass hits=10 baseline_hits=7 (PASS)
+control I (result-token removal) SUP-25026 token->None (PASS (token read, not guessed))
+tier-row presence: 10/10 closes emitted a tier/guard_skipped row; no row: []
+build era split at PROCESS_START 2026-11-21T16:04:59Z (serve89.py, pid 8): pre-restart closes=0 post-restart closes=10
+    pre-restart: none
+    post-restart: 10/10 emitted a tier/guard_skipped row; no row: []
+dr mix in band: {'record_only': 10, 'repository_delivery': 0}
+ghost_pass=0 truth_contradicted=8 undetermined=0
+VERDICT: FAIL

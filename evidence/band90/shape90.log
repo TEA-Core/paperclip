@@ -1,0 +1,32 @@
+===== SUP-25026 close=2026-11-22T17:23:15.384Z run=2af4fbec-26e5-4af5-a7a5-c5ce5e4aee6b
+   2026-11-22T17:00:33.722Z d=-1361.66s author=agent:4ba1bf2b run=n tags=[] len=334
+   2026-11-22T17:22:18.722Z d=-56.66s author=system: run=n tags=['DECL', 'PASS-TOKEN'] len=3491
+   2026-11-22T17:23:15.354Z d=-0.03s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=2012
+===== SUP-25029 close=2026-11-22T18:04:34.069Z run=02f9a7e7-bc7e-4dcc-893d-aecebcab47f3
+   2026-11-22T18:00:34.981Z d=-239.09s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T18:04:34.019Z d=-0.05s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=777
+===== SUP-25030 close=2026-11-22T19:05:11.694Z run=0c0765fb-bad4-4ccc-82e2-516aaafeed41
+   2026-11-22T19:00:34.685Z d=-277.01s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T19:05:01.149Z d=-10.55s author=agent:4ba1bf2b run=Y tags=['MACHINE-FAIL'] len=1824
+   2026-11-22T19:05:11.665Z d=-0.03s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=668
+===== SUP-25031 close=2026-11-22T20:05:58.332Z run=65d1c0ae-99dc-4ef2-9756-139299f91fda
+   2026-11-22T20:00:33.975Z d=-324.36s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T20:05:50.208Z d=-8.12s author=agent:4ba1bf2b run=Y tags=['MACHINE-FAIL'] len=1727
+   2026-11-22T20:05:58.289Z d=-0.04s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=571
+===== SUP-25035 close=2026-11-22T21:04:43.071Z run=e53de740-3b7a-4db1-9fd4-a5de29808374
+   2026-11-22T21:00:34.341Z d=-248.73s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T21:03:58.121Z d=-44.95s author=agent:4ba1bf2b run=Y tags=['MACHINE-FAIL'] len=1778
+   2026-11-22T21:04:43.047Z d=-0.02s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=670
+===== SUP-25036 close=2026-11-22T22:04:52.882Z run=1cec29ad-c9b9-4707-858a-d7c06c20299c
+   2026-11-22T22:00:33.937Z d=-258.94s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T22:04:52.849Z d=-0.03s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=2206
+===== SUP-25037 close=2026-11-22T23:04:14.967Z run=c42cd76b-e73b-4d27-9fc7-6fb869f0f58d
+   2026-11-22T23:00:34.170Z d=-220.80s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-22T23:04:14.944Z d=-0.02s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=605
+===== SUP-25039 close=2026-11-23T00:04:20.375Z run=656f4034-f7ec-471c-aeae-d72f1fbb960a
+   2026-11-23T00:00:35.524Z d=-224.85s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-23T00:04:02.137Z d=-18.24s author=agent:4ba1bf2b run=Y tags=['MACHINE-FAIL'] len=1547
+   2026-11-23T00:04:20.346Z d=-0.03s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=511
+===== SUP-25040 close=2026-11-23T01:04:30.519Z run=e588df73-4bd5-45b5-a7bd-e68435412bcf
+   2026-11-23T01:00:34.120Z d=-236.40s author=agent:4ba1bf2b run=Y tags=[] len=334
+   2026-11-23T01:04:30.408Z d=-0.11s author=agent:4ba1bf2b run=Y tags=['DECL', 'PASS-TOKEN', 'MACHINE-FAIL'] len=1641
