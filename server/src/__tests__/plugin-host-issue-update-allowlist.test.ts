@@ -298,7 +298,7 @@ describeEmbeddedPostgres("plugin-host issues.update patch allow-list", () => {
       billingCode: "BILL-1",
       originKind: `plugin:${PLUGIN_KEY}:feature`,
       originId: "origin-1",
-      originRunId: "run-ref-1",
+      originRunId: null,
       requestDepth: 2,
     });
     const linked = await db.select().from(issueLabels).where(eq(issueLabels.issueId, card.id));
@@ -312,7 +312,6 @@ describeEmbeddedPostgres("plugin-host issues.update patch allow-list", () => {
       "labelIds",
       "originId",
       "originKind",
-      "originRunId",
       "priority",
       "requestDepth",
       "status",

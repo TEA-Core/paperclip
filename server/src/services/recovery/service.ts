@@ -212,6 +212,9 @@ import {
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
 import {
+  ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
+  findLiveIssueExecutionHolder,
+  listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
 } from "../issue-execution-lease.js";
@@ -1585,6 +1588,11 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** Promote wakes held behind a run on one card after its lock is cleared. */
+    promoteDeferredWakesAfterLockClear?: (
+      run: typeof heartbeatRuns.$inferSelect,
+      issueId: string,
+    ) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -3521,6 +3529,20 @@ export function recoveryService(
     return result;
   }
 
+  async function promoteDeferredWakesAfterLockClear(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueIds: string[],
+  ) {
+    if (!deps.promoteDeferredWakesAfterLockClear) return;
+    for (const issueId of issueIds) {
+      try {
+        await deps.promoteDeferredWakesAfterLockClear(run, issueId);
+      } catch (err) {
+        logger.error({ err, runId: run.id, issueId }, "failed to promote wakes held behind a cleared lock");
+      }
+    }
+  }
+
   async function terminateSilentActiveRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     cleanup: Awaited<ReturnType<typeof cleanupSourceResolvedRunProcess>>;
@@ -3540,6 +3562,7 @@ export function recoveryService(
       },
     };
 
+    let clearedIssueIds: string[] = [];
     const finalizedRun = await db.transaction(async (tx) => {
       const [updatedRun] = await tx
         .update(heartbeatRuns)
@@ -3578,7 +3601,7 @@ export function recoveryService(
           );
       }
 
-      await tx
+      clearedIssueIds = await tx
         .update(issues)
         .set({
           executionRunId: null,
@@ -3586,7 +3609,9 @@ export function recoveryService(
           executionLockedAt: null,
           updatedAt: input.now,
         })
-        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)));
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)))
+        .returning({ id: issues.id })
+        .then((rows) => rows.map((row) => row.id));
 
       await tx.insert(heartbeatRunWatchdogDecisions).values({
         companyId: input.run.companyId,
@@ -3630,6 +3655,23 @@ export function recoveryService(
     // wedged child is not a reason to make the agent need manual clearing before
     // it can take new work. Paused/terminated agents are left as they are.
     await finalizeAgentAfterSourceResolvedRun(finalizedRun, "cancelled");
+    // This hard-stop clears the lock itself, so the normal release never
+    // promotes the wakes held behind the run. Promote them here.
+    const promotionIssueIds = [...clearedIssueIds];
+    if (!issueIdFromRunContext(finalizedRun.contextSnapshot)) {
+      const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+        companyId: finalizedRun.companyId,
+        runId: finalizedRun.id,
+        agentId: finalizedRun.agentId,
+      }).catch((err) => {
+        logger.error({ err, runId: finalizedRun.id }, "failed to list cards held behind a terminated silent run");
+        return [] as string[];
+      });
+      for (const issueId of unlockedIssueIds) {
+        if (!promotionIssueIds.includes(issueId)) promotionIssueIds.push(issueId);
+      }
+    }
+    await promoteDeferredWakesAfterLockClear(finalizedRun, promotionIssueIds);
     return true;
   }
 
@@ -9516,12 +9558,16 @@ export function recoveryService(
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks() {
+  async function sweepStaleIssueLocks(opts?: {
+    now?: Date;
+    beforeSilentLockClear?: (input: { runId: string; issueId: string }) => Promise<void>;
+  }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
     };
+    const sweepNow = opts?.now ?? new Date();
 
     const candidates = await db
       .select({
@@ -9603,14 +9649,77 @@ export function recoveryService(
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
-      if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+      if (outcome.terminalized) {
+        result.terminalizedRunIds.push(row.id);
+        // The dead author may also hold wakes on authored cards that carry no
+        // lock stamp; those cards are never cleared below, so promote here.
+        const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+          companyId: row.companyId,
+          runId: row.id,
+          agentId: row.agentId,
+        }).catch((err) => {
+          logger.error({ err, runId: row.id }, "failed to list cards held behind a terminalized author");
+          return [] as string[];
+        });
+        await promoteDeferredWakesAfterLockClear({ ...row, status: outcome.status }, unlockedIssueIds);
+      }
     }
 
-    const isCleanable = (runId: string | null) => {
+    // A stamped hold also lapses when its author has produced no output past
+    // the silence bound and a wake is held behind it: the author may still
+    // have a live in-memory handle, so no terminal path will ever clear it.
+    // A run with recent output is active and never lapses here.
+    const silentRunIds = new Set<string>();
+    for (const row of runRows) {
+      if (row.status !== "running") continue;
+      // The lapse exists for issue-less authors: a run whose recorded
+      // context names a card is that card's live worker, and its lock is
+      // cleared by its own finish, never by this sweep.
+      if (issueIdFromRunContext(row.contextSnapshot)) continue;
+      const lastActivityAt = row.lastOutputAt ?? row.startedAt ?? row.createdAt;
+      if (lastActivityAt && sweepNow.getTime() - new Date(lastActivityAt).getTime() > ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS) {
+        silentRunIds.add(row.id);
+      }
+    }
+    const deferredWakeIssueIds = new Set<string>();
+    if (candidates.length > 0) {
+      const deferredRows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          inArray(agentWakeupRequests.companyId, [...new Set(candidates.map((issue) => issue.companyId))]),
+        ));
+      const candidateIssueIds = new Set(candidates.map((issue) => issue.id));
+      for (const row of deferredRows) {
+        const wakeIssueId = readWakeIssueIdFromPayload(row.payload);
+        if (wakeIssueId && candidateIssueIds.has(wakeIssueId)) deferredWakeIssueIds.add(wakeIssueId);
+      }
+    }
+    // Waiting work behind a silent author is not only a deferred wake: a
+    // successor already promoted to a queued run for the card is held the
+    // same way, and the lapse must reach it too.
+    const waitingIssueIds = new Set(deferredWakeIssueIds);
+    if (candidates.length > 0) {
+      const candidateIssueIds = [...new Set(candidates.map((issue) => issue.id))];
+      const queuedRows = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' in (${sql.join(candidateIssueIds.map((id) => sql`${id}`), sql`, `)})`,
+        ));
+      for (const row of queuedRows) {
+        const queuedIssueId = issueIdFromRunContext(row.contextSnapshot);
+        if (queuedIssueId) waitingIssueIds.add(queuedIssueId);
+      }
+    }
+    const isCleanable = (runId: string | null, issueId?: string) => {
       if (!runId) return true;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(status)) return true;
+      return Boolean(issueId && silentRunIds.has(runId) && waitingIssueIds.has(issueId));
     };
 
     for (const issue of candidates) {
@@ -9628,10 +9737,19 @@ export function recoveryService(
       }
       await runRecoverySweepIssue(issue, "recovery.sweep_stale_issue_locks", async () => {
       if (
-        !isCleanable(issue.checkoutRunId) ||
-        !isCleanable(issue.executionRunId)
+        !isCleanable(issue.checkoutRunId, issue.id) ||
+        !isCleanable(issue.executionRunId, issue.id)
       ) {
         return;
+      }
+
+      const silenceClearRunId = [issue.executionRunId, issue.checkoutRunId].find((runId) => {
+        if (!runId || !silentRunIds.has(runId)) return false;
+        const status = runStatusById.get(runId);
+        return !status || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      });
+      if (silenceClearRunId) {
+        await opts?.beforeSilentLockClear?.({ runId: silenceClearRunId, issueId: issue.id });
       }
 
       const updated = await db.transaction(async tx => {
@@ -9639,6 +9757,24 @@ export function recoveryService(
           eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
         )).for("update");
         if (!source) return null;
+        if (silenceClearRunId) {
+          const [fresh] = await tx
+            .select({
+              status: heartbeatRuns.status,
+              lastOutputAt: heartbeatRuns.lastOutputAt,
+              startedAt: heartbeatRuns.startedAt,
+              createdAt: heartbeatRuns.createdAt,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, silenceClearRunId));
+          const freshActivityAt = fresh?.lastOutputAt ?? fresh?.startedAt ?? fresh?.createdAt ?? null;
+          const resumed = fresh?.status === "running"
+            && !issueIdFromRunContext(fresh.contextSnapshot)
+            && freshActivityAt != null
+            && sweepNow.getTime() - new Date(freshActivityAt).getTime() <= ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS;
+          if (resumed) return null;
+        }
         return tx
           .update(issues)
           .set({
@@ -9685,7 +9821,77 @@ export function recoveryService(
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // This sweep clears the lock itself, so the normal release never
+      // promotes the wakes held behind the cleared run. Promote them here.
+      const clearedRun = (issue.executionRunId ? runById.get(issue.executionRunId) : undefined)
+        ?? (issue.checkoutRunId ? runById.get(issue.checkoutRunId) : undefined);
+      if (clearedRun) {
+        await promoteDeferredWakesAfterLockClear(
+          { ...clearedRun, status: runStatusById.get(clearedRun.id) ?? clearedRun.status },
+          [updated.id],
+        );
+      }
       });
+    }
+
+    // Every lock clear does not pass through the route's promotion hook
+    // (hook-less service updates, checkout, release, plugin host writes):
+    // those cards are already unlocked, so the candidate pass above never
+    // sees them and a held wake strands forever. Visit unlocked cards that
+    // still hold a deferred wake and promote it when no live holder remains.
+    const unlockedHeldCards = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        originRunId: issues.originRunId,
+      })
+      .from(issues)
+      .where(and(
+        isNull(issues.executionRunId),
+        isNull(issues.checkoutRunId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        sql`exists (
+          select 1 from ${agentWakeupRequests}
+          where ${agentWakeupRequests.companyId} = ${issues.companyId}
+            and ${agentWakeupRequests.status} = 'deferred_issue_execution'
+            and ${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text
+        )`,
+      ));
+    for (const card of unlockedHeldCards) {
+      if (result.issueIds.includes(card.id)) continue;
+      const holder = await findLiveIssueExecutionHolder(db, card.companyId, card.id).catch((err) => {
+        logger.error({ err, issueId: card.id }, "failed to resolve the holder of an unlocked card with a held wake");
+        return null;
+      });
+      if (holder) continue;
+      let promotionRun = card.originRunId
+        ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, card.originRunId)).then((rows) => rows[0] ?? null)
+        : null;
+      if (!promotionRun) {
+        const [wake] = await db
+          .select({ agentId: agentWakeupRequests.agentId })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, card.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${card.id}::text`,
+          ))
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1);
+        if (wake) {
+          promotionRun = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, card.companyId), eq(heartbeatRuns.agentId, wake.agentId)))
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+        }
+      }
+      if (!promotionRun) continue;
+      await promoteDeferredWakesAfterLockClear(promotionRun, [card.id]);
     }
 
     if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
