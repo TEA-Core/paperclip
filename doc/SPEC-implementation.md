@@ -294,6 +294,13 @@ debt-bearing issue with no probe-able repository/branch or merged PR is refused
 fail-closed; the refusal names the exits (verify landing, or cancel).
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
+An owing reclassification also writes a system-owned
+`issue.repository_landing_debt` marker linked to its source audit ID, without
+agent/run foreign keys. A missing source event cannot make that outstanding marker
+debt-free. Agent cleanup detaches actor/run foreign keys rather than deleting
+landing-debt or accepted-done audit evidence. Company deletion removes the owing
+issue and its evidence in one transaction. No-repository close rechecks use a
+monotonic 15-second budget, so wall-clock adjustments do not cause false timeouts.
 
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
 the approving decision to its certified pull request and head, including when

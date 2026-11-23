@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { eq, and, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -32,6 +32,12 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { projectRoutes } from "../routes/projects.js";
+import { companyService } from "../services/companies.js";
+import { prunePluginLogs } from "../services/plugin-log-retention.js";
+import { detachIssuesFromClosedExecutionWorkspace } from "../services/execution-workspaces.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
@@ -144,6 +150,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       next();
     });
     app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", agentRoutes(db));
+    app.use("/api", projectRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -1913,6 +1921,124 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       const response = await patch(id, { deliveryRequirement: "record_only" });
       expect(response.status, JSON.stringify(response.body)).toBe(200);
     }
+
+    it.each(["agentId", "runId"] as const)("preserves unassigned issue debt through the agent-delete route (%s linkage)", async (link) => {
+      const { companyId, issueId, agentId } = await seedIssue("DELETE");
+      board();
+      await flip(issueId);
+      // Existing pre-marker debt must survive without the newer redundant marker.
+      await db.delete(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.repository_landing_debt"),
+      ));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "completed" });
+      await db.update(activityLog).set({
+        actorType: "agent", actorId: agentId,
+        agentId: link === "agentId" ? agentId : null, runId: link === "runId" ? runId : null,
+      }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+      const deleted = await request(app).delete(`/api/agents/${agentId}`);
+      expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
+      const closed = await patch(issueId, { status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(409);
+      expect(closed.body.code).toBe("done_transition_missing_delivery");
+      const debt = await debtRows(issueId);
+      expect(debt).toHaveLength(1);
+      expect(debt[0]).toMatchObject({ actorType: "agent", actorId: agentId, agentId: null, runId: null });
+      expect(debt[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it("refuses a missing reclassification audit until verified landing discharges its independent marker", async () => {
+      const { issueId } = await seedIssue("MISSING");
+      board();
+      await flip(issueId);
+      await db.delete(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+      ));
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      landing();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      mockGetByName.mockResolvedValue(null);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+    });
+
+    it.each(["project", "project workspace", "workspace detach", "work product", "description", "comment", "document", "retention"] as const)(
+      "retains debt after %s cleanup", async (cleanup) => {
+        const { companyId, issueId, projectId, projectWorkspaceId, executionWorkspaceId } = await seedIssue("CLEANUP");
+        board();
+        await flip(issueId);
+        if (cleanup === "description" || cleanup === "comment" || cleanup === "document") {
+          const settings = instanceSettingsService(db);
+          const { enableExternalObjects } = await settings.getExperimental();
+          onTestFinished(async () => { await settings.updateExperimental({ enableExternalObjects }); });
+          await settings.updateExperimental({ enableExternalObjects: true });
+        }
+        let response: request.Response | undefined;
+        const mentions = (kind: "description" | "comment" | "document") => db.select().from(externalObjectMentions).where(and(
+          eq(externalObjectMentions.sourceIssueId, issueId), eq(externalObjectMentions.sourceKind, kind),
+        ));
+        const note = "Delivery: https://github.com/TEA-Core/paperclip/pull/404";
+        if (cleanup === "workspace detach") {
+          await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+          await detachIssuesFromClosedExecutionWorkspace(db, { companyId, executionWorkspaceId });
+          expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionWorkspaceId).toBeNull();
+        }
+        if (cleanup === "project") {
+          // A linked issue's project FK restricts deletion. Exercise the lawful
+          // cascade when only its execution-workspace link still names the project.
+          await db.update(issues).set({ projectId: null }).where(eq(issues.id, issueId));
+          response = await request(app).delete(`/api/projects/${projectId}`);
+        }
+        if (cleanup === "project workspace") response = await request(app).delete(`/api/projects/${projectId}/workspaces/${projectWorkspaceId}`);
+        if (cleanup === "work product") {
+          const [product] = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+          response = await request(app).delete(`/api/work-products/${product!.id}`);
+        }
+        if (cleanup === "description") {
+          expect((await patch(issueId, { description: note })).status).toBe(200);
+          await vi.waitFor(async () => expect(await mentions("description")).toHaveLength(1));
+          response = await patch(issueId, { description: "" });
+        }
+        if (cleanup === "comment") {
+          const comment = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: note });
+          expect(comment.status).toBe(201);
+          await vi.waitFor(async () => expect(await mentions("comment")).toHaveLength(1));
+          response = await request(app).delete(`/api/issues/${issueId}/comments/${comment.body.id}`);
+        }
+        if (cleanup === "document") {
+          const document = await request(app).put(`/api/issues/${issueId}/documents/cleanup-note`)
+            .send({ format: "markdown", body: note });
+          expect(document.status, JSON.stringify(document.body)).toBe(201);
+          await vi.waitFor(async () => expect(await mentions("document")).toHaveLength(1));
+          response = await request(app).delete(`/api/issues/${issueId}/documents/cleanup-note`);
+        }
+        if (cleanup === "retention") await prunePluginLogs(db, 0);
+        else if (cleanup !== "workspace detach") expect(response?.status, JSON.stringify(response?.body)).toBe(200);
+        if (cleanup === "description" || cleanup === "comment" || cleanup === "document") {
+          await vi.waitFor(async () => expect(await mentions(cleanup)).toEqual([]));
+        }
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        const closed = await patch(issueId, { status: "done" });
+        expect(closed.status, JSON.stringify(closed.body)).toBe(409);
+        expect(closed.body.code).toBe("done_transition_missing_delivery");
+      },
+    );
+
+    it.each(["issue", "company"] as const)("allows %s removal only with the owing issue gone", async (scope) => {
+      const { companyId, issueId } = await seedIssue("GONE");
+      board();
+      await flip(issueId);
+      if (scope === "company") expect((await companyService(db).remove(companyId))?.id).toBe(companyId);
+      else {
+        const removed = await request(app).delete(`/api/issues/${issueId}`);
+        expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+      }
+      expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual([]);
+      expect((await patch(issueId, { status: "done" })).status).toBe(404);
+    });
 
     it.each(["recovery", "approval-comment", "escalation"] as const)(
       "%s refuses unpaid debt before board bypass and preserves its pending state",

@@ -281,12 +281,12 @@ export interface DoneTransitionGuardResult {
 }
 
 /**
- * Durable audit-row debt: explicit outstanding debt has no history exemption.
- * Only pre-deploy rows without a disposition use the accepted-close cutoff.
+ * Durable audit-row debt: the system-owned marker survives loss of its actor's
+ * reclassification event. Only legacy events without a disposition use the close cutoff.
  */
 export function unpaidLandingDebt() {
   return and(
-    eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+    inArray(activityLog.action, ["issue.delivery_requirement_reclassified", "issue.repository_landing_debt"]),
     sql`${activityLog.details}->>'landingCheckOwed' = 'true'`,
     sql`${activityLog.details}->>'landingDebtDisposition' IS DISTINCT FROM 'discharged'`,
     sql`(${activityLog.details}->>'landingDebtDisposition' IS NOT NULL OR NOT EXISTS (

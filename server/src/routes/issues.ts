@@ -22405,7 +22405,7 @@ export function issueRoutes(
             const landingCheckOwed =
               storedDeliveryRequirement === "repository_delivery" &&
               (!isClosedIssueStatus(lockedRequirementRead.status) || !isClosedIssueStatus(updated.status));
-            await logActivityInTransaction(tx as unknown as Db, {
+            const reclassification = await logActivityInTransaction(tx as unknown as Db, {
               companyId: updated.companyId,
               actorType: actor.actorType,
               boardApiKeyId: actor.boardApiKeyId,
@@ -22428,6 +22428,19 @@ export function issueRoutes(
                 landingDebtDisposition: landingCheckOwed ? "outstanding" : "not_owed",
               },
             });
+            if (landingCheckOwed) {
+              // Independent of deletable actor/run links: loss of the source
+              // event cannot make an outstanding obligation look debt-free.
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId: updated.companyId, actorType: "system", actorId: "landing-debt",
+                action: "issue.repository_landing_debt", entityType: "issue",
+                entityId: updated.id, issueId: updated.id,
+                details: {
+                  reclassificationActivityId: reclassification.id,
+                  landingCheckOwed: true, landingDebtDisposition: "outstanding",
+                },
+              });
+            }
             await svc.addComment(
               updated.id,
               [
