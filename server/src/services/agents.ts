@@ -795,11 +795,9 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      const current = data.status !== undefined
-        ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
-        : existing;
+      const current = await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null);
       if (!current) return null;
-      if (current.status === "deleted" && data.status && data.status !== "deleted") {
+      if (current.status === "deleted") {
         throw conflict("Deleted agents cannot be updated");
       }
       if (current.status === "terminated" && data.status && data.status !== "terminated") {

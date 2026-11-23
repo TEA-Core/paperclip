@@ -1473,9 +1473,14 @@ export function builtInAgentService(db: Db) {
       mode === "reset"
       || currentState.stockStatus === "missing"
       || currentState.stockStatus === "stock_update_available";
-    const nextRoutine = shouldWrite
+    let nextRoutine = shouldWrite
       ? await createOrResetRoutine(agent, definition, routine, mode)
       : routine!;
+    if (!shouldWrite && nextRoutine.assigneeAgentId !== agent.id) {
+      const rebound = await routineSvc.update(nextRoutine.id, { assigneeAgentId: agent.id }, { agentId: null, userId: "built-in-bundles" });
+      if (!rebound) throw notFound("Built-in routine not found");
+      nextRoutine = rebound;
+    }
     await upsertManagedResourceBinding({
       companyId: agent.companyId,
       bundleKey: definition.key,
