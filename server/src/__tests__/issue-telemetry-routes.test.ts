@@ -49,8 +49,15 @@ const mockDbSelectJoined = vi.hoisted(() => () => {
     Promise.resolve([]).then(onFulfilled, onRejected);
   return query;
 });
+// The landing-debt probe reads activity_log; these fixtures have no debt rows.
 const mockDbSelectFrom = vi.hoisted(() =>
-  vi.fn(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined })),
+  vi.fn((table?: unknown) => ({
+    where: (...args: unknown[]) =>
+      (table as Record<symbol, unknown> | undefined)?.[Symbol.for("drizzle:Name")] === "activity_log"
+        ? mockDbSelectJoined()
+        : (mockDbSelectWhere as (...a: unknown[]) => unknown)(...args),
+    innerJoin: mockDbSelectJoined,
+  })),
 );
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
@@ -201,7 +208,6 @@ describe("issue telemetry routes", () => {
       ...patch,
     }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }));
     mockDbSelectWhere.mockImplementation(() => ({
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>

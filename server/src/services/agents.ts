@@ -1097,6 +1097,19 @@ export function agentService(db: Db) {
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
+        // The actor identity remains truthful, but its deletable FK links must
+        // not take issue landing obligations or legacy close settlement with it.
+        await tx.update(activityLog).set({ agentId: null, runId: null }).where(and(
+          eq(activityLog.entityType, "issue"),
+          or(
+            inArray(activityLog.action, ["issue.delivery_requirement_reclassified", "issue.repository_landing_debt"]),
+            and(eq(activityLog.action, "issue.updated"), sql`${activityLog.details}->>'status' = 'done'`),
+          ),
+          or(
+            eq(activityLog.agentId, id),
+            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
+          ),
+        ));
         await tx.delete(activityLog).where(
           or(
             eq(activityLog.agentId, id),

@@ -469,9 +469,10 @@ export function createMergedOperatorMergeCardSweepService(
             sql`select pg_advisory_xact_lock(hashtextextended(${mergedOperatorMergeCardLockKey(row.companyId, row.id)}, 0))`,
           );
           const current = await txDb
-            .select({ id: issues.id, status: issues.status })
+            .select()
             .from(issues)
-            .where(eq(issues.id, row.id))
+            .where(and(eq(issues.id, row.id), eq(issues.companyId, row.companyId)))
+            .for("update")
             .then((rows) => rows[0] ?? null);
           if (
             !current ||
@@ -507,6 +508,8 @@ export function createMergedOperatorMergeCardSweepService(
           // passed explicitly: passing the tx handle as the service's own
           // connection would make update's internal `dbOrTx === db` check open
           // a nested transaction on the tx handle.
+          // The debt recheck and discharge share this lock and commit with the close.
+          await guardVerdict.finalizeLandingDebt(txDb, current, current.statusVersion + 1);
           await issueSvc.addComment(row.id, closeCommentBody, {}, {
             authorType: "system",
           }, txDb);
