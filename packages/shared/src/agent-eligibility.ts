@@ -235,7 +235,7 @@ export function getAgentWorkEligibility(input: {
       ? "invalid_org_chain"
       : "eligible";
   const invokabilityReason: AgentEligibilityLifecycleReason = !isAgentStatusInvokable(input.agent.status)
-    ? input.agent.status === "terminated"
+    ? (input.agent.status === "terminated" || input.agent.status === "deleted")
       ? "terminated"
       : input.agent.status === "pending_approval"
         ? "pending_approval"

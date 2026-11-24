@@ -2253,6 +2253,45 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(verified[0]!.details).toMatchObject({ creationSnapshot: "not_recorded" });
     });
 
+    it("refuses a legacy card after project deletion cascades through its workspace binding", async () => {
+      const bound = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });
+      await expectRefused(bound, await close(bound.identifier), NO_WORKSPACE_REFUSAL);
+
+      // issues.project_id restricts deletion; project_workspace_id is instead
+      // nulled by the real project -> workspace cascade.
+      const deleted = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });
+      const [before] = await db.select({
+        projectId: projectWorkspaces.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+        .where(eq(issues.id, deleted.issueId));
+      expect(before!.projectWorkspaceId).not.toBeNull();
+      asBoard();
+      const removal = await request(app).delete(`/api/projects/${before!.projectId}`);
+      expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+      expect(await db.select().from(projects).where(eq(projects.id, before!.projectId!))).toEqual([]);
+      const [after] = await db.select({
+        projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId,
+      }).from(issues).where(eq(issues.id, deleted.issueId));
+      expect(after).toEqual({ projectId: null, projectWorkspaceId: null });
+      expect(await activityRows(before!.projectId!, "project.deleted")).toHaveLength(1);
+      currentActor = deleted.actor;
+      await expectRefused(deleted, await close(deleted.identifier), NO_WORKSPACE_REFUSAL);
+    });
+
+    it("does not attribute an unrelated project deletion to a legacy never-had card", async () => {
+      const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+      const unrelatedProjectId = await insertProject(fixture.companyId);
+      asBoard();
+      const removal = await request(app).delete(`/api/projects/${unrelatedProjectId}`);
+      expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+      expect(await activityRows(unrelatedProjectId, "project.deleted")).toHaveLength(1);
+      currentActor = fixture.actor;
+      const res = await close(fixture.identifier);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("done");
+    });
+
     it("refuses a close request whose own description cites repository work and closes with a clean one", async () => {
       const cited = await seedAdmissible();
       const refused = await request(app).patch(`/api/issues/${cited.identifier}`).send({
@@ -2555,11 +2594,13 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           await db.execute(sql`create table task_census_probe (
             company_id uuid, holder uuid references agents(id), created_at timestamptz, payload jsonb
           )`);
-          const when = shape === "old-actor" ? new Date("2000-01-01T00:00:00Z") : new Date();
-          await db.execute(sql`insert into task_census_probe values (
-            ${fixture.companyId}, ${fixture.closerAgentId}, ${when.toISOString()}::timestamptz,
-            ${JSON.stringify({ card: fixture.issueId, evidence: citation })}::jsonb
-          )`);
+          const offsetSeconds = shape === "old-actor" ? -1 : 1;
+          await db.execute(sql`insert into task_census_probe
+            select ${fixture.companyId}::uuid, ${fixture.closerAgentId}::uuid,
+              created_at + ${offsetSeconds} * interval '1 second',
+              ${JSON.stringify({ card: fixture.issueId, evidence: citation })}::jsonb
+            from issues where id = ${fixture.issueId}::uuid
+          `);
         } else if (shape === "run-array") {
           const runId = await insertNativeRun(fixture, {});
           await db.execute(sql`create table task_census_probe (company_id uuid, source_run_ids uuid[], payload jsonb)`);
