@@ -1038,4 +1038,54 @@ describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => 
     );
     warnSpy.mockRestore();
   });
+
+  it("refuses a foreign marked candidate behind a company-local resource pointer", async () => {
+    const { companyId, maintainerId } = await seedHandoffCompany();
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, maintainerId));
+    const foreignCompanyId = randomUUID();
+    const foreignAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: foreignCompanyId,
+      name: "Foreign Wiki company",
+      issuePrefix: `FW${foreignCompanyId.slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: foreignCompanyId,
+      name: "Foreign Wiki Maintainer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      metadata: {
+        pluginManagedAgent: {
+          pluginKey: "paperclipai.plugin-llm-wiki",
+          agentKey: "wiki-maintainer",
+        },
+      },
+    });
+    await db.update(pluginManagedResources)
+      .set({ resourceId: foreignAgentId })
+      .where(eq(pluginManagedResources.companyId, companyId));
+
+    // Call the guard directly so route-level foreign-assignee authorization
+    // cannot mask a resolver that incorrectly accepts the foreign candidate.
+    await expect(assertWikiHandoffWriteIntegrity({
+      db,
+      companyId,
+      issue: {
+        title: "[PPC ER] Weekly Report - handoff to Wiki Maintainer",
+        description: null,
+        executionPolicy: null,
+        executionState: null,
+      },
+      incomingAssigneeAgentId: foreignAgentId,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        reason: "wiki_handoff_non_canonical_assignee",
+        canonicalMaintainerAgentId: maintainerId,
+        assigneeAgentId: foreignAgentId,
+      },
+    });
+  });
 });

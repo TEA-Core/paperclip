@@ -1082,4 +1082,79 @@ describeEmbeddedPostgres("Wiki handoff canonical maintainer lookup (SUP-24936)",
       await pending;
     }
   }, 20_000);
+
+  it.each([
+    ["description-only", "noncreator Reporter"],
+    ["four-field", "noncreator Reporter"],
+    ["description-only", "unrelated engineer"],
+    ["four-field", "unrelated engineer"],
+  ] as const)("refuses adoption from a noncreator agent: %s repair by %s", async (shape, caller) => {
+    const { company, maintainer, intruder, stale } = await seedWikiCompany("maintainer");
+    const stub = await seedUnassignedHandoff(company.id);
+    const callerAgent = caller === "noncreator Reporter" ? stale : intruder;
+    if (caller === "noncreator Reporter") {
+      await db.update(agents).set({ name: "Writer Reporter", role: "pm" }).where(eq(agents.id, callerAgent.id));
+    }
+    const [project] = await db.insert(projects).values({
+      companyId: company.id,
+      name: "Weekly reports",
+    }).returning();
+    await db.update(issues).set({
+      title: "[PPC ER] Weekly Report - 2026-11-21 - handoff to Wiki Maintainer",
+      projectId: project!.id,
+      deliveryRequirement: "record_only",
+    }).where(eq(issues.id, stub.id));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company.id,
+      agentId: callerAgent.id,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: stub.id },
+    });
+    const actor: Express.Request["actor"] = {
+      type: "agent",
+      agentId: callerAgent.id,
+      companyId: company.id,
+      source: "agent_key",
+      runId,
+    };
+    const body = shape === "four-field"
+      ? {
+          description: "Unauthorized handoff repair",
+          projectId: project!.id,
+          executionPolicy: userReviewPolicy(),
+          deliveryRequirement: "record_only",
+        }
+      : { description: "Unauthorized handoff repair" };
+    let res!: request.Response;
+    try {
+      res = await request(createApp(db, actor))
+        .patch(`/api/issues/${stub.id}`)
+        .set("X-Paperclip-Run-Id", runId)
+        .send(body);
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    }
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: "wiki_handoff_unassigned",
+    });
+    const [stored] = await db.select().from(issues).where(eq(issues.id, stub.id));
+    expect(stored).toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      status: "backlog",
+      description: stub.description,
+      projectId: project!.id,
+      deliveryRequirement: "record_only",
+    });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id))).toEqual([]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, maintainer.id))).toEqual([]);
+  });
 });
