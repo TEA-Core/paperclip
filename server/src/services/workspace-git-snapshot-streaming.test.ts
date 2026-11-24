@@ -51,8 +51,8 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
   };
 }
 
-// Real Git lanes spawn per-file processes; shared CI shards and macOS slow them well past 130s.
-const realGitTimeoutMs = 300_000;
+// macOS adds per-file process and filesystem overhead to the real deletion lane.
+const realGitTimeoutMs = process.platform === "darwin" ? 300_000 : 180_000;
 it("streams and stages all four real Git filename lanes above 32 MiB through the shared scheduler", async () => {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "pc-stream-git-")));
   directories.push(root);
