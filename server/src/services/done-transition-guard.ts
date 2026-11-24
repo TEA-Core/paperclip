@@ -3177,7 +3177,7 @@ async function noWorkspaceHistoryRefusal(
         and(
           eq(activityLog.companyId, issue.companyId),
           eq(activityLog.entityType, "project"),
-          eq(activityLog.action, "project.deleted"),
+          inArray(activityLog.action, ["project.deleted", "project.workspace_deleted"]),
           sql`${activityLog.details} -> 'affectedIssues' @> ${JSON.stringify([{ issueId: issue.id }])}::jsonb`,
         ),
       )

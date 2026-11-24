@@ -881,27 +881,63 @@ export function projectRoutes(db: Db) {
     const workspaceId = req.params.workspaceId as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    const workspace = await svc.removeWorkspace(id, workspaceId);
-    if (!workspace) {
+    const actor = getActorInfo(req);
+    const result = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const executionWorkspaceIds = tx
+        .select({ id: executionWorkspaces.id })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.projectWorkspaceId, workspaceId));
+      const bound = and(
+        eq(issues.companyId, existing.companyId),
+        or(
+          eq(issues.projectWorkspaceId, workspaceId),
+          sql`${issues.executionWorkspaceId} in (${executionWorkspaceIds})`,
+        ),
+      );
+      const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` }).from(issues).where(bound);
+      const affected = await tx
+        .select({ issueId: issues.id, projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId, executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(bound)
+        .orderBy(asc(issues.id))
+        .limit(PROJECT_DELETE_AFFECTED_ISSUE_LIMIT);
+      const removed = await projectService(txDb).removeWorkspace(id, workspaceId);
+      if (!removed) return null;
+      const { publication } = await persistActivity(txDb, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        boardApiKeyId: actor.boardApiKeyId,
+        action: "project.workspace_deleted",
+        entityType: "project",
+        entityId: id,
+        details: {
+          workspaceId: removed.id,
+          name: removed.name,
+          affectedIssues: affected,
+          affectedCount: total,
+          affectedTruncated: total > affected.length,
+        },
+      });
+      const { affectedIssues: _persistedOnly, ...publishedDetails } = (publication.payload.details ?? {}) as Record<string, unknown>;
+      const { affectedIssues: _pluginPersistedOnly, ...publishedPluginPayload } = (publication.pluginEvent?.payload ?? {}) as Record<string, unknown>;
+      return {
+        workspace: removed,
+        publication: {
+          ...publication,
+          payload: { ...publication.payload, details: publishedDetails },
+          pluginEvent: publication.pluginEvent ? { ...publication.pluginEvent, payload: publishedPluginPayload } : null,
+        },
+      };
+    });
+    if (!result) {
       res.status(404).json({ error: "Project workspace not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: existing.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      boardApiKeyId: actor.boardApiKeyId,
-      action: "project.workspace_deleted",
-      entityType: "project",
-      entityId: id,
-      details: {
-        workspaceId: workspace.id,
-        name: workspace.name,
-      },
-    });
+    publishActivity(result.publication);
+    const workspace = result.workspace;
 
     res.json(workspace);
   });
