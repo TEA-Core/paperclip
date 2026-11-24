@@ -214,6 +214,17 @@ function signAwsSecretsManagerRequest(input: {
   };
 }
 
+// Per-caller wait on a shared promise: the caller can leave on abort, the shared work is untouched.
+function waitWithAbort<T>(shared: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return shared;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    shared.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 async function loadAwsCredentials(region: string): Promise<AwsCredentialIdentity> {
   const now = Date.now();
   let cached = awsCredentialProviders.get(region);
@@ -962,7 +973,7 @@ class AwsSecretsManagerJsonGateway implements AwsSecretsManagerGateway {
   private async call<T>(operation: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
     const body = JSON.stringify(payload);
-    const credentials = await loadAwsCredentials(this.config.region);
+    const credentials = await waitWithAbort(loadAwsCredentials(this.config.region), signal);
     signal?.throwIfAborted();
     const headers = signAwsSecretsManagerRequest({
       endpoint: this.endpoint,
