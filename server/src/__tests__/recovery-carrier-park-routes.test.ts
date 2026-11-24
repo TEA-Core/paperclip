@@ -1013,6 +1013,86 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   });
 
+  it("skips blocked-source recovery without waiting when a park wins after candidate selection", async () => {
+    const f = await fixture();
+    const [carrier] = await db.update(issues).set({ status: "backlog" })
+      .where(eq(issues.id, f.carrierId)).returning();
+    f.body.expectedStatus = "backlog";
+    f.body.expectedStatusVersion = carrier!.statusVersion;
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    let release!: () => void, markReady!: (pid: number) => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    let holdId: string | undefined, holderPid: number | undefined, barrier: Promise<void> | undefined;
+    const select = new Proxy(db.select, { apply(target, _receiver, args) {
+      const builder = Reflect.apply(target, db, args);
+      builder.from = new Proxy(builder.from, { apply(from, fromReceiver, fromArgs) {
+        const query = Reflect.apply(from, fromReceiver, fromArgs);
+        if (fromArgs[0] !== issueRecoveryActions || holdId) return query;
+        if (!query || typeof query !== "object") throw new Error("Expected the real Drizzle query object");
+        const then = Reflect.get(query, "then");
+        if (typeof then !== "function") throw new Error("Expected the real Drizzle query promise");
+        const execute = then.bind(query);
+        Object.defineProperty(query, "then", { value: (
+          fulfilled?: (value: unknown) => unknown, rejected?: (reason: unknown) => unknown,
+        ) => {
+          const read = async () => {
+            const rows = await new Promise<unknown>((resolve, reject) => { execute(resolve, reject); });
+            if (!holdId && Array.isArray(rows) && rows.some(row => row.id === f.actionId)) {
+              // Candidate selection saw no park. Commit real board acceptance
+              // after the real active-action read, retaining its actual rows.
+              const accepted = await park(f);
+              expect(accepted.status).toBe(201);
+              holdId = accepted.body.hold.id;
+              barrier = db.transaction(async tx => {
+                await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.sourceId)).for("update");
+                const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+                markReady(Number(row.pid));
+                await released;
+              });
+              holderPid = await Promise.race([ready, barrier.then(() => {
+                throw new Error("Source barrier ended before readiness");
+              })]);
+            }
+            return rows;
+          };
+          return read().then(fulfilled, rejected);
+        } });
+        return query;
+      } });
+      return builder;
+    } });
+    const observed = new Proxy(db, { get(target, key, receiver) {
+      return key === "select" ? select : Reflect.get(target, key, receiver);
+    } });
+    let settled = false;
+    const work = recoveryService(observed, { enqueueWakeup: async () => {
+      throw new Error("Parked recovery must not dispatch");
+    } }).reconcileBlockedWithoutBlockers({ companyId: f.companyId })
+      .then(value => { settled = true; return { value, error: null }; },
+        error => { settled = true; return { value: null, error }; });
+    let observation: "completed" | "blocked" | null = null;
+    try {
+      await expect.poll(async () => {
+        if (settled) return observation = "completed";
+        if (holderPid === undefined) return null;
+        const [waiting] = await db.execute(sql`select pid from pg_stat_activity
+          where datname = current_database() and ${holderPid} = any(pg_blocking_pids(pid))`);
+        return observation = waiting ? "blocked" : null;
+      }, { timeout: 10_000 }).not.toBeNull();
+      expect(observation).toBe("completed");
+      expect((await work).error).toBeNull();
+    } finally {
+      release();
+      await Promise.allSettled([work, ...(barrier ? [barrier] : [])]);
+    }
+    expect(await snapshot(f)).toEqual(before);
+    expect(await db.select().from(issueComments).where(eq(issueComments.companyId, f.companyId))).toEqual([]);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, holdId!)))[0])
+      .toMatchObject({ status: "active", recoveryCarrierPark: { recoveryActionId: f.actionId } });
+    await assertNoProtectedWrites();
+  }, 30_000);
+
   it("pins the notice recheck when park commits after carrier reuse but before source notice", async () => {
     const f = await fixture();
     // Only the source is a blocked-without-blockers candidate. The carrier is
