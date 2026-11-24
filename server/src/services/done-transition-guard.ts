@@ -314,7 +314,7 @@ export function unpaidLandingDebt() {
   );
 }
 
-type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
+export type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
   "executionWorkspaceId" | "projectWorkspaceId" | "projectId" | "statusVersion"> & { deliveryRequirement: string };
 
 /** Prepare outside the close transaction; finalize only while holding the issue row lock. */

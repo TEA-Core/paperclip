@@ -2524,6 +2524,9 @@ export const acceptIssueThreadInteractionSchema = z
       .array(z.string().trim().min(1).max(120))
       .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
       .optional(),
+    // Board-only documented basis for closing a native completion review past
+    // legacy (disposition-less) landing debt when no landing proof exists.
+    landingDebtCloseNote: z.string().trim().min(1).max(2000).optional(),
   })
   .superRefine((value, ctx) => {
     const seenClientKeys = new Set<string>();

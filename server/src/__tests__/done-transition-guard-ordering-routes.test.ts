@@ -2238,6 +2238,125 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       },
     );
 
+    describe("native completion review accept", () => {
+      async function seedNativeReview(prefix: string, debt: "legacy" | "explicit") {
+        const fixture = await seedIssue(prefix);
+        const { companyId, issueId } = fixture;
+        board();
+        await flip(issueId);
+        if (debt === "legacy") {
+          await db.delete(activityLog).where(and(
+            eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.repository_landing_debt"),
+          ));
+          await db.update(activityLog).set({
+            createdAt: new Date("2020-01-01"),
+            details: sql`${activityLog.details} - 'landingDebtDisposition'`,
+          }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+        }
+        await db.update(issues).set({ status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board" })
+          .where(eq(issues.id, issueId));
+        const interaction = await issueThreadInteractionService(db).create(
+          { id: issueId, companyId },
+          {
+            kind: "request_confirmation", title: "Completion review", resolverPolicy: "human_only",
+            continuationPolicy: "wake_assignee", idempotencyKey: `native-review:${issueId}`,
+            payload: {
+              version: 1, prompt: "Approve completion?", acceptLabel: "Approve", rejectLabel: "Reject",
+              target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" },
+            },
+          },
+          { userId: "local-board" },
+        );
+        const accept = (body: object = {}) =>
+          request(app).post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`).send(body);
+        const state = async () => ({
+          issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
+          interaction: (await issueThreadInteractionService(db).getById(interaction.id))?.status,
+          debt: (await debtRows(issueId))[0]?.details,
+        });
+        return { ...fixture, accept, state };
+      }
+
+      it("refuses a legacy-debt accept with neither landing proof nor a documented-close note", async () => {
+        const { accept, state } = await seedNativeReview("NATREFUSE", "legacy");
+        const refused = await accept();
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        const after = await state();
+        expect(after.issue?.status).toBe("in_review");
+        expect(after.interaction).toBe("pending");
+        expect(after.debt?.landingCheckOwed).toBe(true);
+        expect(after.debt?.landingDebtDisposition).toBeUndefined();
+      });
+
+      it("accepts at the native door with server-verified landing proof and discharges debt atomically", async () => {
+        const { accept, state } = await seedNativeReview("NATPROOF", "legacy");
+        landing();
+        const accepted = await accept();
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+        const after = await state();
+        expect(after.issue?.status).toBe("done");
+        expect(after.interaction).toBe("accepted");
+        expect(after.debt?.landingDebtDisposition).toBe("discharged");
+        expect(after.debt?.landingProof).toBeDefined();
+      });
+
+      it("accepts at the native door with a documented-close note and no landing proof, discharging only legacy debt", async () => {
+        const { accept, state } = await seedNativeReview("NATNOTE", "legacy");
+        const accepted = await accept({ landingDebtCloseNote: "  Landed out of band via release train 42.  " });
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+        const after = await state();
+        expect(after.issue?.status).toBe("done");
+        expect(after.interaction).toBe("accepted");
+        expect(after.debt).toMatchObject({
+          landingDebtDisposition: "discharged",
+          documentedClose: { note: "Landed out of band via release train 42.", actorUserId: "local-board" },
+        });
+        expect(after.debt?.landingProof).toBeUndefined();
+      });
+
+      it("rejects a blank documented-close note", async () => {
+        const { accept, state } = await seedNativeReview("NATBLANK", "legacy");
+        expect((await accept({ landingDebtCloseNote: "   " })).status).toBe(400);
+        expect((await state()).interaction).toBe("pending");
+      });
+
+      it("keeps explicit disposition-bearing debt proof-only: a note does not waive it", async () => {
+        const { accept, state } = await seedNativeReview("NATEXPLICIT", "explicit");
+        const refused = await accept({ landingDebtCloseNote: "Landed out of band." });
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        const after = await state();
+        expect(after.issue?.status).toBe("in_review");
+        expect(after.interaction).toBe("pending");
+        expect(after.debt?.landingDebtDisposition).toBe("outstanding");
+        expect(after.debt?.documentedClose).toBeUndefined();
+        landing();
+        expect((await accept()).status).toBe(200);
+        expect((await state()).debt?.landingDebtDisposition).toBe("discharged");
+      });
+
+      it.each(["proof", "note"] as const)(
+        "rolls the %s acceptance and discharge back together when the commit fails",
+        async (basis) => {
+          const { issueId, accept, state } = await seedNativeReview(`NATROLL${basis.toUpperCase()}`, "legacy");
+          const body = basis === "note" ? { landingDebtCloseNote: "Landed out of band." } : {};
+          if (basis === "proof") landing();
+          const removeFailure = await rejectTerminalUpdate(issueId, "commit");
+          try {
+            expect((await accept(body)).status).toBe(500);
+            expect(await db.execute(sql`select is_called from test_debt_close_attempt`)).toMatchObject([{ is_called: true }]);
+            const after = await state();
+            expect(after.issue?.status).toBe("in_review");
+            expect(after.interaction).toBe("pending");
+            expect(after.debt?.landingDebtDisposition).toBeUndefined();
+          } finally {
+            await removeFailure();
+          }
+          expect((await accept(body)).status).toBe(200);
+          expect((await state()).debt?.landingDebtDisposition).toBe("discharged");
+        },
+      );
+    });
+
     it.each(["flip-first", "close-first"] as const)("serializes %s on the issue row", async (order) => {
       const { issueId } = await seedIssue("RACE");
       board();

@@ -307,9 +307,13 @@ repository/branch or merged PR is refused fail-closed; the refusal names the exi
 An unavailable or malformed carrier-head lookup remains unverified and produces
 the same HTTP 409 delivery refusal, including auth errors and rejected requests;
 it must not escape as HTTP 500 or authorize a close.
-Native `native_completion_review` acceptance carries no landing proof, so it
-refuses (HTTP 409 `done_transition_missing_delivery`, acceptance rolled back)
-when it would close an issue with unpaid landing debt.
+Board acceptance of the final pending `native_completion_review` on an issue with
+unpaid landing debt closes it only with server-verified landing proof (finalized
+under the issue lock like the other doors) or, for legacy debt without a
+`landingDebtDisposition` only, a nonblank `landingDebtCloseNote` on the accept
+body, persisted with the board actor on the discharged row. Explicit debt stays
+proof-only. Otherwise it refuses with HTTP 409 `done_transition_missing_delivery`.
+Acceptance, close, and discharge commit or roll back together.
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 An owing reclassification also writes a system-owned
