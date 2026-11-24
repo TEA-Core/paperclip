@@ -209,9 +209,11 @@ including its approval, dispatch and outcome state, lives at that key; there
 is no separate outcome copy to synchronize. If another call owns the legacy
 key, a distinct call uses its full `side_effect:v2:` key.
 
-Run UUIDs are lowercased when building the invocation's derived replay
-identity and checking its legacy receipt, so uppercase spelling of the same
-stored run does not dispatch another call.
+Run UUIDs use one strict parser before run lookup, gateway context creation,
+derived replay-key construction and legacy receipt ownership checks. Hex case,
+omitted hyphens, hyphens after four-digit groups, matching braces and the
+`urn:uuid:` prefix all map to lowercase `8-4-4-4-12` form. Invalid identifiers
+are not repaired into valid run IDs; existing refusal behavior is retained.
 
 Caller-supplied keys have a different contract: within a company, the same
 principal replays its stored outcome even with changed arguments or from a

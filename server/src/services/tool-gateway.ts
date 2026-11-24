@@ -1,4 +1,5 @@
 import { composeConnectionInstructions } from "./connection-instructions.js";
+import { canonicalizeUuid } from "../lib/uuid.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { boundedMcpToolName } from "./mcp-tool-names.js";
 import { browserUseService } from "./browser-use.js";
@@ -1728,9 +1729,10 @@ export function createToolGatewayService(
     runId: string;
     issueId?: string | null;
     projectId?: string | null;
-  }): Promise<{ issueId: string | null; projectId: string | null }> {
+  }): Promise<{ runId: string; issueId: string | null; projectId: string | null }> {
     const [run] = await db
       .select({
+        runId: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
@@ -1738,7 +1740,7 @@ export function createToolGatewayService(
         projectId: runContextSnapshotString("projectId"),
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, input.runId))
+      .where(eq(heartbeatRuns.id, canonicalizeUuid(input.runId) ?? input.runId))
       .limit(1);
 
     if (!run || run.companyId !== input.companyId) {
@@ -1812,6 +1814,7 @@ export function createToolGatewayService(
       }
     }
     return {
+      runId: run.runId,
       issueId,
       projectId,
     };
@@ -7275,7 +7278,7 @@ export function createToolGatewayService(
           projectId: row.gateway.projectId,
         });
         agentId = run.agentId;
-        runId = tokenRunId;
+        runId = runContext.runId;
         responsibleUserId = run.responsibleUserId;
         issueId = runContext.issueId;
         projectId = runContext.projectId;
@@ -9165,7 +9168,7 @@ export function createToolGatewayService(
       actorId?: string;
     }): Promise<ToolGatewaySession> {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const { issueId, projectId } = await resolveRunContext(input);
+      const { runId, issueId, projectId } = await resolveRunContext(input);
       const now = new Date();
       const sessionId = randomUUID();
       const token = generateGatewayToken(sessionId);
@@ -9174,7 +9177,7 @@ export function createToolGatewayService(
         token,
         companyId: input.companyId,
         agentId: input.agentId,
-        runId: input.runId,
+        runId,
         issueId,
         projectId,
         createdAt: now,
@@ -9185,7 +9188,7 @@ export function createToolGatewayService(
         id: session.id,
         companyId: session.companyId,
         agentId: input.agentId,
-        runId: input.runId,
+        runId,
         issueId: session.issueId,
         projectId: session.projectId,
         tokenHash: hashGatewayToken(token),
@@ -11258,22 +11261,26 @@ export function createToolGatewayService(
           "plugin_tools_disabled",
         );
       }
+      const runContext = {
+        ...input.runContext,
+        runId: canonicalizeUuid(input.runContext.runId) ?? input.runContext.runId,
+      };
       if (input.actor.type === "agent") {
-        if (input.actor.companyId !== input.runContext.companyId) {
+        if (input.actor.companyId !== runContext.companyId) {
           throw new ToolGatewayHttpError(
             403,
             "Agent key cannot access another company",
             "actor_company_mismatch",
           );
         }
-        if (input.actor.agentId !== input.runContext.agentId) {
+        if (input.actor.agentId !== runContext.agentId) {
           throw new ToolGatewayHttpError(
             403,
             "Agent cannot execute tools as another agent",
             "actor_agent_mismatch",
           );
         }
-        if (input.actor.runId && input.actor.runId !== input.runContext.runId) {
+        if (input.actor.runId && (canonicalizeUuid(input.actor.runId) ?? input.actor.runId) !== runContext.runId) {
           throw new ToolGatewayHttpError(
             403,
             "Agent cannot execute tools for another run",
@@ -11283,26 +11290,26 @@ export function createToolGatewayService(
       }
 
       const context = await resolveRunContext({
-        companyId: input.runContext.companyId,
-        agentId: input.runContext.agentId,
-        runId: input.runContext.runId,
-        projectId: input.runContext.projectId,
+        companyId: runContext.companyId,
+        agentId: runContext.agentId,
+        runId: runContext.runId,
+        projectId: runContext.projectId,
       });
       let invocationId = String(randomUUID());
       const sessionLike: ToolGatewaySession = {
         id: "plugin-route",
         token: "plugin-route",
-        companyId: input.runContext.companyId,
-        agentId: input.runContext.agentId,
-        runId: input.runContext.runId,
+        companyId: runContext.companyId,
+        agentId: runContext.agentId,
+        runId: runContext.runId,
         issueId: context.issueId,
-        projectId: input.runContext.projectId ?? context.projectId,
+        projectId: runContext.projectId ?? context.projectId,
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
 
-      const pluginToolAllowlist = input.runContext.agentId
-        ? await pluginToolAllowlistForAgent(input.runContext.companyId, input.runContext.agentId)
+      const pluginToolAllowlist = runContext.agentId
+        ? await pluginToolAllowlistForAgent(runContext.companyId, runContext.agentId)
         : null;
       const tool = findStaticTool(input.tool, pluginToolAllowlist);
 
@@ -11343,12 +11350,12 @@ export function createToolGatewayService(
 
       if (recorded.replayed) {
         if (isReplayableFailure(recorded.invocation)) {
-          const replayFailure = replayedInvocationFailure(recorded.invocation, input.runContext.runId);
+          const replayFailure = replayedInvocationFailure(recorded.invocation, runContext.runId);
           await writeAudit({
             session: sessionLike,
-            companyId: input.runContext.companyId,
-            agentId: input.runContext.agentId,
-            runId: input.runContext.runId,
+            companyId: runContext.companyId,
+            agentId: runContext.agentId,
+            runId: runContext.runId,
             issueId: context.issueId,
             action: "tool_gateway.call_failed",
             details: {
@@ -11387,9 +11394,9 @@ export function createToolGatewayService(
         void emitConnectionInvoked(db, invocationId);
         await writeAudit({
           session: sessionLike,
-          companyId: input.runContext.companyId,
-          agentId: input.runContext.agentId,
-          runId: input.runContext.runId,
+          companyId: runContext.companyId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
           issueId: context.issueId,
           action: "tool_gateway.call_denied",
           details: {
@@ -11428,9 +11435,9 @@ export function createToolGatewayService(
 
       await writeAudit({
         session: sessionLike,
-        companyId: input.runContext.companyId,
-        agentId: input.runContext.agentId,
-        runId: input.runContext.runId,
+        companyId: runContext.companyId,
+        agentId: runContext.agentId,
+        runId: runContext.runId,
         issueId: context.issueId,
         action: "tool_gateway.call_allowed",
         details: {
@@ -11448,7 +11455,7 @@ export function createToolGatewayService(
         const result = await pluginToolDispatcher.executeTool(
           input.tool,
           requestedParameters,
-          input.runContext,
+          runContext,
         );
         const resultValidation = validateToolContent({
           value: result,
@@ -11481,9 +11488,9 @@ export function createToolGatewayService(
         });
         await writeAudit({
           session: sessionLike,
-          companyId: input.runContext.companyId,
-          agentId: input.runContext.agentId,
-          runId: input.runContext.runId,
+          companyId: runContext.companyId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
           issueId: context.issueId,
           action: "tool_gateway.call_completed",
           details: {
@@ -11541,9 +11548,9 @@ export function createToolGatewayService(
         });
         await writeAudit({
           session: sessionLike,
-          companyId: input.runContext.companyId,
-          agentId: input.runContext.agentId,
-          runId: input.runContext.runId,
+          companyId: runContext.companyId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
           issueId: context.issueId,
           action: "tool_gateway.call_failed",
           details: {

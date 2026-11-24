@@ -92,6 +92,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { canonicalizeUuid } from "../lib/uuid.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -1044,6 +1045,7 @@ export function pluginRoutes(
       return;
     }
 
+    runContext.runId = canonicalizeUuid(runContext.runId) ?? runContext.runId;
     assertCompanyAccess(req, runContext.companyId);
     const scopeError = await validateToolRunContextScope(runContext);
     if (scopeError) {

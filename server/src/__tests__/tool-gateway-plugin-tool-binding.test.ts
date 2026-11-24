@@ -15,6 +15,7 @@ import {
   issueApprovals,
   issueThreadInteractions,
   issues,
+  projects,
   toolAccessAuditEvents,
   toolActionRequests,
   toolApplications,
@@ -28,6 +29,7 @@ import {
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { toolGatewayRoutes } from "../routes/tool-gateway.js";
+import { pluginRoutes } from "../routes/plugins.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -206,6 +208,16 @@ function countingDispatcher(execute?: PluginToolDispatcher["executeTool"]) {
   return { dispatcher, counter };
 }
 
+const runIdSpellings: Array<[string, (id: string) => string]> = [
+  ["canonical", (id) => id],
+  ["uppercase", (id) => id.toUpperCase()],
+  ["hyphen-less", (id) => id.replaceAll("-", "")],
+  ["braces", (id) => `{${id}}`],
+  ["urn", (id) => `urn:uuid:${id}`],
+  ["mixed", (id) => `URN:UUID:{${id.replaceAll("-", "").toUpperCase()}}`],
+  ["four-digit groups", (id) => id.replaceAll("-", "").match(/.{4}/g)!.join("-")],
+];
+
 async function rejectionOf(promise: Promise<unknown>): Promise<ToolGatewayHttpError & { details: Record<string, unknown> }> {
   return promise.then(
     () => {
@@ -276,6 +288,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -864,24 +877,95 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(new Set(invocations.map((row) => row.runId))).toEqual(new Set([run.id, otherRun!.id]));
   });
 
-  it("replays one stored run UUID regardless of caller spelling when the actor has no run header", async () => {
+  it.each(runIdSpellings)("replays one stored run UUID with %s spelling on direct plugin calls", async (_name, spell) => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
     const { dispatcher, counter } = countingDispatcher();
     const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
-    const call = (runId: string) => gateway.executePluginTool({
-      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: null },
+    const call = (runId: string, actorRunId: string | null = null) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: actorRunId },
       tool: "a.b:wiki_append_log",
       parameters: { path: "log/index.md", content: "same entry" },
       runContext: { companyId: company.id, agentId: agent.id, runId, projectId: "" },
     });
 
     const first = await call(run.id);
-    expect(await call(run.id.toUpperCase())).toEqual(first);
+    expect(await call(spell(run.id))).toEqual(first);
+    expect(await call(spell(run.id), run.id)).toEqual(first);
     expect(counter.attempts).toBe(1);
     const invocations = await db.select().from(toolInvocations);
     expect(invocations).toHaveLength(1);
     expect(invocations[0]!.runId).toBe(run.id);
+  });
+
+  it.each(runIdSpellings)("replays one stored run UUID with %s spelling through the plugin HTTP route", async (_name, spell) => {
+    const { company, agent, issue, run } = await createAgentFixture(db, {});
+    const [project] = await db.insert(projects).values({ companyId: company.id, name: "Run identity" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, issue.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id, projectId: project!.id } }).where(eq(heartbeatRuns.id, run.id));
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", companyId: company.id, agentId: agent.id, source: "agent_key" };
+      next();
+    });
+    app.use("/api", pluginRoutes(db, {} as Parameters<typeof pluginRoutes>[1], undefined, undefined, { toolDispatcher: dispatcher }, undefined, { toolGateway: gateway }));
+    const call = (runId: string) => request(app).post("/api/plugins/tools/execute").send({
+      tool: "a.b:wiki_append_log", parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId, projectId: project!.id },
+    });
+
+    const first = await call(run.id);
+    expect(first.status).toBe(200);
+    const replay = await call(spell(run.id));
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(counter.attempts).toBe(1);
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]!.runId).toBe(run.id);
+  });
+
+  it.each(runIdSpellings)("replays one stored run UUID with %s spelling through gateway sessions", async (_name, spell) => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const call = async (runId: string) => {
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId });
+      expect(session.runId).toBe(run.id);
+      return gateway.executeTool({
+        sessionToken: session.token, tool: "a.b:wiki_append_log",
+        parameters: { path: "log/index.md", content: "same entry" },
+      });
+    };
+    const first = await call(run.id);
+    const replay = await call(spell(run.id));
+    expect(replay).toMatchObject({ status: "replayed", invocationId: first.invocationId, result: first.result });
+    expect(counter.attempts).toBe(1);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it.each([
+    ["text", (_id: string): string => "not-a-run"],
+    ["unmatched brace", (id: string) => `{${id}`],
+    ["suffix", (id: string) => `${id}tail`],
+    ["duplicate hyphen", (id: string) => id.replace("-", "--")],
+  ] as const)("keeps malformed %s run identity refused before dispatch", async (_name, spell) => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await expect(gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: null },
+      tool: "a.b:wiki_append_log", parameters: { path: "log/index.md", content: "entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: spell(run.id), projectId: "" },
+    })).rejects.toMatchObject({ cause: { code: "22P02" } });
+    expect(counter.attempts).toBe(0);
+    expect(await db.select().from(toolInvocations)).toEqual([]);
   });
 
   it("replays a caller's explicit key across changed arguments and later runs, but not across principals or companies", async () => {

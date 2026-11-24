@@ -964,6 +964,36 @@ describeEmbeddedPostgres("tool access policy service", () => {
     }
   });
 
+  it.each([
+    ["canonical", (id: string) => id],
+    ["uppercase", (id: string) => id.toUpperCase()],
+    ["hyphen-less", (id: string) => id.replaceAll("-", "")],
+    ["braces", (id: string) => `{${id}}`],
+    ["urn", (id: string) => `urn:uuid:${id}`],
+    ["mixed", (id: string) => `URN:UUID:{${id.replaceAll("-", "").toUpperCase()}}`],
+    ["four-digit groups", (id: string) => id.replaceAll("-", "").match(/.{4}/g)!.join("-")],
+  ] as const)("records one derived invocation for %s run UUID spelling", async (_name, spell) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const run = await createRun(db, company.id, agent.id);
+    const { connection } = await createTool(db, company.id);
+    const svc = toolAccessPolicyService(db);
+    const inputFor = (runId: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      runContext: { heartbeatRunId: runId },
+      request: { connectionId: connection.id, toolName: "send_email", arguments: { body: "same" }, sideEffecting: true },
+    });
+    const input = inputFor(run.id);
+    const first = await svc.recordInvocation(input, await svc.decide(input));
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
+    const alternate = inputFor(spell(run.id));
+    const replay = await svc.recordInvocation(alternate, await svc.decide(alternate));
+    expect(replay.replayed).toBe(true);
+    expect(replay.invocation.id).toBe(first.invocation.id);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
   it("ignores another principal's earlier-build row under the shared legacy key", async () => {
     const company = await createCompany(db);
     const { connection } = await createTool(db, company.id);

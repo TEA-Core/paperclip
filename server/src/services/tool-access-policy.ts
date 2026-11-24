@@ -43,6 +43,7 @@ import type {
 } from "@paperclipai/shared";
 import { toolPolicyConditionsSchema } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
+import { canonicalizeUuid } from "../lib/uuid.js";
 import {
   effectiveToolProfileBindings,
   profileIdsInBindingOrder,
@@ -1072,7 +1073,8 @@ export function toolAccessPolicyService(db: Db) {
   > {
     const redaction = summarizeAndRedact(input.request.arguments ?? {});
     let agentId = input.actor.agentId ?? (input.actor.actorType === "agent" ? input.actor.actorId : null);
-    let heartbeatRunId = input.runContext?.heartbeatRunId ?? null;
+    const suppliedRunId = input.runContext?.heartbeatRunId ?? null;
+    const heartbeatRunId = canonicalizeUuid(suppliedRunId) ?? suppliedRunId;
     let issueId = input.runContext?.issueId ?? null;
     let projectId = input.runContext?.projectId ?? null;
     let routineId = input.runContext?.routineId ?? null;
@@ -1618,7 +1620,7 @@ export function toolAccessPolicyService(db: Db) {
       agentId: input.actor.agentId ?? null,
       issueId: input.runContext?.issueId ?? null,
       gatewayId: input.runContext?.gatewayId ?? null,
-      runId: input.runContext?.heartbeatRunId ?? null,
+      runId: canonicalizeUuid(input.runContext?.heartbeatRunId) ?? input.runContext?.heartbeatRunId ?? null,
       connectionId: input.request.connectionId ?? null,
       catalogEntryId: input.request.catalogEntryId ?? null,
       applicationId: input.request.applicationId ?? null,
@@ -1753,9 +1755,6 @@ export function toolAccessPolicyService(db: Db) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
     const { ctx, redaction } = loaded;
-    // UUID lookups accept uppercase spelling, but both key hashing and legacy
-    // receipt ownership must use the stored run's canonical spelling.
-    ctx.heartbeatRunId = ctx.heartbeatRunId?.toLowerCase() ?? null;
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
     const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
     // Derived keys are server-generated and name their owner; a caller key in
