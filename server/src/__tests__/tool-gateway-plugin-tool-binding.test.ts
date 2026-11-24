@@ -30,6 +30,8 @@ import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { pluginRoutes } from "../routes/plugins.js";
+import { toolAccessPolicyService } from "../services/tool-access-policy.js";
+import { errorHandler } from "../middleware/error-handler.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -217,6 +219,43 @@ const runIdSpellings: Array<[string, (id: string) => string]> = [
   ["mixed", (id) => `URN:UUID:{${id.replaceAll("-", "").toUpperCase()}}`],
   ["four-digit groups", (id) => id.replaceAll("-", "").match(/.{4}/g)!.join("-")],
 ];
+
+const invalidRunIds: Array<[string, (id: string) => unknown]> = [
+  ["array with canonical UUID", (id) => [id]],
+  ["array with another UUID", () => ["00000000-0000-0000-0000-000000000000"]],
+  ["object", (id) => ({ runId: id })],
+  ["number", () => 123],
+  ["zero", () => 0],
+  ["boolean", () => false],
+  ["empty string", () => ""],
+  ["whitespace", (id) => ` ${id}`],
+  ["trailing whitespace", (id) => `${id} `],
+  ["NUL", (id) => `${id}\0`],
+  ["newline", (id) => `${id}\n`],
+  ["Unicode lookalike", (id) => `\uFF11${id.slice(1)}`],
+  ["too short", (id) => id.slice(1)],
+  ["too long", (id) => `${id}0`],
+  ["non-UUID string", () => "not-a-run"],
+  ["unmatched brace", (id) => `{${id}`],
+  ["suffix", (id) => `${id}tail`],
+  ["duplicate hyphen", (id) => id.replace("-", "--")],
+];
+
+function countingDb(db: TestDb) {
+  const queries = { count: 0 };
+  const methods = new Set(["select", "selectDistinct", "selectDistinctOn", "insert", "update", "delete", "execute", "transaction"]);
+  const counted = new Proxy(db, {
+    get(target, key) {
+      const value: unknown = Reflect.get(target, key, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (typeof key === "string" && methods.has(key)) queries.count += 1;
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+  return { counted, queries };
+}
 
 async function rejectionOf(promise: Promise<unknown>): Promise<ToolGatewayHttpError & { details: Record<string, unknown> }> {
   return promise.then(
@@ -949,23 +988,208 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(await db.select().from(toolInvocations)).toHaveLength(1);
   });
 
-  it.each([
-    ["text", (_id: string): string => "not-a-run"],
-    ["unmatched brace", (id: string) => `{${id}`],
-    ["suffix", (id: string) => `${id}tail`],
-    ["duplicate hyphen", (id: string) => id.replace("-", "--")],
-  ] as const)("keeps malformed %s run identity refused before dispatch", async (_name, spell) => {
+  it.each(invalidRunIds.flatMap(([shape, value]) =>
+    (["direct", "HTTP", "session", "HTTP session", "policy decide", "policy record", "policy audit"] as const)
+      .map((entry) => ({ shape, value, entry })),
+  ))("rejects $shape run ID at $entry with clean 400 before queries or dispatch", async ({ value, entry }) => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
+    const validPolicyInput = {
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      runContext: { heartbeatRunId: run.id },
+      request: { toolName: "a.b:wiki_append_log", arguments: { content: "entry" }, sideEffecting: true },
+    };
+    const decision = await toolAccessPolicyService(db).decide(validPolicyInput);
+    const { counted, queries } = countingDb(db);
     const { dispatcher, counter } = countingDispatcher();
-    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
-    await expect(gateway.executePluginTool({
-      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: null },
-      tool: "a.b:wiki_append_log", parameters: { path: "log/index.md", content: "entry" },
-      runContext: { companyId: company.id, agentId: agent.id, runId: spell(run.id), projectId: "" },
-    })).rejects.toMatchObject({ cause: { code: "22P02" } });
+    const gateway = createToolGatewayService(counted, { pluginToolDispatcher: dispatcher });
+    const invalidRunId = value(run.id) as string;
+    if (entry === "HTTP" || entry === "HTTP session") {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = { type: "agent", companyId: company.id, agentId: agent.id, source: "agent_key" };
+        next();
+      });
+      app.use("/api", entry === "HTTP"
+        ? pluginRoutes(counted, {} as Parameters<typeof pluginRoutes>[1], undefined, undefined, { toolDispatcher: dispatcher }, undefined, { toolGateway: gateway })
+        : toolGatewayRoutes(counted, gateway));
+      app.use(errorHandler);
+      const response = await request(app)
+        .post(entry === "HTTP" ? "/api/plugins/tools/execute" : "/api/tool-gateway/sessions")
+        .send(entry === "HTTP" ? {
+          tool: "a.b:wiki_append_log", parameters: { content: "entry" },
+          runContext: { companyId: company.id, agentId: agent.id, runId: invalidRunId, projectId: randomUUID() },
+        } : { companyId: company.id, agentId: agent.id, runId: invalidRunId });
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe("invalid_run_id");
+    } else {
+      const policy = toolAccessPolicyService(counted);
+      const invalidPolicyInput = { ...validPolicyInput, runContext: { heartbeatRunId: invalidRunId } };
+      const call = entry === "direct" ? gateway.executePluginTool({
+        actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: null },
+        tool: "a.b:wiki_append_log", parameters: { content: "entry" },
+        runContext: { companyId: company.id, agentId: agent.id, runId: invalidRunId, projectId: "" },
+      }) : entry === "session" ? gateway.createSession({ companyId: company.id, agentId: agent.id, runId: invalidRunId })
+        : entry === "policy decide" ? policy.decide(invalidPolicyInput)
+        : entry === "policy record" ? policy.recordInvocation(invalidPolicyInput, decision)
+        : policy.writeAudit(invalidPolicyInput, decision);
+      await expect(call).rejects.toMatchObject({ status: 400, details: { code: "invalid_run_id" } });
+    }
+    expect(queries.count).toBe(0);
     expect(counter.attempts).toBe(0);
     expect(await db.select().from(toolInvocations)).toEqual([]);
+    expect(await db.select().from(toolGatewaySessions)).toEqual([]);
+  });
+
+  it.each(["direct", "HTTP"] as const)("refuses an array retry after a canonical successful call on %s", async (entry) => {
+    const { company, agent, issue, run } = await createAgentFixture(db, {});
+    const [project] = await db.insert(projects).values({ companyId: company.id, name: "Array replay" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, issue.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id, projectId: project!.id } }).where(eq(heartbeatRuns.id, run.id));
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const { counted, queries } = countingDb(db);
+    const gateway = createToolGatewayService(counted, { pluginToolDispatcher: dispatcher });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", companyId: company.id, agentId: agent.id, source: "agent_key" };
+      next();
+    });
+    app.use("/api", pluginRoutes(counted, {} as Parameters<typeof pluginRoutes>[1], undefined, undefined, { toolDispatcher: dispatcher }, undefined, { toolGateway: gateway }));
+    app.use(errorHandler);
+    const call = (runId: unknown) => {
+      const runContext = { companyId: company.id, agentId: agent.id, runId: runId as string, projectId: project!.id };
+      return entry === "HTTP" ? request(app).post("/api/plugins/tools/execute").send({
+        tool: "a.b:wiki_append_log", parameters: { content: "same entry" }, runContext,
+      }) : gateway.executePluginTool({
+        actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: null },
+        tool: "a.b:wiki_append_log", parameters: { content: "same entry" }, runContext,
+      });
+    };
+    await call(run.id);
+    queries.count = 0;
+    if (entry === "HTTP") {
+      const replay = await call([run.id]) as request.Response;
+      expect(replay.status).toBe(400);
+      expect(replay.body.code).toBe("invalid_run_id");
+    } else {
+      await expect(call([run.id])).rejects.toMatchObject({ status: 400, details: { code: "invalid_run_id" } });
+    }
+    expect(queries.count).toBe(0);
+    expect(counter.attempts).toBe(1);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it.each(invalidRunIds.filter(([shape]) => shape === "array with canonical UUID" || shape === "non-UUID string")
+    .flatMap(([shape, value]) => (["diagnostic", "browser auth", "instructions", "resources", "revoke actor", "revoke scope", "stop", "restart", "direct actor", "HTTP actor"] as const)
+      .map((entry) => ({ shape, value, entry }))),
+  )("rejects $shape at the additional $entry run-ID boundary before queries", async ({ value, entry }) => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    const { counted, queries } = countingDb(db);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(counted, { pluginToolDispatcher: dispatcher });
+    const invalidRunId = value(run.id) as string;
+    const binding = { companyId: company.id, agentId: agent.id, runId: invalidRunId };
+    if (entry === "HTTP actor") {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = { type: "agent", companyId: company.id, agentId: agent.id, runId: invalidRunId, source: "agent_key" };
+        next();
+      });
+      app.use("/api", pluginRoutes(counted, {} as Parameters<typeof pluginRoutes>[1], undefined, undefined, { toolDispatcher: dispatcher }, undefined, { toolGateway: gateway }));
+      app.use(errorHandler);
+      const response = await request(app).post("/api/plugins/tools/execute").send({
+        tool: "a.b:wiki_append_log", parameters: {},
+        runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: randomUUID() },
+      });
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe("invalid_run_id");
+    } else {
+      const call = entry === "diagnostic" ? gateway.recordRuntimeMcpDeliveryDiagnostic({
+        ...binding, permittedNotInstalledConnections: [], permittedConnectionCount: 0, installedConnectionCount: 0,
+      }) : entry === "browser auth" ? gateway.browserUseSessionAuthorized({
+        ...binding, issueId: randomUUID(), connectionId: randomUUID(), grantId: randomUUID(), invocationId: randomUUID(),
+      }) : entry === "instructions" ? gateway.resolveConnectionInstructionsForRun(binding)
+        : entry === "resources" ? gateway.browserUseResources({ ...binding, issueId: randomUUID() })
+        : entry === "revoke actor" || entry === "revoke scope" ? gateway.revokeSession({
+          companyId: company.id, sessionId: randomUUID(),
+          ...(entry === "revoke actor" ? { actor: { runId: invalidRunId } } : { agentScope: { agentId: agent.id, runId: invalidRunId } }),
+        }) : entry === "stop" ? gateway.stopRuntimeSlot({ companyId: company.id, slotId: randomUUID(), actor: { runId: invalidRunId } })
+        : entry === "restart" ? gateway.restartRuntimeSlot({ companyId: company.id, slotId: randomUUID(), actor: { runId: invalidRunId } })
+        : gateway.executePluginTool({
+          actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: invalidRunId },
+          tool: "a.b:wiki_append_log", parameters: {},
+          runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+        });
+      await expect(call).rejects.toMatchObject({ status: 400, details: { code: "invalid_run_id" } });
+    }
+    expect(queries.count).toBe(0);
+    expect(counter.attempts).toBe(0);
+    expect(await db.select().from(toolInvocations)).toEqual([]);
+  });
+
+  it.each([null, undefined])("keeps %j optional policy run context unbound", async (runId) => {
+    const { company, agent } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const input = {
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      runContext: { heartbeatRunId: runId },
+      request: { toolName: "a.b:wiki_append_log", arguments: { content: "entry" }, sideEffecting: true },
+    };
+    const policy = toolAccessPolicyService(db);
+    const recorded = await policy.recordInvocation(input, await policy.decide(input));
+    expect(recorded.replayed).toBe(false);
+    expect(recorded.invocation.runId).toBeNull();
+  });
+
+  it.each(["direct", "session"] as const)("keeps a required null run refused with 403 at %s without queries", async (entry) => {
+    const { company, agent } = await createAgentFixture(db, {});
+    const { counted, queries } = countingDb(db);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(counted, { pluginToolDispatcher: dispatcher });
+    const call = entry === "session" ? gateway.createSession({ companyId: company.id, agentId: agent.id, runId: null as never })
+      : gateway.executePluginTool({
+        actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: null },
+        tool: "a.b:wiki_append_log", parameters: {},
+        runContext: { companyId: company.id, agentId: agent.id, runId: null as never, projectId: "" },
+      });
+    await expect(call).rejects.toMatchObject({ status: 403, reasonCode: "run_company_mismatch" });
+    expect(queries.count).toBe(0);
+    expect(counter.attempts).toBe(0);
+  });
+
+  it.each((["HTTP", "HTTP session"] as const).flatMap((entry) =>
+    [null, undefined].map((runId) => ({ entry, runId })),
+  ))("keeps a missing required run at $entry as HTTP 400 without queries", async ({ entry, runId }) => {
+    const { company, agent } = await createAgentFixture(db, {});
+    const { counted, queries } = countingDb(db);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(counted, { pluginToolDispatcher: dispatcher });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", companyId: company.id, agentId: agent.id, source: "agent_key" };
+      next();
+    });
+    app.use("/api", entry === "HTTP"
+      ? pluginRoutes(counted, {} as Parameters<typeof pluginRoutes>[1], undefined, undefined, { toolDispatcher: dispatcher }, undefined, { toolGateway: gateway })
+      : toolGatewayRoutes(counted, gateway));
+    app.use(errorHandler);
+    const response = await request(app)
+      .post(entry === "HTTP" ? "/api/plugins/tools/execute" : "/api/tool-gateway/sessions")
+      .send(entry === "HTTP" ? {
+        tool: "a.b:wiki_append_log", runContext: { companyId: company.id, agentId: agent.id, runId, projectId: randomUUID() },
+      } : { companyId: company.id, agentId: agent.id, runId });
+    expect(response.status).toBe(400);
+    expect(queries.count).toBe(0);
+    expect(counter.attempts).toBe(0);
+    expect(await db.select().from(toolInvocations)).toEqual([]);
+    expect(await db.select().from(toolGatewaySessions)).toEqual([]);
   });
 
   it("replays a caller's explicit key across changed arguments and later runs, but not across principals or companies", async () => {

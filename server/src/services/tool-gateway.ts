@@ -1730,6 +1730,10 @@ export function createToolGatewayService(
     issueId?: string | null;
     projectId?: string | null;
   }): Promise<{ runId: string; issueId: string | null; projectId: string | null }> {
+    const runId = canonicalizeUuid(input.runId);
+    if (runId === null) {
+      throw new ToolGatewayHttpError(403, "Run does not belong to company", "run_company_mismatch");
+    }
     const [run] = await db
       .select({
         runId: heartbeatRuns.id,
@@ -1740,7 +1744,7 @@ export function createToolGatewayService(
         projectId: runContextSnapshotString("projectId"),
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, canonicalizeUuid(input.runId) ?? input.runId))
+      .where(eq(heartbeatRuns.id, runId))
       .limit(1);
 
     if (!run || run.companyId !== input.companyId) {
@@ -8714,6 +8718,7 @@ export function createToolGatewayService(
       permittedConnectionCount: number;
       installedConnectionCount: number;
     }) {
+      const runId = canonicalizeUuid(input.runId);
       // Fire whenever zero runtime MCP servers are delivered, and state which
       // condition actually holds so the row cannot be read as "permit this
       // connection" when nothing is even permitted.
@@ -8729,7 +8734,7 @@ export function createToolGatewayService(
         .from(heartbeatRuns)
         .where(
           and(
-            eq(heartbeatRuns.id, input.runId),
+            eq(heartbeatRuns.id, runId!),
             eq(heartbeatRuns.companyId, input.companyId),
             eq(heartbeatRuns.agentId, input.agentId),
           ),
@@ -8738,7 +8743,7 @@ export function createToolGatewayService(
       await writeAudit({
         companyId: input.companyId,
         agentId: input.agentId,
-        runId: input.runId,
+        runId,
         issueId: run?.issueId ?? null,
         action: "tool_gateway.runtime_mcp_delivery",
         details: {
@@ -9167,8 +9172,8 @@ export function createToolGatewayService(
       actorType?: LogActivityInput["actorType"];
       actorId?: string;
     }): Promise<ToolGatewaySession> {
-      await assertAgentInCompany(input.companyId, input.agentId);
       const { runId, issueId, projectId } = await resolveRunContext(input);
+      await assertAgentInCompany(input.companyId, input.agentId);
       const now = new Date();
       const sessionId = randomUUID();
       const token = generateGatewayToken(sessionId);
@@ -9345,11 +9350,12 @@ export function createToolGatewayService(
     },
 
     async browserUseSessionAuthorized(binding: { companyId: string; agentId: string; runId: string; issueId: string; connectionId: string; grantId: string; invocationId: string }) {
+      const runId = canonicalizeUuid(binding.runId);
       const [connection] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, binding.companyId), eq(toolConnections.id, binding.connectionId)));
       const [invocation] = await db.select().from(toolInvocations).where(and(eq(toolInvocations.companyId, binding.companyId), eq(toolInvocations.id, binding.invocationId)));
       if (!connection || !invocation || !connection.enabled || connection.status !== "active") return false;
       const [issue] = await db.select({ projectId: issues.projectId }).from(issues).where(and(eq(issues.companyId, binding.companyId), eq(issues.id, binding.issueId)));
-      const session: ToolGatewaySession = { ...binding, id: randomUUID(), token: "", projectId: issue?.projectId ?? null, createdAt: new Date(), expiresAt: new Date(Date.now() + 60000) };
+      const session: ToolGatewaySession = { ...binding, runId, id: randomUUID(), token: "", projectId: issue?.projectId ?? null, createdAt: new Date(), expiresAt: new Date(Date.now() + 60000) };
       try {
         const grant = await resolveConnectionGrant(session, connection, false);
         if (grant.id !== binding.grantId) return false;
@@ -9362,6 +9368,7 @@ export function createToolGatewayService(
 
     /** Standing instructions use exactly the same authorization as tool discovery. */
     async resolveConnectionInstructionsForRun(binding: { companyId: string; agentId: string; runId: string }) {
+      canonicalizeUuid(binding.runId);
       const candidates = await db.select().from(toolConnections).where(and(
         eq(toolConnections.companyId, binding.companyId), eq(toolConnections.enabled, true),
         eq(toolConnections.status, "active"), sql`${toolConnections.agentInstructions}->>'enabled' = 'true'`,
@@ -9399,8 +9406,9 @@ export function createToolGatewayService(
     },
 
     async browserUseResources(binding: { companyId: string; agentId: string; runId?: string; issueId?: string }) {
-      if (!binding.runId || !binding.issueId) return [];
-      const session: ToolGatewaySession = { ...binding, runId: binding.runId, issueId: binding.issueId, id: randomUUID(), token: "", projectId: null, createdAt: new Date(), expiresAt: new Date(Date.now() + 60000) };
+      const runId = canonicalizeUuid(binding.runId);
+      if (!runId || !binding.issueId) return [];
+      const session: ToolGatewaySession = { ...binding, runId, issueId: binding.issueId, id: randomUUID(), token: "", projectId: null, createdAt: new Date(), expiresAt: new Date(Date.now() + 60000) };
       const tools = (await listToolsForContext(session)).filter(t => t.providerType === "provider_rest");
       const resources: Array<{ id: string; label: string; connectionId: string }> = [];
       for (const connectionId of new Set(tools.map(t => t.connectionId!))) {
@@ -11261,11 +11269,16 @@ export function createToolGatewayService(
           "plugin_tools_disabled",
         );
       }
+      const runId = canonicalizeUuid(input.runContext.runId);
+      if (runId === null) {
+        throw new ToolGatewayHttpError(403, "Run does not belong to company", "run_company_mismatch");
+      }
       const runContext = {
         ...input.runContext,
-        runId: canonicalizeUuid(input.runContext.runId) ?? input.runContext.runId,
+        runId,
       };
       if (input.actor.type === "agent") {
+        const actorRunId = canonicalizeUuid(input.actor.runId);
         if (input.actor.companyId !== runContext.companyId) {
           throw new ToolGatewayHttpError(
             403,
@@ -11280,7 +11293,7 @@ export function createToolGatewayService(
             "actor_agent_mismatch",
           );
         }
-        if (input.actor.runId && (canonicalizeUuid(input.actor.runId) ?? input.actor.runId) !== runContext.runId) {
+        if (actorRunId && actorRunId !== runContext.runId) {
           throw new ToolGatewayHttpError(
             403,
             "Agent cannot execute tools for another run",
@@ -11585,6 +11598,8 @@ export function createToolGatewayService(
       };
       agentScope?: { agentId: string; runId?: string | null } | null;
     }) {
+      canonicalizeUuid(input.actor?.runId);
+      const scopedRunId = canonicalizeUuid(input.agentScope?.runId);
       const now = input.revokedAt ?? new Date();
       const [existing] = await db
         .select()
@@ -11604,8 +11619,8 @@ export function createToolGatewayService(
         );
       }
       if (input.agentScope) {
-        const runMatches = input.agentScope.runId
-          ? existing.runId === input.agentScope.runId
+        const runMatches = scopedRunId
+          ? existing.runId === scopedRunId
           : true;
         if (existing.agentId !== input.agentScope.agentId || !runMatches) {
           throw new ToolGatewayHttpError(
@@ -11673,12 +11688,13 @@ export function createToolGatewayService(
       slotId: string;
       actor?: { agentId?: string | null; runId?: string | null };
     }) {
+      const runId = canonicalizeUuid(input.actor?.runId);
       try {
         return await runtimeSupervisor.stopSlot({
           companyId: input.companyId,
           slotId: input.slotId,
           agentId: input.actor?.agentId ?? null,
-          runId: input.actor?.runId ?? null,
+          runId,
         });
       } catch (err) {
         if (err instanceof ToolRuntimeSupervisorError) {
@@ -11698,12 +11714,13 @@ export function createToolGatewayService(
       slotId: string;
       actor?: { agentId?: string | null; runId?: string | null };
     }) {
+      const runId = canonicalizeUuid(input.actor?.runId);
       try {
         return await runtimeSupervisor.restartSlot({
           companyId: input.companyId,
           slotId: input.slotId,
           agentId: input.actor?.agentId ?? null,
-          runId: input.actor?.runId ?? null,
+          runId,
         });
       } catch (err) {
         if (err instanceof ToolRuntimeSupervisorError) {

@@ -1071,10 +1071,9 @@ export function toolAccessPolicyService(db: Db) {
     | { ok: true; ctx: ToolAccessContext; redaction: RedactionResult }
     | { ok: false; decision: ToolAccessDecision; redaction: RedactionResult }
   > {
+    const heartbeatRunId = canonicalizeUuid(input.runContext?.heartbeatRunId);
     const redaction = summarizeAndRedact(input.request.arguments ?? {});
     let agentId = input.actor.agentId ?? (input.actor.actorType === "agent" ? input.actor.actorId : null);
-    const suppliedRunId = input.runContext?.heartbeatRunId ?? null;
-    const heartbeatRunId = canonicalizeUuid(suppliedRunId) ?? suppliedRunId;
     let issueId = input.runContext?.issueId ?? null;
     let projectId = input.runContext?.projectId ?? null;
     let routineId = input.runContext?.routineId ?? null;
@@ -1620,7 +1619,7 @@ export function toolAccessPolicyService(db: Db) {
       agentId: input.actor.agentId ?? null,
       issueId: input.runContext?.issueId ?? null,
       gatewayId: input.runContext?.gatewayId ?? null,
-      runId: canonicalizeUuid(input.runContext?.heartbeatRunId) ?? input.runContext?.heartbeatRunId ?? null,
+      runId: canonicalizeUuid(input.runContext?.heartbeatRunId),
       connectionId: input.request.connectionId ?? null,
       catalogEntryId: input.request.catalogEntryId ?? null,
       applicationId: input.request.applicationId ?? null,

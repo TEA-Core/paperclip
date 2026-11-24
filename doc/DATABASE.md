@@ -212,8 +212,11 @@ key, a distinct call uses its full `side_effect:v2:` key.
 Run UUIDs use one strict parser before run lookup, gateway context creation,
 derived replay-key construction and legacy receipt ownership checks. Hex case,
 omitted hyphens, hyphens after four-digit groups, matching braces and the
-`urn:uuid:` prefix all map to lowercase `8-4-4-4-12` form. Invalid identifiers
-are not repaired into valid run IDs; existing refusal behavior is retained.
+`urn:uuid:` prefix all map to lowercase `8-4-4-4-12` form. Invalid provided
+run IDs (including arrays, objects, numbers and malformed strings) fail with
+HTTP 400 and code `invalid_run_id` before any database query, replay key or
+dispatch. Null or omitted optional policy/actor context stays unbound.
+Required null run context retains its existing service 403 / HTTP 400 refusal.
 
 Caller-supplied keys have a different contract: within a company, the same
 principal replays its stored outcome even with changed arguments or from a
