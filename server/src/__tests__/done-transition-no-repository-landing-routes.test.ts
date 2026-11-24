@@ -2258,6 +2258,41 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(verified[0]!.details).toMatchObject({ creationSnapshot: "not_recorded" });
     });
 
+    it.each([
+      ["project.workspace_deleted", false],
+      ["project.workspace_deleted", true],
+      ["project.deleted", false],
+      ["project.deleted", true],
+    ] as const)("deletion audit company scope: %s (same company: %s)", async (action, sameCompany) => {
+      const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+      const auditCompanyId = sameCompany ? fixture.companyId : (await seedAdmissible()).companyId;
+      const workspaceId = randomUUID();
+      // Seed a historical claim directly: write-side deletion cannot produce
+      // a foreign-company claim, but the audit reader must still isolate it.
+      await db.insert(activityLog).values({
+        companyId: auditCompanyId,
+        actorType: "user",
+        actorId: BOARD_USER_ID,
+        action,
+        entityType: "project",
+        entityId: randomUUID(),
+        details: {
+          workspaceId,
+          affectedIssues: [{ issueId: fixture.issueId, projectWorkspaceId: workspaceId }],
+          affectedCount: 1,
+          affectedTruncated: false,
+        },
+      });
+      currentActor = fixture.actor;
+      const result = await close(fixture.identifier);
+      if (sameCompany) {
+        await expectRefused(fixture, result, NO_WORKSPACE_REFUSAL);
+      } else {
+        expect(result.status, JSON.stringify(result.body)).toBe(200);
+        expect(await statusOf(fixture.issueId)).toBe("done");
+      }
+    });
+
     it("refuses a legacy card after project deletion cascades through its workspace binding", async () => {
       const bound = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });
       await expectRefused(bound, await close(bound.identifier), NO_WORKSPACE_REFUSAL);
