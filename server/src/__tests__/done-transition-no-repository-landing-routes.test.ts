@@ -2292,6 +2292,91 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await statusOf(fixture.issueId)).toBe("done");
     });
 
+    async function bulkBindToWorkspace(companyId: string, projectWorkspaceId: string, count: number) {
+      for (let offset = 0; offset < count; offset += 1000) {
+        const size = Math.min(1000, count - offset);
+        await db.insert(issues).values(
+          Array.from({ length: size }, (_, index) => ({
+            id: randomUUID(),
+            companyId,
+            projectWorkspaceId,
+            identifier: `BULK-${offset + index}-${randomUUID().slice(0, 8)}`,
+            title: "Bulk bound card",
+            status: "todo",
+            priority: "medium",
+          })),
+        );
+      }
+    }
+
+    it.each([
+      [5000, false],
+      [5001, true],
+    ] as const)("records at most 5000 affected cards on project deletion (%i bound cards, truncated=%s)", async (bound, truncated) => {
+      const fixture = await seedNoWorkspace({ withProjectWorkspace: true, omitCreationSnapshot: true });
+      const [binding] = await db.select({
+        projectId: projectWorkspaces.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+        .where(eq(issues.id, fixture.issueId));
+      await bulkBindToWorkspace(fixture.companyId, binding!.projectWorkspaceId!, bound - 1);
+
+      asBoard();
+      const removal = await request(app).delete(`/api/projects/${binding!.projectId}`);
+      expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+
+      const [audit] = await activityRows(binding!.projectId!, "project.deleted");
+      const details = audit!.details as {
+        affectedIssues: Array<{ issueId: string; projectWorkspaceId: string }>;
+        affectedCount: number;
+        affectedTruncated: boolean;
+      };
+      expect(details.affectedCount).toBe(bound);
+      expect(details.affectedTruncated).toBe(truncated);
+      expect(details.affectedIssues).toHaveLength(Math.min(bound, 5000));
+      expect(new Set(details.affectedIssues.map((entry) => entry.issueId)).size).toBe(details.affectedIssues.length);
+      expect(details.affectedIssues.every((entry) => entry.projectWorkspaceId === binding!.projectWorkspaceId)).toBe(true);
+      const [after] = await db.select({ projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
+        .where(eq(issues.id, fixture.issueId));
+      expect(after!.projectWorkspaceId).toBeNull();
+    }, 120_000);
+
+    it("rolls the project deletion back when its audit write fails", async () => {
+      const fixture = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });
+      const [binding] = await db.select({
+        projectId: projectWorkspaces.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+        .where(eq(issues.id, fixture.issueId));
+
+      await db.execute(sql`
+        create or replace function test_fail_project_deleted_audit() returns trigger language plpgsql as $$
+        begin
+          if new.action = 'project.deleted' then raise exception 'audit write refused'; end if;
+          return new;
+        end $$`);
+      await db.execute(sql`
+        create trigger fail_project_deleted_audit before insert on activity_log
+        for each row execute function test_fail_project_deleted_audit()`);
+      try {
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${binding!.projectId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(500);
+      } finally {
+        await db.execute(sql`drop trigger if exists fail_project_deleted_audit on activity_log`);
+        await db.execute(sql`drop function if exists test_fail_project_deleted_audit()`);
+      }
+
+      expect(await db.select().from(projects).where(eq(projects.id, binding!.projectId!))).toHaveLength(1);
+      expect(await db.select().from(projectWorkspaces).where(eq(projectWorkspaces.id, binding!.projectWorkspaceId!))).toHaveLength(1);
+      const [after] = await db.select({ projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
+        .where(eq(issues.id, fixture.issueId));
+      expect(after!.projectWorkspaceId).toBe(binding!.projectWorkspaceId);
+      expect(await activityRows(binding!.projectId!, "project.deleted")).toHaveLength(0);
+      currentActor = fixture.actor;
+      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+    });
+
     it("refuses a close request whose own description cites repository work and closes with a clean one", async () => {
       const cited = await seedAdmissible();
       const refused = await request(app).patch(`/api/issues/${cited.identifier}`).send({
