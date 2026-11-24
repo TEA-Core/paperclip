@@ -1,3 +1,4 @@
+import { readRecoveryCarrierParkSnapshot, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -80,6 +81,7 @@ import {
   projects,
   toolConnections,
   workspaceOperations,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
@@ -4189,6 +4191,7 @@ function createIssueBlockerAttention(
     directBlockerIssueId: input.directBlockerIssueId ?? null,
     terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
     terminalBlocker: input.terminalBlocker ?? null,
+    ...(input.carrierPark ? { carrierPark: input.carrierPark } : {}),
   };
 }
 
@@ -4341,9 +4344,14 @@ async function listIssueBlockerAttentionMap(
     (row) => row.companyId === companyId && row.status === "blocked",
   );
   const attentionMap = new Map<string, IssueBlockerAttention>();
+  const { parks: carrierParks, blockers: rootBlockers } = await readRecoveryCarrierParkSnapshot(
+    dbOrTx, companyId, issueRows.map(row => row.id),
+  );
   for (const row of issueRows) {
     if (row.status !== "blocked") {
-      attentionMap.set(row.id, createIssueBlockerAttention({ computed: false }));
+      const carrierPark = carrierParks.get(row.id);
+      attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
+        ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
     }
   }
   if (roots.length === 0) return attentionMap;
@@ -4378,7 +4386,11 @@ async function listIssueBlockerAttentionMap(
       }
       const explicitBlockerRowsPromise: Promise<
         IssueBlockerAttentionQueryRow[]
-      > = dbOrTx
+      > = depth === 0
+        ? Promise.resolve(chunk.flatMap(issueId => (rootBlockers.get(issueId) ?? []).map(row => ({
+            ...row, issueId, blockerIssueId: row.id,
+          }))))
+        : dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
           blockerIssueId: issues.id,
@@ -4949,6 +4961,11 @@ async function listIssueBlockerAttentionMap(
     });
     if (topLevelEdges.length === 0) {
       const allEdges = edgesByIssueId.get(root.id) ?? [];
+      const carrierPark = carrierParks.get(root.id);
+      if (carrierPark?.state === "accepted") {
+        attentionMap.set(root.id, createIssueBlockerAttention({ computed: true, carrierPark }));
+        continue;
+      }
       if (allEdges.length > 0) {
         const terminalSampleNode = nodesById.get(allEdges[0].blockerIssueId);
         attentionMap.set(root.id, createIssueBlockerAttention({
@@ -5054,6 +5071,15 @@ async function listIssueBlockerAttentionMap(
     }));
   }
 
+  for (const [id, carrierPark] of carrierParks) {
+    const attention = attentionMap.get(id);
+    if (!attention) continue;
+    attention.carrierPark = carrierPark;
+    if (carrierPark.state === "stale" && attention.state === "covered") {
+      attention.state = "needs_attention";
+      attention.reason = "attention_required";
+    }
+  }
   return attentionMap;
 }
 
@@ -13242,27 +13268,52 @@ export function issueService(
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        const [lockedIssue] = await tx
-          .select({ companyId: issues.companyId, status: issues.status })
-          .from(issues)
-          .where(eq(issues.id, id))
-          .for("update");
-        if (!lockedIssue) return null;
+        const [carrier] = await tx.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+        if (!carrier) return null;
+        // Match park admission's source-before-carrier lock order, including released fences.
+        const actionSources = await tx.select({ sourceId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          or(eq(issueRecoveryActions.recoveryIssueId, id), sql`exists (
+            select 1 from ${issueTreeHolds}
+            where ${issueTreeHolds.companyId} = ${carrier.companyId} and ${issueTreeHolds.rootIssueId} = ${id}
+              and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.status} in ('active', 'released')
+              and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`)}
+          )`),
+        ));
+        const sourceIds = [...new Set(actionSources.map(row => row.sourceId))].sort();
+        if (sourceIds.length) await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, carrier.companyId), inArray(issues.id, sourceIds),
+        )).orderBy(asc(issues.id)).for("update");
+        const [lockedCarrier] = await tx.select({ status: issues.status }).from(issues).where(and(
+          eq(issues.id, id), eq(issues.companyId, carrier.companyId),
+        )).for("update");
+        if (!lockedCarrier) return null;
+        const parks = await tx.select({ status: issueTreeHolds.status, actionStatus: issueRecoveryActions.status,
+          actionSourceId: issueRecoveryActions.sourceIssueId }).from(issueTreeHolds).leftJoin(issueRecoveryActions, and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`),
+        )).where(and(eq(issueTreeHolds.companyId, carrier.companyId), eq(issueTreeHolds.rootIssueId, id),
+          eq(issueTreeHolds.mode, "pause"), inArray(issueTreeHolds.status, ["active", "released"]),
+          sql`${issueTreeHolds.recoveryCarrierPark} is not null`));
+        if (parks.some(hold => hold.status === "active" || !hold.actionSourceId || !sourceIds.includes(hold.actionSourceId) ||
+            !hold.actionStatus || !["resolved", "cancelled"].includes(hold.actionStatus))) {
+          throw conflict("Recovery carrier cannot be deleted while its board park has pending effects.");
+        }
         // The issue lock serializes this check with attribution FK insertion.
         // Invalidating proof does not make its child contribution disposable.
         const [attribution] = await tx
           .select({ id: issueChildCarrierAttributions.id })
           .from(issueChildCarrierAttributions)
           .where(and(
-            eq(issueChildCarrierAttributions.companyId, lockedIssue.companyId),
+            eq(issueChildCarrierAttributions.companyId, carrier.companyId),
             or(
-              lockedIssue.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
+              lockedCarrier.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
               and(
                 eq(issueChildCarrierAttributions.ancestorIssueId, id),
                 sql`EXISTS (
                   SELECT 1 FROM ${issues}
                   WHERE ${issues.id} = ${issueChildCarrierAttributions.childIssueId}
-                    AND ${issues.companyId} = ${lockedIssue.companyId} AND ${issues.status} <> 'cancelled'
+                    AND ${issues.companyId} = ${carrier.companyId} AND ${issues.status} <> 'cancelled'
                 )`,
               ),
             ),

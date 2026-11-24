@@ -708,6 +708,134 @@ Use an issue-backed recovery action only when the recovery is genuinely independ
 
 A comment or system notice can be evidence for a recovery action, but it is not a recovery action by itself. Comment-only recovery is not a healthy liveness path because it does not define a typed owner, wake or monitor policy, retry bound, timeout, escalation path, or resolution outcome.
 
+#### Board-accepted unresolved recovery carrier park
+
+The board can explicitly accept an intentionally unresolved carrier disposition
+with `POST /api/issues/:id/recovery-carrier-park`. The read-only
+`GET /api/issues/:id/recovery-carrier-park/candidate` supplies current identity,
+ownership, status-version and terminal-blocker expectations; the board chooses
+the historical rejected confirmation and supplies its acceptance reason.
+The rejected confirmation is provenance, not consent by itself.
+
+Admission requires the exact same-company source/action/carrier linkage, an
+escalated/exhausted board-owned action without wake/monitor policy, current
+decision and blocker snapshots, and no carrier-subtree execution, queued work,
+execution locks or scheduled monitor. A source with a scheduled monitor must
+settle that schedule before parking; this operation never clears it.
+Deferred issue-execution receipts count as queued work, including verified
+interaction input and persisted issue/task identities in wake context or deferred
+skip metadata; park admission must not silently abandon that input.
+Unfinished `skipped` receipts with a deferrable reason also count as pending
+execution on the carrier tree or exact action. Acceptance rejects them atomically
+rather than retiring or discarding them. Finished skips, terminal skip reasons
+and unrelated bare-source receipts do not create a carrier execution conflict.
+
+The acceptance binding, ordinary manual pause hold and audit event commit
+together. Source and recovery-action rows are read-only: no resolution,
+cancellation, attempt/evidence refresh, supersession, replacement action, monitor
+or wake is authorized. Repeated identical acceptance returns the same hold.
+While the acceptance is active, the exact-action binding gates automatic action
+upserts and source recovery re-arm, including exhaustion drain; board release
+lifts that gate but is not new source repair authority. Independent authorized
+board resolution remains separate. This is not a general source-task pause.
+The active company/action binding is unique; unbound or released holds do not
+occupy that slot.
+New bindings store the database's canonical source, action, decision, assignee
+and blocker UUIDs. Equivalent blocker ordering and UUID letter case do not make
+an otherwise identical acceptance stale; persisted consent is not rewritten.
+Source and admission gates compare uppercase, compact and braced UUID spellings
+consistently, including older bindings, without casting untrusted saved JSON,
+rewriting stored consent or touching the action row. Malformed aliases sharing
+the protected UUID's hex digits fail closed. Admission also checks the
+server-derived action identity in queued wake context.
+Exhaustion drain excludes the exact parked action before its bounded candidate
+page, so parked rows cannot hide later eligible work. Carrier eligibility and
+wake preflight use the lock-holding transaction; wake publication follows commit.
+Locked preflight distinguishes a board park, an existing live monitor and ordinary
+unavailability. Park refusal posts no missing-owner notice or fallback audit.
+An existing monitor keeps its schedule and metadata without creating a carrier.
+Monitor admission rereads the exact action under the source lock and skips a
+stale or independently resolved action without falling back to a new carrier.
+Due and future checks use one clock sample taken after acquiring that lock.
+Recovery notices recheck the exact source/action under the source lock, including
+the comment's source-recency update.
+Attention projection treats uppercase legacy UUIDs as the same identity without
+rewriting consent. A candidate with live blockers remains discoverable, but its
+board form explains the blocker that prevents terminal-only admission.
+Stale execution-pointer cleanup retains the source lock and pointer compare-and-set
+checks without suppressing unrelated source maintenance. Healthy-child blocker
+repair rechecks the source-action gate under the source lock and preserves an
+operator's terminal source close that won that lock. Active typed parks prevent
+automatic stale-review carrier archival; ordinary unparked cleanup and review-stage
+archival rules are unchanged.
+
+The carrier stays visible and nonterminal. Its accepted park is separate from
+the source's unresolved escalation and from actual dependency counts/tree
+liveness. Terminal blocker history is retained; the ordinary all-done re-block
+PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
+rejection never create acceptance. A stale binding surfaces attention and keeps
+the manual execution hold; it cannot grant a fresh run.
+Attention reads direct blocker facts and park consent in one company-scoped
+statement, including when the caller already owns a transaction. The graph uses
+that same root-blocker snapshot, so neither a concurrent reopen nor a late park
+acceptance can combine live blocker facts with unrelated accepted consent.
+Deferred promotion rechecks the typed park under the issue lock. The ordinary
+pause's verified-interaction exception cannot bypass a carrier park: a legacy
+deferred receipt is cancelled without a run and cannot replay on release.
+Action-associated wake admission locks the source and carrier before an
+issue-scoped target or queue insertion. Action-only coalescing preserves its
+existing run-first order before that gate. A typed park takes priority over
+ordinary holds anywhere in its subtree;
+nested ordinary holds remain active and require their own explicit release.
+Typed inheritance follows the full same-company parent chain in one recursive
+read for non-root lookups, using UNION cycle deduplication and a visited set.
+The root fast path, ordinary 100-node budget and nearest fallback stay unchanged.
+Native dependency/child-completion producers persist a terminal skipped intent
+when the carrier is parked. A native dispatch attempt suppressed by a park also
+marks its original intent skipped; release cannot replay it. Other native
+deferral policies remain unchanged.
+
+Early scheduling, cutoff and budget deferrals take the same exact-action and
+issue locks before coalescing or persisting replay work. A typed park refuses
+that work and terminally skips the original native intent; ordinary quiescence
+still defers normally. The dormant wake-queue module preserves the same typed
+fence instead of granting its ordinary verified-interaction exception.
+
+Action-only coalescing isolates a nonfatal context-snapshot update in a
+savepoint when it already owns a transaction. Its diagnostic run-log event is
+recorded after that transaction settles, including with a one-connection pool.
+A coalesced receipt associated with a queued, running or scheduled-retry run
+still counts as active admission work even if its diagnostic snapshot failed.
+
+Blocked-recovery candidate selection excludes the current typed paused subtree
+and sources with an exact protected active/escalated action before applying
+its bounded ordinary-work limit. The fence applies only while the park is
+active; board release lifts it.
+This is not a bare-source or global exhausted-action exemption; locked per-issue
+checks still handle parks accepted after candidate selection.
+
+A typed park intentionally excludes comment delivery. Existing manual-pause
+admission rejects ordinary issue-comment writes, and the composer stays disabled.
+Internal wake attempts do not create a deferred delivery queue. Board release
+does not replay those attempts or start work.
+
+Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/release`
+retires the acceptance and releases this hold. It checks the bound action's UUID
+identity regardless of letter case, audits atomically and repeats idempotently.
+It changes no source/action row, starts no work, and does not approve a review
+stage or authorize repair. The park gate refuses only automated supersession,
+re-mint, upsert and monitor/carrier re-arm of the exact bound action while the
+acceptance is active; unrelated source sweeps (stranded, stale-lock, orphan)
+keep running, and release lifts the gate.
+Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
+sentinel blocker or consent backfill exists. Rollback retains the pause and audit
+evidence; it must not release holds or revive source recovery as cleanup.
+Deleting a carrier is refused while its typed park is active, or while a
+released binding still protects unresolved source effects. The shared removal
+service takes source locks before the carrier lock and rechecks the fence.
+Deletion cannot cascade away that fence or clear the bound unresolved action's
+carrier pointer; an unrelated ordinary card remains deletable.
+
 #### Recovery action freshness
 
 Source-scoped recovery actions are snapshots of the source issue's liveness state at the time the action was opened. They must be revalidated after newer durable source activity, including source issue status changes, assignee changes, blocker changes, execution policy or monitor changes, document or work-product updates that define a valid waiting path, and structured resume or disposition updates.
