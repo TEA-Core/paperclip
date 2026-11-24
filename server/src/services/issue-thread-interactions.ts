@@ -2333,11 +2333,15 @@ export function issueThreadInteractionService(
         const finalizeProof = args.mutationOptions?.finalizeLandingProof;
         const closeNote = args.actor.userId ? args.input.landingDebtCloseNote : undefined;
         // A note waives only legacy debt; explicit debt is cleared by proof alone.
-        const noteCoversDebt = !!closeNote && owedDebt.every((row) => row.legacy);
+        const legacyDebtOnly = owedDebt.every((row) => row.legacy);
+        const noteCoversDebt = !!closeNote && legacyDebtOnly;
         if (owedDebt.length > 0 && !finalizeProof && !noteCoversDebt) {
-          throw conflict("Issue has unpaid landing debt; accept with landing proof or a documented-close note.", {
-            code: "done_transition_missing_delivery", issueId: issueContext.id,
-          });
+          throw conflict(
+            args.actor.userId && legacyDebtOnly
+              ? "Issue has unpaid landing debt; accept with landing proof or a documented-close note."
+              : "Issue has unpaid landing debt; accept with landing proof.",
+            { code: "done_transition_missing_delivery", issueId: issueContext.id },
+          );
         }
         // Each explicit reviewer must be able to answer independently. Completing
         // on the first answer would cancel the other pending decisions.

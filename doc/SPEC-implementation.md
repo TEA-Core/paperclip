@@ -313,6 +313,8 @@ under the issue lock like the other doors) or, for legacy debt without a
 `landingDebtDisposition` only, a nonblank `landingDebtCloseNote` on the accept
 body, persisted with the board actor on the discharged row. Explicit debt stays
 proof-only. Otherwise it refuses with HTTP 409 `done_transition_missing_delivery`.
+The refusal offers landing proof for explicit debt; it offers a documented-close
+note only when that board actor can use the legacy path.
 Acceptance, close, and discharge commit or roll back together.
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.

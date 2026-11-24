@@ -2281,11 +2281,25 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         const { accept, state } = await seedNativeReview("NATREFUSE", "legacy");
         const refused = await accept();
         expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect(refused.body.error).toBe(
+          "Issue has unpaid landing debt; accept with landing proof or a documented-close note.",
+        );
         const after = await state();
         expect(after.issue?.status).toBe("in_review");
         expect(after.interaction).toBe("pending");
         expect(after.debt?.landingCheckOwed).toBe(true);
         expect(after.debt?.landingDebtDisposition).toBeUndefined();
+
+        const followed = await accept({ landingDebtCloseNote: "Landing completed out of band." });
+        expect(followed.status, JSON.stringify(followed.body)).toBe(200);
+        const closed = await state();
+        expect(closed.issue?.status).toBe("done");
+        expect(closed.interaction).toBe("accepted");
+        expect(closed.debt).toMatchObject({
+          landingDebtDisposition: "discharged",
+          documentedClose: { note: "Landing completed out of band.", actorUserId: "local-board" },
+        });
       });
 
       it("accepts at the native door with server-verified landing proof and discharges debt atomically", async () => {
@@ -2324,14 +2338,21 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         const { accept, state } = await seedNativeReview("NATEXPLICIT", "explicit");
         const refused = await accept({ landingDebtCloseNote: "Landed out of band." });
         expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect(refused.body.error).toBe("Issue has unpaid landing debt; accept with landing proof.");
         const after = await state();
         expect(after.issue?.status).toBe("in_review");
         expect(after.interaction).toBe("pending");
         expect(after.debt?.landingDebtDisposition).toBe("outstanding");
         expect(after.debt?.documentedClose).toBeUndefined();
         landing();
-        expect((await accept()).status).toBe(200);
-        expect((await state()).debt?.landingDebtDisposition).toBe("discharged");
+        const followed = await accept();
+        expect(followed.status, JSON.stringify(followed.body)).toBe(200);
+        const closed = await state();
+        expect(closed.issue?.status).toBe("done");
+        expect(closed.interaction).toBe("accepted");
+        expect(closed.debt?.landingDebtDisposition).toBe("discharged");
+        expect(closed.debt?.landingProof).toBeDefined();
       });
 
       it.each(["proof", "note"] as const)(
