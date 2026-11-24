@@ -1427,6 +1427,81 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(await db.select().from(toolInvocations)).toHaveLength(1);
   });
 
+  it("atomically reserves an explicit key when both callers reach the first insert together", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    let finishDispatch!: () => void;
+    const dispatchMayFinish = new Promise<void>((resolve) => { finishDispatch = resolve; });
+    const base = twoPluginDispatcher();
+    const { dispatcher, counter } = countingDispatcher(async (tool, parameters, runContext) => {
+      await dispatchMayFinish;
+      return base.executeTool(tool, parameters, runContext);
+    });
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    // Explicit keys do not take the derived-key advisory lock. Both callers
+    // must finish their empty lookup before either INSERT can commit.
+    const call = () => gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "raced entry" },
+      idempotencyKey: `atomic-reservation:${run.id}`,
+    });
+    const answers: Promise<PromiseSettledResult<Awaited<ReturnType<typeof call>>>>[] = [];
+    const invoke = () => call().then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    try {
+      // This suite owns its private Postgres. The trigger is a real SQL
+      // reservation barrier, not a sleep or a mock of the conflict handler.
+      await db.$client`
+        CREATE FUNCTION binding_invocation_reservation_barrier() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(1177, 23991);
+          RETURN NEW;
+        END;
+        $$`;
+      await db.$client`
+        CREATE TRIGGER binding_invocation_reservation_barrier
+        BEFORE INSERT ON tool_invocations FOR EACH ROW
+        EXECUTE FUNCTION binding_invocation_reservation_barrier()`;
+      await db.$client.begin(async (gate) => {
+        await gate`SELECT pg_advisory_xact_lock(1177, 23991)`;
+        answers.push(invoke(), invoke());
+        await expect.poll(async () => {
+          const [locks] = await gate<{ waiting: number }[]>`
+            SELECT count(*)::integer AS waiting FROM pg_locks
+            WHERE locktype = 'advisory' AND classid = 1177 AND objid = 23991
+              AND objsubid = 2 AND NOT granted
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`;
+          return locks?.waiting;
+        }, { timeout: 10_000 }).toBe(2);
+        // Committing releases both INSERTs only after both are observed.
+      });
+      const firstAnswer = await Promise.race(answers);
+      finishDispatch();
+      const outcomes = await Promise.all(answers);
+      expect(firstAnswer.status).toBe("rejected");
+      expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ result: expect.anything() }) },
+      ]);
+      expect(outcomes.filter((outcome) => outcome.status === "rejected")).toEqual([
+        { status: "rejected", reason: expect.objectContaining({
+          status: 409, details: expect.objectContaining({ reasonCode: "tool_invocation_in_progress" }),
+        }) },
+      ]);
+      expect(counter.attempts).toBe(1);
+      expect(await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id))).toHaveLength(1);
+    } finally {
+      finishDispatch();
+      await Promise.all(answers);
+      await db.$client`DROP TRIGGER IF EXISTS binding_invocation_reservation_barrier ON tool_invocations`;
+      await db.$client`DROP FUNCTION IF EXISTS binding_invocation_reservation_barrier()`;
+    }
+  }, 30_000);
+
   it("answers an identical call while the first is still running with 409 in-progress, then replays the outcome", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
