@@ -8105,6 +8105,68 @@ describe("evaluateDoneTierDeclaration", () => {
         );
       }
 
+      describe("self-referential approval-state before trusted approval", () => {
+        const approvalStateName = "paperclip/approval-state";
+        const failedStatus = (context: string): CarrierContext => (
+          { __typename: "StatusContext", context, state: "FAILURE", isRequired: true }
+        );
+
+        describe.each([
+          ["check run", failedRun],
+          ["commit status", failedStatus],
+        ] as const)("%s", (_kind, failedContext) => {
+          it("accepts when only approval-state is terminal-failed, with other checks passing or running", async () => {
+            carrierFetch({
+              mergeStateStatus: "BLOCKED",
+              contexts: [
+                failedContext(approvalStateName),
+                { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "SUCCESS", isRequired: true },
+                { __typename: "CheckRun", name: "tests", status: "IN_PROGRESS", conclusion: null, isRequired: true },
+                { __typename: "StatusContext", context: "lint", state: "SUCCESS", isRequired: true },
+                { __typename: "StatusContext", context: "deploy", state: "PENDING", isRequired: true },
+              ],
+            });
+            const result = await closeDelegated();
+            expect(result.allowed).toBe(true);
+            expect(result.tier).toBe("tier1");
+          });
+
+          it.each(["ci-required", "paperclip/approved"])(
+            "still refuses the unrelated required failure %s alongside approval-state",
+            async (name) => {
+              carrierFetch({
+                mergeStateStatus: "BLOCKED",
+                contexts: [failedContext(approvalStateName), failedContext(name)],
+              });
+              const result = await closeDelegated();
+              expect(result.allowed).toBe(false);
+              expect(result.tier).toBe(null);
+              expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+              expect(result.reason).toContain(`${name} (failure)`);
+              expect(result.reason).not.toContain(`${approvalStateName} (failure)`);
+              expect(result.remedy).toContain("passing or running");
+            },
+          );
+
+          it.each([
+            "paperclip/approval-state-x",
+            "x-paperclip/approval-state",
+            "Paperclip/Approval-State",
+            " paperclip/approval-state",
+            "paperclip/approval-state ",
+          ])("still refuses the lookalike required failure %s", async (name) => {
+            carrierFetch({
+              mergeStateStatus: "BLOCKED",
+              contexts: [failedContext(approvalStateName), failedContext(name)],
+            });
+            const result = await closeDelegated();
+            expect(result.allowed).toBe(false);
+            expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+            expect(result.reason).toContain(`${name} (failure)`);
+          });
+        });
+      });
+
       it("refuses when the carrier's required check is already terminal-failed (SUP-24120 / PR 4329 shape)", async () => {
         carrierFetch({
           mergeStateStatus: "BLOCKED",

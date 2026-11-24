@@ -1118,6 +1118,9 @@ interface LandingCarrierHealth {
 // ACTION_REQUIRED awaits manual approval and is not terminal-failed.
 const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
 const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+// SUP-25177: the carrier's own pre-approval status is self-referential: it must
+// not gate the trusted approval that makes it pass. Unrelated checks still gate.
+const SELF_REFERENTIAL_APPROVAL_STATE_CHECK = "paperclip/approval-state";
 // A hung carrier read must not hold the close; an aborted read fails open.
 const LANDING_CARRIER_PROBE_TIMEOUT_MS = 10_000;
 // The refusal names at most this many failed checks, each cut to a bounded length.
@@ -1189,7 +1192,7 @@ async function fetchLandingCarrierHealth(
         name = ctx.context;
         if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
       }
-      if (name === null) continue;
+      if (name === null || name === SELF_REFERENTIAL_APPROVAL_STATE_CHECK) continue;
       const key = `${ctx.__typename}\u0000${name}`;
       const entry = byCheck.get(key) ?? { name, failed: null, open: false };
       if (failed) entry.failed = failed;
