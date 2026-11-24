@@ -50,6 +50,7 @@ import { errorHandler } from "../middleware/index.js";
 import { agentService } from "../services/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import { projectRoutes } from "../routes/projects.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -2340,6 +2341,40 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         .where(eq(issues.id, fixture.issueId));
       expect(after!.projectWorkspaceId).toBeNull();
     }, 120_000);
+
+    it("persists the affected card ids on project deletion but publishes only the counts", async () => {
+      const fixture = await seedNoWorkspace({ withProjectWorkspace: true, omitCreationSnapshot: true });
+      const [binding] = await db.select({
+        projectId: projectWorkspaces.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+        .where(eq(issues.id, fixture.issueId));
+      await bulkBindToWorkspace(fixture.companyId, binding!.projectWorkspaceId!, 2);
+
+      const published: Array<{ type: string; payload: Record<string, unknown> }> = [];
+      const unsubscribe = subscribeCompanyLiveEvents(fixture.companyId, (event) => {
+        published.push(event as unknown as { type: string; payload: Record<string, unknown> });
+      });
+      try {
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${binding!.projectId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+      } finally {
+        unsubscribe();
+      }
+
+      const [audit] = await activityRows(binding!.projectId!, "project.deleted");
+      const persisted = audit!.details as { affectedIssues: Array<{ issueId: string }>; affectedCount: number };
+      expect(persisted.affectedCount).toBe(3);
+      expect(persisted.affectedIssues.map((entry) => entry.issueId)).toContain(fixture.issueId);
+
+      const events = published.filter(
+        (event) => event.type === "activity.logged" && event.payload.action === "project.deleted",
+      );
+      expect(events).toHaveLength(1);
+      expect(events[0]!.payload.details).toEqual({ affectedCount: 3, affectedTruncated: false });
+      expect(JSON.stringify(events)).not.toContain(fixture.issueId);
+    });
 
     it("rolls the project deletion back when its audit write fails", async () => {
       const fixture = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });

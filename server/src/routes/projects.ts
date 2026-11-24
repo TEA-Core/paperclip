@@ -927,6 +927,11 @@ export function projectRoutes(db: Db) {
         .limit(PROJECT_DELETE_AFFECTED_ISSUE_LIMIT);
       const removed = await projectService(txDb).remove(id);
       if (!removed) return null;
+      const details = {
+        affectedIssues: affected,
+        affectedCount: total,
+        affectedTruncated: total > affected.length,
+      };
       const activity = await persistActivity(txDb, {
         companyId: removed.companyId,
         actorType: actor.actorType,
@@ -936,13 +941,19 @@ export function projectRoutes(db: Db) {
         action: "project.deleted",
         entityType: "project",
         entityId: removed.id,
-        details: {
-          affectedIssues: affected,
-          affectedCount: total,
-          affectedTruncated: total > affected.length,
-        },
+        details,
       });
-      return { project: removed, publication: activity.publication };
+      const { publication } = activity;
+      const { affectedIssues: _persistedOnly, ...publishedDetails } = (publication.payload.details ?? {}) as Record<string, unknown>;
+      const { affectedIssues: _pluginPersistedOnly, ...publishedPluginPayload } = (publication.pluginEvent?.payload ?? {}) as Record<string, unknown>;
+      return {
+        project: removed,
+        publication: {
+          ...publication,
+          payload: { ...publication.payload, details: publishedDetails },
+          pluginEvent: publication.pluginEvent ? { ...publication.pluginEvent, payload: publishedPluginPayload } : null,
+        },
+      };
     });
     if (!result) {
       res.status(404).json({ error: "Project not found" });
