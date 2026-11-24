@@ -167,6 +167,23 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     return blockedPid!;
   }
 
+  function observeTransactions(boundary: {
+    beforeBegin?: () => Promise<void>;
+    afterCommit?: (result: unknown) => Promise<void>;
+  }): Db {
+    // Execute the real transaction and retain its real result. Only schedule
+    // competing committed work at the database boundary, never fake SQL rows.
+    const transaction = new Proxy(db.transaction, { async apply(target, _receiver, args) {
+      await boundary.beforeBegin?.();
+      const result: unknown = await Reflect.apply(target, db, args);
+      await boundary.afterCommit?.(result);
+      return result;
+    } });
+    return new Proxy(db, { get(target, key, receiver) {
+      return key === "transaction" ? transaction : Reflect.get(target, key, receiver);
+    } });
+  }
+
   async function blockParkAdmission(f: Fixture) {
     const barrierKey = Number.parseInt(f.companyId.slice(0, 8), 16);
     await db.execute(sql`create or replace function wait_for_park_barrier() returns trigger language plpgsql as $$
@@ -309,6 +326,62 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     expect(await snapshot(other)).toEqual(otherBefore);
     expect(await parkRecords(f)).toEqual({ holds: [], audit: [] });
     expect(await parkRecords(other)).toEqual({ holds: [], audit: [] });
+  });
+
+  it("pins A3: rejects matching nonterminal blockers at the untyped service boundary", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.blockerId));
+    const [blocker] = await db.select().from(issues).where(eq(issues.id, f.blockerId));
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    // A JavaScript caller can bypass the route's terminal-only Zod enum.
+    // Match the real version so only the service's terminal predicate refuses.
+    const input = JSON.parse(JSON.stringify({ ...f.body, expectedBlockers: [{
+      id: f.blockerId, status: blocker!.status, statusVersion: blocker!.statusVersion,
+    }] }));
+    await expect(recoveryCarrierParkService(db).park(f.companyId, f.carrierId, input,
+      { actorType: "user", actorId: "park-operator", boardApiKeyId: null, runId: null },
+    )).rejects.toMatchObject({ status: 409 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
+  });
+
+  it("pins A8: refuses a foreign hold at the direct release company guard", async () => {
+    const f = await fixture(), other = await fixture(), holdId = randomUUID();
+    // SQL permits this inconsistent legacy company/root pair. Keeping the
+    // local root intentionally prevents its separate identity guard masking
+    // the hold's own tenancy boundary.
+    const binding = { version: 1 as const, ...parkRecoveryCarrierSchema.parse(f.body) };
+    await db.insert(issueTreeHolds).values({ id: holdId, companyId: other.companyId,
+      rootIssueId: f.carrierId, mode: "pause", releasePolicy: { strategy: "manual" },
+      recoveryCarrierPark: binding });
+    const before = await snapshot(f), foreignBefore = await snapshot(other);
+    const records = await parkRecords(f), foreignRecords = await parkRecords(other);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    await expect(recoveryCarrierParkService(db).release(f.companyId, f.carrierId, holdId,
+      { recoveryActionId: f.actionId, reason: "Foreign hold must remain private" },
+      { actorType: "user", actorId: "park-operator", boardApiKeyId: null, runId: null },
+    )).rejects.toMatchObject({ status: 404 });
+    expect(await snapshot(f)).toEqual(before);
+    expect(await snapshot(other)).toEqual(foreignBefore);
+    expect(await parkRecords(f)).toEqual(records);
+    expect(await parkRecords(other)).toEqual(foreignRecords);
+    await assertNoProtectedWrites();
+  });
+
+  it("pins E1: exact parked-action wake refusal precedes paused-agent errors", async () => {
+    const f = await fixture();
+    expect((await park(f)).status).toBe(201);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    const before = await snapshot(f), records = await parkRecords(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    await expect(heartbeatService(db).wakeup(f.agentId, { source: "automation", reason: "recovery",
+      payload: { recoveryActionId: f.actionId },
+    })).resolves.toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    expect(await parkRecords(f)).toEqual(records);
+    await assertNoProtectedWrites();
   });
 
   it.each(["source monitor", "child monitor", "child checkout", "child execution"] as const)(
@@ -602,7 +675,7 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
     await assertNoProtectedWrites();
   }, 30_000);
 
-  it("does not remint a legacy carrier hidden after park acceptance while exhaustion waits for the source", async () => {
+  it.each(["hidden", "cancelled"] as const)("does not remint a legacy carrier %s after park acceptance while exhaustion waits for the source", async drift => {
     const f = await fixture();
     await db.update(issues).set({ status: "backlog", assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, f.sourceId));
     const assertNoProtectedWrites = await protectSourceRows(f);
@@ -635,7 +708,8 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       await Promise.all([barrier, acceptance, Promise.race([sourceReady,
         handoff.then(() => { throw new Error("Source handoff ended before readiness"); })])]);
       // Independent fixture drift makes acceptance stale; its manual hold must still fence remint.
-      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, f.carrierId));
+      await db.update(issues).set(drift === "hidden" ? { hiddenAt: new Date() } : { status: "cancelled" })
+        .where(eq(issues.id, f.carrierId));
       before = await snapshot(f);
     } finally {
       releaseBarrier();
@@ -855,6 +929,122 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
         expect(after.source[0]!.status).toBe("blocked");
       }
     });
+
+  it("pins F1: an already parked escalation does not wait on a newly busy source", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    const [source] = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+    expect((await park(f)).status).toBe(201);
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    let release!: () => void, markReady!: (pid: number) => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<number>(resolve => { markReady = resolve; });
+    let barrier: Promise<void> | undefined, holderPid: number | undefined;
+    const observed = observeTransactions({ afterCommit: async result => {
+      if (!barrier && result && typeof result === "object" && "id" in result && result.id === f.actionId) {
+        // The action upsert has released its own source lock. An unrelated
+        // writer now holds it; protected work must skip without waiting again.
+        barrier = db.transaction(async tx => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.sourceId)).for("update");
+          const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
+          markReady(Number(row.pid));
+          await released;
+        });
+        holderPid = await Promise.race([ready, barrier.then(() => {
+          throw new Error("Source barrier ended before readiness");
+        })]);
+      }
+    } });
+    let settled = false;
+    const work = recoveryService(observed, { enqueueWakeup: async () => {
+      throw new Error("Protected escalation must not dispatch");
+    } }).escalateStrandedAssignedIssue({ issue: source!, previousStatus: "in_progress",
+      latestRun: null, recoveryCause: "configuration_incomplete", boardEscalation: true })
+      .then(value => { settled = true; return { value, error: null }; },
+        error => { settled = true; return { value: null, error }; });
+    let observation: "completed" | "blocked" | null = null;
+    try {
+      await expect.poll(async () => {
+        if (settled) return observation = "completed";
+        if (holderPid === undefined) return null;
+        const [waiting] = await db.execute(sql`select pid from pg_stat_activity
+          where datname = current_database() and ${holderPid} = any(pg_blocking_pids(pid))`);
+        return observation = waiting ? "blocked" : null;
+      }, { timeout: 10_000 }).not.toBeNull();
+      expect(observation).toBe("completed");
+      expect(await work).toEqual({ value: null, error: null });
+    } finally {
+      release();
+      await Promise.allSettled([work, ...(barrier ? [barrier] : [])]);
+    }
+    expect(await snapshot(f)).toEqual(before);
+    await assertNoProtectedWrites();
+  }, 30_000);
+
+  it("pins F2b: park commits after stranded preflight but before its write transaction", async () => {
+    const f = await fixture(), needId = randomUUID();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.agentId }).where(eq(issues.id, f.sourceId));
+    await db.insert(issues).values({ id: needId, companyId: f.companyId,
+      title: "Unfinished requirement", status: "todo", assigneeUserId: "park-operator" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: needId,
+      relatedIssueId: f.sourceId, type: "blocks" });
+    const [source] = await db.select().from(issues).where(eq(issues.id, f.sourceId));
+    const before = await snapshot(f), assertNoProtectedWrites = await protectSourceRows(f);
+    let actionPrepared = false, holdId: string | undefined;
+    const observed = observeTransactions({
+      afterCommit: async result => {
+        if (result && typeof result === "object" && "id" in result && result.id === f.actionId) actionPrepared = true;
+      },
+      beforeBegin: async () => {
+        if (!actionPrepared || holdId) return;
+        actionPrepared = false;
+        const accepted = await park(f);
+        expect(accepted.status).toBe(201);
+        holdId = accepted.body.hold.id;
+      },
+    });
+    await expect(recoveryService(observed, { enqueueWakeup: async () => {
+      throw new Error("Protected escalation must not dispatch");
+    } }).escalateStrandedAssignedIssue({ issue: source!, previousStatus: "in_progress",
+      latestRun: null, recoveryCause: "process_lost", boardEscalation: true })).resolves.toBeNull();
+    expect(await snapshot(f)).toEqual(before);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, holdId!)))[0])
+      .toMatchObject({ status: "active", recoveryCarrierPark: { recoveryActionId: f.actionId } });
+    await assertNoProtectedWrites();
+  });
+
+  it("pins the notice recheck when park commits after carrier reuse but before source notice", async () => {
+    const f = await fixture();
+    // Only the source is a blocked-without-blockers candidate. The carrier is
+    // still parkable, but must not independently escalate before this race.
+    const [carrier] = await db.update(issues).set({ status: "backlog" })
+      .where(eq(issues.id, f.carrierId)).returning();
+    f.body.expectedStatus = "backlog";
+    f.body.expectedStatusVersion = carrier!.statusVersion;
+    const before = await snapshot(f);
+    const assertNoProtectedWrites = await protectSourceRows(f);
+    let carrierReused = false, holdId: string | undefined;
+    const observed = observeTransactions({
+      afterCommit: async result => {
+        if (result && typeof result === "object" && "kind" in result && result.kind === "carrier") carrierReused = true;
+      },
+      beforeBegin: async () => {
+        if (!carrierReused || holdId) return;
+        carrierReused = false;
+        const accepted = await park(f);
+        expect(accepted.status).toBe(201);
+        holdId = accepted.body.hold.id;
+      },
+    });
+    await recoveryService(observed, { enqueueWakeup: async () => {
+      throw new Error("Parked carrier must not dispatch");
+    } }).reconcileBlockedWithoutBlockers({ companyId: f.companyId });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.sourceId))).toEqual([]);
+    expect(await snapshot(f)).toEqual(before);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, holdId!)))[0])
+      .toMatchObject({ status: "active", recoveryCarrierPark: { recoveryActionId: f.actionId } });
+    await assertNoProtectedWrites();
+  });
 
   it.each([false, true])("serializes action-only wake admission with a winning park (coalescing=%s)", async coalescing => {
     const f = await fixture();
@@ -1275,6 +1465,47 @@ describePostgres("board accepted recovery carrier park (real routes)", () => {
       await limited.$client.end({ timeout: 0 });
     }
   }, 15_000);
+
+  it("pins F4: a park between carrier commit and publication leaves no durable wake", async () => {
+    const f = await fixture();
+    await db.update(issueRecoveryActions).set({ recoveryIssueId: null }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.delete(issues).where(eq(issues.id, f.carrierId));
+    await db.update(agents).set({ role: "cto", status: "active", adapterType: "codex_local" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "backlog", assigneeAgentId: f.agentId, createdByAgentId: f.agentId })
+      .where(eq(issues.id, f.sourceId));
+    let holdId: string | undefined, acceptedSnapshot: Awaited<ReturnType<typeof snapshot>> | undefined;
+    const observed = observeTransactions({ afterCommit: async result => {
+      if (holdId || !result || typeof result !== "object" || !("kind" in result) || result.kind !== "carrier" ||
+          !("issueId" in result) || typeof result.issueId !== "string") return;
+      f.carrierId = result.issueId;
+      const [carrier] = await db.select().from(issues).where(eq(issues.id, f.carrierId));
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+      const decidedAt = new Date();
+      await db.insert(issueThreadInteractions).values({ id: f.decisionId, companyId: f.companyId,
+        issueId: f.carrierId, kind: "request_confirmation", status: "rejected",
+        payload: { version: 1, prompt: "Repair and close?" }, resolvedByUserId: "park-operator",
+        resolvedAt: decidedAt, updatedAt: decidedAt });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.blockerId,
+        relatedIssueId: f.carrierId, type: "blocks" });
+      f.body = { ...f.body, expectedStatus: carrier!.status, expectedStatusVersion: carrier!.statusVersion,
+        expectedAssigneeAgentId: carrier!.assigneeAgentId, expectedAssigneeUserId: carrier!.assigneeUserId,
+        expectedActionUpdatedAt: action!.updatedAt.toISOString(), expectedDecisionUpdatedAt: decidedAt.toISOString() };
+      const accepted = await park(f);
+      expect(accepted.status).toBe(201);
+      holdId = accepted.body.hold.id;
+      acceptedSnapshot = await snapshot(f);
+    } });
+    // A real durable queue port exposes the producer's publication contract;
+    // heartbeat's separate admission gate must not mask a missed producer gate.
+    await recoveryService(observed, { enqueueWakeup: async (agentId, opts) => {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId, source: "automation",
+        status: "queued", reason: opts?.reason, payload: opts?.payload });
+      return null;
+    } }).reconcileExhaustedRecoveryDrain({ companyId: f.companyId });
+    expect(await snapshot(f)).toEqual(acceptedSnapshot);
+    expect((await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, holdId!)))[0])
+      .toMatchObject({ status: "active", recoveryCarrierPark: { recoveryActionId: f.actionId } });
+  });
 
   it("lets stale pointer cleanup proceed after a park wins the source lock, without writing the action", async () => {
     const f = await fixture();
