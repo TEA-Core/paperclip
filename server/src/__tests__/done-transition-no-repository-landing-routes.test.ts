@@ -2052,6 +2052,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     /** A record_only card with no project and no workspace, held by the closer, on a run that named no workspace. */
     async function seedNoWorkspace(
       options: {
+        companyId?: string;
         deliveryRequirement?: "record_only" | "repository_delivery";
         withProject?: boolean;
         withProjectWorkspace?: boolean;
@@ -2060,7 +2061,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     ): Promise<NoWorkspaceIssue> {
       seedSequence += 1;
       const prefix = `NWS${seedSequence}`;
-      const companyId = await insertCompany(prefix);
+      const companyId = options.companyId ?? await insertCompany(prefix);
       const closerAgentId = await insertAgent(companyId, "Closer");
       const rulerAgentId = await insertAgent(companyId, "Ruler");
       let projectId: string | null = null;
@@ -2402,6 +2403,90 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         .where(eq(issues.id, fixture.issueId));
       expect(after!.projectWorkspaceId).toBeNull();
     }, 120_000);
+
+    it.each(["project.deleted", "project.workspace_deleted"] as const)(
+      "refuses an unaccounted legacy card after truncated %s audit",
+      async (action) => {
+        const fixture = await seedNoWorkspace({ withProjectWorkspace: true, omitCreationSnapshot: true });
+        const [binding] = await db.select({
+          projectId: projectWorkspaces.projectId,
+          projectWorkspaceId: projectWorkspaces.id,
+        }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+          .where(eq(issues.id, fixture.issueId));
+        await bulkBindToWorkspace(fixture.companyId, binding!.projectWorkspaceId, 5000);
+        const [first] = await db.select({ id: issues.id }).from(issues)
+          .where(eq(issues.projectWorkspaceId, binding!.projectWorkspaceId)).orderBy(issues.id).limit(1);
+        const [last] = await db.select({ id: issues.id }).from(issues)
+          .where(eq(issues.projectWorkspaceId, binding!.projectWorkspaceId)).orderBy(sql`${issues.id} desc`).limit(1);
+        async function prepareCard(issueId: string): Promise<NoWorkspaceIssue> {
+          await db.update(issues).set({
+            status: "in_progress", deliveryRequirement: "record_only",
+            assigneeAgentId: fixture.closerAgentId, createdByUserId: BOARD_USER_ID,
+          }).where(eq(issues.id, issueId));
+          const runId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: runId, companyId: fixture.companyId, agentId: fixture.closerAgentId,
+            status: "running", contextSnapshot: { issueId },
+          });
+          await insertRuling({ companyId: fixture.companyId, issueId, authorUserId: BOARD_USER_ID });
+          return {
+            ...fixture, issueId, identifier: issueId,
+            actor: { type: "agent", companyId: fixture.companyId, agentId: fixture.closerAgentId, source: "agent_key", runId },
+          };
+        }
+        const listed = await prepareCard(first!.id);
+        const omitted = await prepareCard(last!.id);
+        const intact = await seedAdmissible({
+          companyId: fixture.companyId, withProjectWorkspace: true, omitCreationSnapshot: true,
+        });
+        const recorded = await seedAdmissible({ companyId: fixture.companyId });
+        const foreign = await seedAdmissible({ omitCreationSnapshot: true });
+        const [intactBefore] = await db.select({ projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
+          .where(eq(issues.id, intact.issueId));
+        asBoard();
+        const path = action === "project.deleted"
+          ? `/api/projects/${binding!.projectId}`
+          : `/api/projects/${binding!.projectId}/workspaces/${binding!.projectWorkspaceId}`;
+        const removal = await request(app).delete(path);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+        const [audit] = await activityRows(binding!.projectId, action);
+        const details = audit!.details as {
+          affectedIssues: Array<{ issueId: string }>; affectedCount: number; affectedTruncated: boolean;
+        };
+        expect(details.affectedCount).toBe(5001);
+        expect(details.affectedTruncated).toBe(true);
+        expect(details.affectedIssues).toHaveLength(5000);
+        expect(details.affectedIssues.some((entry) => entry.issueId === listed.issueId)).toBe(true);
+        expect(details.affectedIssues.some((entry) => entry.issueId === omitted.issueId)).toBe(false);
+        const [erased] = await db.select({
+          projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+        }).from(issues).where(eq(issues.id, omitted.issueId));
+        expect(erased).toEqual({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
+        currentActor = listed.actor;
+        await expectRefused(listed, await close(listed.issueId), NO_WORKSPACE_REFUSAL);
+        currentActor = intact.actor;
+        await expectRefused(intact, await close(intact.issueId), NO_WORKSPACE_REFUSAL);
+        const [intactAfter] = await db.select({ projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
+          .where(eq(issues.id, intact.issueId));
+        expect(intactAfter).toEqual(intactBefore);
+        for (const control of [foreign, recorded]) {
+          currentActor = control.actor;
+          const allowed = await close(control.issueId);
+          expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+          expect(await statusOf(control.issueId)).toBe("done");
+        }
+        currentActor = omitted.actor;
+        const result = await close(omitted.issueId);
+        expect(result.status, JSON.stringify(result.body)).toBe(422);
+        expect(await statusOf(omitted.issueId)).toBe("in_progress");
+        expect(result.body.error).toMatch(/deletion/i);
+        expect(result.body.error).toMatch(/audit.*(?:cap|limit)/i);
+        expect(result.body.details.remedy).toMatch(/board/i);
+        expect(result.body.details.remedy).toMatch(/close/i);
+      },
+      120_000,
+    );
 
     it("persists the affected card ids on project deletion but publishes only the counts", async () => {
       const fixture = await seedNoWorkspace({ withProjectWorkspace: true, omitCreationSnapshot: true });

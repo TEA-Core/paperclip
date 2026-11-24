@@ -3163,26 +3163,40 @@ async function noWorkspaceHistoryRefusal(
   }
   const created = activity.filter((row) => row.action === "issue.created");
   const projectAbsentNow = issueRow?.projectId == null && issueRow?.projectWorkspaceId == null;
-  if (!projectAbsentNow && (created.length === 0 || created.some((row) => !creationSnapshotComplete(row.details)))) {
+  const creationUnknown = created.length === 0 || created.some((row) => !creationSnapshotComplete(row.details));
+  if (!projectAbsentNow && creationUnknown) {
     return noRepositoryRefusal(
       "cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.",
     );
   }
 
   if (projectAbsentNow) {
+    const affectedIssue = sql<boolean>`${activityLog.details} -> 'affectedIssues' @> ${JSON.stringify([{ issueId: issue.id }])}::jsonb`;
     const [deletedBinding] = await db
-      .select({ id: activityLog.id })
+      .select({ affectedIssue })
       .from(activityLog)
       .where(
         and(
           eq(activityLog.companyId, issue.companyId),
           eq(activityLog.entityType, "project"),
           inArray(activityLog.action, ["project.deleted", "project.workspace_deleted"]),
-          sql`${activityLog.details} -> 'affectedIssues' @> ${JSON.stringify([{ issueId: issue.id }])}::jsonb`,
+          or(
+            affectedIssue,
+            creationUnknown && issueRow?.executionWorkspaceId == null
+              ? sql`${activityLog.details} -> 'affectedTruncated' = 'true'::jsonb`
+              : undefined,
+          ),
         ),
       )
       .limit(1);
-    if (deletedBinding) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+    if (deletedBinding) {
+      if (deletedBinding.affectedIssue) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+      return noRepositoryRefusal(
+        "cannot be declared because a project or workspace deletion in this company exceeded the audit cap: the incomplete audit cannot rule out a former binding for this issue.",
+        "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified; " +
+          "keep the issue record_only and close again; the board close path stays available.",
+      );
+    }
   }
 
   const mention = await db
