@@ -3169,6 +3169,22 @@ async function noWorkspaceHistoryRefusal(
     );
   }
 
+  if (projectAbsentNow) {
+    const [deletedBinding] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "project"),
+          eq(activityLog.action, "project.deleted"),
+          sql`${activityLog.details} -> 'affectedIssues' @> ${JSON.stringify([{ issueId: issue.id }])}::jsonb`,
+        ),
+      )
+      .limit(1);
+    if (deletedBinding) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+  }
+
   const mention = await db
     .select({ objectType: externalObjectMentions.objectType, providerKey: externalObjectMentions.providerKey })
     .from(externalObjectMentions)

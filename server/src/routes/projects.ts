@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { activityLog } from "@paperclipai/db";
+import { and, asc, eq, or, sql } from "drizzle-orm";
+import { activityLog, issues, projectWorkspaces } from "@paperclipai/db";
 import { projectToolContext } from "../services/project-tool-context.js";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { z } from "zod";
@@ -53,6 +53,8 @@ import { secretService } from "../services/secrets.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
+
+const PROJECT_DELETE_AFFECTED_ISSUE_LIMIT = 5000;
 
 export function projectRoutes(db: Db) {
   const router = Router();
@@ -908,23 +910,46 @@ export function projectRoutes(db: Db) {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    const project = await svc.remove(id);
-    if (!project) {
+    const actor = getActorInfo(req);
+    const result = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const workspaceIds = tx.select({ id: projectWorkspaces.id }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, id));
+      const bound = and(
+        eq(issues.companyId, existing.companyId),
+        or(eq(issues.projectId, id), sql`${issues.projectWorkspaceId} in (${workspaceIds})`),
+      );
+      const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` }).from(issues).where(bound);
+      const affected = await tx
+        .select({ issueId: issues.id, projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId })
+        .from(issues)
+        .where(bound)
+        .orderBy(asc(issues.id))
+        .limit(PROJECT_DELETE_AFFECTED_ISSUE_LIMIT);
+      const removed = await projectService(txDb).remove(id);
+      if (!removed) return null;
+      const activity = await persistActivity(txDb, {
+        companyId: removed.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        boardApiKeyId: actor.boardApiKeyId,
+        action: "project.deleted",
+        entityType: "project",
+        entityId: removed.id,
+        details: {
+          affectedIssues: affected,
+          affectedCount: total,
+          affectedTruncated: total > affected.length,
+        },
+      });
+      return { project: removed, publication: activity.publication };
+    });
+    if (!result) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: project.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      boardApiKeyId: actor.boardApiKeyId,
-      action: "project.deleted",
-      entityType: "project",
-      entityId: project.id,
-    });
+    if (result.publication) publishActivity(result.publication);
+    const project = result.project;
 
     res.json(project);
   });
