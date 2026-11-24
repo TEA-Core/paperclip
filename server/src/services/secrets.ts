@@ -650,6 +650,7 @@ type SecretResolutionOptions = {
   bindingContext?: SecretBindingContext;
   accessContext?: SecretConsumerContext;
   allowUserSecretScope?: boolean;
+  signal?: AbortSignal;
 };
 
 export type AgentSecretReadContext = {
@@ -1366,6 +1367,7 @@ export function secretService(db: Db | DbTransaction) {
     version: number | "latest",
     options?: SecretResolutionOptions,
   ): Promise<RuntimeSecretResolution> {
+    options?.signal?.throwIfAborted();
     const bindingContext = options?.bindingContext;
     const accessContext = options?.accessContext ?? bindingContext;
     const secret = await getById(secretId);
@@ -1398,11 +1400,13 @@ export function secretService(db: Db | DbTransaction) {
         provider: providerId,
         providerConfigId: secret.providerConfigId,
       });
+      options?.signal?.throwIfAborted();
       const value = await provider.resolveVersion({
         material: versionRow.material as Record<string, unknown>,
         externalRef: secret.externalRef,
         providerVersionRef: versionRow.providerVersionRef,
         providerConfig,
+        signal: options?.signal,
         context: {
           companyId,
           secretId: secret.id,
@@ -1410,6 +1414,7 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
         },
       });
+      options?.signal?.throwIfAborted();
       await Promise.all([
         db
           .update(companySecrets)
@@ -1467,7 +1472,7 @@ export function secretService(db: Db | DbTransaction) {
   function isSecretResolutionOptions(
     value: SecretBindingContext | SecretResolutionOptions | undefined,
   ): value is SecretResolutionOptions {
-    return Boolean(value && ("bindingContext" in value || "accessContext" in value));
+    return Boolean(value && ("bindingContext" in value || "accessContext" in value || "signal" in value));
   }
 
   async function resolveSecretValue(

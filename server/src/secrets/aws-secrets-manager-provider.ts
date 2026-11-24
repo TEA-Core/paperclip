@@ -110,7 +110,7 @@ interface AwsSecretsManagerGateway {
     SecretId: string;
     VersionId?: string;
     VersionStage?: string;
-  }): Promise<{
+  }, signal?: AbortSignal): Promise<{
     SecretString?: string;
     ARN?: string;
     Name?: string;
@@ -212,6 +212,17 @@ function signAwsSecretsManagerRequest(input: {
       `AWS4-HMAC-SHA256 Credential=${input.credentials.accessKeyId}/${credentialScope}, ` +
       `SignedHeaders=${signedHeaders}, Signature=${signature}`,
   };
+}
+
+// Per-caller wait on a shared promise: the caller can leave on abort, the shared work is untouched.
+function waitWithAbort<T>(shared: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return shared;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    shared.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 async function loadAwsCredentials(region: string): Promise<AwsCredentialIdentity> {
@@ -919,13 +930,13 @@ class AwsSecretsManagerJsonGateway implements AwsSecretsManagerGateway {
     SecretId: string;
     VersionId?: string;
     VersionStage?: string;
-  }) {
+  }, signal?: AbortSignal) {
     return this.call<{
       SecretString?: string;
       ARN?: string;
       Name?: string;
       VersionId?: string;
-    }>("GetSecretValue", input);
+    }>("GetSecretValue", input, signal);
   }
 
   deleteSecret(input: {
@@ -959,9 +970,11 @@ class AwsSecretsManagerJsonGateway implements AwsSecretsManagerGateway {
     }>("ListSecrets", input);
   }
 
-  private async call<T>(operation: string, payload: Record<string, unknown>): Promise<T> {
+  private async call<T>(operation: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     const body = JSON.stringify(payload);
-    const credentials = await loadAwsCredentials(this.config.region);
+    const credentials = await waitWithAbort(loadAwsCredentials(this.config.region), signal);
+    signal?.throwIfAborted();
     const headers = signAwsSecretsManagerRequest({
       endpoint: this.endpoint,
       region: this.config.region,
@@ -973,7 +986,9 @@ class AwsSecretsManagerJsonGateway implements AwsSecretsManagerGateway {
       method: "POST",
       headers,
       body,
-      signal: AbortSignal.timeout(AWS_SECRETS_MANAGER_REQUEST_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(AWS_SECRETS_MANAGER_REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(AWS_SECRETS_MANAGER_REQUEST_TIMEOUT_MS),
     });
     const text = await response.text();
     const parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
@@ -1301,7 +1316,7 @@ export function createAwsSecretsManagerProvider(
           VersionId: input.providerVersionRef ?? material.versionId ?? undefined,
           VersionStage:
             input.providerVersionRef || material.versionId ? undefined : DEFAULT_VERSION_STAGE,
-        });
+        }, input.signal);
         if (typeof resolved.SecretString !== "string") {
           throw new Error("SecretString was empty");
         }

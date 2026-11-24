@@ -22,6 +22,7 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   authUsers,
   companySecretProposals,
@@ -100,6 +101,7 @@ import {
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { unpaidLandingDebt, type LandingDebtCloseRow } from "./done-transition-guard.js";
 import { authorizationService } from "./authorization.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { resolveDeploymentMode } from "../config-file.js";
@@ -206,6 +208,8 @@ type InteractionResolutionMutationOptions = {
     tx: DbTransaction,
     interaction: IssueThreadInteraction,
   ) => Promise<void>;
+  /** Native completion review only: server-verified landing proof, finalized under the issue lock after the done write. */
+  finalizeLandingProof?: (tx: Db, locked: LandingDebtCloseRow) => Promise<void>;
 };
 
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -365,7 +369,7 @@ type ResolvedInteractionResult = {
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
 type IssueTouchDb = Pick<Db, "update">;
 
-function isNativeCompletionReview(
+export function isNativeCompletionReview(
   row: Pick<IssueThreadInteractionRow, "kind" | "payload">,
 ) {
   if (row.kind !== "request_confirmation") return false;
@@ -2314,9 +2318,34 @@ export function issueThreadInteractionService(
               ),
             ),
           )).limit(1);
+        const closing = otherPending.length === 0 && issueContext.status === "in_review";
+        // Read debt before the done write: that write's audit would otherwise
+        // settle legacy rows through the read-side cutoff.
+        const owedDebt = closing ? await tx.select({
+          id: activityLog.id,
+          legacy: sql<boolean>`${activityLog.details}->>'landingDebtDisposition' IS NULL`,
+        }).from(activityLog).where(and(
+          eq(activityLog.companyId, issueContext.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueContext.id),
+          unpaidLandingDebt(),
+        )) : [];
+        const finalizeProof = args.mutationOptions?.finalizeLandingProof;
+        const closeNote = args.actor.userId ? args.input.landingDebtCloseNote : undefined;
+        // A note waives only legacy debt; explicit debt is cleared by proof alone.
+        const legacyDebtOnly = owedDebt.every((row) => row.legacy);
+        const noteCoversDebt = !!closeNote && legacyDebtOnly;
+        if (owedDebt.length > 0 && !finalizeProof && !noteCoversDebt) {
+          throw conflict(
+            args.actor.userId && legacyDebtOnly
+              ? "Issue has unpaid landing debt; accept with landing proof or a documented-close note."
+              : "Issue has unpaid landing debt; accept with landing proof.",
+            { code: "done_transition_missing_delivery", issueId: issueContext.id },
+          );
+        }
         // Each explicit reviewer must be able to answer independently. Completing
         // on the first answer would cancel the other pending decisions.
-        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await issueService(db).update(
+        const completedIssue = !closing ? null : await issueService(db).update(
           args.issue.id,
           {
             status: "done",
@@ -2326,6 +2355,23 @@ export function issueThreadInteractionService(
           tx,
           postCommitActivityPublications,
         );
+        if (owedDebt.length > 0) {
+          if (completedIssue?.status !== "done") {
+            throw conflict("Issue did not close; landing debt left unpaid.", {
+              code: "done_transition_missing_delivery", issueId: issueContext.id,
+            });
+          }
+          if (finalizeProof) await finalizeProof(tx as unknown as Db, completedIssue);
+          else {
+            await tx.update(activityLog).set({
+              details: sql`${activityLog.details} || jsonb_build_object(
+                'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+                'closeStatusVersion', ${completedIssue.statusVersion}::int,
+                'documentedClose', jsonb_build_object('note', ${closeNote}::text,
+                  'actorUserId', ${args.actor.userId}::text, 'interactionId', ${lockedCurrent.id}::text))`,
+            }).where(inArray(activityLog.id, owedDebt.map((row) => row.id)));
+          }
+        }
         if (completedIssue) {
           continuationIssue = {
             id: completedIssue.id,

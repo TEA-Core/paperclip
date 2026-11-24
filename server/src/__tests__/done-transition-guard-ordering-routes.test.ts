@@ -21,6 +21,7 @@ import {
   issueExecutionDecisions,
   issueRecoveryActions,
   issueWorkProducts,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -43,6 +44,8 @@ import * as githubFetch from "../services/github-fetch.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
+import { reapStrandedSummaryGenerationIssues, SUMMARIZER_AGENT_ID } from "../services/execution-control-reconciliation.js";
+import { createMergedOperatorMergeCardSweepService } from "../services/merged-operator-merge-cards.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1952,6 +1955,102 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(response.status, JSON.stringify(response.body)).toBe(200);
     }
 
+    async function rejectTerminalUpdate(issueId: string, mode: "throw" | "refuse" | "commit") {
+      // Sequence increments survive rollback, proving the failure happened
+      // AFTER a real discharge, not at an earlier guard refusal.
+      await db.execute(sql`create sequence test_debt_close_attempt`);
+      await db.execute(sql`create function test_refuse_terminal_update() returns trigger language plpgsql as $$
+        begin
+          if not exists (select 1 from activity_log where entity_id = NEW.id::text
+            and details->>'landingDebtDisposition' = 'discharged') then
+            raise exception 'close did not reach the discharge';
+          end if;
+          perform nextval('test_debt_close_attempt');
+          ${sql.raw(mode === "refuse" ? "return null;" : "raise exception 'injected terminal update failure';")}
+        end $$`);
+      const trigger = mode === "commit"
+        ? "create constraint trigger test_refuse_terminal_update after update on issues deferrable initially deferred"
+        : "create trigger test_refuse_terminal_update before update on issues";
+      await db.execute(sql`${sql.raw(trigger)}
+        for each row when (NEW.id = ${sql.raw(`'${issueId}'::uuid`)} and NEW.status = 'done')
+        execute function test_refuse_terminal_update()`);
+      return async () => {
+        await db.execute(sql`drop trigger test_refuse_terminal_update on issues`);
+        await db.execute(sql`drop function test_refuse_terminal_update()`);
+        await db.execute(sql`drop sequence test_debt_close_attempt`);
+      };
+    }
+
+    async function expectAttemptedDischargeRolledBack(issueId: string) {
+      expect(await db.execute(sql`select is_called from test_debt_close_attempt`)).toMatchObject([{ is_called: true }]);
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(rows.filter((row) => row.details?.landingDebtDisposition === "discharged")).toEqual([]);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).not.toBe("done");
+    }
+
+    it.each(["summary", "operator"] as const)(
+      "rolls landing debt back when the %s sweep terminal update throws or refuses",
+      async (door) => {
+        // The operator sweep constructs a transaction-scoped issue service.
+        // Restore this file's shared seam before later routes reuse it.
+        const poolAddComment = realAddCommentRef.current!;
+        onTestFinished(() => {
+          realAddCommentRef.current = poolAddComment;
+          mockAddComment.mockImplementation(poolAddComment);
+        });
+        const { issueId, companyId } = await seedIssue("SWEEPROLLBACK");
+        board();
+        await flip(issueId);
+        if (door === "summary") {
+          await db.insert(agents).values({
+            id: SUMMARIZER_AGENT_ID, companyId, name: "Summarizer", adapterType: "claude_local", status: "idle",
+          });
+          await db.update(issues).set({ assigneeAgentId: SUMMARIZER_AGENT_ID, status: "in_progress" })
+            .where(eq(issues.id, issueId));
+        } else {
+          await db.update(issues).set({
+            assigneeAgentId: null, assigneeUserId: "local-board",
+            description: "Merge-gate: TEA-Core/paperclip#404\n",
+          }).where(eq(issues.id, issueId));
+          const dependentId = randomUUID();
+          await db.insert(issues).values({
+            id: dependentId, companyId, title: "Waiting on operator merge",
+            status: "blocked", assigneeUserId: "local-board",
+          });
+          await db.insert(issueRelations).values({
+            companyId, issueId, relatedIssueId: dependentId, type: "blocks",
+          });
+        }
+        const sweep = door === "summary"
+          ? () => reapStrandedSummaryGenerationIssues(db).then((result) => result.terminalized)
+          : () => createMergedOperatorMergeCardSweepService(db, {
+            resolvePullRequest: async () => ({
+              state: "merged", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+              mergedAt: "2026-08-29T00:11:06Z",
+            }),
+          }).sweepMergedOperatorMergeCards().then((result) => result.closed);
+        landing();
+        for (const mode of ["throw", "refuse"] as const) {
+          // The summary settle window reads both issue and audit timestamps.
+          const past = new Date(Date.now() - 20 * 60_000);
+          await db.update(issues).set({ updatedAt: past }).where(eq(issues.id, issueId));
+          await db.update(activityLog).set({ createdAt: past }).where(eq(activityLog.entityId, issueId));
+          await db.update(issueComments).set({ createdAt: past }).where(eq(issueComments.issueId, issueId));
+          const removeFailure = await rejectTerminalUpdate(issueId, mode);
+          try {
+            expect(await sweep()).toBe(0);
+            await expectAttemptedDischargeRolledBack(issueId);
+          } finally {
+            await removeFailure();
+          }
+        }
+        expect(await sweep()).toBe(1);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("done");
+      },
+    );
+
     it.each(["agentId", "runId"] as const)("preserves unassigned issue debt through the agent-delete route (%s linkage)", async (link) => {
       const { companyId, issueId, agentId } = await seedIssue("DELETE");
       board();
@@ -2117,6 +2216,17 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         expect(refused.status, JSON.stringify(refused.body)).toBe(409);
         expect(refused.body.code).toBe("done_transition_missing_delivery");
         expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        // These doors finalize after the status write. Refuse COMMIT after
+        // their discharge, proving that neither change survives independently.
+        landing();
+        const removeFailure = await rejectTerminalUpdate(issueId, "commit");
+        try {
+          const failed = await close();
+          expect(failed.status, JSON.stringify(failed.body)).toBe(500);
+          await expectAttemptedDischargeRolledBack(issueId);
+        } finally {
+          await removeFailure();
+        }
         const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
         expect(stored?.status).not.toBe("done");
         // The same door succeeds once real repository compare evidence exists.
@@ -2127,6 +2237,146 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("done");
       },
     );
+
+    describe("native completion review accept", () => {
+      async function seedNativeReview(prefix: string, debt: "legacy" | "explicit") {
+        const fixture = await seedIssue(prefix);
+        const { companyId, issueId } = fixture;
+        board();
+        await flip(issueId);
+        if (debt === "legacy") {
+          await db.delete(activityLog).where(and(
+            eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.repository_landing_debt"),
+          ));
+          await db.update(activityLog).set({
+            createdAt: new Date("2020-01-01"),
+            details: sql`${activityLog.details} - 'landingDebtDisposition'`,
+          }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+        }
+        await db.update(issues).set({ status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board" })
+          .where(eq(issues.id, issueId));
+        const interaction = await issueThreadInteractionService(db).create(
+          { id: issueId, companyId },
+          {
+            kind: "request_confirmation", title: "Completion review", resolverPolicy: "human_only",
+            continuationPolicy: "wake_assignee", idempotencyKey: `native-review:${issueId}`,
+            payload: {
+              version: 1, prompt: "Approve completion?", acceptLabel: "Approve", rejectLabel: "Reject",
+              target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" },
+            },
+          },
+          { userId: "local-board" },
+        );
+        const accept = (body: object = {}) =>
+          request(app).post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`).send(body);
+        const state = async () => ({
+          issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
+          interaction: (await issueThreadInteractionService(db).getById(interaction.id))?.status,
+          debt: (await debtRows(issueId))[0]?.details,
+        });
+        return { ...fixture, accept, state };
+      }
+
+      it("refuses a legacy-debt accept with neither landing proof nor a documented-close note", async () => {
+        const { accept, state } = await seedNativeReview("NATREFUSE", "legacy");
+        const refused = await accept();
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect(refused.body.error).toBe(
+          "Issue has unpaid landing debt; accept with landing proof or a documented-close note.",
+        );
+        const after = await state();
+        expect(after.issue?.status).toBe("in_review");
+        expect(after.interaction).toBe("pending");
+        expect(after.debt?.landingCheckOwed).toBe(true);
+        expect(after.debt?.landingDebtDisposition).toBeUndefined();
+
+        const followed = await accept({ landingDebtCloseNote: "Landing completed out of band." });
+        expect(followed.status, JSON.stringify(followed.body)).toBe(200);
+        const closed = await state();
+        expect(closed.issue?.status).toBe("done");
+        expect(closed.interaction).toBe("accepted");
+        expect(closed.debt).toMatchObject({
+          landingDebtDisposition: "discharged",
+          documentedClose: { note: "Landing completed out of band.", actorUserId: "local-board" },
+        });
+      });
+
+      it("accepts at the native door with server-verified landing proof and discharges debt atomically", async () => {
+        const { accept, state } = await seedNativeReview("NATPROOF", "legacy");
+        landing();
+        const accepted = await accept();
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+        const after = await state();
+        expect(after.issue?.status).toBe("done");
+        expect(after.interaction).toBe("accepted");
+        expect(after.debt?.landingDebtDisposition).toBe("discharged");
+        expect(after.debt?.landingProof).toBeDefined();
+      });
+
+      it("accepts at the native door with a documented-close note and no landing proof, discharging only legacy debt", async () => {
+        const { accept, state } = await seedNativeReview("NATNOTE", "legacy");
+        const accepted = await accept({ landingDebtCloseNote: "  Landed out of band via release train 42.  " });
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+        const after = await state();
+        expect(after.issue?.status).toBe("done");
+        expect(after.interaction).toBe("accepted");
+        expect(after.debt).toMatchObject({
+          landingDebtDisposition: "discharged",
+          documentedClose: { note: "Landed out of band via release train 42.", actorUserId: "local-board" },
+        });
+        expect(after.debt?.landingProof).toBeUndefined();
+      });
+
+      it("rejects a blank documented-close note", async () => {
+        const { accept, state } = await seedNativeReview("NATBLANK", "legacy");
+        expect((await accept({ landingDebtCloseNote: "   " })).status).toBe(400);
+        expect((await state()).interaction).toBe("pending");
+      });
+
+      it("keeps explicit disposition-bearing debt proof-only: a note does not waive it", async () => {
+        const { accept, state } = await seedNativeReview("NATEXPLICIT", "explicit");
+        const refused = await accept({ landingDebtCloseNote: "Landed out of band." });
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect(refused.body.error).toBe("Issue has unpaid landing debt; accept with landing proof.");
+        const after = await state();
+        expect(after.issue?.status).toBe("in_review");
+        expect(after.interaction).toBe("pending");
+        expect(after.debt?.landingDebtDisposition).toBe("outstanding");
+        expect(after.debt?.documentedClose).toBeUndefined();
+        landing();
+        const followed = await accept();
+        expect(followed.status, JSON.stringify(followed.body)).toBe(200);
+        const closed = await state();
+        expect(closed.issue?.status).toBe("done");
+        expect(closed.interaction).toBe("accepted");
+        expect(closed.debt?.landingDebtDisposition).toBe("discharged");
+        expect(closed.debt?.landingProof).toBeDefined();
+      });
+
+      it.each(["proof", "note"] as const)(
+        "rolls the %s acceptance and discharge back together when the commit fails",
+        async (basis) => {
+          const { issueId, accept, state } = await seedNativeReview(`NATROLL${basis.toUpperCase()}`, "legacy");
+          const body = basis === "note" ? { landingDebtCloseNote: "Landed out of band." } : {};
+          if (basis === "proof") landing();
+          const removeFailure = await rejectTerminalUpdate(issueId, "commit");
+          try {
+            expect((await accept(body)).status).toBe(500);
+            expect(await db.execute(sql`select is_called from test_debt_close_attempt`)).toMatchObject([{ is_called: true }]);
+            const after = await state();
+            expect(after.issue?.status).toBe("in_review");
+            expect(after.interaction).toBe("pending");
+            expect(after.debt?.landingDebtDisposition).toBeUndefined();
+          } finally {
+            await removeFailure();
+          }
+          expect((await accept(body)).status).toBe(200);
+          expect((await state()).debt?.landingDebtDisposition).toBe("discharged");
+        },
+      );
+    });
 
     it.each(["flip-first", "close-first"] as const)("serializes %s on the issue row", async (order) => {
       const { issueId } = await seedIssue("RACE");
@@ -2618,6 +2868,16 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(refused.body.code).toBe("done_transition_missing_delivery");
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
       expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      landing();
+      const accepted = await patch(issueId, { status: "done" });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+      expect((await debtRows(issueId))[0]?.details).toMatchObject({
+        landingDebtDisposition: "discharged",
+        landingProof: {
+          head: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+          source: "remote",
+        },
+      });
     });
 
     it("names the exit when landing cannot be verified", async () => {

@@ -297,6 +297,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   prepareLandingDebtClose,
+  type LandingDebtCloseRow,
   evaluateDoneTierDeclaration,
   resolveCitedCommits,
   DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
@@ -513,7 +514,7 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import { isNativeCompletionReview, resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
 import { isAgentInstructionsChangeTargetKey } from "../services/change-consent-gate.js";
 import {
@@ -25461,6 +25462,18 @@ export function issueRoutes(
         deferredPostCommit,
       });
       const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
+      // Native completion review: prepare landing proof outside any lock; the
+      // service finalizes it, or applies a board note, under the issue lock.
+      let finalizeLandingProof: ((tx: Db, locked: LandingDebtCloseRow) => Promise<void>) | undefined;
+      if (req.actor.type === "board" && isNativeCompletionReview(current) && issue.status === "in_review") {
+        const debt = await prepareLandingDebtClose(db, issue);
+        if (debt.owed) {
+          const measured = await evaluateDoneTransitionGuard(db, issue, null, true, undefined, true);
+          if (measured.allowed && measured.landingVerified) {
+            finalizeLandingProof = (tx, locked) => debt.finalize(tx, locked, measured);
+          }
+        }
+      }
       const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept
         ? await interactionSvc.acceptInteraction(...acceptArgs, {
             // The decision commits in the interaction's transaction, under the issue
@@ -25512,7 +25525,7 @@ export function issueRoutes(
               },
             } : {}),
           })
-        : await interactionSvc.acceptInteraction(...acceptArgs);
+        : await interactionSvc.acceptInteraction(...acceptArgs, ...(finalizeLandingProof ? [{ finalizeLandingProof }] as const : []));
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
       let resolvedContinuationIssue = continuationIssue;

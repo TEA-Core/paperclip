@@ -175,6 +175,7 @@ export interface SecretProviderModule {
     providerVersionRef?: string | null;
     context?: SecretProviderRuntimeContext;
     providerConfig?: SecretProviderVaultRuntimeConfig | null;
+    signal?: AbortSignal;
   }): Promise<string>;
   rotate?(input: {
     material: StoredSecretVersionMaterial;

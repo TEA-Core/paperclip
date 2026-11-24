@@ -288,8 +288,9 @@ cover the checked delivery head; an older merge on the same branch is insufficie
 Every positive debt-bearing proof records its immutable delivery head and source.
 Before discharge, the close transaction rechecks that same remote or worktree
 branch head under the issue/workspace locks; a detached checkout's HEAD is not
-the branch proof. GitHub App credential requests and the remote head lookup share
-one 15-second deadline. Local branch probes are bounded to 15 seconds.
+branch proof. GitHub credential requests, including secret-provider value
+lookups, and the remote head lookup share one 15-second abort signal. Local
+branch probes are bounded to 15 seconds.
 Mismatch, expiry, or lookup failure refuses the close. The discharged marker
 retains the head and repository/base/branch evidence. Database locks do not freeze
 external Git refs. Carrier search, PR-detail requests, and content comparisons
@@ -306,6 +307,15 @@ repository/branch or merged PR is refused fail-closed; the refusal names the exi
 An unavailable or malformed carrier-head lookup remains unverified and produces
 the same HTTP 409 delivery refusal, including auth errors and rejected requests;
 it must not escape as HTTP 500 or authorize a close.
+Board acceptance of the final pending `native_completion_review` on an issue with
+unpaid landing debt closes it only with server-verified landing proof (finalized
+under the issue lock like the other doors) or, for legacy debt without a
+`landingDebtDisposition` only, a nonblank `landingDebtCloseNote` on the accept
+body, persisted with the board actor on the discharged row. Explicit debt stays
+proof-only. Otherwise it refuses with HTTP 409 `done_transition_missing_delivery`.
+The refusal offers landing proof for explicit debt; it offers a documented-close
+note only when that board actor can use the legacy path.
+Acceptance, close, and discharge commit or roll back together.
 Board tier-form bypass and delivery overrides cannot discharge this debt;
 genuine record-only cards without debt retain their existing close behavior.
 An owing reclassification also writes a system-owned
