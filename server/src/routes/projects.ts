@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, asc, eq, or, sql } from "drizzle-orm";
-import { activityLog, issues, projectWorkspaces } from "@paperclipai/db";
+import { activityLog, executionWorkspaces, issues, projectWorkspaces } from "@paperclipai/db";
 import { projectToolContext } from "../services/project-tool-context.js";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { z } from "zod";
@@ -914,13 +914,20 @@ export function projectRoutes(db: Db) {
     const result = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       const workspaceIds = tx.select({ id: projectWorkspaces.id }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, id));
+      const executionWorkspaceIds = tx.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(eq(executionWorkspaces.projectId, id));
+      const sourceIssueIds = tx.select({ id: executionWorkspaces.sourceIssueId }).from(executionWorkspaces).where(eq(executionWorkspaces.projectId, id));
       const bound = and(
         eq(issues.companyId, existing.companyId),
-        or(eq(issues.projectId, id), sql`${issues.projectWorkspaceId} in (${workspaceIds})`),
+        or(
+          eq(issues.projectId, id),
+          sql`${issues.projectWorkspaceId} in (${workspaceIds})`,
+          sql`${issues.executionWorkspaceId} in (${executionWorkspaceIds})`,
+          sql`${issues.id} in (${sourceIssueIds})`,
+        ),
       );
       const [{ total }] = await tx.select({ total: sql<number>`count(*)::int` }).from(issues).where(bound);
       const affected = await tx
-        .select({ issueId: issues.id, projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId })
+        .select({ issueId: issues.id, projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId, executionWorkspaceId: issues.executionWorkspaceId })
         .from(issues)
         .where(bound)
         .orderBy(asc(issues.id))

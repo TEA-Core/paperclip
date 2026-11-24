@@ -51,6 +51,8 @@ import { agentService } from "../services/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import { projectRoutes } from "../routes/projects.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { setPluginEventBus } from "../services/activity-log.js";
+import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -147,6 +149,7 @@ const NO_REPOSITORY_DONE_TIER = {
 } as const;
 
 describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
+  const deletionEventBus = createPluginEventBus();
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let app!: express.Express;
@@ -169,6 +172,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     process.env.PAPERCLIP_HOME = home;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-no-repository-landing-");
     db = createDb(tempDb.connectionString);
+    setPluginEventBus(deletionEventBus);
     app = express();
     app.use(express.json());
     // A request may name its own actor (concurrent closes by different agents).
@@ -2280,6 +2284,28 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await expectRefused(deleted, await close(deleted.identifier), NO_WORKSPACE_REFUSAL);
     });
 
+    it.each(["binding", "source issue"] as const)(
+      "refuses project deletion erasing an execution-only workspace %s",
+      async (association) => {
+        const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+        const { projectId, workspaceId } = await insertWorkspace(fixture.companyId, {
+          sourceIssueId: association === "source issue" ? fixture.issueId : null,
+        });
+        if (association === "binding") {
+          await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, fixture.issueId));
+        }
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${projectId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+        expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId))).toEqual([]);
+        const [after] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+          .where(eq(issues.id, fixture.issueId));
+        expect(after!.executionWorkspaceId).toBeNull();
+        currentActor = fixture.actor;
+        await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+      },
+    );
+
     it("does not attribute an unrelated project deletion to a legacy never-had card", async () => {
       const fixture = await seedAdmissible({ omitCreationSnapshot: true });
       const unrelatedProjectId = await insertProject(fixture.companyId);
@@ -2410,6 +2436,150 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await activityRows(binding!.projectId!, "project.deleted")).toHaveLength(0);
       currentActor = fixture.actor;
       await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+    });
+
+    describe("workspace-link deletion", () => {
+      async function seedBoundWorkspace() {
+        const fixture = await seedAdmissible({ withProjectWorkspace: true, omitCreationSnapshot: true });
+        const [binding] = await db.select({
+          projectId: projectWorkspaces.projectId,
+          projectWorkspaceId: projectWorkspaces.id,
+        }).from(issues).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, issues.projectWorkspaceId))
+          .where(eq(issues.id, fixture.issueId));
+        return { ...fixture, ...binding! };
+      }
+
+      it("retains the former binding for close refusal after the real workspace DELETE", async () => {
+        const bound = await seedBoundWorkspace();
+        await expectRefused(bound, await close(bound.identifier), NO_WORKSPACE_REFUSAL);
+
+        // A separate card prevents the still-bound refusal audit masking erased evidence.
+        const deleted = await seedBoundWorkspace();
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${deleted.projectId}/workspaces/${deleted.projectWorkspaceId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+        expect(await db.select().from(projectWorkspaces).where(eq(projectWorkspaces.id, deleted.projectWorkspaceId))).toEqual([]);
+        expect(await db.select().from(projects).where(eq(projects.id, deleted.projectId))).toHaveLength(1);
+        const [after] = await db.select({
+          projectId: issues.projectId,
+          projectWorkspaceId: issues.projectWorkspaceId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+        }).from(issues).where(eq(issues.id, deleted.issueId));
+        expect(after).toEqual({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
+        currentActor = deleted.actor;
+        await expectRefused(deleted, await close(deleted.identifier), NO_WORKSPACE_REFUSAL);
+      });
+
+      it("does not attribute an unrelated workspace deletion to a never-bound card", async () => {
+        const fixture = await seedAdmissible({ omitCreationSnapshot: true });
+        const projectId = await insertProject(fixture.companyId);
+        const workspaceId = randomUUID();
+        await db.insert(projectWorkspaces).values({
+          id: workspaceId, companyId: fixture.companyId, projectId, name: "Other workspace",
+        });
+        await bulkBindToWorkspace(fixture.companyId, workspaceId, 1);
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${projectId}/workspaces/${workspaceId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+        currentActor = fixture.actor;
+        const result = await close(fixture.identifier);
+        expect(result.status, JSON.stringify(result.body)).toBe(200);
+        expect(await statusOf(fixture.issueId)).toBe("done");
+      });
+
+      it.each([
+        [5000, false],
+        [5001, true],
+      ] as const)("bounds persisted attribution at 5000 cards (%i bound, truncated=%s)", async (bound, truncated) => {
+        const fixture = await seedBoundWorkspace();
+        await bulkBindToWorkspace(fixture.companyId, fixture.projectWorkspaceId, bound - 1);
+        asBoard();
+        const removal = await request(app).delete(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`);
+        expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+        const [audit] = await activityRows(fixture.projectId, "project.workspace_deleted");
+        const details = audit!.details as {
+          affectedIssues: Array<{ issueId: string; projectWorkspaceId: string }>;
+          affectedCount: number;
+          affectedTruncated: boolean;
+        };
+        expect(details.affectedCount).toBe(bound);
+        expect(details.affectedTruncated).toBe(truncated);
+        expect(details.affectedIssues).toHaveLength(Math.min(bound, 5000));
+        expect(new Set(details.affectedIssues.map((entry) => entry.issueId)).size).toBe(details.affectedIssues.length);
+        expect(details.affectedIssues.every((entry) => entry.projectWorkspaceId === fixture.projectWorkspaceId)).toBe(true);
+      }, 120_000);
+
+      it("persists affected card ids without exposing them in live or plugin deletion events", async () => {
+        const fixture = await seedBoundWorkspace();
+        await bulkBindToWorkspace(fixture.companyId, fixture.projectWorkspaceId, 2);
+        const published: Array<{ type: string; payload: Record<string, unknown> }> = [];
+        const pluginPayloads: Array<Record<string, unknown>> = [];
+        const subscriber = deletionEventBus.forPlugin("test.workspace-deletion");
+        subscriber.subscribe("project.workspace_deleted", { companyId: fixture.companyId }, async (event) => {
+          pluginPayloads.push(event.payload as Record<string, unknown>);
+        });
+        const unsubscribe = subscribeCompanyLiveEvents(fixture.companyId, (event) => {
+          published.push(event as unknown as { type: string; payload: Record<string, unknown> });
+        });
+        try {
+          asBoard();
+          const removal = await request(app).delete(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`);
+          expect(removal.status, JSON.stringify(removal.body)).toBe(200);
+          await vi.waitFor(() => expect(pluginPayloads).toHaveLength(1));
+        } finally {
+          unsubscribe();
+          subscriber.clear();
+        }
+        const [audit] = await activityRows(fixture.projectId, "project.workspace_deleted");
+        expect(audit!.details).toMatchObject({
+          affectedCount: 3,
+          affectedTruncated: false,
+          affectedIssues: expect.arrayContaining([
+            expect.objectContaining({ issueId: fixture.issueId, projectWorkspaceId: fixture.projectWorkspaceId }),
+          ]),
+        });
+        const events = published.filter(
+          (event) => event.type === "activity.logged" && event.payload.action === "project.workspace_deleted",
+        );
+        expect(events).toHaveLength(1);
+        expect(events[0]!.payload.details).toEqual({
+          workspaceId: fixture.projectWorkspaceId, name: "Primary", affectedCount: 3, affectedTruncated: false,
+        });
+        expect(JSON.stringify(events)).not.toContain(fixture.issueId);
+        expect(pluginPayloads[0]).toMatchObject({
+          workspaceId: fixture.projectWorkspaceId, name: "Primary", affectedCount: 3, affectedTruncated: false,
+        });
+        expect(pluginPayloads[0]).not.toHaveProperty("affectedIssues");
+        expect(JSON.stringify(pluginPayloads)).not.toContain(fixture.issueId);
+      });
+
+      it("rolls back the workspace unlink when deletion audit persistence fails", async () => {
+        const fixture = await seedBoundWorkspace();
+        await db.execute(sql`
+          create function test_fail_workspace_deleted_audit() returns trigger language plpgsql as $$
+          begin
+            if new.action = 'project.workspace_deleted' then raise exception 'audit write refused'; end if;
+            return new;
+          end $$`);
+        await db.execute(sql`
+          create trigger fail_workspace_deleted_audit before insert on activity_log
+          for each row execute function test_fail_workspace_deleted_audit()`);
+        try {
+          asBoard();
+          const removal = await request(app).delete(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`);
+          expect(removal.status, JSON.stringify(removal.body)).toBe(500);
+        } finally {
+          await db.execute(sql`drop trigger if exists fail_workspace_deleted_audit on activity_log`);
+          await db.execute(sql`drop function if exists test_fail_workspace_deleted_audit()`);
+        }
+        expect(await db.select().from(projectWorkspaces).where(eq(projectWorkspaces.id, fixture.projectWorkspaceId))).toHaveLength(1);
+        const [after] = await db.select({ projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
+          .where(eq(issues.id, fixture.issueId));
+        expect(after!.projectWorkspaceId).toBe(fixture.projectWorkspaceId);
+        expect(await activityRows(fixture.projectId, "project.workspace_deleted")).toHaveLength(0);
+        currentActor = fixture.actor;
+        await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+      });
     });
 
     it("refuses a close request whose own description cites repository work and closes with a clean one", async () => {
