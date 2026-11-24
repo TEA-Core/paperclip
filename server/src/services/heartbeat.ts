@@ -21821,7 +21821,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const existing = await getAgent(agentId);
     if (!existing) return;
 
-    if (existing.status === "paused" || existing.status === "terminated") {
+    if (existing.status === "paused" || existing.status === "terminated" || existing.status === "deleted") {
       return;
     }
 
@@ -21850,7 +21850,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), ne(agents.status, "deleted")))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -31086,6 +31086,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
+      recoveryAgent.status !== "deleted" &&
       recoveryAgent.status !== "pending_approval";
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))

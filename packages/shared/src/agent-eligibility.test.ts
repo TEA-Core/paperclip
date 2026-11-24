@@ -52,6 +52,17 @@ describe("agent work eligibility", () => {
     }
   });
 
+  it("reports deleted agents as terminated for both work and invocation", () => {
+    const target = agent({ status: "deleted" });
+    const manager = agent({ id: "manager-1", name: "CTO", reportsTo: null });
+    expect(getAgentWorkEligibility({ agent: target, agents: [target, manager] })).toMatchObject({
+      assignable: false,
+      invokable: false,
+      assignabilityReason: "terminated",
+      invokabilityReason: "terminated",
+    });
+  });
+
   it("allows paused agents to keep assignments but blocks invocation", () => {
     const target = agent({ status: "paused" });
     const manager = agent({ id: "manager-1", name: "CTO", status: "active", reportsTo: null });

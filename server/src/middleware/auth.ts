@@ -381,7 +381,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      if (agentRecord.status === "terminated") {
+      if (agentRecord.status === "terminated" || agentRecord.status === "deleted") {
         next(unauthorized("Agent is terminated and cannot authenticate"));
         return;
       }
@@ -472,7 +472,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
       return;
     }
-    if (agentRecord.status === "terminated") {
+    if (agentRecord.status === "terminated" || agentRecord.status === "deleted") {
       next(unauthorized("Agent is terminated and cannot authenticate"));
       return;
     }

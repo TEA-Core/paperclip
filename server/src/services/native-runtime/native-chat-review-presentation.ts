@@ -431,7 +431,7 @@ export async function authorizeNativeChatReviewPresentation(
     // A later or unrelated run may set the shared agent's runtime-health status
     // to error; that does not revoke this completed response. Explicit pauses
     // (including budget pauses), termination and approval gates still deny.
-    ["paused", "terminated", "pending_approval"].includes(agent.status)
+    ["paused", "terminated", "deleted", "pending_approval"].includes(agent.status)
   )
     return false;
   try {

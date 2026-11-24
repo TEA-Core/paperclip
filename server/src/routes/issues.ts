@@ -6213,7 +6213,7 @@ export function issueRoutes(
       }),
       resolvesInCompany: async (agentId) => {
         const agent = await agentsSvc.getById(agentId);
-        return Boolean(agent && agent.companyId === input.companyId);
+        return Boolean(agent && agent.companyId === input.companyId && agent.status !== "deleted");
       },
     });
   // R20: whether the policy's stall arbiter can take work right now. The engine
@@ -6244,7 +6244,7 @@ export function issueRoutes(
       agent &&
         agent.companyId === input.companyId &&
         agent.status !== "paused" &&
-        agent.status !== "terminated" &&
+        agent.status !== "terminated" && agent.status !== "deleted" &&
         agent.status !== "pending_approval",
     );
   };
@@ -10753,7 +10753,7 @@ export function issueRoutes(
     if (resolved.agent.status === "pending_approval") {
       throw conflict("Cannot assign work to pending approval agents");
     }
-    if (resolved.agent.status === "terminated") {
+    if ((resolved.agent.status === "terminated" || resolved.agent.status === "deleted")) {
       throw conflict("Cannot assign work to terminated agents");
     }
     // Agents must not route work to a paused peer/manager: the assignment is
@@ -14709,7 +14709,7 @@ export function issueRoutes(
             !sourceOwner ||
             sourceOwner.companyId !== lockedIssue.companyId ||
             sourceOwner.status === "paused" ||
-            sourceOwner.status === "terminated"
+            (sourceOwner.status === "terminated" || sourceOwner.status === "deleted")
           ) {
             throw conflict(
               "The assigned agent is unavailable. Resume or review the agent before retrying.",
@@ -17903,6 +17903,9 @@ export function issueRoutes(
         details: {
           title: issue.title,
           identifier: issue.identifier,
+          projectId: issue.projectId ?? null,
+          projectWorkspaceId: issue.projectWorkspaceId ?? null,
+          description: issue.description ?? null,
           ...(watchdogProductBugFollowUp
             ? {
                 watchdogDiscovery: {
@@ -21996,6 +21999,9 @@ export function issueRoutes(
       requestedDeliveryRequirement: updateFields.deliveryRequirement,
       requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
       requestedProjectWorkspaceId: updateFields.projectWorkspaceId,
+      requestedProjectId: updateFields.projectId,
+      requestedTitle: updateFields.title,
+      requestedDescription: updateFields.description,
     };
     const noRepositoryLandingRefusal = (reason: string) =>
       unprocessable(reason, {

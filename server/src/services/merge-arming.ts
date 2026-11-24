@@ -6254,7 +6254,7 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
     ));
   const agentStanding = agentIds.map((id) => {
     const agent = agentRows.find((candidate) => candidate.id === id);
-    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
+    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "deleted" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
   });
   memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
@@ -6309,7 +6309,7 @@ async function decisionStandingProblem(db: Db, companyId: string, issueId: strin
           .select({ companyId: agents.companyId, status: agents.status })
           .from(agents)
           .where(eq(agents.id, decision.actorAgentId));
-        if (!agent || agent.companyId !== companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+        if (!agent || agent.companyId !== companyId || (agent.status === "terminated" || agent.status === "deleted") || agent.status === "pending_approval") {
           return `the agent that decided stage ${stageId} is no longer a current agent of the company`;
         }
         if (lapsePaused && agent.status === "paused") {

@@ -4219,6 +4219,7 @@ export function agentRoutes(
         const statusEligible =
           row.status !== "paused" &&
           row.status !== "terminated" &&
+          row.status !== "deleted" &&
           row.status !== "pending_approval";
 
         return {
@@ -4241,6 +4242,7 @@ export function agentRoutes(
       .filter((item) =>
         item.status !== "paused" &&
         item.status !== "terminated" &&
+        item.status !== "deleted" &&
         item.status !== "pending_approval",
       )
       .sort((left, right) => {
@@ -4788,7 +4790,7 @@ export function agentRoutes(
         );
         if (match) {
           const existingAgent = await svc.getById(match.entityId);
-          if (existingAgent && existingAgent.status !== "terminated") {
+          if (existingAgent && existingAgent.status !== "terminated" && existingAgent.status !== "deleted") {
             const priorApprovalId = (match.details as Record<string, unknown> | null)?.approvalId;
             const existingApproval =
               typeof priorApprovalId === "string" ? await approvalsSvc.getById(priorApprovalId) : null;
@@ -6102,6 +6104,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    await heartbeat.cancelInvocationsForAgents([id], "Cancelled because the agent was deleted");
 
     await logActivity(db, {
       companyId: agent.companyId,

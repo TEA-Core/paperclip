@@ -3405,7 +3405,7 @@ export function recoveryService(
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(and(eq(agents.id, run.agentId), notInArray(agents.status, ["paused", "terminated"])));
+      .where(and(eq(agents.id, run.agentId), notInArray(agents.status, ["paused", "terminated", "deleted"])));
   }
 
   const watchdog = createActiveRunWatchdog(db, {
