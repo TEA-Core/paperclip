@@ -299,6 +299,7 @@ export function browserUseService(
     invocationId: string,
     name: string,
     value: unknown,
+    beforeDispatch?: () => Promise<void>,
   ) {
     const args = argsSchema.parse(value ?? {});
     const config = await getSettings(binding.companyId, grant.id);
@@ -312,6 +313,7 @@ export function browserUseService(
       // A safe Test action that creates no paid work and exposes no unapproved profile.
       if (!config.allowedProfileIds.length) return { profiles: [] };
       const profiles: Array<{ id: string; name?: string | null }> = [];
+      await beforeDispatch?.();
       for (let page = 1; page <= 100; page++) {
         const list = await client.profiles(page);
         profiles.push(
@@ -376,6 +378,7 @@ export function browserUseService(
         return snapshot(s);
       }
       if (name === "browser_cancel" || name === "browser_end") {
+        await beforeDispatch?.();
         await control(s, name === "browser_cancel" ? "cancel" : "end");
         return snapshot(
           (await db.select().from(sessions).where(eq(sessions.id, s.id)))[0],
@@ -473,6 +476,7 @@ export function browserUseService(
       return row;
     });
     let result: Awaited<ReturnType<typeof client.start>>;
+    await beforeDispatch?.();
     try {
       result = await client.start({
         // The v4 API has no create idempotency key. An opaque marker lets a
