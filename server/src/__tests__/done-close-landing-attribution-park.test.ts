@@ -32,6 +32,13 @@ vi.mock("../services/merge-arming.js", async (importOriginal) => {
   };
 });
 
+// The fake db here models only the backstop's own reads; the child-carrier owner
+// gate has its own real-DB coverage, so it resolves "no block" for these cases.
+vi.mock("../services/child-carrier-attribution.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/child-carrier-attribution.js")>()),
+  childCarrierStampBlock: vi.fn().mockResolvedValue(null),
+}));
+
 const mockCreateGitHubExternalObjectProvider = vi.hoisted(() => vi.fn());
 vi.mock("../services/github-external-object-provider.js", () => ({
   createGitHubExternalObjectProvider: mockCreateGitHubExternalObjectProvider,

@@ -92,6 +92,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { canonicalizeUuid } from "../lib/uuid.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -1037,13 +1038,15 @@ export function pluginRoutes(
       return;
     }
 
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
+    if (!runContext.agentId || runContext.runId == null || !runContext.companyId || !runContext.projectId) {
       res.status(400).json({
         error: '"runContext" must include agentId, runId, companyId, and projectId',
       });
       return;
     }
 
+    runContext.runId = canonicalizeUuid(runContext.runId)!;
+    const actorRunId = req.actor.type === "agent" ? canonicalizeUuid(req.actor.runId) : null;
     assertCompanyAccess(req, runContext.companyId);
     const scopeError = await validateToolRunContextScope(runContext);
     if (scopeError) {
@@ -1058,7 +1061,7 @@ export function pluginRoutes(
             type: "agent",
             agentId: req.actor.agentId,
             companyId: req.actor.companyId,
-            runId: req.actor.runId ?? null,
+            runId: actorRunId,
           },
           tool,
           parameters: parameters ?? {},

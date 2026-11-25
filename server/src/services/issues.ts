@@ -1,3 +1,4 @@
+import { readRecoveryCarrierParkSnapshot, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -57,6 +58,7 @@ import {
   executionWorkspaces,
   issueApprovals,
   issueAttachments,
+  issueChildCarrierAttributions,
   issueCreateIdempotencyKeys,
   issueInboxArchives,
   issueLabels,
@@ -79,6 +81,7 @@ import {
   projects,
   toolConnections,
   workspaceOperations,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
@@ -272,7 +275,7 @@ import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
-import { findLiveIssueExecutionHolder } from "./issue-execution-lease.js";
+import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -323,6 +326,10 @@ export type IssuePostCommitAction = {
   runId: string;
   issueId: string;
   issueStatus: string;
+} | {
+  type: "promote_deferred_wakes";
+  runId: string;
+  issueId: string;
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -335,6 +342,20 @@ export async function executeIssuePostCommitActions(
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
+    if (action.type === "promote_deferred_wakes") {
+      try {
+        const run = await heartbeat.getRun(action.runId);
+        if (run) {
+          await heartbeat.releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, action.issueId);
+        }
+      } catch (err) {
+        logger.warn(
+          { err, runId: action.runId, issueId: action.issueId },
+          "deferred wake promotion deferred to recovery sweep",
+        );
+      }
+      continue;
+    }
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
@@ -4170,6 +4191,7 @@ function createIssueBlockerAttention(
     directBlockerIssueId: input.directBlockerIssueId ?? null,
     terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
     terminalBlocker: input.terminalBlocker ?? null,
+    ...(input.carrierPark ? { carrierPark: input.carrierPark } : {}),
   };
 }
 
@@ -4322,9 +4344,14 @@ async function listIssueBlockerAttentionMap(
     (row) => row.companyId === companyId && row.status === "blocked",
   );
   const attentionMap = new Map<string, IssueBlockerAttention>();
+  const { parks: carrierParks, blockers: rootBlockers } = await readRecoveryCarrierParkSnapshot(
+    dbOrTx, companyId, issueRows.map(row => row.id),
+  );
   for (const row of issueRows) {
     if (row.status !== "blocked") {
-      attentionMap.set(row.id, createIssueBlockerAttention({ computed: false }));
+      const carrierPark = carrierParks.get(row.id);
+      attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
+        ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
     }
   }
   if (roots.length === 0) return attentionMap;
@@ -4359,7 +4386,11 @@ async function listIssueBlockerAttentionMap(
       }
       const explicitBlockerRowsPromise: Promise<
         IssueBlockerAttentionQueryRow[]
-      > = dbOrTx
+      > = depth === 0
+        ? Promise.resolve(chunk.flatMap(issueId => (rootBlockers.get(issueId) ?? []).map(row => ({
+            ...row, issueId, blockerIssueId: row.id,
+          }))))
+        : dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
           blockerIssueId: issues.id,
@@ -4930,6 +4961,11 @@ async function listIssueBlockerAttentionMap(
     });
     if (topLevelEdges.length === 0) {
       const allEdges = edgesByIssueId.get(root.id) ?? [];
+      const carrierPark = carrierParks.get(root.id);
+      if (carrierPark?.state === "accepted") {
+        attentionMap.set(root.id, createIssueBlockerAttention({ computed: true, carrierPark }));
+        continue;
+      }
       if (allEdges.length > 0) {
         const terminalSampleNode = nodesById.get(allEdges[0].blockerIssueId);
         attentionMap.set(root.id, createIssueBlockerAttention({
@@ -5035,6 +5071,15 @@ async function listIssueBlockerAttentionMap(
     }));
   }
 
+  for (const [id, carrierPark] of carrierParks) {
+    const attention = attentionMap.get(id);
+    if (!attention) continue;
+    attention.carrierPark = carrierPark;
+    if (carrierPark.state === "stale" && attention.state === "covered") {
+      attention.state = "needs_attention";
+      attention.reason = "attention_required";
+    }
+  }
   return attentionMap;
 }
 
@@ -7402,9 +7447,55 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
-export function issueService(db: Db) {
+export function issueService(
+  db: Db,
+  opts: {
+    /** Called after a helper clears an execution lock outside the normal release. */
+    onExecutionLockCleared?: (info: {
+      companyId: string;
+      issueId: string;
+      run: typeof heartbeatRuns.$inferSelect;
+    }) => Promise<void>;
+  } = {},
+) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  async function notifyExecutionLockCleared(companyId: string, issueId: string, runId: string | null) {
+    if (!opts.onExecutionLockCleared || !runId) return;
+    // The lock clear has already committed. A lookup or callback failure must
+    // not reject release, force-release, or update: the caller would report
+    // an error for a write that succeeded.
+    try {
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (!run) return;
+      await opts.onExecutionLockCleared({ companyId, issueId, run });
+    } catch (err) {
+      logger.error({ err, issueId, runId }, "failed to promote wakes after an execution lock was cleared");
+    }
+  }
+
+  // release and adminForceRelease clear the lock without the update path's
+  // post-commit action. With no route hook, the held wake waited for the next
+  // sweep. Promote it here, except on a closed card, which must stay closed.
+  async function promoteClearedLockWithoutHook(
+    companyId: string,
+    issueId: string,
+    runId: string | null,
+    resultingStatus: string,
+  ) {
+    if (!runId || opts.onExecutionLockCleared) return;
+    if (resultingStatus === "done" || resultingStatus === "cancelled") return;
+    await executeIssuePostCommitActions(db, [{
+      type: "promote_deferred_wakes",
+      runId,
+      issueId,
+    }]);
+  }
 
   function provisionalTitleFromDescription(description: string) {
     const simpleTitle = description.trim().replace(/\s+/g, " ").slice(0, 120);
@@ -8541,7 +8632,7 @@ export function issueService(db: Db) {
   async function clearExecutionRunIfTerminal(
     issueId: string,
   ): Promise<boolean> {
-    return db.transaction(async (tx) => {
+    const cleared = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
@@ -8582,8 +8673,10 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
+      return updated ? { companyId: issue.companyId, runId: issue.executionRunId } : null;
     });
+    if (cleared) await notifyExecutionLockCleared(cleared.companyId, issueId, cleared.runId);
+    return Boolean(cleared);
   }
 
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
@@ -8591,7 +8684,7 @@ export function issueService(db: Db) {
   // heartbeat run that is terminal or no longer exists. No assignee/status
   // precondition. Explicit retry claims remain owned by queue-first settlement.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
-    return db.transaction(async (tx) => {
+    const cleared = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
@@ -8661,8 +8754,10 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
+      return updated ? { companyId: issue.companyId, runId: issue.executionRunId ?? issue.checkoutRunId } : null;
     });
+    if (cleared) await notifyExecutionLockCleared(cleared.companyId, issueId, cleared.runId);
+    return Boolean(cleared);
   }
 
   async function addStopRelayCommentIfNeeded(
@@ -11421,7 +11516,7 @@ export function issueService(db: Db) {
         const values = {
           ...issueData,
           titleNeedsGeneration,
-          originRunId: issueData.originRunId ?? actorRunId ?? null,
+          originRunId: issueData.originRunId !== undefined ? issueData.originRunId : (actorRunId ?? null),
           responsibleUserId,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
@@ -11908,7 +12003,10 @@ export function issueService(db: Db) {
 
     update: async (
       id: string,
-      data: Partial<typeof issues.$inferInsert> & {
+      data: Omit<Partial<typeof issues.$inferInsert>, "originRunId"> & {
+        // Creation provenance is immutable through the typed update API.
+        // Reassignment may clear it below, but no caller may establish it.
+        originRunId?: never;
         labelIds?: string[];
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
@@ -11951,6 +12049,11 @@ export function issueService(db: Db) {
       postCommitActions?: IssuePostCommitAction[],
       options: { bindRuntimeSharedWorkspace?: boolean } = {},
     ) => {
+      if (Object.hasOwn(data, "originRunId")) {
+        throw badRequest("originRunId can only be set when an issue is created", {
+          code: "issue_origin_run_id_immutable",
+        });
+      }
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
         postCommitActivityPublications ?? ownedActivityPublications;
@@ -12438,6 +12541,11 @@ export function issueService(db: Db) {
         patch.executionLockedAt = null;
       }
 
+      // The promotion decision must use the row this transaction locks, not
+      // the pre-transaction read. A lock that appears between those reads is
+      // still cleared by the write, and the held wake must be promoted.
+      const clearedExecutionRunId: { value: string | null } = { value: null };
+
       const runUpdate = async (tx: any) => {
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
@@ -12449,6 +12557,14 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Invalidate creation proof against the assignee this write locks.
+        // A pre-lock echo can still change an interleaved writer's assignee.
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          issueData.assigneeAgentId !== receiptExisting.assigneeAgentId
+        ) {
+          patch.originRunId = null;
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -12622,7 +12738,30 @@ export function issueService(db: Db) {
           (receiptExisting.executionRunId || receiptExisting.checkoutRunId)
         ) {
           const holder = await findLiveIssueExecutionHolder(tx as Db, receiptExisting.companyId, id);
+          // An adopted issue-less author does not keep the card across a
+          // reassignment: its stamp is authorship of the previous assignee,
+          // and keeping it holds the new assignee's wakes behind a run that
+          // is not working this card. A run whose recorded context names
+          // this card is its genuine worker and keeps the hold.
+          const adoptedAuthorHold = holder
+            ? await (async () => {
+                if (patch.assigneeAgentId === undefined || patch.assigneeAgentId === holder.agentId) return false;
+                const [holderRun] = await tx
+                  .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+                  .from(heartbeatRuns)
+                  .where(eq(heartbeatRuns.id, holder.runId));
+                const holderContext = holderRun?.contextSnapshot;
+                const holderIssueId =
+                  holderContext && typeof holderContext === "object" &&
+                  typeof (holderContext as Record<string, unknown>).issueId === "string"
+                    ? ((holderContext as Record<string, unknown>).issueId as string)
+                    : null;
+                if (holderIssueId === id) return false;
+                return runIsIssueAuthor(tx as Db, receiptExisting.companyId, id, holder.runId);
+              })()
+            : false;
           if (
+            !adoptedAuthorHold &&
             holder?.status === "running" &&
             (holder.runId === receiptExisting.executionRunId || holder.runId === receiptExisting.checkoutRunId)
           ) {
@@ -13037,6 +13176,9 @@ export function issueService(db: Db) {
             },
           }, activityPublications);
         }
+        if (receiptExisting.executionRunId && !updated.executionRunId) {
+          clearedExecutionRunId.value = receiptExisting.executionRunId;
+        }
         return {
           ...enriched,
           ...(nextBlockedByIssueIds !== undefined
@@ -13049,6 +13191,35 @@ export function issueService(db: Db) {
       const result = await (!isTransactionHandle(dbOrTx)
         ? db.transaction(runUpdate)
         : runUpdate(dbOrTx));
+      const promotedRunId = clearedExecutionRunId.value;
+      if (
+        result &&
+        promotedRunId &&
+        result.status !== "done" &&
+        result.status !== "cancelled"
+      ) {
+        if (!isTransactionHandle(dbOrTx)) {
+          await notifyExecutionLockCleared(existing.companyId, id, promotedRunId);
+          // Callers that construct the service without the route's hook
+          // (heartbeat-internal, channel and plugin writes) still promote
+          // the wakes held behind the cleared lock, through the same
+          // post-commit action the transactional path queues. Without this
+          // the held wake stayed deferred with no lock left to release it.
+          if (!opts.onExecutionLockCleared) {
+            queuedPostCommitActions.push({
+              type: "promote_deferred_wakes",
+              runId: promotedRunId,
+              issueId: id,
+            });
+          }
+        } else if (postCommitActions) {
+          postCommitActions.push({
+            type: "promote_deferred_wakes",
+            runId: promotedRunId,
+            issueId: id,
+          });
+        }
+      }
       if (!isTransactionHandle(dbOrTx) && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);
@@ -13097,6 +13268,64 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        const [carrier] = await tx.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+        if (!carrier) return null;
+        // Match park admission's source-before-carrier lock order, including released fences.
+        const actionSources = await tx.select({ sourceId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          or(eq(issueRecoveryActions.recoveryIssueId, id), sql`exists (
+            select 1 from ${issueTreeHolds}
+            where ${issueTreeHolds.companyId} = ${carrier.companyId} and ${issueTreeHolds.rootIssueId} = ${id}
+              and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.status} in ('active', 'released')
+              and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`)}
+          )`),
+        ));
+        const sourceIds = [...new Set(actionSources.map(row => row.sourceId))].sort();
+        if (sourceIds.length) await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, carrier.companyId), inArray(issues.id, sourceIds),
+        )).orderBy(asc(issues.id)).for("update");
+        const [lockedCarrier] = await tx.select({ status: issues.status }).from(issues).where(and(
+          eq(issues.id, id), eq(issues.companyId, carrier.companyId),
+        )).for("update");
+        if (!lockedCarrier) return null;
+        const parks = await tx.select({ status: issueTreeHolds.status, actionStatus: issueRecoveryActions.status,
+          actionSourceId: issueRecoveryActions.sourceIssueId }).from(issueTreeHolds).leftJoin(issueRecoveryActions, and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`),
+        )).where(and(eq(issueTreeHolds.companyId, carrier.companyId), eq(issueTreeHolds.rootIssueId, id),
+          eq(issueTreeHolds.mode, "pause"), inArray(issueTreeHolds.status, ["active", "released"]),
+          sql`${issueTreeHolds.recoveryCarrierPark} is not null`));
+        if (parks.some(hold => hold.status === "active" || !hold.actionSourceId || !sourceIds.includes(hold.actionSourceId) ||
+            !hold.actionStatus || !["resolved", "cancelled"].includes(hold.actionStatus))) {
+          throw conflict("Recovery carrier cannot be deleted while its board park has pending effects.");
+        }
+        // The issue lock serializes this check with attribution FK insertion.
+        // Invalidating proof does not make its child contribution disposable.
+        const [attribution] = await tx
+          .select({ id: issueChildCarrierAttributions.id })
+          .from(issueChildCarrierAttributions)
+          .where(and(
+            eq(issueChildCarrierAttributions.companyId, carrier.companyId),
+            or(
+              lockedCarrier.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
+              and(
+                eq(issueChildCarrierAttributions.ancestorIssueId, id),
+                sql`EXISTS (
+                  SELECT 1 FROM ${issues}
+                  WHERE ${issues.id} = ${issueChildCarrierAttributions.childIssueId}
+                    AND ${issues.companyId} = ${carrier.companyId} AND ${issues.status} <> 'cancelled'
+                )`,
+              ),
+            ),
+          ))
+          .limit(1);
+        if (attribution) {
+          throw conflict(
+            "Issue is referenced by a non-cancelled child's carrier attribution and cannot be deleted. Cancel the child only if its work is no longer required.",
+            { code: "issue_carrier_attribution_delete_refused" },
+          );
+        }
+
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -13735,8 +13964,9 @@ export function issueService(db: Db) {
       id: string,
       actorAgentId?: string,
       actorRunId?: string | null,
-    ) =>
-      db.transaction(async (tx) => {
+    ) => {
+      const clearedLock: { value: { companyId: string; runId: string | null } | null } = { value: null };
+      const released = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -13795,15 +14025,27 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        clearedLock.value = { companyId: existing.companyId, runId: existing.executionRunId ?? existing.checkoutRunId };
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
-      }),
+      });
+      if (clearedLock.value && released) {
+        await notifyExecutionLockCleared(clearedLock.value.companyId, id, clearedLock.value.runId);
+        await promoteClearedLockWithoutHook(
+          clearedLock.value.companyId,
+          id,
+          clearedLock.value.runId,
+          released.status,
+        );
+      }
+      return released;
+    },
 
     adminForceRelease: async (
       id: string,
       options: { clearAssignee?: boolean } = {},
-    ) =>
-      db.transaction(async (tx) => {
+    ) => {
+      const forced = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -13845,7 +14087,19 @@ export function issueService(db: Db) {
             executionRunId: existing.executionRunId,
           },
         };
-      }),
+      });
+      if (forced) {
+        const clearedRunId = forced.previous.executionRunId ?? forced.previous.checkoutRunId;
+        await notifyExecutionLockCleared(forced.issue.companyId, id, clearedRunId);
+        await promoteClearedLockWithoutHook(
+          forced.issue.companyId,
+          id,
+          clearedRunId,
+          forced.issue.status,
+        );
+      }
+      return forced;
+    },
 
     listLabels: (companyId: string) =>
       db

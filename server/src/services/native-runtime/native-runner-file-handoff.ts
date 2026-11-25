@@ -852,7 +852,7 @@ export async function stageNativeRunnerWakeAttachments(input: {
     .limit(1);
   if (
     !run ||
-    ["paused", "terminated", "pending_approval", "error"].includes(
+    ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
       run.agentStatus,
     )
   ) {
@@ -1120,7 +1120,7 @@ async function assertCurrentBinding(
     .limit(1);
   if (
     !context ||
-    ["paused", "terminated", "pending_approval", "error"].includes(
+    ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
       context.agent.status,
     )
   ) {

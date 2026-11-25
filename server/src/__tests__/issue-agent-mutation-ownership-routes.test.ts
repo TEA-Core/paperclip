@@ -428,6 +428,8 @@ function createRunContextDb(
     // whether this issue is a summary-generation card; the generic fallback
     // row would fabricate one and hijack the return assignee.
     if (tableName === "summary_slots") return [];
+    // Landing-debt probe: no reclassification rows exist in these fixtures.
+    if (tableName === "activity_log") return [];
     if (heartbeatRunQuery) {
       const predicate = heartbeatRunQueries.at(-1);
       const [selectedRunId, selectedCompanyId, selectedAgentId, selectedStatus] = predicate?.params ?? [];
@@ -834,8 +836,10 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue(),
+    // The written row carries the stored issue (e.g. its deliveryRequirement),
+    // as the real UPDATE ... RETURNING does.
+    mockIssueService.update.mockImplementation(async (id: string, patch: Record<string, unknown>) => ({
+      ...((await mockIssueService.getById(id)) ?? makeIssue()),
       ...patch,
     }));
     mockIssueService.addComment.mockResolvedValue({

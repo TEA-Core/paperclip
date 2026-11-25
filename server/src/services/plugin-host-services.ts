@@ -1989,11 +1989,20 @@ export function buildHostServices(
             ? pluginOperationIssueOriginKind(pluginKey)
             : originKind,
         );
+        // originRunId is ownership proof, and a plugin cannot mint it. The
+        // host holds no authenticated agent run for a plugin call: every
+        // actor field here is plugin-supplied, so a plugin can name any
+        // agent together with that agent's live run and pass a
+        // belongs-to-the-actor check on both supplied values. A
+        // plugin-supplied origin/actor run is therefore never stored as
+        // proof; only host-authenticated doors (agent/board run actors) may
+        // record an origin run.
+        const verifiedOriginRunId: string | null = null;
         const issue = (await issues.create(companyId, {
           ...(restampPluginMonitorScheduledBy(issueInput as Record<string, unknown>) as any),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
-          originRunId: params.originRunId ?? actorRunId ?? null,
+          originRunId: verifiedOriginRunId,
           createdByAgentId: actorAgentId ?? null,
           createdByUserId: actorUserId ?? null,
           actorResponsibleUserId: actorUserId ?? null,
@@ -2012,6 +2021,9 @@ export function buildHostServices(
             originId: issue.originId,
             billingCode: issue.billingCode,
             blockedByIssueIds: params.blockedByIssueIds ?? [],
+            projectId: issue.projectId ?? null,
+            projectWorkspaceId: issue.projectWorkspaceId ?? null,
+            description: issue.description ?? null,
           },
         });
         return issue;
@@ -2028,6 +2040,9 @@ export function buildHostServices(
         for (const key of Object.keys(PLUGIN_ISSUE_UPDATE_PATCH_FIELDS)) {
           if (Object.hasOwn(rawPatch, key)) patch[key] = rawPatch[key];
         }
+        // originRunId is ownership proof. A plugin update can name any run,
+        // so the supplied value is never stored. Create refuses it the same way.
+        delete patch.originRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
@@ -2540,7 +2555,15 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
+        // A plugin supplies both authorAgentId and sourceRunId. That pair is
+        // not host-authenticated provenance, so it must not become the child's
+        // originRunId on accept. The interaction itself still creates.
+        const supplied = params.interaction as CreateIssueThreadInteraction;
+        const interactionInput: CreateIssueThreadInteraction = {
+          ...supplied,
+          sourceRunId: null,
+        };
+        const interaction = await issueThreadInteractionService(db).create(issue, interactionInput, {
           agentId: params.authorAgentId ?? null,
         });
         await logPluginActivity({

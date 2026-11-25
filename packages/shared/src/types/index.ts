@@ -795,6 +795,9 @@ export type {
 } from "./issue.js";
 export type {
   IssueTreeControlPreview,
+  RecoveryCarrierParkBinding,
+  RecoveryCarrierParkSummary,
+  RecoveryCarrierParkCandidate,
   IssueTreeHold,
   ReleaseIssueTreeHoldResponse,
   IssueTreeHoldMember,

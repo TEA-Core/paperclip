@@ -1089,6 +1089,30 @@ describe("issue execution policy transitions", () => {
       changesRequestedCount: 0,
     });
 
+    it("preserves an untrusted child carrier claim through final-stage approval", () => {
+      const stage = policy.stages.at(-1)!;
+      const participant = stage.participants[0]!;
+      const claim = { prNumber: 653, headSha: "a".repeat(40), claimedAt: "2026-11-22T00:00:00Z" };
+      const actor = participant.type === "agent" ? { agentId: participant.agentId } : { userId: participant.userId };
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: participant.type === "agent" ? participant.agentId : null,
+          assigneeUserId: participant.type === "user" ? participant.userId : null,
+          executionPolicy: policy,
+          executionState: {
+            ...parkedReviewState(), currentStageId: stage.id, currentStageIndex: policy.stages.length - 1,
+            currentStageType: stage.type, currentParticipant: participant,
+            completedStageIds: policy.stages.slice(0, -1).map((entry) => entry.id),
+            childCarrierClaim: claim,
+          },
+        },
+        policy, requestedStatus: "done", requestedAssigneePatch: {}, actor, commentBody: "Approved the exact child contribution.",
+      });
+      expect(result.decision?.outcome).toBe("approved");
+      expect(result.patch.executionState).toMatchObject({ status: "completed", childCarrierClaim: claim });
+    });
+
     it("parks blocked without recording any execution decision and leaves the stage armed", () => {
       const before = parkedReviewState();
       const result = applyIssueExecutionPolicyTransition({

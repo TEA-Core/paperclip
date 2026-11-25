@@ -488,6 +488,15 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("control-plane-operation-no-deliverable");
     });
 
+    it("allows transition with decision-only-no-repository-deliverable override", async () => {
+      const override: DoneTransitionOverride = {
+        disposition: "decision-only-no-repository-deliverable",
+        reason: "The recorded decision has no repository deliverable.",
+      };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+    });
+
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
@@ -6287,6 +6296,145 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
+    describe("record-only pass contradictions", () => {
+      it.each([
+        ["exit_nonzero", "exit 2"],
+        ["exited_nonzero", "exited 2"],
+        ["failed_positive", "failed=1"],
+        ["scanned_zero", "scanned=0"],
+        ["non_clean", "non-clean"],
+        ["failed_closed", "failed closed. All four configured repos shape"],
+        ["refused", "REFUSED"],
+        ["partial_failure", "partial failure"],
+      ])("refuses %s in a pass predicate", async (marker, prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier2Audit).toBeUndefined();
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.reason).toContain(marker);
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(result.remedy).toContain("Report the non-clean cycle and do not close");
+      });
+
+      it.each(["exit -2", "exited +02", "failed=001", "scanned=00", "NON-CLEAN", "FAILED CLOSED. ALL four repos"])(
+        "refuses integer and case variants: %s",
+        async (prose) => {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        },
+      );
+
+      it.each([
+        "scanned=0.0", "scanned=-0", "scanned=0e5", "scanned=.0", "scanned=0.", "failed=1.5", "failed=1e2",
+        "failed=+.5e1", "exit 2.0", "exit -0.5", "exited 1e1", "exit 2.",
+        "failed=1e-400", "exit 1e-400", "exited -1e-400",
+      ])("refuses complete decimal contradiction form: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+      });
+
+      it.each([
+        "scanned=0.5", "scanned=+.5", "scanned=1e2", "scanned=0.001", "failed=0.0", "failed=-1", "failed=0e3",
+        "failed=.0", "exit 0.0", "exit -0", "exited 00.00", "exit 0e5", "scanned=1e-400",
+      ])("does not refuse non-contradicting decimal form: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.code).not.toBe("done_transition_record_only_probe_contradiction");
+        expect(result.allowed).toBe(true);
+      });
+
+      it("refuses a contradiction on the same-run comment path", async () => {
+        setupDbMock({
+          heartbeatRuns: [
+            { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+          ],
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), null, "run-1",
+          () => Promise.resolve([mockComment(tier2Line(`${RECORD_ONLY_EVIDENCE}; exit 2`), "run-1")]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+      });
+
+      it("keeps a structured system-backstop contradiction from producing a close audit", async () => {
+        const result = await evaluateDoneTransitionGuardForBackstopClose({
+          db: mockDb,
+          issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+          actorId: "execution-control-reconciliation",
+          closeComment: null,
+          structuredDoneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}; exit 2` },
+        });
+        expect(result.allowed).toBe(false);
+        if (result.allowed) return;
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(logActivity).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        "exit criteria met",
+        "anon request refused 401",
+        "failed closed on anon request, expected negative path confirmed",
+        "the scan failed closed on anonymous requests as expected",
+        "exit 0; exited 0; exit -0; exited +00; failed=0; scanned=12",
+        "preexit 2; failed=0; scanned=01; unREFUSED; non-cleanliness",
+      ])("accepts harmless trailing prose: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only" });
+      });
+
+      it.each([
+        "scanned=0, failed=4 because required check-run App token was unavailable",
+        "scan failed closed with exit 2 in all four repos due unavailable GH_CI_ONLY_TOKEN/GH_TOKEN",
+        "the scan failed closed on all 4 repos because GH_CI_ONLY_TOKEN and GH_TOKEN are unavailable",
+        "scan failed with exit 2 due to missing check-run App token",
+        "all four scans exited 2 because the CheckRun App token is unavailable",
+        "scan executed but failed closed (exit 2; scanned=0, failed=4, check-run App token unavailable)",
+        "exited 2 with check-run App token unavailable for all four repositories (scan failure recorded, not a clean scan)",
+      ])("refuses recurrence evidence: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.tier2Audit).toBeUndefined();
+      });
+
+      it("accepts a clean recurrence scan with separate REFUSED-vet lines", async () => {
+        const evidence = RECORD_ONLY_EVIDENCE.replace(
+          "the sweep consumption point served 42 fresh records",
+          "scanned=4 failed=0 matched=29 armed=0 exit 0",
+        );
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(),
+          `${tier2Line(evidence)}\n\nVet: REFUSED missing paperclip/approved; exit 1`,
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only", probeEvidence: evidence });
+      });
+    });
+
     // SUP-24299: "Liveness unverified." is the Tier 1 suffix. The record-only
     // matcher ends in a catch-all predicate, so it used to accept the suffix as
     // predicate text and the close landed as both live and unverified.
@@ -6992,30 +7140,35 @@ describe("evaluateDoneTierDeclaration", () => {
       if (!verdict.allowed) return;
       expect(verdict.closeComment).toContain("Closed at Tier 2 (live): record-only probe");
       expect(ghFetchMock).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
+      // SUP-23925: the tier close row is RETURNED for the caller's close
+      // transaction, not written here — a caller whose close later refused or
+      // lost the race can never leave an orphan close row behind.
+      expect(verdict.closeRowAudits).toHaveLength(1);
+      expect(verdict.closeRowAudits[0]).toMatchObject({
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: "issue-1",
+        details: {
+          identifier: "SUP-12345",
+          reason: expect.stringContaining("Tier 2 declaration found:"),
+          systemBackstopActor: "execution-control-reconciliation",
+          probeEvidence: RECORD_ONLY_EVIDENCE,
+          probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
+          probeTarget: "https://ops.example.com",
+          observed: "2026-11-04T09:15:00Z",
+          observedRangeEnd: null,
+          tierForm: "record-only",
+          probeHead: null,
+          mergeCommit: null,
+          // SUP-23490: the backstop door carries no run id, so the machine
+          // record says so instead of inventing a closing run.
+          closingRunId: null,
+          closingRunStartedAt: null,
+        },
+      });
+      expect(logActivity).not.toHaveBeenCalledWith(
         mockDb,
-        expect.objectContaining({
-          action: "issue.done_transition_tier2_close",
-          entityType: "issue",
-          entityId: "issue-1",
-          details: {
-            identifier: "SUP-12345",
-            reason: expect.stringContaining("Tier 2 declaration found:"),
-            systemBackstopActor: "execution-control-reconciliation",
-            probeEvidence: RECORD_ONLY_EVIDENCE,
-            probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
-            probeTarget: "https://ops.example.com",
-            observed: "2026-11-04T09:15:00Z",
-            observedRangeEnd: null,
-            tierForm: "record-only",
-            probeHead: null,
-            mergeCommit: null,
-            // SUP-23490: the backstop door carries no run id, so the machine
-            // record says so instead of inventing a closing run.
-            closingRunId: null,
-            closingRunStartedAt: null,
-          },
-        }),
+        expect.objectContaining({ action: "issue.done_transition_tier2_close" }),
       );
     });
 
@@ -7031,6 +7184,50 @@ describe("evaluateDoneTierDeclaration", () => {
       if (verdict.allowed) return;
       expect(verdict.code).toBe("done_transition_tier_conflict");
       expect(logActivity).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Tier 0 decision-only via accompanying comment", () => {
+    it("allows a non-empty decision-only declaration only when the decision-only override is active", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier0");
+    });
+
+    it("does not allow a Tier 0 declaration without the decision-only override", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    it("rejects Tier 1 evidence when the decision-only override requires Tier 0", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): There is nothing to land. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tier 0");
     });
   });
 
@@ -7180,6 +7377,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).toContain('issue.deliveryRequirement === "record_only"');
       expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
       expect(route).toContain("TIER2_RECORD_ONLY_FORM");
+      expect((route.match(/tier0Alternative/g) ?? []).length).toBeGreaterThanOrEqual(3);
+      expect(route).toContain('` or "Closed at Tier 0 (decision-only): <reason>"`');
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
@@ -9753,7 +9952,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(await reclassifiedRows(issueId)).toEqual([]);
   });
 
-  it("audits a record_only reclassification without a close, and leaves the later plain close unchanged", async () => {
+  it("audits a record_only reclassification without a close, and refuses the later plain close while landing debt remains", async () => {
     const { issueId, identifier } = await seedCard("repository_delivery");
 
     const flip = await request(app)
@@ -9772,17 +9971,21 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     const comments = await systemCommentsFor(issueId);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("Delivery requirement reclassified");
-    expect(comments[0]).toContain("from `repository_delivery` to `record_only` by user `cloud-user-1`");
+    expect(comments[0]).toContain("changed from `repository_delivery` to `record_only` by user `cloud-user-1`");
 
-    // The two-request path stays open: the later close takes the record-only skip.
+    // The two-request path is closed: the debt survives the relabel, no probe-able
+    // repository exists here, and the refusal names the exit.
     const close = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Close after the earlier reclassification." });
-    expect(close.status, JSON.stringify(close.body)).toBe(200);
-    expect(await storedCard(issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
+    expect(close.status, JSON.stringify(close.body)).toBe(409);
+    expect(close.body.code).toBe("done_transition_missing_delivery");
+    expect(close.body.details.remedy).toContain("probe-able repository and branch or a merged PR");
+    expect(close.body.details.remedy).toContain("cancel the issue");
+    expect((await storedCard(issueId)).status).not.toBe("done");
     const rows = activityFor(issueId);
-    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
-    expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+
     expect(await reclassifiedRows(issueId)).toHaveLength(1);
   });
 
@@ -9862,7 +10065,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(reclassified).toHaveLength(1);
     expect(reclassified[0]).toMatchObject({ landingCheckOwed: false });
     const comments = await systemCommentsFor(issueId);
-    expect(comments[0]).toContain("The issue was already closed");
+    expect(comments[0]).toContain("creates no new landing debt");
   });
 
   it("writes no reclassification audit when the stored value is already record_only or the requested value is not record_only", async () => {
