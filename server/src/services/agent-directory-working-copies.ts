@@ -43,6 +43,7 @@ async function workingCopyGid(parent: string): Promise<number> {
 
 async function workingCopyPermissions(filename: string, gid: number, recursive = true): Promise<void> {
   const stat = await fs.lstat(filename);
+  if (stat.isSymbolicLink()) return;
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
   if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
   // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.

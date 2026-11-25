@@ -160,6 +160,36 @@ describe("persistent agent directories", () => {
     }
   });
 
+  it("does not change external targets of symlinks encountered while staging permissions", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "agent-copy-outside-"));
+    const filename = path.join(outside, "private.md");
+    await fs.writeFile(filename, "outside", { mode: 0o600 });
+    const beforeDirectory = await fs.stat(outside);
+    const beforeFile = await fs.stat(filename);
+    const cp = fs.cp.bind(fs);
+    const copyWithLinks = vi.spyOn(fs, "cp").mockImplementationOnce(async (...args: Parameters<typeof fs.cp>) => {
+      await cp(...args);
+      // Inject links after canonical validation, at the permission pass boundary.
+      await fs.symlink(outside, path.join(String(args[1]), "external-directory"));
+      await fs.symlink(filename, path.join(String(args[1]), "external-file"));
+    });
+    try {
+      const copy = await run();
+      expect((await fs.lstat(path.join(copy.localRoot, "external-directory"))).isSymbolicLink()).toBe(true);
+      expect((await fs.lstat(path.join(copy.localRoot, "external-file"))).isSymbolicLink()).toBe(true);
+      const afterDirectory = await fs.stat(outside);
+      const afterFile = await fs.stat(filename);
+      expect(afterDirectory.mode).toBe(beforeDirectory.mode);
+      expect(afterDirectory.gid).toBe(beforeDirectory.gid);
+      expect(afterFile.mode).toBe(beforeFile.mode);
+      expect(afterFile.gid).toBe(beforeFile.gid);
+      expect(await fs.readFile(filename, "utf8")).toBe("outside");
+    } finally {
+      copyWithLinks.mockRestore();
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
   async function sparseFile(filename: string, size: number) {
     const handle = await fs.open(filename, "w");
     try { await handle.truncate(size); } finally { await handle.close(); }
