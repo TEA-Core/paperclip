@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -877,6 +877,10 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     const decision = await toolAccessPolicyService(db).decide(input);
     const first = await toolAccessPolicyService(db).recordInvocation(input, decision);
+    // Until the first call has an outcome, a retry is told it is in progress.
+    await expect(toolAccessPolicyService(db).recordInvocation(input, decision))
+      .rejects.toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_in_progress" } });
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
     const replay = await toolAccessPolicyService(db).recordInvocation(input, decision);
 
     expect(first.replayed).toBe(false);
@@ -908,12 +912,199 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     const decision = await toolAccessPolicyService(db).decide(input);
     const first = await toolAccessPolicyService(db).recordInvocation(input, decision);
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
     const replay = await toolAccessPolicyService(db).recordInvocation(input, decision);
 
     expect(first.replayed).toBe(false);
     expect(first.invocation.idempotencyKey).toMatch(/^side_effect:/);
     expect(replay.replayed).toBe(true);
     expect(replay.invocation.id).toBe(first.invocation.id);
+  });
+
+  it("isolates both principals' outcomes when the shared legacy key forces both callers onto v2 keys", async () => {
+    const company = await createCompany(db);
+    const { connection } = await createTool(db, company.id);
+    const legacyOwner = await createAgent(db, company.id);
+    const callers = [await createAgent(db, company.id), await createAgent(db, company.id)];
+    const inputFor = (agentId: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agentId, agentId },
+      request: { connectionId: connection.id, toolName: "send_email", arguments: { to: "ops@example.com", body: "same" }, sideEffecting: true },
+    });
+    const svc = toolAccessPolicyService(db);
+    for (const agent of [legacyOwner, ...callers]) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "agent", principalId: agent.id,
+        permissionKey: "tools:use", scope: { toolName: "send_email" },
+      });
+    }
+    // A third principal occupies the shared legacy slot. Both target callers
+    // have the same (empty) run context and must reserve their own v2 slot.
+    const seed = inputFor(legacyOwner.id);
+    const legacy = await svc.recordInvocation(seed, await svc.decide(seed));
+    expect(legacy.invocation.idempotencyKey).toMatch(/^side_effect:(?!v2:)/);
+    const recorded = [];
+    for (const agent of callers) {
+      const input = inputFor(agent.id);
+      const call = await svc.recordInvocation(input, await svc.decide(input));
+      expect(call.replayed).toBe(false);
+      expect(call.invocation.idempotencyKey).toMatch(/^side_effect:v2:/);
+      await db.update(toolInvocations).set({
+        status: "succeeded", completedAt: new Date(), resultSummary: { summary: agent.id },
+      }).where(eq(toolInvocations.id, call.invocation.id));
+      recorded.push(call);
+    }
+    expect(recorded[0]!.invocation.idempotencyKey).not.toBe(recorded[1]!.invocation.idempotencyKey);
+    for (const [index, agent] of callers.entries()) {
+      const input = inputFor(agent.id);
+      const replay = await svc.recordInvocation(input, await svc.decide(input));
+      expect(replay.replayed).toBe(true);
+      expect(replay.invocation.id).toBe(recorded[index]!.invocation.id);
+      expect(replay.invocation.resultSummary).toEqual({ summary: agent.id });
+    }
+  });
+
+  it.each([
+    ["canonical", (id: string) => id],
+    ["uppercase", (id: string) => id.toUpperCase()],
+    ["hyphen-less", (id: string) => id.replaceAll("-", "")],
+    ["braces", (id: string) => `{${id}}`],
+    ["urn", (id: string) => `urn:uuid:${id}`],
+    ["mixed", (id: string) => `URN:UUID:{${id.replaceAll("-", "").toUpperCase()}}`],
+    ["four-digit groups", (id: string) => id.replaceAll("-", "").match(/.{4}/g)!.join("-")],
+  ] as const)("records one derived invocation for %s run UUID spelling", async (_name, spell) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const run = await createRun(db, company.id, agent.id);
+    const { connection } = await createTool(db, company.id);
+    const svc = toolAccessPolicyService(db);
+    const inputFor = (runId: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      runContext: { heartbeatRunId: runId },
+      request: { connectionId: connection.id, toolName: "send_email", arguments: { body: "same" }, sideEffecting: true },
+    });
+    const input = inputFor(run.id);
+    const first = await svc.recordInvocation(input, await svc.decide(input));
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
+    const alternate = inputFor(spell(run.id));
+    const replay = await svc.recordInvocation(alternate, await svc.decide(alternate));
+    expect(replay.replayed).toBe(true);
+    expect(replay.invocation.id).toBe(first.invocation.id);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it("ignores another principal's earlier-build row under the shared legacy key", async () => {
+    const company = await createCompany(db);
+    const { connection } = await createTool(db, company.id);
+    const [owner, other] = [await createAgent(db, company.id), await createAgent(db, company.id)];
+    const inputFor = (agentId: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agentId, agentId },
+      request: { connectionId: connection.id, toolName: "send_email", arguments: { to: "ops@example.com", body: "same" }, sideEffecting: true },
+    });
+    for (const agent of [owner, other]) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent.id,
+        permissionKey: "tools:use",
+        scope: { toolName: "send_email" },
+      });
+    }
+    const ownerInput = inputFor(owner.id);
+    const recorded = await toolAccessPolicyService(db).recordInvocation(ownerInput, await toolAccessPolicyService(db).decide(ownerInput));
+    const row = recorded.invocation;
+    // Rewrite the owner's row as an earlier build recorded it: the unversioned
+    // key, which names no principal (no run or issue here either).
+    const canonical = (value: Record<string, unknown>) =>
+      `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${JSON.stringify(value[key])}`).join(",")}}`;
+    const legacyKey = `side_effect:${createHash("sha256").update(canonical({
+      companyId: row.companyId,
+      runId: row.runId,
+      issueId: row.issueId,
+      applicationId: row.applicationId,
+      connectionId: row.connectionId,
+      catalogEntryId: row.catalogEntryId,
+      toolName: row.toolName,
+      argumentsHash: row.argumentsHash,
+    })).digest("hex")}`;
+    await db.update(toolInvocations).set({ idempotencyKey: legacyKey, argumentsSummary: null }).where(eq(toolInvocations.id, row.id));
+
+    const otherInput = inputFor(other.id);
+    const otherCall = await toolAccessPolicyService(db).recordInvocation(otherInput, await toolAccessPolicyService(db).decide(otherInput));
+
+    expect(otherCall.replayed).toBe(false);
+    expect(otherCall.invocation.id).not.toBe(row.id);
+    // The owner's own retry still meets its earlier-build row: refused, not run.
+    await expect(toolAccessPolicyService(db).recordInvocation(ownerInput, await toolAccessPolicyService(db).decide(ownerInput)))
+      .rejects.toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_replay_ambiguous" } });
+  });
+
+  it("records concurrent distinct full arguments that share one legacy key, then replays each own outcome", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection } = await createTool(db, company.id);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id, principalType: "agent", principalId: agent.id,
+      permissionKey: "tools:use", scope: { toolName: "send_email" },
+    });
+    let arrivals = 0;
+    let release!: () => void;
+    const bothArrived = new Promise<void>((resolve) => { release = resolve; });
+    type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+    const wrap = (target: typeof db): typeof db => new Proxy(target, {
+      get(target, prop) {
+        if (prop === "transaction") {
+          return (callback: (tx: Transaction) => Promise<unknown>) => target.transaction(
+            (tx) => callback(wrap(tx as unknown as typeof db) as unknown as Transaction),
+          );
+        }
+        if (prop === "insert") {
+          return (table: Parameters<typeof target.insert>[0]) => {
+            const builder = target.insert(table);
+            if (table !== toolInvocations) return builder;
+            return {
+              values: (values: Parameters<typeof builder.values>[0]) => {
+                const insert = builder.values(values);
+                return {
+                  onConflictDoNothing: (config: Parameters<typeof insert.onConflictDoNothing>[0]) => ({
+                    returning: async () => {
+                      arrivals += 1;
+                      if (arrivals === 2) release();
+                      await bothArrived;
+                      return insert.onConflictDoNothing(config).returning();
+                    },
+                  }),
+                };
+              },
+            };
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const inputs = ["first", "second"].map((tail) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connection.id, toolName: "send_email", sideEffecting: true,
+        arguments: { body: `${"x".repeat(600)}${tail}` },
+      },
+    }));
+    const svc = toolAccessPolicyService(wrap(db));
+    const decisions = await Promise.all(inputs.map((input) => svc.decide(input)));
+    const recorded = await Promise.all(inputs.map((input, index) => svc.recordInvocation(input, decisions[index]!)));
+    expect(recorded.map((entry) => entry.replayed)).toEqual([false, false]);
+    expect(recorded[0]!.invocation.id).not.toBe(recorded[1]!.invocation.id);
+    for (const [index, entry] of recorded.entries()) {
+      await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() })
+        .where(eq(toolInvocations.id, entry.invocation.id));
+      const replay = await svc.recordInvocation(inputs[index]!, decisions[index]!);
+      expect(replay.replayed).toBe(true);
+      expect(replay.invocation.id).toBe(entry.invocation.id);
+    }
   });
 
   it("enforces rate-limit policies before explicit grants", async () => {
@@ -1335,6 +1526,52 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(trustConfig.trustRule?.lastHitAt).toEqual(expect.any(String));
     expect(trustEvents.some((event) => event.eventType === "trust_rule_created")).toBe(true);
     expect(trustEvents.some((event) => event.eventType === "trust_rule_used")).toBe(true);
+  });
+
+  it("matches pinned trust-rule hashes on the full arguments and never on the pre-upgrade truncated hash", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review send_email",
+      policyType: "require_approval",
+      selectors: { toolName: "send_email" },
+      priority: 10,
+    });
+    const hashOf = (value: Record<string, string>) =>
+      createHash("sha256").update(`{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${JSON.stringify(value[key])}`).join(",")}}`).digest("hex");
+    const longArgs = { to: "ops@example.com", body: `release notes ${"y".repeat(900)}` };
+    const shortArgs = { to: "ops@example.com", body: "ship it" };
+    // Earlier builds hashed display-truncated arguments: strings over 500
+    // characters were cut before hashing, so long calls shared one hash.
+    const legacyLongHash = hashOf({ ...longArgs, body: `${longArgs.body.slice(0, 500)}...[truncated]` });
+    const [rule] = await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Pinned remembered sends",
+      policyType: "trust_rule",
+      selectors: { toolName: "send_email" },
+      priority: 1,
+      config: { trustRule: { argumentFilters: { allowedHashes: [legacyLongHash, hashOf(shortArgs)] } } },
+    }).returning();
+    const decide = (argumentsValue: Record<string, string>) => toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "send_email", arguments: argumentsValue },
+    });
+
+    // A hash pinned before the upgrade fails closed for long arguments: the
+    // call falls back to review instead of matching a truncated prefix.
+    await expect(decide(longArgs)).resolves.toMatchObject({ allowed: false, decision: "require_approval" });
+    await expect(decide({ ...longArgs, body: `${longArgs.body} different tail` })).resolves.toMatchObject({ decision: "require_approval" });
+    // Short arguments hash identically before and after the upgrade.
+    await expect(decide(shortArgs)).resolves.toMatchObject({ allowed: true, reasonCode: "allow_trust_rule", matchedPolicyIds: [rule!.id] });
+
+    await db.update(toolPolicies).set({
+      config: { trustRule: { argumentFilters: { exactHash: hashOf(longArgs) } } },
+    }).where(eq(toolPolicies.id, rule!.id));
+    await expect(decide(longArgs)).resolves.toMatchObject({ allowed: true, reasonCode: "allow_trust_rule" });
+    await expect(decide({ ...longArgs, body: `${longArgs.body} different tail` })).resolves.toMatchObject({ decision: "require_approval" });
   });
 
   it("does not count approved actions outside the final trust-rule agent scope", async () => {

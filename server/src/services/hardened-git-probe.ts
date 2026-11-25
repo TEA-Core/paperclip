@@ -159,7 +159,7 @@ function inheritedGitEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * One wall-clock budget shared by every Git process and file copy of a
+ * One monotonic budget shared by every Git process and file copy of a
  * check: each step gets only the time left, and `expired` records that the
  * budget ran out (rather than a step failing for another reason).
  */
@@ -169,12 +169,12 @@ export interface ProbeDeadline {
 }
 
 function remainingBudget(deadline: ProbeDeadline): number {
-  const remaining = deadline.at - Date.now();
+  const remaining = deadline.at - performance.now();
   if (remaining <= 0) {
     deadline.expired = true;
     throw new HardenedGitError("timeout", "the shared deadline passed");
   }
-  return remaining;
+  return Math.ceil(remaining); // AbortSignal.timeout requires whole milliseconds.
 }
 
 export interface HardenedGitOptions {
@@ -1101,7 +1101,7 @@ export async function recheckRecordedWorktree(input: {
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
   const budgetMs = input.budgetMs ?? IN_TRANSACTION_RECHECK_BUDGET_MS;
-  const deadline: ProbeDeadline = { at: Date.now() + budgetMs, expired: false };
+  const deadline: ProbeDeadline = { at: performance.now() + budgetMs, expired: false };
   const repoRoot = path.dirname(input.commonDir);
   const options: HardenedGitOptions = { cwd: repoRoot, deadline };
   const timedOut = {
@@ -1286,7 +1286,7 @@ async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): P
 function refStoreDeadlinePassed(options: HardenedGitOptions): boolean {
   const deadline = options.deadline;
   if (!deadline) return false;
-  if (Date.now() <= deadline.at) return false;
+  if (performance.now() <= deadline.at) return false;
   deadline.expired = true;
   return true;
 }
@@ -1387,14 +1387,14 @@ export async function localRefOutsideRemoteBaseRefusal(
   repoRoot: string,
   remoteBaseSha: string,
   issueIdentifier: string,
-  deadlineAt = Date.now() + 15_000,
+  deadlineAt = performance.now() + 15_000,
 ): Promise<string | null> {
   if (!SHA_RE.test(remoteBaseSha)) return "the remote base commit could not be read";
   const options: HardenedGitOptions = { cwd: repoRoot, deadline: { at: deadlineAt, expired: false } };
   const refs = await readSiblingRefs(repoRoot, options);
   const seen = new Set<string>();
   for (const ref of refs) {
-    if (Date.now() > deadlineAt) return "the local refs could not be compared with the remote base within the deadline";
+    if (performance.now() > deadlineAt) return "the local refs could not be compared with the remote base within the deadline";
     void issueIdentifier;
     if (!SHA_RE.test(ref.sha) || ref.sha === remoteBaseSha || seen.has(ref.sha)) continue;
     seen.add(ref.sha);

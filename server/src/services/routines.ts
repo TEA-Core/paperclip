@@ -2027,7 +2027,7 @@ export function routineService(
       trigger: typeof routineTriggers.$inferSelect | null;
       source: "schedule" | "manual" | "api" | "webhook";
       actor?: Actor;
-      issue: { id: string; title: string; identifier: string | null; status: string; parentId: string | null; projectId: string | null; originKind: string | null; originId: string | null; responsibleUserId: string | null };
+      issue: { id: string; title: string; identifier: string | null; status: string; parentId: string | null; projectId: string | null; projectWorkspaceId: string | null; description: string | null; originKind: string | null; originId: string | null; responsibleUserId: string | null };
       routineRunId: string;
     },
     publications: ActivityPublication[],
@@ -2102,6 +2102,9 @@ export function routineService(
           details: {
             title: input.issue.title,
             identifier: input.issue.identifier,
+            projectId: input.issue.projectId ?? null,
+            projectWorkspaceId: input.issue.projectWorkspaceId ?? null,
+            description: input.issue.description ?? null,
             status: input.issue.status,
             ...routineReference,
           },

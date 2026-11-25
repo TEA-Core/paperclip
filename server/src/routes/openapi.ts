@@ -182,6 +182,8 @@ import {
   // Issue tree
   createIssueTreeHoldSchema,
   previewIssueTreeControlSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
   releaseIssueTreeHoldSchema,
   // Issue interactions
   createIssueThreadInteractionSchema,
@@ -1721,6 +1723,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/tree-control/state",
   "GET /api/issues/{id}/tree-holds",
   "GET /api/issues/{id}/tree-holds/{holdId}",
+  "GET /api/issues/{id}/recovery-carrier-park/candidate",
+  "POST /api/issues/{id}/recovery-carrier-park",
+  "POST /api/issues/{id}/recovery-carrier-park/{holdId}/release",
   "POST /api/issues/{id}/tree-control/preview",
   "POST /api/issues/{id}/tree-holds",
   "POST /api/issues/{id}/tree-holds/{holdId}/release",
@@ -4413,7 +4418,7 @@ registry.registerPath({
         .optional()
         .nullable()
         .describe(
-          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, or `control-plane-operation-no-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
+          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, `control-plane-operation-no-deliverable`, or `decision-only-no-repository-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). The decision-only disposition requires `Closed at Tier 0 (decision-only): <reason>` in the close comment. A no-deliverable-head override does not clear a review-ladder refusal.",
         ),
       deliveryIdentity: z
         .object({
@@ -8593,6 +8598,39 @@ registry.registerPath({
   summary: "Get issue tree control state",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/recovery-carrier-park/candidate",
+  tags: ["issues"],
+  summary: "Get recovery carrier park candidate",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park",
+  tags: ["issues"],
+  summary: "Park a recovery carrier by board decision",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(parkRecoveryCarrierSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park/{holdId}/release",
+  tags: ["issues"],
+  summary: "Release a board-parked recovery carrier",
+  request: {
+    params: z.object({ id: z.string(), holdId: z.string() }),
+    body: jsonBody(releaseRecoveryCarrierParkSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({

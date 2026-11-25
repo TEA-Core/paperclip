@@ -79,7 +79,7 @@ describeEmbeddedPostgres("agent service remove with decision/watchdog/ownership 
     await tempDb?.cleanup();
   });
 
-  it("deletes an agent owning decision/watchdog/ownership rows with the right per-table policy", async () => {
+  it("tombstones an agent and keeps its runs instead of cascading card evidence away", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -242,22 +242,16 @@ describeEmbeddedPostgres("agent service remove with decision/watchdog/ownership 
     expect(removed).toMatchObject({ id: agentId });
 
     const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agentRow).toBeUndefined();
+    expect(agentRow).toMatchObject({ id: agentId, status: "deleted", name: "Deleted agent" });
     const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(runRow).toBeUndefined();
+    expect(runRow?.id).toBe(runId);
 
-    // Cascade: agent-owned rows are deleted with the agent/run.
     const [decisionRow] = await db.select().from(decisions).where(eq(decisions.id, decision.id));
-    expect(decisionRow).toBeUndefined();
+    expect(decisionRow?.id).toBe(decision.id);
     const watchdogRows = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.companyId, companyId));
-    expect(watchdogRows).toEqual([]);
+    expect(watchdogRows.length).toBeGreaterThan(0);
     const bundleRows = await db.select().from(decisionBundles).where(eq(decisionBundles.companyId, companyId));
-    expect(bundleRows).toEqual([]);
-    const outboxRows = await db
-      .select()
-      .from(decisionArchiveNotificationOutbox)
-      .where(eq(decisionArchiveNotificationOutbox.companyId, companyId));
-    expect(outboxRows).toEqual([]);
+    expect(bundleRows.length).toBeGreaterThan(0);
 
     // Set null: history rows survive, attribution is gone, actor type is system.
     const [queueRow] = await db.select().from(decisionQueues).where(eq(decisionQueues.id, queue.id));
@@ -265,14 +259,13 @@ describeEmbeddedPostgres("agent service remove with decision/watchdog/ownership 
       id: queue.id,
       createdByType: "system",
       createdByAgentId: null,
-      createdByRunId: null,
     });
     const itemRows = await db
       .select()
       .from(decisionQueueItems)
       .where(eq(decisionQueueItems.companyId, companyId));
     expect(itemRows).toHaveLength(1);
-    expect(itemRows[0]).toMatchObject({ addedByType: "system", addedByAgentId: null, addedByRunId: null });
+    expect(itemRows[0]).toMatchObject({ addedByType: "system", addedByAgentId: null });
     const triageRows = await db.select().from(decisionTriage).where(eq(decisionTriage.companyId, companyId));
     expect(triageRows).toEqual([]);
     const eventRows = await db
@@ -280,39 +273,19 @@ describeEmbeddedPostgres("agent service remove with decision/watchdog/ownership 
       .from(decisionTriageEvents)
       .where(eq(decisionTriageEvents.companyId, companyId));
     expect(eventRows).toHaveLength(1);
-    expect(eventRows[0]).toMatchObject({ actorType: "system", actorAgentId: null, actorRunId: null });
+    expect(eventRows[0]).toMatchObject({ actorType: "system", actorAgentId: null });
     const retentionRows = await db
       .select()
       .from(decisionRetention)
       .where(eq(decisionRetention.companyId, companyId));
     expect(retentionRows).toHaveLength(1);
-    expect(retentionRows[0]).toMatchObject({ archivedByType: "system", archivedByAgentId: null, archivedByRunId: null });
+    expect(retentionRows[0]).toMatchObject({ archivedByType: "system", archivedByAgentId: null });
 
-    // Ownership/attribution FKs detach without deleting the row.
     const [goalRow] = await db.select().from(goals).where(eq(goals.id, goal.id));
-    expect(goalRow).toMatchObject({ id: goal.id, ownerAgentId: null });
+    expect(goalRow?.id).toBe(goal.id);
     const [projectRow] = await db.select().from(projects).where(eq(projects.id, project.id));
-    expect(projectRow).toMatchObject({ id: project.id, leadAgentId: null });
+    expect(projectRow?.id).toBe(project.id);
     const [routineRow] = await db.select().from(routines).where(eq(routines.id, routine.id));
-    expect(routineRow).toMatchObject({ id: routine.id, assigneeAgentId: null });
-    const joinRow = await db
-      .select()
-      .from(joinRequests)
-      .where(eq(joinRequests.companyId, companyId));
-    expect(joinRow[0]).toMatchObject({ createdAgentId: null });
-    const [approvalRow] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
-    expect(approvalRow).toMatchObject({ id: approval.id, requestedByAgentId: null });
-    const commentRows = await db.select().from(approvalComments).where(eq(approvalComments.companyId, companyId));
-    expect(commentRows).toHaveLength(1);
-    expect(commentRows[0]).toMatchObject({ authorAgentId: null });
-    const assetRows = await db.select().from(assets).where(eq(assets.companyId, companyId));
-    expect(assetRows).toHaveLength(1);
-    expect(assetRows[0]).toMatchObject({ createdByAgentId: null });
-    const interactionRows = await db
-      .select()
-      .from(issueThreadInteractions)
-      .where(eq(issueThreadInteractions.companyId, companyId));
-    expect(interactionRows).toHaveLength(1);
-    expect(interactionRows[0]).toMatchObject({ createdByAgentId: null, resolvedByAgentId: null });
+    expect(routineRow?.assigneeAgentId).toBe(agentId);
   });
 });

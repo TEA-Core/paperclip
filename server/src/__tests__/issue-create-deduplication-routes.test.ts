@@ -290,7 +290,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(recreatedClosed.body.id).not.toBe(closedIssueId);
   });
 
-  it("stores the request run header on manual creates", async () => {
+  it("does not store an unauthenticated run header as the origin run on manual creates", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);
     const app = createApp();
@@ -322,6 +322,8 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     const [created] = await db.select().from(issues).where(eq(issues.id, response.body.id));
 
     expect(created.originKind).toBe("manual");
-    expect(created.originRunId).toBe(runId);
+    // originRunId is ownership proof: a local_trusted (board) request can only
+    // claim a run through an unauthenticated header, so it is not stored.
+    expect(created.originRunId).toBeNull();
   });
 });

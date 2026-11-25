@@ -204,7 +204,7 @@ function declaration(head: string = headSha()) {
 
 // The status PATCH is the one door that re-checks a zero-delta measurement inside its write.
 async function close(issue: Parameters<typeof evaluateDoneTierDeclaration>[1] = card(), comment = declaration()) {
-  return evaluateDoneTierDeclaration(db, issue, comment, null, async () => [], null, null, true);
+  return evaluateDoneTierDeclaration(db, issue, comment, null, async () => [], null, null, { zeroDeltaRecheckedAtWrite: true });
 }
 
 const UNRECORDED =
