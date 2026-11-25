@@ -263,10 +263,14 @@ export function resolveBootEnvPlan(input: { cwd: string }): Readonly<BootEnvPlan
     stateDir = path.dirname(configPath);
   }
   const sources: Array<{ kind: EnvSourceKind; path: string }> = [{ kind: "own", path: path.join(stateDir, ".env") }];
+  const ownEntries = stateDir === localState ? localEntries : peekEntries(sources[0].path);
+  // An own-file opt-out may remove a source, never add one to the frozen plan.
+  const disableCwdEnv = snapshot.PAPERCLIP_DISABLE_CWD_ENV_FILE === "true" ||
+    ownEntries?.PAPERCLIP_DISABLE_CWD_ENV_FILE === "true";
   const cwdEnv = path.join(cwd, ".env");
   if (mode === "instance" && evidence.length > 0) {
     console.warn(`Skipping cwd env file ${cwdEnv}: worktree evidence is present`);
-  } else if (mode === "instance" && snapshot.PAPERCLIP_DISABLE_CWD_ENV_FILE !== "true" && !sameFile(cwdEnv, sources[0].path)) {
+  } else if (mode === "instance" && !disableCwdEnv && !sameFile(cwdEnv, sources[0].path)) {
     sources.push({ kind: "cwd", path: cwdEnv });
   }
   current.plan = Object.freeze({
@@ -358,7 +362,7 @@ export function loadBootEnv(input: { cwd: string }): {
 const IDENTITY_KEYS: Record<string, true> = {
   PAPERCLIP_HOME: true, PAPERCLIP_INSTANCE_ID: true, PAPERCLIP_WORKTREE_NAME: true,
   PAPERCLIP_WORKTREES_DIR: true,
-  PAPERCLIP_CONFIG: true, PAPERCLIP_CONTEXT: true, PAPERCLIP_IN_WORKTREE: true, PAPERCLIP_DB_BACKUP_ENABLED: true,
+  PAPERCLIP_CONFIG: true, PAPERCLIP_CONTEXT: true, PAPERCLIP_IN_WORKTREE: true,
 };
 const WORKTREE_FILE_ALLOWED: Record<string, true> = {
   PAPERCLIP_SECRETS_MASTER_KEY: true, PAPERCLIP_AGENT_JWT_SECRET: true, BETTER_AUTH_SECRET: true,

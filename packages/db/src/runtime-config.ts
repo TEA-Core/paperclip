@@ -5,7 +5,7 @@ import {
   resolveDefaultEmbeddedPostgresDir,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
-import { currentBootEnvPlan, readEnvFileVetted, resolveBootEnvPlan } from "@paperclipai/shared/boot-env";
+import { captureOperatorEnv, currentBootEnvPlan, readEnvFileVetted, resolveBootEnvPlan } from "@paperclipai/shared/boot-env";
 
 type PartialConfig = {
   database?: {
@@ -141,6 +141,7 @@ function readConfig(configPath: string): PartialConfig | null {
 }
 
 export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
+  captureOperatorEnv();
   const configPath = resolvePaperclipConfigPath();
   const envPath = resolvePaperclipEnvPath(configPath);
   const vettedEntries = vettedEnvEntries(envPath);

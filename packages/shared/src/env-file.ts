@@ -498,10 +498,7 @@ export function writeEnvFileAtomicallyIfChanged(
   previousContents: string | null,
   nextContents: string,
 ): boolean {
-  if (previousContents === nextContents) return false;
-
   const directory = path.dirname(filePath);
-  fs.mkdirSync(directory, { recursive: true });
 
   // Remove temp orphans left by a writer process that is no longer alive
   // (a SIGKILL between temp write and rename). A live writer's temp, and
@@ -528,6 +525,8 @@ export function writeEnvFileAtomicallyIfChanged(
   } catch {
     // Cleanup is best-effort and never blocks the write itself.
   }
+  if (previousContents === nextContents) return false;
+  fs.mkdirSync(directory, { recursive: true });
 
   const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
 

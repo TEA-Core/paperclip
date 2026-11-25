@@ -67,6 +67,7 @@ function redactConnectionString(raw: string): string {
 
 function resolveAgentJwtSecretStatus(
   envFilePath: string,
+  refusals: ReturnType<typeof bootEnvReport>["refusals"],
 ): {
   status: "pass" | "warn";
   message: string;
@@ -79,7 +80,7 @@ function resolveAgentJwtSecretStatus(
     };
   }
 
-  if (bootEnvReport().refusals.some((refusal) => refusal.path === envFilePath)) {
+  if (refusals.some((refusal) => refusal.path === envFilePath)) {
     return { status: "warn", message: `env file refused: ${envFilePath}` };
   }
 
@@ -96,7 +97,8 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const uiUrl = opts.uiMode === "none" ? "disabled" : baseUrl;
   const configPath = resolvePaperclipConfigPath();
   const envFilePath = resolvePaperclipEnvPath();
-  const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath);
+  const refusals = bootEnvReport().refusals;
+  const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath, refusals);
 
   const dbMode =
     opts.db.mode === "embedded-postgres"
@@ -154,6 +156,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
         ? color(agentJwtSecret.message, "green")
         : color(agentJwtSecret.message, "yellow"),
     ),
+    refusals.length > 0
+      ? row("Env files", color(`refused: ${refusals.map(({ path, kind }) => `${path} (${kind})`).join("; ")}`, "yellow"))
+      : null,
     row("Heartbeat", heartbeat),
     row("DB Backup", dbBackup),
     row("Backup Dir", opts.databaseBackupDir),

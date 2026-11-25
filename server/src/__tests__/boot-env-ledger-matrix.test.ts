@@ -789,4 +789,150 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     expect(booted.loadConfig().databaseUrl).toBeUndefined();
     expect(fs.readFileSync(envPath, "utf8")).toBe("ZZ_PLAIN=declined\n");
   });
+  it("reenters a worktree with its documented shell exports", async () => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      const exports = {
+        PAPERCLIP_HOME: fixture.isolatedHome,
+        PAPERCLIP_INSTANCE_ID: fixture.worktreeName,
+        PAPERCLIP_CONFIG: fixture.configPath,
+        PAPERCLIP_CONTEXT: path.join(fixture.isolatedHome, "context.json"),
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_WORKTREE_NAME: fixture.worktreeName,
+      };
+      fs.writeFileSync(fixture.ownEnvPath, envFileContents(exports));
+      Object.assign(process.env, exports);
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+        path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
+      );
+      expect(bootEnvReport().refusals).toEqual([]);
+      expect(process.env.PAPERCLIP_HOME).toBe(fixture.isolatedHome);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an operator-selected worktree instance ID", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: "PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_INSTANCE_ID=previous-id\n",
+    });
+    try {
+      operatorWorktreeLayout(fixture);
+      process.env.PAPERCLIP_INSTANCE_ID = "nightly_demo";
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("nightly_demo");
+      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+        path.join(fixture.isolatedHome, "instances", "nightly_demo", "db"),
+      );
+      expect(operatorEnvValue("PAPERCLIP_INSTANCE_ID")).toBe("nightly_demo");
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an underscore in a valid own-file instance ID", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: "PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_INSTANCE_ID=nightly_demo\nPAPERCLIP_WORKTREE_NAME=feature-one\n",
+    });
+    try {
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+        path.join(fixture.isolatedHome, "instances", "nightly_demo", "db"),
+      );
+      expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("nightly_demo");
+      expect(bootEnvReport().refusals).toEqual([]);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")(
+    "boots isolated when the worktree parent is searchable but not listable",
+    async () => {
+      const fixture = await makeWorktreeFixture({});
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      fs.chmodSync(fixture.repoRoot, 0o100);
+      try {
+        const booted = await bootServerModules();
+        const dataDir = booted.loadConfig().embeddedPostgresDataDir!;
+        expect(path.relative(fixture.isolatedHome, dataDir).startsWith("..")).toBe(false);
+        expect(dataDir).not.toBe(path.join(fixture.root, "shared-main", "db"));
+        expect(process.env.PAPERCLIP_IN_WORKTREE).toBe("true");
+      } finally {
+        fs.chmodSync(fixture.repoRoot, 0o700);
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("honours the ordinary-instance own-file database backup opt-out", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: "PAPERCLIP_DB_BACKUP_ENABLED=false\n",
+    });
+    try {
+      process.env.PAPERCLIP_CONFIG = fixture.configPath;
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(currentBootEnvPlan()?.mode).toBe("instance");
+      expect(booted.loadConfig().databaseBackupEnabled).toBe(false);
+      expect(bootEnvOrigin("PAPERCLIP_DB_BACKUP_ENABLED")).toBe("own");
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("honours the ordinary-instance own-file cwd-env opt-out", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: "PAPERCLIP_DISABLE_CWD_ENV_FILE=true\n",
+    });
+    try {
+      fs.writeFileSync(path.join(fixture.worktreeRoot, ".env"), "ZZ_CWD_DISABLED=loaded\n");
+      process.env.PAPERCLIP_CONFIG = fixture.configPath;
+      process.chdir(fixture.worktreeRoot);
+      await bootServerModules();
+      expect(currentBootEnvPlan()?.mode).toBe("instance");
+      expect(process.env.ZZ_CWD_DISABLED).toBeUndefined();
+      expect(currentBootEnvPlan()?.sources).toEqual([{ kind: "own", path: fixture.ownEnvPath }]);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+  it("cleans a dead env-writer orphan on an otherwise unchanged repair boot", async () => {
+    const fixture = await makeWorktreeFixture({
+      ownEnvContents: "PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_TOOL_ACTION_SIGNING_SECRET=fixture-signing-key\n",
+    });
+    try {
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      await bootServerModules();
+      const before = fs.readFileSync(fixture.ownEnvPath, "utf8");
+      const inode = fs.statSync(fixture.ownEnvPath).ino;
+      const orphan = path.join(fixture.stateDir, "..env.424242.dead.tmp");
+      fs.writeFileSync(orphan, "partial fixture\n");
+      vi.spyOn(process, "kill").mockImplementation((pid) => {
+        if (pid === 424242) throw Object.assign(new Error("dead fixture writer"), { code: "ESRCH" });
+        return true;
+      });
+      await bootServerModules();
+      expect(fs.existsSync(orphan)).toBe(false);
+      expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(before);
+      expect(fs.statSync(fixture.ownEnvPath).ino).toBe(inode);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
 });

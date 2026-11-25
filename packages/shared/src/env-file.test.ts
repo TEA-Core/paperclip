@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parse as parseDotenv } from "dotenv";
 import { encodeEnvValue, updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "./env-file.js";
 
@@ -510,6 +510,31 @@ describe("env file editor", () => {
 
     expect(fs.existsSync(deadOrphan)).toBe(false);
     expect(fs.existsSync(liveOrphan)).toBe(true);
+  });
+
+  it("cleans a dead writer's orphan on a no-op without replacing the env file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-env-noop-orphan-"));
+    const filePath = path.join(dir, ".env");
+    const deadOrphan = path.join(dir, "..env.424242.dead.tmp");
+    const liveOrphan = path.join(dir, `..env.${process.pid}.live.tmp`);
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid === 424242) throw Object.assign(new Error("dead fixture writer"), { code: "ESRCH" });
+      return true;
+    });
+    try {
+      fs.writeFileSync(filePath, "KEY=current\n");
+      fs.writeFileSync(deadOrphan, "partial\n");
+      fs.writeFileSync(liveOrphan, "partial\n");
+      const before = fs.statSync(filePath);
+      expect(writeEnvFileAtomicallyIfChanged(filePath, "KEY=current\n", "KEY=current\n")).toBe(false);
+      expect(fs.existsSync(deadOrphan)).toBe(false);
+      expect(fs.readFileSync(liveOrphan, "utf8")).toBe("partial\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("KEY=current\n");
+      expect(fs.statSync(filePath)).toMatchObject({ ino: before.ino, mtimeMs: before.mtimeMs });
+    } finally {
+      kill.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("keeps a trailing comment when a backslash escapes the comment marker (SUP-24365)", () => {

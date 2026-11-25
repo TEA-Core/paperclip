@@ -186,7 +186,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   const stale = persistedConfig !== null && resolveHomeAwarePath(persistedConfig) !== plan.configPath &&
     !fs.existsSync(resolveHomeAwarePath(persistedConfig));
   const worktreeName = (stale ? null : staged("PAPERCLIP_WORKTREE_NAME")) ?? fallback.worktreeName;
-  const instanceId = (stale ? null : staged("PAPERCLIP_INSTANCE_ID")) ?? sanitizeWorktreeInstanceId(worktreeName);
+  const instanceId = operatorOrLayout("PAPERCLIP_INSTANCE_ID") ??
+    (stale ? null : staged("PAPERCLIP_INSTANCE_ID")) ?? sanitizeWorktreeInstanceId(worktreeName);
   const homeDir = resolveHomeAwarePath((stale ? null : staged("PAPERCLIP_HOME")) ?? fallback.homeDir);
   const instanceRoot = path.join(homeDir, "instances", instanceId);
   const claimed: WorktreeRuntimeContext = {
@@ -200,17 +201,29 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   };
   const mainHomes = [path.join(os.homedir(), ".paperclip")];
   const operatorHome = operatorOrLayout("PAPERCLIP_HOME");
-  if (operatorHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
-  const unsafe = (candidate: WorktreeRuntimeContext): boolean => {
+  const exportedWorktreeHome = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
+    operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
+  if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
+  const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
+  const parent = path.dirname(path.dirname(stateRoot));
+  let parentEntries: fs.Dirent[] | null;
+  try {
+    parentEntries = fs.readdirSync(parent, { withFileTypes: true });
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? error.code : null;
+    if (code !== "EACCES" && code !== "EPERM") throw error;
+    parentEntries = null;
+  }
+  const unsafe = (candidate: WorktreeRuntimeContext, pathBoundIdentity = false): boolean => {
     if (!/^[a-z0-9_-]+$/.test(candidate.instanceId)) return true;
     if (mainHomes.some((main) => isPathInside(candidate.homeDir, main) || isPathInside(main, candidate.homeDir))) return true;
     const registered = readWorktreePortRegistry(fallback.homeDir);
     for (const entry of readWorktreePortRegistry(candidate.homeDir)) registered.add(entry);
     const siblings = collectSiblingWorktreePorts(candidate, registered).configPaths;
     // Conventional sibling worktrees need not have booted into the registry yet.
-    const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
-    const parent = path.dirname(path.dirname(stateRoot));
-    for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+    // Without a listing, refuse reusable claims and require path-derived identity.
+    if (parentEntries === null && !pathBoundIdentity) return true;
+    for (const entry of parentEntries ?? []) {
       if (entry.isDirectory()) siblings.add(path.join(parent, entry.name, ".paperclip", "config.json"));
     }
     for (const configPath of siblings) {
@@ -243,7 +256,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     storageDir: path.join(isolatedRoot, "data", "storage"),
     secretsKeyFilePath: path.join("/etc/paperclip/worktrees", isolatedId, "master.key"),
   };
-  if (unsafe(isolated)) throw new Error("No isolated worktree identity is available");
+  if (unsafe(isolated, true)) throw new Error("No isolated worktree identity is available");
   return isolated;
 }
 
@@ -700,7 +713,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   setBootDerivedEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", toolActionSigningSecret);
   setBootDerivedEnv("PAPERCLIP_DB_BACKUP_ENABLED", "false");
 
-  if (repairedEnv && repairedContents !== null) {
+  if (repairedContents !== null) {
     try {
       writeEnvFileAtomicallyIfChanged(effectiveContext.envPath, existingContents, repairedContents);
     } catch (error) {

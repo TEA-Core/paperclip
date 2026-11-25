@@ -98,6 +98,31 @@ function makeWorktreeFixture(envContents: string): { worktreeRoot: string; confi
 }
 
 describe("resolveDatabaseTarget", () => {
+  it("resolves an ordinary instance in a cold process without boot setup", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-cold-db-target-"));
+    const configPath = path.join(root, "config.json");
+    try {
+      process.env.PAPERCLIP_CONFIG = configPath;
+      writeJson(configPath, {
+        database: {
+          mode: "embedded-postgres",
+          embeddedPostgresDataDir: path.join(root, "db"),
+          embeddedPostgresPort: 15432,
+        },
+      });
+      expect(resolveTarget()).toEqual({
+        mode: "embedded-postgres",
+        dataDir: path.join(root, "db"),
+        port: 15432,
+        source: "embedded-postgres@15432",
+        configPath,
+        envPath: path.join(root, ".env"),
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses DATABASE_URL from process env first", () => {
     process.env.DATABASE_URL = "postgres://env-user:env-pass@db.example.com:5432/paperclip";
 

@@ -1011,6 +1011,8 @@ operator values, change the plan, or stage additional files.
 If setup or doctor creates a missing agent JWT secret after that load, it
 publishes the newly generated value with boot origin only for the frozen plan's
 own file. It does not reload the file or promote an existing file value.
+The database target resolver also captures the initial environment when called
+standalone, before choosing its plan; an existing capture is never replaced.
 
 Worktree evidence includes the exported worktree flag, the own-file declaration,
 the managed worktree layout, and an existing port-registry entry. With evidence
@@ -1026,7 +1028,7 @@ skipped with a warning.
 | Own `.env`: identity | Validated claims only, never committed directly | Never committed |
 | Own `.env`: protected settings | Ignored with key-name warning, except the allowlist below | Loaded |
 | Own `.env`: other settings | Loaded with file origin | Loaded with file origin |
-| Cwd `.env` | Never loaded | Loaded after own `.env`, unless disabled by the operator |
+| Cwd `.env` | Never loaded | Loaded after own `.env`, unless disabled by the operator or own file |
 | Other paths or refused files | Never supply boot values | No additional sources; refused sources warn and are skipped |
 
 Protected names start with `PAPERCLIP_`, `DATABASE_`, `BETTER_AUTH_`, `DOTENV_`,
@@ -1045,6 +1047,17 @@ identities are preserved. A stale copied config claim is discarded; a file's
 `PAPERCLIP_CONFIG` never redirects the boot. Rejected claims leave the file
 unchanged and use layout-derived isolation. A colliding layout name receives a
 config-path-derived suffix; if no safe identity exists, boot refuses.
+Explicit operator instance IDs take precedence over own-file IDs, subject to
+the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
+identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
+the main home. A different transient runtime home does not replace persisted
+worktree paths.
+If the parent can be searched but not listed, reusable identity claims are
+refused and the config-path-derived identity is used; registered sibling
+collisions and main-home checks still apply.
+
+An unchanged repair also cleans temporary env files belonging to dead writers,
+without rewriting the env file. Live writers' temporary files are retained.
 
 Limits of this protection:
 
@@ -1062,8 +1075,9 @@ Limits of this protection:
   the operator snapshot rather than file-loaded parent values.
 - There remains a read/repair race: boot uses staged values while a subsequent
   repair read can see newer bytes.
-- Warnings are stderr-only. Symlinked state directories are not an ownership
-  boundary (env-file symlinks themselves are refused).
+- Refused env sources appear in the startup banner even when an operator JWT
+  is available. Other warnings remain stderr-only. Symlinked state directories
+  are not an ownership boundary (env-file symlinks themselves are refused).
 - Dotenv's `PAPERCLIP_IN_WORKTREE=true#nospace` declaration remains accepted.
 
 
