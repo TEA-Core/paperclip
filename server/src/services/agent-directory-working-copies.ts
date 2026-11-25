@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { and, eq } from "drizzle-orm";
@@ -41,15 +42,25 @@ async function workingCopyGid(): Promise<number | null> {
   return process.getuid?.() === 0 || process.getegid?.() === gid || process.getgroups?.().includes(gid) ? gid : null;
 }
 
-const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
+// Group readability is opt-in via the canonical group-read bit, never inferred
+// from owner access alone. Strip write access for every non-owner.
+const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700) |
+  (mode & 0o400 && mode & 0o040 ? 0o040 | (mode & 0o100 ? 0o010 : 0) : 0);
+const STAGED_MODE_VERSION = 3;
+const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
+const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
 
-async function workingCopyPermissions(filename: string, gid: number, recursive = true): Promise<void> {
+async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
   const stat = await fs.lstat(filename);
   if (stat.isSymbolicLink()) return;
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
+  if (gid !== null && stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
   // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
+  const owner = stat.mode & 0o700;
+  const mode = gid === null ? owner : stat.isDirectory()
+    ? owner | ((owner >> 3) & 0o050) | (recursive ? 0o2000 : 0)
+    : stagedMode(stat.mode) & 0o7777;
+  if (gid !== null || mode !== (stat.mode & 0o7777)) await fs.chmod(filename, mode);
   if (recursive && stat.isDirectory()) {
     for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
   }
@@ -63,9 +74,10 @@ async function workingCopyParents(agentRoot: string): Promise<number | null> {
   for (const segment of ["file-sync", "runs"]) {
     parent = path.join(parent, segment);
     await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-    if (gid !== null) await workingCopyPermissions(parent, gid, false).catch(error => {
+    await workingCopyPermissions(parent, gid, false).catch(async error => {
       if (!permissionDenied(error)) throw error;
       gid = null;
+      await workingCopyPermissions(parent, null, false);
     });
   }
   return gid;
@@ -74,33 +86,46 @@ async function workingCopyParents(agentRoot: string): Promise<number | null> {
 async function stageWorkingCopy(canonical: string, localRoot: string, gid: number | null): Promise<number | null> {
   const runDir = path.dirname(localRoot);
   await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
+  // A retry may reuse a previously published run directory. Close it before
+  // copying any canonical modes, including group/world-writable entries.
+  await fs.chmod(runDir, 0o700);
   await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
-  if (gid === null) return null;
   try {
-    await workingCopyPermissions(runDir, gid, false);
     await workingCopyPermissions(localRoot, gid);
+    if (gid === null) return null;
+    // Publish last: no group member can reach a partially hardened tree.
+    await workingCopyPermissions(runDir, gid, false);
     return gid;
   } catch (error) {
     if (!permissionDenied(error)) throw error;
     await fs.chmod(runDir, 0o700);
     await fs.rm(localRoot, { recursive: true, force: true });
     await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
+    await workingCopyPermissions(localRoot, null);
     return null;
   }
 }
 
-function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot): T {
+function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot, staged: (mode: number) => number): T {
   // A live file still at its staged mode keeps the canonical mode on save;
-  // only a mode the run itself set is written back.
+  // only a mode the run itself set is written back. A file the run created
+  // gets the staged rule (owner bits, group read at most), never group write.
+  if (entry.kind !== "file" || entry.mode === undefined) return entry;
   const before = base.entries.get(name);
-  return entry.kind === "file" && before?.kind === "file" && entry.mode === stagedMode(before.mode) ? { ...entry, mode: before.mode } : entry;
+  if (before?.kind !== "file") return { ...entry, mode: stagedMode(entry.mode) };
+  return entry.mode === staged(before.mode) || stagedMode(entry.mode) === before.mode ? { ...entry, mode: before.mode } : entry;
 }
-const stagedForGroup = (row: Copy) => typeof row.receipt?.stagedGid === "number";
-function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot): DirectorySnapshot {
-  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base)])) };
+function stagingFormula(row: Copy): (mode: number) => number {
+  if (typeof row.receipt?.stagedGid !== "number") {
+    return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? ownerOnlyMode : mode => mode;
+  }
+  return typeof row.receipt?.stagedModeVersion === "number" ? stagedMode : legacyStagedMode;
 }
-function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot): AgentFileManifest {
-  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base)]) };
+function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot, staged: (mode: number) => number): DirectorySnapshot {
+  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base, staged)])) };
+}
+function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot, staged: (mode: number) => number): AgentFileManifest {
+  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base, staged)]) };
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
@@ -116,6 +141,16 @@ function actor(row: Copy): AuthorizationActor {
 export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string, runId: string) => Promise<Copy | null>, patch: (row: Copy, values: Partial<typeof copies.$inferInsert>) => Promise<Copy>, environmentRuntime?: EnvironmentRuntimeService) {
   const store = agentFileStore(db);
   const ownerFile = (row: Copy) => path.join(path.dirname(row.localRoot), "owner.json");
+  async function writeOwner(row: Copy, runId: string) {
+    const filename = ownerFile(row);
+    const temporary = `${filename}.${randomUUID()}`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify({ runId }), { mode: 0o600, flag: "wx" });
+      await fs.rename(temporary, filename);
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
+  }
   async function owns(row: Copy) {
     if (row.receipt?.warm !== true) return true;
     return await fs.readFile(ownerFile(row), "utf8").then(s => JSON.parse(s).runId === row.runId).catch(error => error.code === "ENOENT" && row.processStoppedAt !== null);
@@ -172,9 +207,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           }
           // The controller-owned marker fences old callbacks. Attach the new
           // collector immediately after it moves, before fallible bookkeeping.
-          const temporary = `${ownerFile(current)}.next`;
-          await fs.writeFile(temporary, JSON.stringify({ runId: input.runId }));
-          await fs.rename(temporary, ownerFile(current));
+          await writeOwner(current, input.runId);
           handedOff = true;
           input.onWarmHandoff?.(successor!);
           const runtime = transports.get(key(current));
@@ -245,12 +278,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const loadedEntry = snapshot.entries.get(deriveBundleState(agent).entryFile);
     const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, ...(stagedGid !== null ? { stagedGid } : {}),
+      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, stagedModeVersion: STAGED_MODE_VERSION, ...(stagedGid !== null ? { stagedGid } : {}),
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
       row = await patch(row, values);
-      if (input.warm) await fs.writeFile(ownerFile(row), JSON.stringify({ runId: row.runId }));
+      if (input.warm) await writeOwner(row, row.runId);
     } catch (error) {
       await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
       throw error;
@@ -301,7 +334,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       try {
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
-        const manifest = stagedForGroup(row) ? canonicalManifest(captured.manifest, baseline(row)) : captured.manifest;
+        const manifest = canonicalManifest(captured.manifest, baseline(row), stagingFormula(row));
         const snapshot = checkpointSnapshot(manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
@@ -349,7 +382,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       row = await patch(row, { attempts: row.attempts + 1 });
       try {
         inspected ??= await retrieve(row, target);
-        const snapshot = stagedForGroup(row) ? canonicalSnapshot(inspected.snapshot, baseline(row)) : inspected.snapshot;
+        const snapshot = canonicalSnapshot(inspected.snapshot, baseline(row), stagingFormula(row));
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
         if (candidateHash === row.baseHash) {

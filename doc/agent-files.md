@@ -39,17 +39,39 @@ workspace sync, Git staging, or task deliverables.
 
 When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
 named `agents` group) and the server process may assign it (it is root or a
-member), the fork stages local run directories with mode `02750` (setgid, group
-read/traverse) owned by that group, files with an owner execute bit as `0750`,
-and other files as `0640`; no world access is granted. Modes are applied
-explicitly after creation/copy, independent of umask. If any group or mode
-assignment is denied, staging does not fail: the run falls back to a fresh
-owner-only copy and its receipt does not claim group staging. Otherwise the
-run tree keeps the owner-only layout and the canonical file modes. Staging never
-changes canonical files: for a group-staged run, a file still at its staged mode
-is written back with its canonical mode, and only a mode the run itself set is
-saved. An owner-only run saves its live modes as they are. Runtime ancestor
-permissions are unchanged and the shared group never gets write access.
+member), the fork stages live directories with modes derived from owner bits:
+at most `02750` (setgid, group read/traverse), owned by that group.
+The `file-sync/`, `runs/`, and run directories have at most `0750`, without
+setgid inheritance. Files retain their owner permissions and gain
+group read only when the canonical file grants both owner read and group read;
+group execute then follows owner execute (`0755` becomes `0750`). Files without
+canonical group-read intent stay owner-only (`0600` stays `0600`, `0700` stays
+`0700`, and `0604` becomes `0600`). No world access or group write is granted.
+The run directory stays `0700` throughout copying and all descendant mode/group
+assignments; only the completed tree is opened to the group. This also applies
+when staging retries in an existing run directory.
+Modes are applied explicitly, independent of umask. If any group or mode
+assignment is denied, the run falls back to a fresh copy behind a `0700` run
+directory and its receipt does not claim group staging. Without an assignable
+group the run also stays private. Both private paths keep only owner permission
+bits on all staged entries; no canonical group/world permission bits are copied.
+Staging never changes canonical files: a file still at its staged mode is saved
+with its canonical mode; only a mode the run itself set is saved. Receipts record
+the staging formula version, so copies staged by the earlier group build (`0640`
+files, `0750` executables) still map those modes back to the canonical mode.
+Version 3 also records the owner-only formula for private runs. Earlier private
+copies kept canonical modes when staged, so their live modes are saved as they are.
+The canonical manifest cache and warm-run `owner.json` fence are created
+atomically as `0600`, including after a warm handoff. Their parent directories
+deny group write, so peers cannot create, replace, or unlink these files under
+umask `002`. Unsafe old manifest caches are discarded and rebuilt.
+Replacing an existing canonical file retains that file's own group, even when its
+parent or the live copy has a different group. If the server may not assign that
+group (`EPERM`/`EINVAL`), the file is still replaced and a warning names the path
+and group. Files and folders a run creates take their canonical parent
+folder's group (never the live copy's agents group), with the same best-effort
+warning. A new file's mode follows the staging rule (owner bits, group read at
+most, never group write; `0664` becomes `0640`), and new folders are `0750`. Runtime ancestor permissions are unchanged.
 
 The fork runs every adapter as one shared principal in the agents group, so any
 adapter process can read the live copies of other agents and other companies
