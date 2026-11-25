@@ -134,16 +134,15 @@ function isAgentPrincipal(principal: LiveRunCapPrincipal | null, agentId: string
 }
 
 /**
- * True when the issue's execution state has a review or approval stage
- * pending in front of this agent that someone else put there for someone
- * else's work, as the execution-policy engine recorded it:
- * - the agent is the current participant;
- * - the delivery author (the assignee when the work was delivered) is known
- *   and is not this agent;
- * - the engine's seat record names this agent, seated by a board user or by
- *   the delivery author itself (a participant that seated itself, or a seat
- *   from a second agent that is not the recorded delivery author, does not
- *   count).
+ * True when the engine recorded a review or approval stage pending in front
+ * of this agent on someone else's delivery, with independent trusted seating:
+ * - the agent is both the current participant and the recorded seat holder;
+ * - the delivery author is known and is not this agent;
+ * - a board user other than the delivery author seated the participant.
+ * Agent-seated stages use general slots, even when the seater is the delivery
+ * author. Assignment and delivery do not prove independent review authority.
+ * The current seat model records agent/user principals only; a missing actor
+ * is not evidence of trusted system or policy authorization.
  * The engine is the only writer of `execution_state`: no issue or wake API
  * accepts it, a plugin issue create that carries it is refused, and a plugin
  * issue update never writes it. A state without a seat record (written before
@@ -162,16 +161,8 @@ function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
   const { participant, seatedBy } = seat as { participant?: unknown; seatedBy?: unknown };
   if (!isAgentPrincipal(readPrincipal(participant), agentId)) return false;
   const seater = readPrincipal(seatedBy);
-  if (!seater || isAgentPrincipal(seater, agentId)) return false;
-  // An agent that seats a participant must be the delivery author itself: a
-  // second agent's delivery on an unassigned card (where the recorded
-  // delivery author stays the earlier author) cannot launder the first
-  // agent's work into the reserved lane. A board user may seat a reviewer on
-  // any delivery, and may be the delivery author an agent seats for.
-  if (seater.type === "agent" && deliveryAuthor.type === "agent" && seater.agentId !== deliveryAuthor.agentId) {
-    return false;
-  }
-  return true;
+  return seater?.type === "user" &&
+    (deliveryAuthor.type !== "user" || seater.userId !== deliveryAuthor.userId);
 }
 
 /**
@@ -184,7 +175,7 @@ function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
  * - review/recovery: the run's issue row has a recovery origin kind (the issue
  *   API does not accept an origin kind; plugins are confined to `plugin:*`),
  *   or a review/approval stage is pending in front of this agent, seated by
- *   someone else on someone else's delivery (`isSeatedReviewParticipant`).
+ *   an independent board user (`isSeatedReviewParticipant`).
  * A wake reason is never read, whoever wrote the row (agent, board, plugin or
  * server), and neither is the issue status: a caller can create or set an
  * issue `in_review` without any review stage.

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LIVE_RUN_CAP_CEILING,
@@ -204,7 +205,7 @@ describe("classifyLiveRunCapRun", () => {
       deliveryAuthor: "deliveryAuthor" in opts ? opts.deliveryAuthor : author,
       participantSeat: {
         participant: { type: "agent", agentId: opts.seatParticipantAgentId ?? participantAgentId },
-        seatedBy: "seatedBy" in opts ? opts.seatedBy : author,
+        seatedBy: "seatedBy" in opts ? opts.seatedBy : { type: "user", userId: "independent-board" },
       },
     };
   };
@@ -218,7 +219,6 @@ describe("classifyLiveRunCapRun", () => {
     { issueOriginKind: "harness_liveness_escalation" },
     { issueExecutionState: pendingStage(agentId) },
     { issueExecutionState: pendingStage(agentId, { currentStageType: "approval" }) },
-    { issueExecutionState: pendingStage(agentId, { seatedBy: { type: "user", userId: "board-user" } }) },
     { issueExecutionState: pendingStage(agentId, { deliveryAuthor: { type: "user", userId: "board-user" } }) },
   ])("treats %j as review/recovery", (override) => {
     expect(classifyLiveRunCapRun({ ...base, ...override })).toBe("review_recovery");
@@ -226,6 +226,7 @@ describe("classifyLiveRunCapRun", () => {
 
   it.each([
     { label: "a stage pending for another agent", issueExecutionState: pendingStage("someone-else") },
+    { label: "a current-participant mismatch", issueExecutionState: { ...pendingStage(agentId), currentParticipant: { type: "agent", agentId: "someone-else" } } },
     { label: "a stage that is not pending", issueExecutionState: { ...pendingStage(agentId), status: "changes_requested" } },
     { label: "an unknown stage type", issueExecutionState: pendingStage(agentId, { currentStageType: "custom" }) },
     { label: "a user participant", issueExecutionState: { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: "u" } } },
@@ -234,6 +235,9 @@ describe("classifyLiveRunCapRun", () => {
     { label: "a stage on the participant's own delivery", issueExecutionState: pendingStage(agentId, { deliveryAuthor: { type: "agent", agentId } }) },
     { label: "a stage with no delivery author", issueExecutionState: pendingStage(agentId, { deliveryAuthor: null }) },
     { label: "a stage the participant seated itself in", issueExecutionState: pendingStage(agentId, { seatedBy: { type: "agent", agentId } }) },
+    { label: "a stage seated by its delivery author", issueExecutionState: pendingStage(agentId, { seatedBy: author }) },
+    { label: "an agent-seated stage on a board user's delivery", issueExecutionState: pendingStage(agentId, { deliveryAuthor: { type: "user", userId: "board-user" }, seatedBy: author }) },
+    { label: "a board user seating review of its own delivery", issueExecutionState: pendingStage(agentId, { deliveryAuthor: { type: "user", userId: "independent-board" } }) },
     { label: "a stage seated by an agent other than the delivery author (a second agent's delivery on an unassigned card)", issueExecutionState: pendingStage(agentId, { seatedBy: { type: "agent", agentId: "second-agent" } }) },
     { label: "a stage seated with no actor", issueExecutionState: pendingStage(agentId, { seatedBy: null }) },
     { label: "a seat recorded for another participant", issueExecutionState: pendingStage(agentId, { seatParticipantAgentId: "someone-else" }) },
@@ -474,6 +478,24 @@ describe("liveRunCapAdmission.admit", () => {
     expect(liveRunCapAdmission.listWaiters().map((waiter) => waiter.runId)).toEqual(["second"]);
     if (first.admitted) first.release();
     expect(liveRunCapAdmission.inFlight()).toBe(0);
+  });
+
+  it("serializes concurrent admissions whose queue-order reads overlap, so only one takes the last general slot", async () => {
+    const ahead = nextTurn();
+    const attempts = ["first", "second"].map((runId) => liveRunCapAdmission.admit({
+      entry: entry(runId),
+      cap,
+      countLive: async () => ({ total: 7, reservedClass: 0 }),
+      countAhead: async () => { await ahead; return 0; },
+    }));
+    // Both unlocked contenders reach the order read before the next event-loop
+    // turn. The lock keeps the second count behind the first reservation.
+    const results = await Promise.all(attempts);
+    try {
+      expect(results.map((result) => result.admitted)).toEqual([true, false]);
+    } finally {
+      for (const result of results) if (result.admitted) result.release();
+    }
   });
 
   it("counts a priority admission still claiming against the reserve, not the general slots", async () => {

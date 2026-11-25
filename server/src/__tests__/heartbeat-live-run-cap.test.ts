@@ -479,12 +479,12 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     };
   }
 
-  it("(i) genuine review work on a pending review stage the run's agent is the participant of starts in a reserved slot", async () => {
+  it("(i) an agent-seated pending review uses general slots and still runs when its turn arrives", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const executor = await seedAgent("Executor");
     const reviewer = await seedAgent("Reviewer");
-    // The executor's submission wakes the reviewer: the wake row names the
-    // executor (an agent) and the reason is free text; the stage is the fact.
+    // An executor's submission may wake a genuine reviewer, but an agent's
+    // seating transition does not grant access to the reserve.
     const genuine = await seedQueuedRun(reviewer, "general", {
       requestedByActorType: "agent",
       requestedByActorId: executor,
@@ -493,9 +493,10 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       issueExecutionState: pendingReviewStage(reviewer, executor),
     });
 
+    await expectGeneralBehindOlderRun(olderGeneral, genuine);
+    await finishLiveRuns(1);
     await heartbeat.resumeQueuedRuns();
-
-    expect(await statusesOf({ olderGeneral, genuine })).toEqual({ olderGeneral: "queued", genuine: "running" });
+    expect(await statusOf(genuine)).toBe("running");
   });
 
   it("(i) genuine recovery work on a recovery-origin issue starts in a reserved slot", async () => {
@@ -979,7 +980,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(selfSeater, issueId, selfSeater));
   });
 
-  it("(p) another agent's own delivery seats this agent as its reviewer, and the review run starts in a reserved slot", async () => {
+  it("(p) another agent's own delivery seats its reviewer in the general lane, behind older general work", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const author = await seedAgent("Author");
     const reviewer = await seedAgent("Reviewer");
@@ -990,9 +991,10 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     });
 
     const genuine = await wakeOnIssue(reviewer, issueId, author);
+    await expectGeneralBehindOlderRun(olderGeneral, genuine);
+    await finishLiveRuns(1);
     await heartbeat.resumeQueuedRuns();
-
-    expect(await statusesOf({ olderGeneral, genuine })).toEqual({ olderGeneral: "queued", genuine: "running" });
+    expect(await statusOf(genuine)).toBe("running");
   });
 
   it("(p) a human comment a plugin relayed (as the plugin host wakes the assignee) takes no reserved slot", async () => {
@@ -1318,10 +1320,11 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
   // ─── (t) round 6: real authenticated edits and deliveries ────────────────
 
   it.each([
-    { shape: "j-f2c: the previous author delivers again after the reviewer's rewrite", previousDelivery: true, assigner: null },
-    { shape: "l3-user-author: board assignment cannot authorize an agent's later delivery", previousDelivery: false, assigner: "board" },
-    { shape: "confederate assignment and delivery cannot authorize the rewriter's review", previousDelivery: false, assigner: "agent" },
-  ] as const)("(t) $shape cannot take a reserved slot or overtake older general work", async ({ previousDelivery, assigner }) => {
+    { shape: "j-f2c: the previous author delivers again after the reviewer's rewrite", previousDelivery: true, assigner: null, boardSeat: false },
+    { shape: "l3-user-author: board assignment cannot authorize an agent's later delivery", previousDelivery: false, assigner: "board", boardSeat: false },
+    { shape: "confederate assignment and delivery cannot authorize the rewriter's review", previousDelivery: false, assigner: "agent", boardSeat: false },
+    { shape: "an independent board user directly seats the review", previousDelivery: false, assigner: "board", boardSeat: true },
+  ] as const)("(t) $shape honors reserved-slot authority and general queue order", async ({ previousDelivery, assigner, boardSeat }) => {
     const olderGeneral = await seedReservedSlotsFree();
     await db.insert(authUsers).values({
       id: "responsible-user",
@@ -1424,17 +1427,18 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     if (assigner !== null) {
       await patchIssue(confederate?.token ?? null, { assigneeAgentId: deliverer.id });
     }
-    await patchIssue(deliverer.token, { status: "in_review" });
+    await patchIssue(boardSeat ? null : deliverer.token, { status: "in_review" });
 
     await db.update(agents).set({
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5 } },
     }).where(eq(agents.id, reviewer.id));
     const candidate = await wakeOnIssue(reviewer.id, issueId, reviewer.id);
     await heartbeat.resumeQueuedRuns();
-    expect.soft(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "queued", candidate: "queued" });
+    const candidateStatus = boardSeat ? "running" : "queued";
+    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "queued", candidate: candidateStatus });
     await finishLiveRuns(1);
     await heartbeat.resumeQueuedRuns();
-    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "running", candidate: "queued" });
+    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "running", candidate: candidateStatus });
   });
 
   // ─── (d) router input ─────────────────────────────────────────────────────
