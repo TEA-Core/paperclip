@@ -238,12 +238,17 @@ describe("persistent agent directories", () => {
         expect((await fs.stat(directory)).mode & 0o2022).toBe(0);
       }
       // Refresh and handoff also replace old permissive metadata privately.
-      await fs.writeFile(manifest, JSON.stringify({ version: 1, entries: [] }));
+      const cached = JSON.parse(await fs.readFile(manifest, "utf8")) as { entries: [string, { kind: string; hash?: string }][] };
+      const poisoned = cached.entries.find(([name]) => name === "private.md")![1];
+      expect(poisoned.kind).toBe("file");
+      poisoned.hash = "0".repeat(64);
+      await fs.writeFile(manifest, JSON.stringify(cached));
       await fs.chmod(manifest, 0o664);
       await fs.chmod(owner, 0o664);
       await run({ warm: true, reuseRunId: copy.runId });
       for (const filename of [manifest, owner]) expect((await fs.stat(filename)).mode & 0o7777).toBe(0o600);
-      expect(JSON.parse(await fs.readFile(manifest, "utf8")).entries.length).toBeGreaterThan(0);
+      const rewritten = new Map((JSON.parse(await fs.readFile(manifest, "utf8")) as typeof cached).entries);
+      expect(rewritten.get("private.md")?.hash).toBe(createHash("sha256").update("private").digest("hex"));
     } finally {
       process.umask(previousUmask);
     }
