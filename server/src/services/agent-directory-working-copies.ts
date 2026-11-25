@@ -47,28 +47,46 @@ async function workingCopyPermissions(filename: string, gid: number, recursive =
   const stat = await fs.lstat(filename);
   if (stat.isSymbolicLink()) return;
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  try {
-    if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
-    // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-    await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
-  } catch (error) {
-    // An entry this process cannot reassign keeps its owner-only mode.
-    if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
-  }
+  if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
+  // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
+  await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
   if (recursive && stat.isDirectory()) {
     for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
   }
 }
 
-async function workingCopyParents(agentRoot: string, runId?: string): Promise<number | null> {
-  const gid = await workingCopyGid();
+const permissionDenied = (error: unknown) => ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "");
+
+async function workingCopyParents(agentRoot: string): Promise<number | null> {
+  let gid = await workingCopyGid();
   let parent = agentRoot;
-  for (const segment of ["file-sync", "runs", ...(runId ? [runId] : [])]) {
+  for (const segment of ["file-sync", "runs"]) {
     parent = path.join(parent, segment);
     await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-    if (gid !== null) await workingCopyPermissions(parent, gid, false);
+    if (gid !== null) await workingCopyPermissions(parent, gid, false).catch(error => {
+      if (!permissionDenied(error)) throw error;
+      gid = null;
+    });
   }
   return gid;
+}
+
+async function stageWorkingCopy(canonical: string, localRoot: string, gid: number | null): Promise<number | null> {
+  const runDir = path.dirname(localRoot);
+  await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
+  await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
+  if (gid === null) return null;
+  try {
+    await workingCopyPermissions(runDir, gid, false);
+    await workingCopyPermissions(localRoot, gid);
+    return gid;
+  } catch (error) {
+    if (!permissionDenied(error)) throw error;
+    await fs.chmod(runDir, 0o700);
+    await fs.rm(localRoot, { recursive: true, force: true });
+    await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
+    return null;
+  }
 }
 
 function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot): T {
@@ -213,11 +231,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // A stopped lifecycle has already accounted for all its bytes. No live
       // or pending candidate ever enters this replacement path.
       await fs.rm(localRoot, { recursive: true, force: true });
-      const gid = await workingCopyParents(path.dirname(root), input.runId);
+      const gid = await workingCopyParents(path.dirname(root));
       try {
-        await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
-        if (gid !== null) await workingCopyPermissions(localRoot, gid);
-        return { ...inspected, stagedGid: gid };
+        return { ...inspected, stagedGid: await stageWorkingCopy(canonical, localRoot, gid) };
       } catch (error) {
         await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
         throw error;

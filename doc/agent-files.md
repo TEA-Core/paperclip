@@ -42,8 +42,9 @@ named `agents` group) and the server process may assign it (it is root or a
 member), the fork stages local run directories with mode `02750` (setgid, group
 read/traverse) owned by that group, files with an owner execute bit as `0750`,
 and other files as `0640`; no world access is granted. Modes are applied
-explicitly after creation/copy, independent of umask; an entry the process
-cannot reassign keeps its existing mode and never fails staging. Otherwise the
+explicitly after creation/copy, independent of umask. If any group or mode
+assignment is denied, staging does not fail: the run falls back to a fresh
+owner-only copy and its receipt does not claim group staging. Otherwise the
 run tree keeps the owner-only layout and the canonical file modes. Staging never
 changes canonical files: for a group-staged run, a file still at its staged mode
 is written back with its canonical mode, and only a mode the run itself set is

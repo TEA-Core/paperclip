@@ -233,13 +233,26 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it("keeps preparing when the agents group cannot be assigned to an entry", async () => {
+  it.each(["EPERM", "EACCES"])("falls back to an owner-only copy when the live tree cannot be shared (%s)", async (code) => {
     await writeShared();
-    const denied = vi.spyOn(fs, "chmod").mockRejectedValue(Object.assign(new Error("denied"), { code: "EPERM" }));
+    await fs.writeFile(path.join(root, "notes.md"), "before");
+    await fs.chmod(path.join(root, "notes.md"), 0o644);
+    const chmod = fs.chmod.bind(fs);
+    const denied = vi.spyOn(fs, "chmod").mockImplementation(async (filename, mode) => {
+      if (String(filename).endsWith(`${path.sep}doctrine`)) throw Object.assign(new Error("denied"), { code });
+      return chmod(filename, mode);
+    });
     let copy;
     try { copy = await withAgentsGid(process.getegid!(), () => run()); } finally { denied.mockRestore(); }
-    expect((await fs.stat(path.join(path.dirname(root), "file-sync/runs", copy.runId))).mode & 0o077).toBe(0);
+    expect(copy.receipt?.stagedGid).toBeUndefined();
+    expect((await fs.stat(path.join(path.dirname(root), "file-sync/runs", copy.runId))).mode & 0o7777).toBe(0o700);
     for (const relative of sharedFiles) expect((await fs.stat(path.join(copy.localRoot, relative))).mode & 0o7777).toBe(0o600);
+    expect((await fs.stat(path.join(copy.localRoot, "notes.md"))).mode & 0o7777).toBe(0o644);
+    await fs.writeFile(path.join(copy.localRoot, "notes.md"), "after");
+    await fs.chmod(path.join(copy.localRoot, "notes.md"), 0o640);
+    expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, "notes.md"), "utf8")).toBe("after");
+    expect((await fs.stat(path.join(root, "notes.md"))).mode & 0o7777).toBe(0o640);
   });
 
   it("does not change external targets of symlinks encountered while staging permissions", async () => {
