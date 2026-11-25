@@ -48,6 +48,28 @@ describe("agent instructions service", () => {
     }));
   });
 
+  it.each([0o077, 0o002])("writes supporting editor files group-readable regardless of umask (%s)", async (umask) => {
+    const root = await makeTempDir("editor-mode-");
+    cleanupDirs.add(root);
+    const previousUmask = process.umask(umask);
+    try {
+      const agent = makeAgent({ instructionsBundleMode: "external", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" });
+      const service = agentInstructionsService();
+      await service.writeFile(agent, "doctrine/nested/mission.md", "first");
+      const filename = path.join(root, "doctrine/nested/mission.md");
+      expect((await fs.stat(filename)).mode & 0o7777).toBe(0o640);
+      await fs.chmod(filename, 0o600);
+      await service.writeFile(agent, "doctrine/nested/mission.md", "saved");
+      expect(await fs.readFile(filename, "utf8")).toBe("saved");
+      expect((await fs.stat(filename)).mode & 0o7777).toBe(0o640);
+      for (const relative of ["doctrine", "doctrine/nested"]) {
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o750);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   it.each(["./AGENTS.md", "notes/../AGENTS.md", "notes\\..\\AGENTS.md", "../invalid"])("reads legacy entry configuration %s without breaking the bundle", async (entry) => {
     const root = await makeTempDir("legacy-entry-"); cleanupDirs.add(root);
     await fs.writeFile(path.join(root, "AGENTS.md"), "legacy instructions");

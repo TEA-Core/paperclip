@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agentInstructionHeads, agents, type Db } from "@paperclipai/db";
-import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes } from "./agent-instruction-files.js";
+import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes, materializeInstructionBytes, createInstructionDirectory } from "./agent-instruction-files.js";
 import { notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 
@@ -461,8 +461,7 @@ async function writeBundleFiles(
     const absolutePath = await assertInstructionPathSafe(rootPath, normalizedPath);
     const existingStat = await statIfExists(absolutePath);
     if (existingStat?.isFile() && !options?.overwriteExisting) continue;
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content, "utf8");
+    await materializeInstructionBytes(rootPath, normalizedPath, Buffer.from(content, "utf8"));
   }
 }
 
@@ -562,7 +561,7 @@ export function agentInstructionsService(db?: Db) {
       entryFile,
       clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
     });
-    await fs.mkdir(managedRoot, { recursive: true });
+    await createInstructionDirectory(managedRoot);
 
     const entryPath = await assertInstructionPathSafe(managedRoot, entryFile);
     const entryStat = await statIfExists(entryPath);
@@ -570,8 +569,7 @@ export function agentInstructionsService(db?: Db) {
       const legacyInstructions = await readLegacyInstructions(agent, current.config);
       if (legacyInstructions.trim().length > 0) {
         await assertUnversionedEntry(agent, entryFile);
-        await fs.mkdir(path.dirname(entryPath), { recursive: true });
-        await fs.writeFile(entryPath, legacyInstructions, "utf8");
+        await materializeInstructionBytes(managedRoot, entryFile, Buffer.from(legacyInstructions, "utf8"));
       }
     }
 
@@ -610,7 +608,7 @@ export function agentInstructionsService(db?: Db) {
     }
 
     await assertInstructionPathSafe(nextRootPath, nextEntryFile);
-    await fs.mkdir(nextRootPath, { recursive: true });
+    await createInstructionDirectory(nextRootPath);
 
     const existingFiles = await listFilesRecursive(nextRootPath);
     if (nextMode === "managed" && !existingFiles.includes(nextEntryFile)) {
@@ -667,10 +665,7 @@ export function agentInstructionsService(db?: Db) {
     if (configured.mode !== "external") agentFilePath(relativePath);
     const prepared = await ensureWritableBundle(agent, options);
     instructionBytes(content);
-    await assertInstructionPathSafe(prepared.state.rootPath!, relativePath);
-    const absolutePath = resolvePathWithinRoot(prepared.state.rootPath!, relativePath);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content, "utf8");
+    await materializeInstructionBytes(prepared.state.rootPath!, relativePath, Buffer.from(content, "utf8"));
     const nextAgent = { ...agent, adapterConfig: prepared.adapterConfig };
     const [bundle, file] = await Promise.all([
       getBundle(nextAgent),
@@ -774,19 +769,17 @@ export function agentInstructionsService(db?: Db) {
     if (options?.replaceExisting) {
       await fs.rm(rootPath, { recursive: true, force: true });
     }
-    await fs.mkdir(rootPath, { recursive: true });
+    await createInstructionDirectory(rootPath);
 
     const normalizedEntries = Object.entries(files).map(([relativePath, content]) => [
       normalizeRelativeFilePath(relativePath),
       content,
     ] as const);
     for (const [relativePath, content] of normalizedEntries) {
-      const absolutePath = resolvePathWithinRoot(rootPath, relativePath);
-      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-      await fs.writeFile(absolutePath, content, "utf8");
+      await materializeInstructionBytes(rootPath, relativePath, Buffer.from(content, "utf8"));
     }
     if (!normalizedEntries.some(([relativePath]) => relativePath === entryFile)) {
-      await fs.writeFile(resolvePathWithinRoot(rootPath, entryFile), "", "utf8");
+      await materializeInstructionBytes(rootPath, entryFile, Buffer.alloc(0));
     }
 
     const adapterConfig = applyBundleConfig(asRecord(agent.adapterConfig), {

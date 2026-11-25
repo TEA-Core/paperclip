@@ -132,14 +132,26 @@ export async function readInstructionBytes(
   }
 }
 
+/** Normalize only directories this call creates; existing storage is not migrated. */
+export async function createInstructionDirectory(directory: string) {
+  const firstCreated = await fs.mkdir(directory, { recursive: true, mode: 0o750 });
+  if (!firstCreated) return;
+  const first = path.resolve(firstCreated);
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    await fs.chmod(current, 0o750);
+    if (current === first) break;
+  }
+}
+
 /** Call while holding the canonical agent lock. Never writes through a symlink. */
 export async function materializeInstructionBytes(
   root: string,
   entryFile: string,
   bytes: Buffer,
+  mode: 0o600 | 0o640 = 0o640,
 ) {
   const absolute = await assertInstructionPathSafe(root, entryFile);
-  await fs.mkdir(path.dirname(absolute), { recursive: true });
+  await createInstructionDirectory(path.dirname(absolute));
   await assertInstructionPathSafe(root, entryFile);
   const temporary = path.join(
     path.dirname(absolute),
@@ -149,6 +161,7 @@ export async function materializeInstructionBytes(
     const file = await fs.open(temporary, "wx", 0o600);
     try {
       await file.writeFile(bytes);
+      await file.chmod(mode);
       await file.sync();
     } finally {
       await file.close();

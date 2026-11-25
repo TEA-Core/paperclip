@@ -37,6 +37,12 @@ workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
 
+Editor saves, bundle initialization/import, and adoption of revision-backed files
+write instruction files as `0640` and create directories as `0750`, explicitly
+independent of umask. Group read is intentional; group write and world access
+are never granted. Existing files and directories are not bulk-migrated: files
+receive the new mode when written. The adoption marker remains private (`0600`).
+
 When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
 named `agents` group) and the server process may assign it (it is root or a
 member), the fork stages live directories with modes derived from owner bits:

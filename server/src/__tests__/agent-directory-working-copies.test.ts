@@ -9,7 +9,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agentFileStore, fileHash, inspectAgentFile, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
+import { adoptAgentFiles, agentFileStore, fileHash, inspectAgentFile, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
 import { agents, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
@@ -114,6 +114,54 @@ describe("persistent agent directories", () => {
       await fs.chmod(path.join(root, relative), 0o644);
     }
   }
+
+  it.each([0o077, 0o002])("stages editor-written instructions and doctrine group-readable without group write (umask=%s)", async (umask) => {
+    const previousUmask = process.umask(umask);
+    try {
+      await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } }).where(eq(agents.id, agentId));
+      const store = agentFileStore(db);
+      for (const relative of sharedFiles) {
+        await store.write({ ...target(), path: relative, bytes: Buffer.from(relative), baseHash: null }, board());
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+      }
+      for (const relative of ["doctrine", "doctrine/nested"]) {
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o750);
+      }
+      const copy = await withAgentsGid(process.getegid!(), () => run());
+      expect(path.basename(copy.localRoot)).toBe("live");
+      for (const relative of sharedFiles) {
+        const stat = await fs.stat(path.join(copy.localRoot, relative));
+        expect(stat.mode & 0o7777).toBe(0o640);
+        expect(stat.gid).toBe(process.getegid!());
+        expect(await fs.readFile(path.join(copy.localRoot, relative), "utf8")).toBe(relative);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it.each([0o077, 0o002])("adopts revision files with explicit group-read modes (umask=%s)", async (umask) => {
+    const revisionId = randomUUID();
+    await db.insert(agentInstructionRevisions).values({
+      id: revisionId, companyId, agentId, entryFile, contentBase64: Buffer.from(initial).toString("base64"),
+      contentHash: fileHash(Buffer.from(initial)), byteLength: Buffer.byteLength(initial), source: "api",
+    });
+    await db.insert(agentInstructionHeads).values({ companyId, agentId, entryFile, revisionId });
+    await fs.rm(root, { recursive: true });
+    const previousUmask = process.umask(umask);
+    try {
+      const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      await db.transaction(tx => adoptAgentFiles(tx, agent));
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+      expect((await fs.stat(path.join(root, entryFile))).mode & 0o7777).toBe(0o640);
+      for (const directory of [root, path.join(root, "policy")]) {
+        expect((await fs.stat(directory)).mode & 0o7777).toBe(0o750);
+      }
+      expect((await fs.stat(path.join(path.dirname(root), "file-sync/adopted.json"))).mode & 0o7777).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
 
   it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
     const gid = process.getegid!();
