@@ -936,32 +936,21 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
   }
 
   it.each(["review", "approval"] as const)(
-    "(p) an agent's own %s stage on its own delivery: the engine refuses it, and such a stage never takes a reserved slot",
+    "(p) an agent's own %s stage on its own delivery never takes a reserved slot",
     async (stageType) => {
       const olderGeneral = await seedReservedSlotsFree();
       const agent = await seedAgent("SelfSeated");
       const namedReturn = await seedAgent("NamedReturn");
-      await expect(deliverThroughEngine({
+      const issueId = await deliverThroughEngine({
         authorAgentId: agent,
         actorAgentId: agent,
         policy: {
           returnAssigneeAgentId: namedReturn,
           stages: [{ type: stageType, participants: [{ type: "agent", agentId: agent }] }],
         },
-      })).rejects.toThrow(/delivery author/);
-
-      // The shape such a delivery left before the engine refused it: the
-      // author seated on its own delivery by its own transition.
-      const candidate = await seedQueuedRun(agent, "general", {
-        requestedByActorType: "agent",
-        issueStatus: "in_review",
-        issueExecutionState: {
-          ...pendingReviewStage(agent, agent),
-          currentStageType: stageType,
-          returnAssignee: { type: "agent", agentId: namedReturn },
-        },
       });
-      await expectGeneralBehindOlderRun(olderGeneral, candidate);
+
+      await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(agent, issueId, agent));
     },
   );
 

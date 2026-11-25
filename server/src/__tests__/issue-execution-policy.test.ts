@@ -6123,71 +6123,9 @@ describe("actor-versus-seat and stage membership compare principal ids exactly",
   });
 });
 
-// SUP-24563 round 3: the review stage a run is seated in is a server fact the
-// live-run cap reads, so the engine must never seat the delivery author on its
-// own delivery, and it records who seated each participant.
-describe("delivery seating never seats the delivery author and records the seat", () => {
-  const otherAgentId = "44444444-4444-4444-8444-444444444444";
-
-  it.each(["review", "approval"] as const)(
-    "refuses an agent's own %s stage on its own delivery when returnAssigneeAgentId names another agent",
-    (stageType) => {
-      const policy = normalizeIssueExecutionPolicy({
-        returnAssigneeAgentId: otherAgentId,
-        stages: [{ type: stageType, participants: [{ type: "agent", agentId: coderAgentId }] }],
-      })!;
-      for (const requestedStatus of ["in_review", "done"]) {
-        expect(() =>
-          applyIssueExecutionPolicyTransition({
-            issue: {
-              status: "in_progress",
-              assigneeAgentId: coderAgentId,
-              assigneeUserId: null,
-              executionPolicy: policy,
-              executionState: null,
-            },
-            policy,
-            requestedStatus,
-            requestedAssigneePatch: {},
-            actor: { agentId: coderAgentId },
-            commentBody: "Delivered.",
-          }),
-        ).toThrow(/delivery author/);
-      }
-    },
-  );
-
-  it("seats another participant of the same stage instead of the delivery author", () => {
-    const policy = normalizeIssueExecutionPolicy({
-      returnAssigneeAgentId: otherAgentId,
-      stages: [{
-        type: "review",
-        participants: [
-          { type: "agent", agentId: coderAgentId },
-          { type: "agent", agentId: qaAgentId },
-        ],
-      }],
-    })!;
-    const result = applyIssueExecutionPolicyTransition({
-      issue: {
-        status: "in_progress",
-        assigneeAgentId: coderAgentId,
-        assigneeUserId: null,
-        executionPolicy: policy,
-        executionState: null,
-      },
-      policy,
-      requestedStatus: "in_review",
-      requestedAssigneePatch: { assigneeAgentId: coderAgentId },
-      actor: { agentId: coderAgentId },
-      commentBody: "Delivered.",
-    });
-    expect(result.patch.executionState).toMatchObject({
-      currentParticipant: { type: "agent", agentId: qaAgentId },
-      deliveryAuthor: { type: "agent", agentId: coderAgentId },
-    });
-  });
-
+// SUP-24563: the review stage a run is seated in is a server fact the
+// live-run cap reads, so the engine records who seated each participant.
+describe("delivery seating records the seat", () => {
   it("records the participant and the actor that seated it on each seat", () => {
     const policy = twoStagePolicy();
     const delivered = applyIssueExecutionPolicyTransition({

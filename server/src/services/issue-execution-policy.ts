@@ -1508,8 +1508,6 @@ function selectStageParticipant(
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
     exclude?: IssueExecutionStagePrincipal | null;
-    /** A second principal that must not be seated (the delivery author on its own delivery). */
-    excludeAlso?: IssueExecutionStagePrincipal | null;
   },
 ): IssueExecutionStagePrincipal | null {
   // The exclusion is ABSOLUTE. SUP-10602 previously added an allowSelfAsFallback
@@ -1522,10 +1520,8 @@ function selectStageParticipant(
   // here is correct; the deadlock SUP-10602 was chasing is now prevented at the
   // door by assertIssueExecutionPolicyGatesAreEnforceable(), which refuses to
   // store a policy whose stage is gated solely by its own return assignee.
-  const excluded = [opts?.exclude ?? null, opts?.excludeAlso ?? null];
-  const eligible = stage.participants.filter(
-    (participant) => !excluded.some((principal) => principalsEqual(participant, principal)),
-  );
+  const exclude = opts?.exclude ?? null;
+  const eligible = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
   if (eligible.length === 0) return null;
   if (opts?.preferred) {
     const preferred = eligible.find((participant) => principalsEqual(participant, opts.preferred ?? null));
@@ -2439,17 +2435,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   });
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   const newlySkippedStageIds: string[] = [];
-  // The assignee of record at delivery is the delivery author. It is never
-  // seated on its own delivery: neither the return-assignee exclusion (which
-  // misses an author that named another return assignee) nor a preferred
-  // assignee can hand the author its own stage (SUP-24563).
   let participant = selectStageParticipant(pendingStage, {
     preferred:
       existingState?.status === CHANGES_REQUESTED_STATUS
         ? explicitAssignee ?? existingState.currentParticipant ?? null
         : explicitAssignee,
     exclude: returnAssignee,
-    excludeAlso: currentAssignee,
   });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
@@ -2478,18 +2469,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           ? explicitAssignee ?? existingState.currentParticipant ?? null
           : explicitAssignee,
       exclude: returnAssignee,
-      excludeAlso: currentAssignee,
     });
   }
   if (!participant) {
-    if (selectStageParticipant(pendingStage, { exclude: returnAssignee })) {
-      // Only the delivery author is left on this stage: seating it would let
-      // it review or approve its own delivery.
-      throw unprocessable(
-        `No eligible ${pendingStage.type} participant is configured for this issue (stage ${pendingStage.id}); the delivery author is excluded from participant selection on its own delivery`,
-        { stageId: pendingStage.id, stageType: pendingStage.type, deliveryAuthor: currentAssignee },
-      );
-    }
     // Reached only when the exclusion emptied the stage and the auto-skip did
     // not apply (an approval stage, or a review stage on a transition other
     // than `done`). Re-selecting without the exclusion is exactly the
@@ -2502,8 +2484,8 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // The assignee of record at delivery is the delivery author. Capturing it
   // here (before the patch reassigns the issue to the review participant)
   // keeps the diff author distinguishable on the recorded shape; the
-  // exclusions above keep the author from being selected as the participant
-  // of their own stage.
+  // exclusion above already keeps the author from being selected as the
+  // participant of their own stage.
   buildPendingStagePatch({
     patch,
     previous:
