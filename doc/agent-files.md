@@ -40,16 +40,24 @@ workspace sync, Git staging, or task deliverables.
 When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
 named `agents` group) and the server process may assign it (it is root or a
 member), the fork stages local run directories with mode `02750` (setgid, group
-read/traverse) owned by that group, files with an owner execute bit as `0750`,
-and other files as `0640`; no world access is granted. Modes are applied
-explicitly after creation/copy, independent of umask. If any group or mode
-assignment is denied, staging does not fail: the run falls back to a fresh
-owner-only copy and its receipt does not claim group staging. Otherwise the
-run tree keeps the owner-only layout and the canonical file modes. Staging never
-changes canonical files: for a group-staged run, a file still at its staged mode
-is written back with its canonical mode, and only a mode the run itself set is
-saved. An owner-only run saves its live modes as they are. Runtime ancestor
-permissions are unchanged and the shared group never gets write access.
+read/traverse) owned by that group. Files retain their owner permissions and gain
+group read only when the canonical file grants both owner read and group read;
+group execute then follows owner execute (`0755` becomes `0750`). Files without
+canonical group-read intent stay owner-only (`0600` stays `0600`, `0700` stays
+`0700`, and `0604` becomes `0600`). No world access or group write is granted.
+The run directory stays `0700` throughout copying and all descendant mode/group
+assignments; only the completed tree is opened to the group. This also applies
+when staging retries in an existing run directory.
+Modes are applied explicitly, independent of umask. If any group or mode
+assignment is denied, the run falls back to a fresh copy behind a `0700` run
+directory and its receipt does not claim group staging. Without an assignable
+group the run also stays private. Both private paths retain canonical modes
+except that group/world write bits are removed from all staged entries.
+Staging never changes canonical files: a file still at its staged mode is saved
+with its canonical mode; only a mode the run itself set is saved. Replacing an
+existing canonical file retains that file's own group, even when its parent or
+the live copy has a different group. New files use the canonical directory's
+normal creation rules, not the live copy's group. Runtime ancestor permissions are unchanged.
 
 The fork runs every adapter as one shared principal in the agents group, so any
 adapter process can read the live copies of other agents and other companies

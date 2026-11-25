@@ -539,14 +539,17 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   // An interrupted restore must not leave a truncated current file. Keep the
   // incoming tree until its owner records success; exact retries deduplicate.
   const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  const existing = await fs.lstat(targetPath).catch(() => null);
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
     });
+    // Atomic replacement must retain the destination's group, not inherit the
+    // incoming tree's group or the canonical parent directory's default.
+    if (existing?.isFile()) await fs.chown(temporary, -1, existing.gid);
     await fs.chmod(temporary, entry.mode);
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
-    const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }

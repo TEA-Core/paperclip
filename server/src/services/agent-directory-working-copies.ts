@@ -41,15 +41,19 @@ async function workingCopyGid(): Promise<number | null> {
   return process.getuid?.() === 0 || process.getegid?.() === gid || process.getgroups?.().includes(gid) ? gid : null;
 }
 
-const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
+// Group readability is opt-in via the canonical group-read bit, never inferred
+// from owner access alone. Strip write access for every non-owner.
+const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700) |
+  (mode & 0o400 && mode & 0o040 ? 0o040 | (mode & 0o100 ? 0o010 : 0) : 0);
 
-async function workingCopyPermissions(filename: string, gid: number, recursive = true): Promise<void> {
+async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
   const stat = await fs.lstat(filename);
   if (stat.isSymbolicLink()) return;
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
+  if (gid !== null && stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
   // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
+  const mode = gid === null ? stat.mode & 0o7755 : stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777;
+  if (gid !== null || mode !== (stat.mode & 0o7777)) await fs.chmod(filename, mode);
   if (recursive && stat.isDirectory()) {
     for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
   }
@@ -74,33 +78,38 @@ async function workingCopyParents(agentRoot: string): Promise<number | null> {
 async function stageWorkingCopy(canonical: string, localRoot: string, gid: number | null): Promise<number | null> {
   const runDir = path.dirname(localRoot);
   await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
+  // A retry may reuse a previously published run directory. Close it before
+  // copying any canonical modes, including group/world-writable entries.
+  await fs.chmod(runDir, 0o700);
   await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
-  if (gid === null) return null;
   try {
-    await workingCopyPermissions(runDir, gid, false);
     await workingCopyPermissions(localRoot, gid);
+    if (gid === null) return null;
+    // Publish last: no group member can reach a partially hardened tree.
+    await workingCopyPermissions(runDir, gid, false);
     return gid;
   } catch (error) {
     if (!permissionDenied(error)) throw error;
     await fs.chmod(runDir, 0o700);
     await fs.rm(localRoot, { recursive: true, force: true });
     await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
+    await workingCopyPermissions(localRoot, null);
     return null;
   }
 }
 
-function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot): T {
+function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot, group: boolean): T {
   // A live file still at its staged mode keeps the canonical mode on save;
   // only a mode the run itself set is written back.
   const before = base.entries.get(name);
-  return entry.kind === "file" && before?.kind === "file" && entry.mode === stagedMode(before.mode) ? { ...entry, mode: before.mode } : entry;
+  return entry.kind === "file" && before?.kind === "file" && entry.mode === (group ? stagedMode(before.mode) : before.mode & ~0o022) ? { ...entry, mode: before.mode } : entry;
 }
 const stagedForGroup = (row: Copy) => typeof row.receipt?.stagedGid === "number";
-function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot): DirectorySnapshot {
-  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base)])) };
+function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot, group: boolean): DirectorySnapshot {
+  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base, group)])) };
 }
-function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot): AgentFileManifest {
-  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base)]) };
+function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot, group: boolean): AgentFileManifest {
+  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base, group)]) };
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
@@ -301,7 +310,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       try {
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
-        const manifest = stagedForGroup(row) ? canonicalManifest(captured.manifest, baseline(row)) : captured.manifest;
+        const manifest = canonicalManifest(captured.manifest, baseline(row), stagedForGroup(row));
         const snapshot = checkpointSnapshot(manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
@@ -349,7 +358,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       row = await patch(row, { attempts: row.attempts + 1 });
       try {
         inspected ??= await retrieve(row, target);
-        const snapshot = stagedForGroup(row) ? canonicalSnapshot(inspected.snapshot, baseline(row)) : inspected.snapshot;
+        const snapshot = canonicalSnapshot(inspected.snapshot, baseline(row), stagedForGroup(row));
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
         if (candidateHash === row.baseHash) {
