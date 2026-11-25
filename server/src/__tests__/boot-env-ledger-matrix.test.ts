@@ -876,6 +876,69 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     },
   );
 
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")(
+    "keeps own-file secrets across boots when an unlistable parent meets an own file without an identity claim",
+    async () => {
+      const fixture = await makeWorktreeFixture({
+        ownEnvContents:
+          "PAPERCLIP_IN_WORKTREE=true\n" +
+          "PAPERCLIP_AGENT_JWT_SECRET=canary-own-jwt\n" +
+          "BETTER_AUTH_SECRET=canary-own-auth\n" +
+          "PAPERCLIP_SECRETS_MASTER_KEY=canary-own-master\n",
+      });
+      process.chdir(fixture.worktreeRoot);
+      fs.chmodSync(fixture.repoRoot, 0o100);
+      try {
+        const dataDirs: string[] = [];
+        for (let boot = 0; boot < 2; boot += 1) {
+          resetBootEnvForTests();
+          for (const key of Object.keys(process.env)) {
+            if (key.startsWith("PAPERCLIP_") || key === "BETTER_AUTH_SECRET") delete process.env[key];
+          }
+          operatorWorktreeLayout(fixture);
+          vi.restoreAllMocks();
+          const booted = await bootServerModules();
+          dataDirs.push(booted.loadConfig().embeddedPostgresDataDir!);
+          expect(bootEnvReport().refusals).toEqual([]);
+          expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("canary-own-jwt");
+          expect(process.env.BETTER_AUTH_SECRET).toBe("canary-own-auth");
+          expect(process.env.PAPERCLIP_SECRETS_MASTER_KEY).toBe("canary-own-master");
+        }
+        expect(path.relative(fixture.isolatedHome, dataDirs[0]!).startsWith("..")).toBe(false);
+        expect(dataDirs[1]).toBe(dataDirs[0]);
+      } finally {
+        fs.chmodSync(fixture.repoRoot, 0o700);
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")(
+    "refuses an own-file identity claim when the worktree parent is not listable",
+    async () => {
+      const fixture = await makeWorktreeFixture({
+        ownEnvContents:
+          "PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_INSTANCE_ID=claimed-sibling\nPAPERCLIP_AGENT_JWT_SECRET=canary-own-jwt\n",
+      });
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      fs.chmodSync(fixture.repoRoot, 0o100);
+      try {
+        const booted = await bootServerModules();
+        const dataDir = booted.loadConfig().embeddedPostgresDataDir!;
+        expect(bootEnvReport().refusals.map((refusal) => refusal.kind)).toContain("identity");
+        expect(dataDir).not.toBe(path.join(fixture.isolatedHome, "instances", "claimed-sibling", "db"));
+        expect(path.relative(fixture.isolatedHome, dataDir).startsWith("..")).toBe(false);
+        expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      } finally {
+        fs.chmodSync(fixture.repoRoot, 0o700);
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("honours the ordinary-instance own-file database backup opt-out", async () => {
     const fixture = await makeWorktreeFixture({
       ownEnvContents: "PAPERCLIP_DB_BACKUP_ENABLED=false\n",

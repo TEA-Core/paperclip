@@ -214,7 +214,10 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     if (code !== "EACCES" && code !== "EPERM") throw error;
     parentEntries = null;
   }
-  const unsafe = (candidate: WorktreeRuntimeContext, pathBoundIdentity = false): boolean => {
+  const suffix = createHash("sha256").update(plan.configPath).digest("hex").slice(0, 12);
+  const isolatedId = `${fallback.instanceId}-${suffix}`;
+  const unsafe = (candidate: WorktreeRuntimeContext): boolean => {
+    const pathBoundIdentity = candidate.homeDir === fallback.homeDir && candidate.instanceId === isolatedId;
     if (!/^[a-z0-9_-]+$/.test(candidate.instanceId)) return true;
     if (mainHomes.some((main) => isPathInside(candidate.homeDir, main) || isPathInside(main, candidate.homeDir))) return true;
     const registered = readWorktreePortRegistry(fallback.homeDir);
@@ -239,14 +242,14 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     return false;
   };
   if (!unsafe(claimed)) return claimed;
-  refuseBootEnv({
+  const ownIdentityClaim = !stale &&
+    ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_WORKTREE_NAME"].some((key) => staged(key) !== null);
+  if (parentEntries !== null || ownIdentityClaim) refuseBootEnv({
     kind: "identity", path: fallback.envPath,
     message: "PAPERCLIP_HOME, PAPERCLIP_INSTANCE_ID or PAPERCLIP_WORKTREE_NAME does not identify an isolated worktree",
   });
   if (!unsafe(fallback)) return fallback;
   // A colliding operator/layout name also cannot adopt another worktree's data.
-  const suffix = createHash("sha256").update(plan.configPath).digest("hex").slice(0, 12);
-  const isolatedId = `${fallback.instanceId}-${suffix}`;
   const isolatedRoot = path.join(fallback.homeDir, "instances", isolatedId);
   const isolated = {
     ...fallback, instanceId: isolatedId, instanceRoot: isolatedRoot,
@@ -256,7 +259,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     storageDir: path.join(isolatedRoot, "data", "storage"),
     secretsKeyFilePath: path.join("/etc/paperclip/worktrees", isolatedId, "master.key"),
   };
-  if (unsafe(isolated, true)) throw new Error("No isolated worktree identity is available");
+  if (unsafe(isolated)) throw new Error("No isolated worktree identity is available");
   return isolated;
 }
 
