@@ -1,13 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import express from "express";
+import request from "supertest";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  agentApiKeys,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   instanceSettings,
@@ -19,6 +24,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { actorMiddleware } from "../middleware/auth.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { issueRoutes } from "../routes/issues.js";
+import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   applyIssueExecutionPolicyTransition,
@@ -1304,6 +1313,128 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     });
 
     await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(reviewer, issueId, reviewer));
+  });
+
+  // ─── (t) round 6: real authenticated edits and deliveries ────────────────
+
+  it.each([
+    { shape: "j-f2c: the previous author delivers again after the reviewer's rewrite", previousDelivery: true, assigner: null },
+    { shape: "l3-user-author: board assignment cannot authorize an agent's later delivery", previousDelivery: false, assigner: "board" },
+    { shape: "confederate assignment and delivery cannot authorize the rewriter's review", previousDelivery: false, assigner: "agent" },
+  ] as const)("(t) $shape cannot take a reserved slot or overtake older general work", async ({ previousDelivery, assigner }) => {
+    const olderGeneral = await seedReservedSlotsFree();
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Cap test owner",
+      email: "cap-test-owner@example.com",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "owner",
+    });
+    await ensureHumanRoleDefaultGrants(db, {
+      companyId,
+      principalId: "responsible-user",
+      membershipRole: "owner",
+      grantedByUserId: null,
+    });
+
+    const keyedActors = new Map<string, string>();
+    async function keyedAgent(name: string) {
+      const id = await seedAgent(name);
+      // Exercise the issue routes without starting their automatic assignment
+      // wakes during setup. Only the final reviewer wake is enabled below.
+      await db.update(agents).set({
+        runtimeConfig: { heartbeat: { wakeOnDemand: false, maxConcurrentRuns: 5 } },
+      }).where(eq(agents.id, id));
+      const token = randomUUID();
+      await db.insert(agentApiKeys).values({
+        agentId: id,
+        companyId,
+        name,
+        keyHash: createHash("sha256").update(token).digest("hex"),
+        responsibleUserId: "responsible-user",
+      });
+      keyedActors.set(token, id);
+      return { id, token };
+    }
+
+    const reviewer = await keyedAgent("RewriterA");
+    const deliverer = await keyedAgent(assigner === "agent" ? "DelivererD" : "DelivererB");
+    const confederate = assigner === "agent" ? await keyedAgent("AssignerC") : null;
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewer.id }] }],
+    })!;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Work before the rewrite",
+      status: "todo",
+      assigneeAgentId: previousDelivery ? deliverer.id : null,
+      createdByAgentId: previousDelivery ? deliverer.id : null,
+      createdByUserId: previousDelivery ? null : "responsible-user",
+      executionPolicy: policy as unknown as Record<string, unknown>,
+    });
+
+    const app = express();
+    app.use(express.json());
+    // Real Bearer agent keys; no injected req.actor. The no-token board path
+    // is the existing local-trusted operator path.
+    app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    async function patchIssue(token: string | null, body: Record<string, unknown>) {
+      const pending = request(app).patch(`/api/issues/${issueId}`);
+      const actorRunId = token ? (await seedLiveRuns(1, keyedActors.get(token)!))[0]! : null;
+      if (token) {
+        pending.set("Authorization", `Bearer ${token}`);
+        pending.set("X-Paperclip-Run-Id", actorRunId!);
+      }
+      let response: request.Response;
+      try {
+        response = await pending.send(body);
+      } finally {
+        // The route caller's turn ends before the next principal acts. Its
+        // live run is attribution context, not background load for admission.
+        if (actorRunId) {
+          await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+            .where(eq(heartbeatRuns.id, actorRunId));
+        }
+      }
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    }
+
+    if (previousDelivery) {
+      await patchIssue(deliverer.token, { status: "in_review" });
+      await patchIssue(reviewer.token, {
+        status: "in_progress",
+        comment: "Request changes before rewriting this work.",
+      });
+      // Establish the reported unassigned-card precondition through the real
+      // board route. This action neither seats nor wakes the reviewer.
+      await patchIssue(null, { status: "todo", assigneeAgentId: null });
+    }
+    await patchIssue(reviewer.token, { description: "General implementation work rewritten by agent A." });
+    if (assigner !== null) {
+      await patchIssue(confederate?.token ?? null, { assigneeAgentId: deliverer.id });
+    }
+    await patchIssue(deliverer.token, { status: "in_review" });
+
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5 } },
+    }).where(eq(agents.id, reviewer.id));
+    const candidate = await wakeOnIssue(reviewer.id, issueId, reviewer.id);
+    await heartbeat.resumeQueuedRuns();
+    expect.soft(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "queued", candidate: "queued" });
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "running", candidate: "queued" });
   });
 
   // ─── (d) router input ─────────────────────────────────────────────────────
