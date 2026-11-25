@@ -21,7 +21,7 @@ The canonical host directory keeps its existing physical location:
     AGENTS.md
     notes/
     any-supported-file
-  file-sync/                   operational state (live copies shared with agents)
+  file-sync/                   operational state (live copies may be agents-group readable)
     adopted.json
     canonical-manifest.json   metadata/hash cache, no file contents
     runs/<initial-run>/
@@ -37,13 +37,16 @@ workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
 
-The fork stages local run directories with mode `02750` (setgid, group
-read/traverse) and regular files with mode `0640`; no world access is granted.
-Modes are applied explicitly after creation/copy, independent of umask and
-canonical-file modes. The group follows `PAPERCLIP_AGENTS_GID`, then the runtime's
-named `agents` group; hosts without either use the existing agent parent
-directory's gid. This does not change canonical files or runtime ancestor
-permissions, and does not grant the shared group write access.
+When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
+named `agents` group) and the server process may assign it (it is root or a
+member), the fork stages local run directories with mode `02750` (setgid, group
+read/traverse) owned by that group, files with an owner execute bit as `0750`,
+and other files as `0640`; no world access is granted. Modes are applied
+explicitly after creation/copy, independent of umask. Otherwise the run tree
+keeps the owner-only layout and the canonical file modes. Staging never changes
+canonical files: on save, a file still at its staged mode is written back with
+its canonical mode, and only a mode the run itself set is saved. Runtime
+ancestor permissions are unchanged and the shared group never gets write access.
 
 Regular files (including binary bytes) and directories are supported, up to
 100,000 entries (files and folders), 256 MiB per file and 2 GiB total. Symlinks,

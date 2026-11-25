@@ -98,20 +98,31 @@ describe("persistent agent directories", () => {
     expect(await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId))).toHaveLength(0);
   });
 
+  async function withAgentsGid<T>(gid: number, fn: () => Promise<T>): Promise<T> {
+    const previous = process.env.PAPERCLIP_AGENTS_GID;
+    process.env.PAPERCLIP_AGENTS_GID = String(gid);
+    try { return await fn(); } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
+      else process.env.PAPERCLIP_AGENTS_GID = previous;
+    }
+  }
+  const sharedFiles = ["AGENTS.md", "doctrine/mission.md", "doctrine/nested/policy.md"];
+  async function writeShared() {
+    for (const relative of sharedFiles) {
+      await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(root, relative), relative, { mode: 0o600 });
+    }
+  }
+
   it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
-    const gid = process.getgid!();
-    const previousGid = process.env.PAPERCLIP_AGENTS_GID;
+    const gid = process.getegid!();
     const previousUmask = process.umask();
-    const files = ["AGENTS.md", "doctrine/mission.md", "doctrine/nested/policy.md"];
+    await writeShared();
+    await fs.writeFile(path.join(root, "doctrine/run.sh"), "#!/bin/sh\n", { mode: 0o700 });
+    await fs.mkdir(path.join(root, "empty"), { mode: 0o700 });
     try {
-      process.env.PAPERCLIP_AGENTS_GID = String(gid);
-      for (const relative of files) {
-        await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true, mode: 0o700 });
-        await fs.writeFile(path.join(root, relative), relative, { mode: 0o600 });
-      }
-      await fs.mkdir(path.join(root, "empty"), { mode: 0o700 });
       process.umask(0o077);
-      const copy = await run();
+      const copy = await withAgentsGid(gid, () => run());
       process.umask(previousUmask);
       const agentRoot = path.dirname(root);
       const directories = ["file-sync", "file-sync/runs", `file-sync/runs/${copy.runId}`];
@@ -129,35 +140,75 @@ describe("persistent agent directories", () => {
           if (entry.isDirectory()) await checkTree(filename);
           else {
             const file = await fs.stat(filename);
-            expect(file.mode & 0o7777).toBe(0o640);
+            expect(file.mode & 0o7777).toBe(entry.name === "run.sh" ? 0o750 : 0o640);
             expect(file.gid).toBe(gid);
           }
         }
       };
       await checkTree(copy.localRoot);
-      if (process.getuid!() === 0) {
-        // Only fixture ancestors are opened for traversal; production ancestors
-        // remain the runtime's responsibility, outside the per-run tree.
-        for (let dir = agentRoot; dir !== os.tmpdir(); dir = path.dirname(dir)) {
-          await fs.chmod(dir, 0o750);
-          await fs.chown(dir, 0, gid);
-        }
-        const { stdout } = await execFile(process.execPath, ["-e", `
-          const fs = require("node:fs");
-          const path = require("node:path");
-          const root = process.argv[1];
-          if (process.getuid() === fs.statSync(root).uid) process.exit(1);
-          console.log(JSON.stringify(process.argv.slice(2).map(file => fs.readFileSync(path.join(root, file), "utf8"))));
-        `, copy.localRoot, ...files], { uid: 65534, gid });
-        expect(JSON.parse(stdout)).toEqual(files);
-      }
-      // Unprivileged CI cannot switch uid: exact modes and gids above prove
-      // non-owner group read/traversal without granting any world permission.
     } finally {
       process.umask(previousUmask);
-      if (previousGid === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
-      else process.env.PAPERCLIP_AGENTS_GID = previousGid;
     }
+  });
+
+  it.skipIf(process.getuid?.() !== 0)("lets a non-owner agents-group member read live/AGENTS.md and live/doctrine/* (needs root to switch uid)", async () => {
+    const gid = process.getegid!();
+    await writeShared();
+    const copy = await withAgentsGid(gid, () => run());
+    // Only the disposable home fixture is opened for traversal; production
+    // ancestors remain the runtime's responsibility, outside the per-run tree.
+    for (let dir = path.dirname(root); dir !== path.dirname(dir) && (dir === home || dir.startsWith(`${home}${path.sep}`)); dir = path.dirname(dir)) {
+      await fs.chmod(dir, 0o750);
+      await fs.chown(dir, 0, gid);
+    }
+    const { stdout } = await execFile(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const root = process.argv[1];
+      if (process.getuid() === fs.statSync(root).uid) process.exit(1);
+      console.log(JSON.stringify(process.argv.slice(2).map(file => fs.readFileSync(path.join(root, file), "utf8"))));
+    `, copy.localRoot, ...sharedFiles], { uid: 65534, gid });
+    expect(JSON.parse(stdout)).toEqual(sharedFiles);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("keeps the owner-only layout when the agents group cannot be assigned", async () => {
+    let gid = 54_321;
+    while (gid === process.getegid!() || process.getgroups!().includes(gid)) gid++;
+    await writeShared();
+    await fs.writeFile(path.join(root, "doctrine/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    const copy = await withAgentsGid(gid, () => run());
+    const agentRoot = path.dirname(root);
+    for (const relative of ["file-sync/runs", `file-sync/runs/${copy.runId}`]) {
+      const stat = await fs.stat(path.join(agentRoot, relative));
+      expect(stat.mode & 0o077).toBe(0);
+      expect(stat.gid).not.toBe(gid);
+    }
+    for (const [relative, mode] of [...sharedFiles.map(file => [file, 0o600] as const), ["doctrine/run.sh", 0o755] as const]) {
+      const stat = await fs.stat(path.join(copy.localRoot, relative));
+      expect(stat.mode & 0o7777).toBe(mode);
+      expect(stat.gid).not.toBe(gid);
+    }
+  });
+
+  it.each([false, true])("writes edited files back with their canonical modes unless the run changed the mode (warm=%s)", async (warm) => {
+    const canonical = { "scripts/run.sh": 0o755, "notes/plain.md": 0o644, "notes/mode.md": 0o644 };
+    for (const [relative, mode] of Object.entries(canonical)) {
+      await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true });
+      await fs.writeFile(path.join(root, relative), "before", { mode });
+      await fs.chmod(path.join(root, relative), mode);
+    }
+    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
+    expect((await fs.stat(path.join(copy.localRoot, "scripts/run.sh"))).mode & 0o7777).toBe(0o750);
+    for (const relative of Object.keys(canonical)) await fs.writeFile(path.join(copy.localRoot, relative), `after ${relative}`);
+    await fs.chmod(path.join(copy.localRoot, "notes/mode.md"), 0o600);
+    const saved = await copies[warm ? "checkpointWarm" : "collectStopped"]({ companyId, runId: copy.runId });
+    expect(saved?.state).toBe(warm ? "warm_saved" : "saved");
+    const expected = { ...canonical, "notes/mode.md": 0o600 };
+    for (const [relative, mode] of Object.entries(expected)) {
+      expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(`after ${relative}`);
+      expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(mode);
+    }
+    if (warm) expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
 
   it("does not change external targets of symlinks encountered while staging permissions", async () => {
