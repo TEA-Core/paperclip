@@ -149,6 +149,32 @@ describe("workspace restore merge", () => {
     }
   });
 
+  it.each(["EPERM", "EINVAL"])("creates new files and folders when the parent group cannot be applied (%s) and warns", async (code) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-chown-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir);
+    await mkdir(path.join(sourceDir, "dir"), { recursive: true });
+    const gid = (await stat(targetDir)).gid;
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    const chown = vi.spyOn(fsPromises, "chown").mockRejectedValue(Object.assign(new Error("denied"), { code }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await writeFile(path.join(sourceDir, "dir", "new.txt"), "new");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, newDirectoryMode: 0o750 });
+      expect(await readFile(path.join(targetDir, "dir", "new.txt"), "utf8")).toBe("new");
+      expect((await stat(path.join(targetDir, "dir"))).mode & 0o7777).toBe(0o750);
+      expect(chown).toHaveBeenCalledWith(path.join(targetDir, "dir"), -1, gid);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(path.join(targetDir, "dir", "new.txt")));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`group ${gid}`));
+    } finally {
+      chown.mockRestore();
+      warn.mockRestore();
+      await disposeDirectorySnapshot(baseline);
+    }
+  });
+
   it("fails the restore on other group-preserving errors", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-chown-"));
     cleanupDirs.push(rootDir);

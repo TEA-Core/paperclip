@@ -281,7 +281,8 @@ export function agentFileStore(db: Db) {
           total += size;
         }
         assertDirectorySize(total, finalEntries.size);
-        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
+        // Folders a run creates never get group write in the canonical tree.
+        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root, newDirectoryMode: 0o750,
           ...(input.checkpoint || input.snapshot ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };

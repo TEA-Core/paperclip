@@ -108,9 +108,12 @@ async function stageWorkingCopy(canonical: string, localRoot: string, gid: numbe
 
 function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot, staged: (mode: number) => number): T {
   // A live file still at its staged mode keeps the canonical mode on save;
-  // only a mode the run itself set is written back.
+  // only a mode the run itself set is written back. A file the run created
+  // gets the staged rule (owner bits, group read at most), never group write.
+  if (entry.kind !== "file" || entry.mode === undefined) return entry;
   const before = base.entries.get(name);
-  return entry.kind === "file" && before?.kind === "file" && entry.mode === staged(before.mode) ? { ...entry, mode: before.mode } : entry;
+  if (before?.kind !== "file") return { ...entry, mode: stagedMode(entry.mode) };
+  return entry.mode === staged(before.mode) || stagedMode(entry.mode) === before.mode ? { ...entry, mode: before.mode } : entry;
 }
 function stagingFormula(row: Copy): (mode: number) => number {
   if (typeof row.receipt?.stagedGid !== "number") {

@@ -68,8 +68,10 @@ umask `002`. Unsafe old manifest caches are discarded and rebuilt.
 Replacing an existing canonical file retains that file's own group, even when its
 parent or the live copy has a different group. If the server may not assign that
 group (`EPERM`/`EINVAL`), the file is still replaced and a warning names the path
-and group. New files use the canonical directory's
-normal creation rules, not the live copy's group. Runtime ancestor permissions are unchanged.
+and group. Files and folders a run creates take their canonical parent
+folder's group (never the live copy's agents group), with the same best-effort
+warning. A new file's mode follows the staging rule (owner bits, group read at
+most, never group write; `0664` becomes `0640`), and new folders are `0750`. Runtime ancestor permissions are unchanged.
 
 The fork runs every adapter as one shared principal in the agents group, so any
 adapter process can read the live copies of other agents and other companies

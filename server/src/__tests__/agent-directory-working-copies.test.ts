@@ -369,6 +369,33 @@ describe("persistent agent directories", () => {
     if (warm) expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
 
+  const canonicalGroup = [...new Set(process.getgroups?.() ?? [])].find(gid => gid !== process.getegid?.());
+  it.skipIf(canonicalGroup === undefined).each([false, true])("saves run-created files and folders with the canonical parent group and no group write (warm=%s)", async (warm) => {
+    await fs.chown(root, -1, canonicalGroup!);
+    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+    const created = { "created.md": 0o664, "newdir/inner.md": 0o666, "newdir/tool.sh": 0o775 };
+    for (const [relative, mode] of Object.entries(created)) {
+      await fs.mkdir(path.dirname(path.join(copy.localRoot, relative)), { recursive: true, mode: 0o775 });
+      await fs.writeFile(path.join(copy.localRoot, relative), relative);
+      await fs.chmod(path.join(copy.localRoot, relative), mode);
+    }
+    await fs.chmod(path.join(copy.localRoot, "newdir"), 0o2775);
+    expect((await fs.stat(path.join(copy.localRoot, "newdir"))).gid).toBe(process.getegid!());
+    const saved = await copies[warm ? "checkpointWarm" : "collectStopped"]({ companyId, runId: copy.runId });
+    expect(saved?.state).toBe(warm ? "warm_saved" : "saved");
+    const expected = { "created.md": 0o640, "newdir/inner.md": 0o640, "newdir/tool.sh": 0o750, newdir: 0o750 };
+    for (const [relative, mode] of Object.entries(expected)) {
+      const stat = await fs.stat(path.join(root, relative));
+      expect(stat.gid).toBe(canonicalGroup);
+      expect(stat.mode & 0o7777).toBe(mode);
+    }
+    if (warm) {
+      expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
+      expect((await fs.stat(path.join(root, "created.md"))).mode & 0o7777).toBe(0o640);
+    }
+  });
+
   it.each([false, true])("maps legacy group-staged modes back to canonical owner-only modes (warm=%s)", async (warm) => {
     const canonical = { "notes/private.md": 0o600, "scripts/private.sh": 0o700, "notes/plain.md": 0o644, "scripts/run.sh": 0o755 };
     for (const [relative, mode] of Object.entries(canonical)) {
