@@ -1280,6 +1280,23 @@ async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): P
   }
   await refuseUnreadableLooseRefs(path.join(commonDir, "refs"), "refs", options);
   await appendReflogTips(path.join(commonDir, "logs"), "logs", refs, seen, options);
+  // Reflog-only commits (including linked worktrees' private HEAD logs) and
+  // `git stash create` commits are not all refs. Inventory unreachable commits
+  // without treating any reflog as a reachability root. Never write lost-found.
+  const unreachable = await runHardenedGit(
+    ["-C", repoRoot, "fsck", "--unreachable", "--no-reflogs", "--no-progress", "--connectivity-only"],
+    options,
+  );
+  for (const line of unreachable.split("\n")) {
+    const match = /^unreachable commit ([0-9a-f]+)$/.exec(line);
+    if (!match || !SHA_RE.test(match[1]!)) continue;
+    const sha = match[1]!;
+    const refname = `unreachable commit ${sha}`;
+    const key = `${sha} ${refname}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push({ sha, refname });
+  }
   return refs;
 }
 

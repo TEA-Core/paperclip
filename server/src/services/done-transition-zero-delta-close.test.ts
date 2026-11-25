@@ -180,7 +180,7 @@ function answerGitHub(url: string): Response {
     return json(tags);
   }
   if (u.pathname === `${repoPath}/pulls`) {
-    return json(pullRequestHeads.map((sha, index) => ({ number: index + 1, state: "open", head: { sha } })));
+    return json(pullRequestHeads.map((sha, index) => ({ number: index + 1, state: "open", head: { sha, repo: { full_name: "TEA-Core/paperclip" } } })));
   }
   return json({ message: "Not Found" }, 404);
 }
@@ -1027,6 +1027,67 @@ describe("zero-delta remote-base authority (RA 1213 still open)", () => {
     pullRequestHeads.push(git(seed, "rev-parse", "HEAD"));
     const result = await close();
     expect(result.allowed, result.reason).toBe(true);
+  });
+
+  it("refuses at the close write when a pull-request head no longer accounts for the unchanged forge branch", async () => {
+    writeFileSync(path.join(seed, "other.txt"), "undelivered\n");
+    git(seed, "add", "other.txt");
+    git(seed, "commit", "-qm", "other work");
+    git(seed, "push", "-q", origin, "HEAD:refs/heads/other-work");
+    pullRequestHeads.push(git(seed, "rev-parse", "HEAD"));
+    const measurement = await measured();
+    pullRequestHeads[0] = headSha();
+
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("remote refs changed");
+  });
+
+  function createUnreferencedStash(): string {
+    writeFileSync(path.join(worktree, "a.txt"), "undelivered stash contents\n");
+    const sha = git(worktree, "stash", "create", "unreferenced work");
+    writeFileSync(path.join(worktree, "a.txt"), "hello\n");
+    expect(git(worktree, "stash", "list")).toBe("");
+    expect(git(worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+    expect(git(worktree, "show", `${sha}:a.txt`)).toBe("undelivered stash contents");
+    return sha;
+  }
+
+  it("refuses a dangling stash-create commit without refs/stash or a stash reflog", async () => {
+    createUnreferencedStash();
+    const result = await close();
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("holds a commit the remote base lacks");
+  });
+
+  it("refuses at the close write when a dangling stash-create commit appears after measurement", async () => {
+    const measurement = await measured();
+    createUnreferencedStash();
+    const verdict = await verify(measurement);
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("changed after the close was measured");
+  });
+
+  it("refuses undelivered work held only by a linked worktree's private HEAD reflog", async () => {
+    const other = path.join(repoRoot, ".paperclip", "worktrees", "other-review");
+    git(repoRoot, "worktree", "add", "-q", "-b", "release", other, "origin/main");
+    rows.projectWorkspace.repoRef = "release";
+    writeFileSync(path.join(other, "private-work.txt"), "undelivered private work\n");
+    git(other, "add", "private-work.txt");
+    git(other, "commit", "-qm", "private work");
+    const privateCommit = git(other, "rev-parse", "HEAD");
+    git(other, "reset", "--hard", "origin/main");
+    rmSync(path.join(repoRoot, ".git", "logs"), { recursive: true, force: true });
+    const privateGitDir = git(other, "rev-parse", "--absolute-git-dir");
+    expect(readFileSync(path.join(privateGitDir, "logs", "HEAD"), "utf8")).toContain(privateCommit);
+    expect(git(other, "status", "--porcelain", "--untracked-files=all")).toBe("");
+    expect(git(other, "show", `${privateCommit}:private-work.txt`)).toBe("undelivered private work");
+
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("holds a commit the remote base lacks");
   });
 
   it("refuses at the close write when a forge branch appears after the measurement", async () => {

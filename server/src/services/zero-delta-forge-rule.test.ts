@@ -21,7 +21,7 @@ const budget = { perCallMs: 1000, totalMs: 5000, concurrency: 2 };
 const api = "https://api.github.com/repos/test/project";
 let branches: Array<{ name: string; commit: { sha: string } }>;
 let tags: typeof branches;
-let pulls: Array<{ state: string; merged_at?: string; head: { sha: string } }>;
+let pulls: Array<{ state: string; merged_at?: string; head: { sha: string; repo: { full_name: string } | null } }>;
 
 function answer(url: string): Response {
   const { pathname } = new URL(url);
@@ -53,7 +53,7 @@ describe("zero-delta forge evidence", () => {
 
   it.each(["open", "closed", "merged"])("accounts for an unrelated %s pull-request head by SHA", async (state) => {
     branches.push({ name: "other-work", commit: { sha: hidden } });
-    pulls.push({ state: state === "merged" ? "closed" : state, ...(state === "merged" ? { merged_at: "2026-11-21T00:00:00Z" } : {}), head: { sha: hidden } });
+    pulls.push({ state: state === "merged" ? "closed" : state, ...(state === "merged" ? { merged_at: "2026-11-21T00:00:00Z" } : {}), head: { sha: hidden, repo: { full_name: "test/project" } } });
     expect(await decide()).toMatchObject({ ok: true, proof: { baseSha: base, headSha: ancestor } });
     pulls[0]!.head.sha = "d".repeat(40);
     expect(await decide()).toMatchObject({ ok: false, reason: expect.stringContaining("not a pull-request head") });
@@ -61,7 +61,7 @@ describe("zero-delta forge evidence", () => {
 
   it.each(["branch", "tag"] as const)("a card-named %s cannot use the pull-request exemption", async (kind) => {
     (kind === "branch" ? branches : tags).push({ name: "CARD-1-hidden", commit: { sha: hidden } });
-    pulls.push({ state: "open", head: { sha: hidden } });
+    pulls.push({ state: "open", head: { sha: hidden, repo: { full_name: "test/project" } } });
     expect(await decide()).toMatchObject({ ok: false, reason: `${kind} CARD-1-hidden names this card and is not on the base line` });
   });
 
@@ -144,5 +144,44 @@ describe("zero-delta forge evidence", () => {
       return answer(url);
     });
     expect(await decide()).toMatchObject({ ok: false, retriable: true, reason: "the forge read ran out of its time budget" });
+  });
+
+  it.each(["other/project", null])("refuses a pull-request exemption from a foreign or unknown head repository (%s)", async (fullName) => {
+    branches.push({ name: "other-work", commit: { sha: hidden } });
+    pulls.push({ state: "open", head: { sha: hidden, repo: fullName === null ? null : { full_name: fullName } } });
+
+    expect(await decide()).toMatchObject({
+      ok: false,
+      reason: "branch other-work is not on the base line and is not a pull-request head",
+    });
+  });
+
+  it.each(["moved", "removed", "forked"] as const)("refuses at the close write when an accounting pull-request head is %s", async (change) => {
+    branches.push({ name: "other-work", commit: { sha: hidden } });
+    pulls.push({ state: "open", head: { sha: hidden, repo: { full_name: "test/project" } } });
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: true });
+
+    if (change === "moved") pulls[0]!.head.sha = ancestor;
+    else if (change === "removed") pulls = [];
+    else pulls[0]!.head.repo = { full_name: "fork/project" };
+
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false,
+      retriable: true,
+      reason: "the remote refs changed after the close was measured",
+    });
+  });
+
+  it("refuses at the close write when the pull-request accounting set cannot be read", async () => {
+    const measured = await decide();
+    expect(measured.ok).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    fetch.mockImplementation(async (url: string) => new URL(url).pathname.endsWith("/pulls")
+      ? Response.json({}, { status: 503 }) : answer(url));
+
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: false, retriable: true });
   });
 });

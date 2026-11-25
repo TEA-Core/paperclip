@@ -2625,7 +2625,7 @@ export interface ZeroDeltaCloseMeasurement {
   baseRef: string;
   baseSha: string;
   headSha: string;
-  /** sha256 of the forge base and every branch and tag. The close write requires the same snapshot. */
+  /** sha256 of the forge base, every branch/tag, and repository-owned PR head set. */
   forgeSnapshotDigest: string;
   /** The project workspace's `defaultRef` and `repoRef` as read; the close write requires both unchanged. */
   projectDefaultRef: string | null;

@@ -21,6 +21,7 @@ export interface ForgeSnapshot {
   baseBranch: string;
   baseSha: string;
   refs: readonly ForgeRef[];
+  pullRequestHeads: ReadonlySet<string>;
   digest: string;
 }
 
@@ -33,7 +34,6 @@ export interface ForgeBudget {
 export interface ForgeReader {
   snapshot(repo: ForgeRepo, baseBranch: string, budget: ForgeBudget): Promise<ForgeSnapshot>;
   aheadBy(repo: ForgeRepo, baseSha: string, tipSha: string, budget: ForgeBudget): Promise<number>;
-  pullRequestHeads(repo: ForgeRepo, budget: ForgeBudget): Promise<ReadonlySet<string>>;
   resolveCommit(repo: ForgeRepo, ref: string, budget: ForgeBudget): Promise<string | null>;
 }
 
@@ -50,8 +50,11 @@ export function resetZeroDeltaForgeCache(): void {
   deliveredToBase.clear();
 }
 
-export function forgeSnapshotDigest(baseSha: string, refs: readonly ForgeRef[]): string {
-  const lines = [...refs].map((ref) => `${ref.kind} ${ref.name} ${ref.sha}`).sort();
+export function forgeSnapshotDigest(baseSha: string, refs: readonly ForgeRef[], pullRequestHeads: ReadonlySet<string>): string {
+  const lines = [
+    ...refs.map((ref) => `${ref.kind} ${ref.name} ${ref.sha}`),
+    ...[...pullRequestHeads].map((sha) => `pr-head ${sha}`),
+  ].sort();
   return createHash("sha256").update(`${baseSha}\n${lines.join("\n")}`).digest("hex");
 }
 
@@ -158,6 +161,15 @@ export function githubForgeReader(token: string): ForgeReader {
       const baseSha = await readCommitSha(before, `the remote base ${baseBranch}`);
       const branchRows = await listAll(token, `${api}${repoPath(repo)}/branches?per_page=100`, budget, startedAt);
       const tagRows = await listAll(token, `${api}${repoPath(repo)}/tags?per_page=100`, budget, startedAt);
+      const pullRows = await listAll(token, `${api}${repoPath(repo)}/pulls?state=all&per_page=100`, budget, startedAt);
+      const pullRequestHeads = new Set<string>();
+      const repositoryName = `${repo.owner}/${repo.repo}`.toLowerCase();
+      for (const row of pullRows) {
+        const head = asRecord(asRecord(row)?.head);
+        if (stringField(head?.repo, "full_name")?.toLowerCase() !== repositoryName) continue;
+        const sha = stringField(head, "sha")?.toLowerCase();
+        if (sha && /^[0-9a-f]{40}$/.test(sha)) pullRequestHeads.add(sha);
+      }
       const after = await forgeGet(token, baseUrl, budget, startedAt);
       if (!after.ok) throw new ForgeReadError(`the remote base ${baseBranch} could not be read`, after.status >= 500);
       if (await readCommitSha(after, `the remote base ${baseBranch}`) !== baseSha) {
@@ -174,7 +186,7 @@ export function githubForgeReader(token: string): ForgeReader {
         if (!parsed) throw new ForgeReadError("the forge tag list omitted a commit", false);
         refs.push({ kind: "tag", name: parsed.name, sha: parsed.sha });
       }
-      return { repo, baseBranch, baseSha, refs, digest: forgeSnapshotDigest(baseSha, refs) };
+      return { repo, baseBranch, baseSha, refs, pullRequestHeads, digest: forgeSnapshotDigest(baseSha, refs, pullRequestHeads) };
     },
     async aheadBy(repo, baseSha, tipSha, budget) {
       const key = `${repo.hostname}/${repo.owner}/${repo.repo} ${baseSha} ${tipSha}`;
@@ -191,21 +203,6 @@ export function githubForgeReader(token: string): ForgeReader {
       if (typeof aheadBy !== "number") throw new ForgeReadError(`the forge could not compare ${tipSha} with the base`, false);
       if (aheadBy === 0) deliveredToBase.set(key, true);
       return aheadBy;
-    },
-    async pullRequestHeads(repo, budget) {
-      const startedAt = Date.now();
-      const rows = await listAll(
-        token,
-        `${gitHubApiBase(repo.hostname)}${repoPath(repo)}/pulls?state=all&per_page=100`,
-        budget,
-        startedAt,
-      );
-      const heads = new Set<string>();
-      for (const row of rows) {
-        const head = stringField(asRecord(asRecord(row)?.head), "sha")?.toLowerCase();
-        if (head && /^[0-9a-f]{40}$/.test(head)) heads.add(head);
-      }
-      return heads;
     },
     async resolveCommit(repo, ref, budget) {
       const startedAt = Date.now();
@@ -243,7 +240,7 @@ export async function decideZeroDeltaFromForge(
 ): Promise<ForgeVerdict> {
   try {
     const snapshot = await forge.snapshot(card.repo, card.baseBranch, budget);
-    const pullHeads = await forge.pullRequestHeads(card.repo, budget);
+    const pullHeads = snapshot.pullRequestHeads;
     const delivered = new Set<string>([snapshot.baseSha]);
     const unclassified = [...new Set(snapshot.refs.map((ref) => ref.sha))].filter(
       (sha) => sha !== snapshot.baseSha && !pullHeads.has(sha),
