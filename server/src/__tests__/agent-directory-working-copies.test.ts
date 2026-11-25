@@ -272,6 +272,30 @@ describe("persistent agent directories", () => {
     if (warm) expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
 
+  it.each([false, true])("maps legacy group-staged modes back to canonical owner-only modes (warm=%s)", async (warm) => {
+    const canonical = { "notes/private.md": 0o600, "scripts/private.sh": 0o700, "notes/plain.md": 0o644, "scripts/run.sh": 0o755 };
+    for (const [relative, mode] of Object.entries(canonical)) {
+      await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true });
+      await fs.writeFile(path.join(root, relative), "before");
+      await fs.chmod(path.join(root, relative), mode);
+    }
+    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+    const { stagedModeVersion: _version, ...legacyReceipt } = copy.receipt!;
+    await db.update(agentInstructionWorkingCopies).set({ receipt: legacyReceipt }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    const legacy = { "notes/private.md": 0o640, "scripts/private.sh": 0o750, "notes/plain.md": 0o640, "scripts/run.sh": 0o750 };
+    for (const [relative, mode] of Object.entries(legacy)) {
+      await fs.writeFile(path.join(copy.localRoot, relative), `after ${relative}`);
+      await fs.chmod(path.join(copy.localRoot, relative), mode);
+    }
+    const saved = await copies[warm ? "checkpointWarm" : "collectStopped"]({ companyId, runId: copy.runId });
+    expect(saved?.state).toBe(warm ? "warm_saved" : "saved");
+    for (const [relative, mode] of Object.entries(canonical)) {
+      expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(`after ${relative}`);
+      expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(mode);
+    }
+  });
+
   it.skipIf(process.getuid?.() === 0)("saves the run's own mode changes for an owner-only copy", async () => {
     let gid = 54_321;
     while (gid === process.getegid!() || process.getgroups!().includes(gid)) gid++;

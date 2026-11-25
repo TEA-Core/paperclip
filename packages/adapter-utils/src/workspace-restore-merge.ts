@@ -546,7 +546,12 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     });
     // Atomic replacement must retain the destination's group, not inherit the
     // incoming tree's group or the canonical parent directory's default.
-    if (existing?.isFile()) await fs.chown(temporary, -1, existing.gid);
+    if (existing?.isFile()) {
+      await fs.chown(temporary, -1, existing.gid).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EPERM" && error.code !== "EINVAL") throw error;
+        console.warn(`[paperclip] Could not keep group ${existing.gid} on restored file ${targetPath}: ${error.code}`);
+      });
+    }
     await fs.chmod(temporary, entry.mode);
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }

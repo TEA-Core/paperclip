@@ -54,9 +54,13 @@ directory and its receipt does not claim group staging. Without an assignable
 group the run also stays private. Both private paths retain canonical modes
 except that group/world write bits are removed from all staged entries.
 Staging never changes canonical files: a file still at its staged mode is saved
-with its canonical mode; only a mode the run itself set is saved. Replacing an
-existing canonical file retains that file's own group, even when its parent or
-the live copy has a different group. New files use the canonical directory's
+with its canonical mode; only a mode the run itself set is saved. Receipts record
+the staging formula version, so copies staged by the earlier group build (`0640`
+files, `0750` executables) still map those modes back to the canonical mode.
+Replacing an existing canonical file retains that file's own group, even when its
+parent or the live copy has a different group. If the server may not assign that
+group (`EPERM`/`EINVAL`), the file is still replaced and a warning names the path
+and group. New files use the canonical directory's
 normal creation rules, not the live copy's group. Runtime ancestor permissions are unchanged.
 
 The fork runs every adapter as one shared principal in the agents group, so any

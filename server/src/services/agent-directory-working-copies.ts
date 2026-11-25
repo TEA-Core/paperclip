@@ -45,6 +45,9 @@ async function workingCopyGid(): Promise<number | null> {
 // from owner access alone. Strip write access for every non-owner.
 const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700) |
   (mode & 0o400 && mode & 0o040 ? 0o040 | (mode & 0o100 ? 0o010 : 0) : 0);
+const STAGED_MODE_VERSION = 2;
+const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
+const ownerOnlyMode = (mode: number) => mode & ~0o022;
 
 async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
   const stat = await fs.lstat(filename);
@@ -98,18 +101,21 @@ async function stageWorkingCopy(canonical: string, localRoot: string, gid: numbe
   }
 }
 
-function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot, group: boolean): T {
+function canonicalMode<T extends { kind: string; mode?: number }>(name: string, entry: T, base: DirectorySnapshot, staged: (mode: number) => number): T {
   // A live file still at its staged mode keeps the canonical mode on save;
   // only a mode the run itself set is written back.
   const before = base.entries.get(name);
-  return entry.kind === "file" && before?.kind === "file" && entry.mode === (group ? stagedMode(before.mode) : before.mode & ~0o022) ? { ...entry, mode: before.mode } : entry;
+  return entry.kind === "file" && before?.kind === "file" && entry.mode === staged(before.mode) ? { ...entry, mode: before.mode } : entry;
 }
-const stagedForGroup = (row: Copy) => typeof row.receipt?.stagedGid === "number";
-function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot, group: boolean): DirectorySnapshot {
-  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base, group)])) };
+function stagingFormula(row: Copy): (mode: number) => number {
+  if (typeof row.receipt?.stagedGid !== "number") return ownerOnlyMode;
+  return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? stagedMode : legacyStagedMode;
 }
-function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot, group: boolean): AgentFileManifest {
-  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base, group)]) };
+function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot, staged: (mode: number) => number): DirectorySnapshot {
+  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base, staged)])) };
+}
+function canonicalManifest(manifest: AgentFileManifest, base: DirectorySnapshot, staged: (mode: number) => number): AgentFileManifest {
+  return { ...manifest, entries: manifest.entries.map(([name, entry]) => [name, canonicalMode(name, entry, base, staged)]) };
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
@@ -254,7 +260,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const loadedEntry = snapshot.entries.get(deriveBundleState(agent).entryFile);
     const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, ...(stagedGid !== null ? { stagedGid } : {}),
+      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, ...(stagedGid !== null ? { stagedGid, stagedModeVersion: STAGED_MODE_VERSION } : {}),
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
@@ -310,7 +316,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       try {
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
-        const manifest = canonicalManifest(captured.manifest, baseline(row), stagedForGroup(row));
+        const manifest = canonicalManifest(captured.manifest, baseline(row), stagingFormula(row));
         const snapshot = checkpointSnapshot(manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
@@ -358,7 +364,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       row = await patch(row, { attempts: row.attempts + 1 });
       try {
         inspected ??= await retrieve(row, target);
-        const snapshot = canonicalSnapshot(inspected.snapshot, baseline(row), stagedForGroup(row));
+        const snapshot = canonicalSnapshot(inspected.snapshot, baseline(row), stagingFormula(row));
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
         if (candidateHash === row.baseHash) {

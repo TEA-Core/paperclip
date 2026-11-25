@@ -123,6 +123,52 @@ describe("workspace restore merge", () => {
     } finally { await disposeDirectorySnapshot(baseline); }
   });
 
+  it.each(["EPERM", "EINVAL"])("replaces a file when its group cannot be kept (%s) and warns", async (code) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-chown-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir);
+    await mkdir(sourceDir);
+    await writeFile(path.join(targetDir, "a.txt"), "before");
+    const gid = (await stat(path.join(targetDir, "a.txt"))).gid;
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    const chown = vi.spyOn(fsPromises, "chown").mockRejectedValue(Object.assign(new Error("denied"), { code }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await writeFile(path.join(sourceDir, "a.txt"), "after");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+      expect(await readFile(path.join(targetDir, "a.txt"), "utf8")).toBe("after");
+      expect(chown).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(path.join(targetDir, "a.txt")));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`group ${gid}`));
+    } finally {
+      chown.mockRestore();
+      warn.mockRestore();
+      await disposeDirectorySnapshot(baseline);
+    }
+  });
+
+  it("fails the restore on other group-preserving errors", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-chown-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir);
+    await mkdir(sourceDir);
+    await writeFile(path.join(targetDir, "a.txt"), "before");
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    const chown = vi.spyOn(fsPromises, "chown").mockRejectedValue(Object.assign(new Error("io"), { code: "EIO" }));
+    try {
+      await writeFile(path.join(sourceDir, "a.txt"), "after");
+      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir })).rejects.toMatchObject({ code: "EIO" });
+      expect(await readFile(path.join(targetDir, "a.txt"), "utf8")).toBe("before");
+    } finally {
+      chown.mockRestore();
+      await disposeDirectorySnapshot(baseline);
+    }
+  });
+
   it("ignores non-file entries when capturing snapshots", async () => {
     if (process.platform === "win32") return;
 
