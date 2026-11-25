@@ -56,11 +56,11 @@ server/src/__tests__/agent-conversations.test.ts(540,9): TS2769
 server/src/__tests__/agent-conversations.test.ts(564,54): TS2322
 server/src/__tests__/agent-conversations.test.ts(865,9): TS2769
 server/src/__tests__/agent-conversations.test.ts(931,37): TS2345
-server/src/__tests__/agent-directory-working-copies.test.ts(328,109): TS2739
-server/src/__tests__/agent-directory-working-copies.test.ts(331,9): TS2739
-server/src/__tests__/agent-directory-working-copies.test.ts(696,111): TS2739
-server/src/__tests__/agent-directory-working-copies.test.ts(709,82): TS2322
-server/src/__tests__/agent-directory-working-copies.test.ts(713,63): TS2322
+server/src/__tests__/agent-directory-working-copies.test.ts(515,109): TS2739
+server/src/__tests__/agent-directory-working-copies.test.ts(518,9): TS2739
+server/src/__tests__/agent-directory-working-copies.test.ts(883,111): TS2739
+server/src/__tests__/agent-directory-working-copies.test.ts(896,82): TS2322
+server/src/__tests__/agent-directory-working-copies.test.ts(900,63): TS2322
 server/src/__tests__/agent-file-checkpoints.test.ts(91,35): TS2352
 server/src/__tests__/agent-secrets-routes.test.ts(169,7): TS2322
 server/src/__tests__/agent-test-environment-routes.test.ts(507,42): TS2493
