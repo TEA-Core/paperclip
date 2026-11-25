@@ -98,6 +98,68 @@ describe("persistent agent directories", () => {
     expect(await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId))).toHaveLength(0);
   });
 
+  it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
+    const gid = process.getgid!();
+    const previousGid = process.env.PAPERCLIP_AGENTS_GID;
+    const previousUmask = process.umask();
+    const files = ["AGENTS.md", "doctrine/mission.md", "doctrine/nested/policy.md"];
+    try {
+      process.env.PAPERCLIP_AGENTS_GID = String(gid);
+      for (const relative of files) {
+        await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true, mode: 0o700 });
+        await fs.writeFile(path.join(root, relative), relative, { mode: 0o600 });
+      }
+      await fs.mkdir(path.join(root, "empty"), { mode: 0o700 });
+      process.umask(0o077);
+      const copy = await run();
+      process.umask(previousUmask);
+      const agentRoot = path.dirname(root);
+      const directories = ["file-sync", "file-sync/runs", `file-sync/runs/${copy.runId}`];
+      for (const relative of directories) {
+        const stat = await fs.stat(path.join(agentRoot, relative));
+        expect(stat.mode & 0o7777).toBe(0o2750);
+        expect(stat.gid).toBe(gid);
+      }
+      const checkTree = async (directory: string) => {
+        const stat = await fs.stat(directory);
+        expect(stat.mode & 0o7777).toBe(0o2750);
+        expect(stat.gid).toBe(gid);
+        for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+          const filename = path.join(directory, entry.name);
+          if (entry.isDirectory()) await checkTree(filename);
+          else {
+            const file = await fs.stat(filename);
+            expect(file.mode & 0o7777).toBe(0o640);
+            expect(file.gid).toBe(gid);
+          }
+        }
+      };
+      await checkTree(copy.localRoot);
+      if (process.getuid!() === 0) {
+        // Only fixture ancestors are opened for traversal; production ancestors
+        // remain the runtime's responsibility, outside the per-run tree.
+        for (let dir = agentRoot; dir !== os.tmpdir(); dir = path.dirname(dir)) {
+          await fs.chmod(dir, 0o750);
+          await fs.chown(dir, 0, gid);
+        }
+        const { stdout } = await execFile(process.execPath, ["-e", `
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const root = process.argv[1];
+          if (process.getuid() === fs.statSync(root).uid) process.exit(1);
+          console.log(JSON.stringify(process.argv.slice(2).map(file => fs.readFileSync(path.join(root, file), "utf8"))));
+        `, copy.localRoot, ...files], { uid: 65534, gid });
+        expect(JSON.parse(stdout)).toEqual(files);
+      }
+      // Unprivileged CI cannot switch uid: exact modes and gids above prove
+      // non-owner group read/traversal without granting any world permission.
+    } finally {
+      process.umask(previousUmask);
+      if (previousGid === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
+      else process.env.PAPERCLIP_AGENTS_GID = previousGid;
+    }
+  });
+
   async function sparseFile(filename: string, size: number) {
     const handle = await fs.open(filename, "w");
     try { await handle.truncate(size); } finally { await handle.close(); }

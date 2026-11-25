@@ -21,7 +21,7 @@ The canonical host directory keeps its existing physical location:
     AGENTS.md
     notes/
     any-supported-file
-  file-sync/                   controller-only operational state
+  file-sync/                   operational state (live copies shared with agents)
     adopted.json
     canonical-manifest.json   metadata/hash cache, no file contents
     runs/<initial-run>/
@@ -36,6 +36,14 @@ the task workspace. Remote providers currently confine file sync to their
 workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
+
+The fork stages local run directories with mode `02750` (setgid, group
+read/traverse) and regular files with mode `0640`; no world access is granted.
+Modes are applied explicitly after creation/copy, independent of umask and
+canonical-file modes. The group follows `PAPERCLIP_AGENTS_GID`, then the runtime's
+named `agents` group; hosts without either use the existing agent parent
+directory's gid. This does not change canonical files or runtime ancestor
+permissions, and does not grant the shared group write access.
 
 Regular files (including binary bytes) and directories are supported, up to
 100,000 entries (files and folders), 256 MiB per file and 2 GiB total. Symlinks,

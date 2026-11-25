@@ -1,10 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { and, eq } from "drizzle-orm";
 import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
@@ -22,6 +24,51 @@ export class AgentDirectoryReuseInvalidatedError extends Error {}
 const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
+const execFileAsync = promisify(execFile);
+
+async function workingCopyGid(parent: string): Promise<number> {
+  // Match the fork runtime's shared group configuration; standalone hosts
+  // without that group retain the existing agent tree's group.
+  const configured = process.env.PAPERCLIP_AGENTS_GID?.trim();
+  if (configured && /^\d+$/.test(configured)) return Number(configured);
+  try {
+    const { stdout } = await execFileAsync("getent", ["group", "agents"], { timeout: 5000, maxBuffer: 4096 });
+    const gid = stdout.trim().split(":")[2];
+    if (gid && /^\d+$/.test(gid)) return Number(gid);
+  } catch {
+    // getent or the agents group may be absent outside the container.
+  }
+  return (await fs.stat(parent)).gid;
+}
+
+async function workingCopyPermissions(filename: string, gid: number, recursive = true): Promise<void> {
+  const stat = await fs.lstat(filename);
+  if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
+  if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
+  // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
+  await fs.chmod(filename, stat.isDirectory() ? 0o2750 : 0o640);
+  if (recursive && stat.isDirectory()) {
+    for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
+  }
+}
+
+async function workingCopyParents(agentRoot: string, runId?: string): Promise<number> {
+  const gid = await workingCopyGid(agentRoot);
+  let parent = agentRoot;
+  for (const segment of ["file-sync", "runs", ...(runId ? [runId] : [])]) {
+    parent = path.join(parent, segment);
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+    await workingCopyPermissions(parent, gid, false);
+  }
+  return gid;
+}
+
+function workingCopySnapshot(snapshot: DirectorySnapshot): DirectorySnapshot {
+  // Permission normalization is staging, not an agent edit. Keep it out of
+  // change detection so an untouched file cannot overwrite another run's save.
+  return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) =>
+    [name, entry.kind === "file" ? { ...entry, mode: (entry.mode & ~0o7777) | 0o640 } : entry])) };
+}
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
 }
@@ -46,7 +93,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const entry = baseline(row).entries.get(row.entryFile);
     if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return false;
     return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) =>
-      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+      directorySnapshotSha256(workingCopySnapshot(checkpointSnapshot(await cachedAgentFileManifest(root)))) === directorySnapshotSha256(workingCopySnapshot(baseline(row))));
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
@@ -87,7 +134,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           // The reservation's earlier check is only a hint. Serialize this last
           // validation and ownership transfer with every canonical writer.
           if (current.entryFile !== deriveBundleState(lockedAgent).entryFile ||
-              directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(canonical))) !== current.baseHash) {
+              directorySnapshotSha256(workingCopySnapshot(checkpointSnapshot(await cachedAgentFileManifest(canonical)))) !== directorySnapshotSha256(workingCopySnapshot(baseline(current)))) {
             throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
           }
           // The controller-owned marker fences old callbacks. Attach the new
@@ -124,7 +171,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // Restart preparation can replace a completed copy under the same run ID.
       // Join cleanup's lock before resetting its receipt or creating new bytes.
       // Interrupted admission may have registered the row before making this root.
-      await fs.mkdir(path.resolve(localRoot, "../../.."), { recursive: true, mode: 0o700 });
+      await workingCopyParents(path.dirname(root));
       return serial(row, () => prepareCopy(input, true), "agent_directory_prepare");
     }
     if (row && !completed.has(row.state) && row.state !== "preparing") {
@@ -151,10 +198,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // A stopped lifecycle has already accounted for all its bytes. No live
       // or pending candidate ever enters this replacement path.
       await fs.rm(localRoot, { recursive: true, force: true });
-      await fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 });
+      const gid = await workingCopyParents(path.dirname(root), input.runId);
       try {
         await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
-        return inspected;
+        await workingCopyPermissions(localRoot, gid);
+        return { ...inspected, snapshot: workingCopySnapshot(inspected.snapshot) };
       } catch (error) {
         await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
         throw error;
