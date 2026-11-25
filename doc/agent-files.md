@@ -39,8 +39,10 @@ workspace sync, Git staging, or task deliverables.
 
 When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
 named `agents` group) and the server process may assign it (it is root or a
-member), the fork stages local run directories with mode `02750` (setgid, group
-read/traverse) owned by that group. Files retain their owner permissions and gain
+member), the fork stages live directories with modes derived from owner bits:
+at most `02750` (setgid, group read/traverse), owned by that group.
+The `file-sync/`, `runs/`, and run directories have at most `0750`, without
+setgid inheritance. Files retain their owner permissions and gain
 group read only when the canonical file grants both owner read and group read;
 group execute then follows owner execute (`0755` becomes `0750`). Files without
 canonical group-read intent stay owner-only (`0600` stays `0600`, `0700` stays
@@ -51,12 +53,18 @@ when staging retries in an existing run directory.
 Modes are applied explicitly, independent of umask. If any group or mode
 assignment is denied, the run falls back to a fresh copy behind a `0700` run
 directory and its receipt does not claim group staging. Without an assignable
-group the run also stays private. Both private paths retain canonical modes
-except that group/world write bits are removed from all staged entries.
+group the run also stays private. Both private paths keep only owner permission
+bits on all staged entries; no canonical group/world permission bits are copied.
 Staging never changes canonical files: a file still at its staged mode is saved
 with its canonical mode; only a mode the run itself set is saved. Receipts record
 the staging formula version, so copies staged by the earlier group build (`0640`
 files, `0750` executables) still map those modes back to the canonical mode.
+Version 3 also records the owner-only formula for private runs. Earlier private
+copies still use their original non-owner-write-stripping formula on save-back.
+The canonical manifest cache and warm-run `owner.json` fence are created
+atomically as `0600`, including after a warm handoff. Their parent directories
+deny group write, so peers cannot create, replace, or unlink these files under
+umask `002`. Unsafe old manifest caches are discarded and rebuilt.
 Replacing an existing canonical file retains that file's own group, even when its
 parent or the live copy has a different group. If the server may not assign that
 group (`EPERM`/`EINVAL`), the file is still replaced and a warning names the path

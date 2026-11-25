@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { and, eq } from "drizzle-orm";
@@ -45,9 +46,9 @@ async function workingCopyGid(): Promise<number | null> {
 // from owner access alone. Strip write access for every non-owner.
 const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700) |
   (mode & 0o400 && mode & 0o040 ? 0o040 | (mode & 0o100 ? 0o010 : 0) : 0);
-const STAGED_MODE_VERSION = 2;
+const STAGED_MODE_VERSION = 3;
 const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
-const ownerOnlyMode = (mode: number) => mode & ~0o022;
+const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
 
 async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
   const stat = await fs.lstat(filename);
@@ -55,7 +56,10 @@ async function workingCopyPermissions(filename: string, gid: number | null, recu
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
   if (gid !== null && stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
   // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  const mode = gid === null ? stat.mode & 0o7755 : stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777;
+  const owner = stat.mode & 0o700;
+  const mode = gid === null ? owner : stat.isDirectory()
+    ? owner | ((owner >> 3) & 0o050) | (recursive ? 0o2000 : 0)
+    : stagedMode(stat.mode) & 0o7777;
   if (gid !== null || mode !== (stat.mode & 0o7777)) await fs.chmod(filename, mode);
   if (recursive && stat.isDirectory()) {
     for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
@@ -70,10 +74,23 @@ async function workingCopyParents(agentRoot: string): Promise<number | null> {
   for (const segment of ["file-sync", "runs"]) {
     parent = path.join(parent, segment);
     await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-    if (gid !== null) await workingCopyPermissions(parent, gid, false).catch(error => {
+    await workingCopyPermissions(parent, gid, false).catch(async error => {
       if (!permissionDenied(error)) throw error;
       gid = null;
+      await workingCopyPermissions(parent, null, false);
     });
+    if (segment === "file-sync") {
+      const manifest = path.join(parent, "canonical-manifest.json");
+      const existing = await fs.lstat(manifest).catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+      });
+      // A cache exposed by the old shared parent cannot be trusted. It is
+      // rebuildable metadata, not canonical content.
+      if (existing && (existing.mode & 0o022 || !existing.isFile() || existing.uid !== process.geteuid?.())) {
+        await fs.unlink(manifest);
+      }
+    }
   }
   return gid;
 }
@@ -108,8 +125,10 @@ function canonicalMode<T extends { kind: string; mode?: number }>(name: string, 
   return entry.kind === "file" && before?.kind === "file" && entry.mode === staged(before.mode) ? { ...entry, mode: before.mode } : entry;
 }
 function stagingFormula(row: Copy): (mode: number) => number {
-  if (typeof row.receipt?.stagedGid !== "number") return ownerOnlyMode;
-  return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? stagedMode : legacyStagedMode;
+  if (typeof row.receipt?.stagedGid !== "number") {
+    return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? ownerOnlyMode : mode => mode & ~0o022;
+  }
+  return typeof row.receipt?.stagedModeVersion === "number" ? stagedMode : legacyStagedMode;
 }
 function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot, staged: (mode: number) => number): DirectorySnapshot {
   return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base, staged)])) };
@@ -131,6 +150,16 @@ function actor(row: Copy): AuthorizationActor {
 export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string, runId: string) => Promise<Copy | null>, patch: (row: Copy, values: Partial<typeof copies.$inferInsert>) => Promise<Copy>, environmentRuntime?: EnvironmentRuntimeService) {
   const store = agentFileStore(db);
   const ownerFile = (row: Copy) => path.join(path.dirname(row.localRoot), "owner.json");
+  async function writeOwner(row: Copy, runId: string) {
+    const filename = ownerFile(row);
+    const temporary = `${filename}.${randomUUID()}`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify({ runId }), { mode: 0o600, flag: "wx" });
+      await fs.rename(temporary, filename);
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
+  }
   async function owns(row: Copy) {
     if (row.receipt?.warm !== true) return true;
     return await fs.readFile(ownerFile(row), "utf8").then(s => JSON.parse(s).runId === row.runId).catch(error => error.code === "ENOENT" && row.processStoppedAt !== null);
@@ -187,9 +216,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           }
           // The controller-owned marker fences old callbacks. Attach the new
           // collector immediately after it moves, before fallible bookkeeping.
-          const temporary = `${ownerFile(current)}.next`;
-          await fs.writeFile(temporary, JSON.stringify({ runId: input.runId }));
-          await fs.rename(temporary, ownerFile(current));
+          await writeOwner(current, input.runId);
           handedOff = true;
           input.onWarmHandoff?.(successor!);
           const runtime = transports.get(key(current));
@@ -260,12 +287,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const loadedEntry = snapshot.entries.get(deriveBundleState(agent).entryFile);
     const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, ...(stagedGid !== null ? { stagedGid, stagedModeVersion: STAGED_MODE_VERSION } : {}),
+      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, stagedModeVersion: STAGED_MODE_VERSION, ...(stagedGid !== null ? { stagedGid } : {}),
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
       row = await patch(row, values);
-      if (input.warm) await fs.writeFile(ownerFile(row), JSON.stringify({ runId: row.runId }));
+      if (input.warm) await writeOwner(row, row.runId);
     } catch (error) {
       await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
       throw error;
