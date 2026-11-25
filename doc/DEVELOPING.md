@@ -1054,7 +1054,8 @@ the main home. A different transient runtime home does not replace persisted
 worktree paths.
 If the parent can be searched but not listed, reusable identity claims are
 refused and the config-path-derived identity is used; registered sibling
-collisions and main-home checks still apply.
+collisions and main-home checks still apply. An own file that makes no
+identity claim is not refused there and keeps its allowlisted secrets.
 
 An unchanged repair also cleans temporary env files belonging to dead writers,
 without rewriting the env file. Live writers' temporary files are retained.
