@@ -6315,6 +6315,70 @@ describe("evaluateDoneTierDeclaration", () => {
         });
         afterEach(() => vi.unstubAllEnvs());
 
+        // Verbatim declaration lines from the measured window. The truthful
+        // prose-only record is intentionally undetermined until it adds counts.
+        const windowDeclarations = {
+          "SUP-25216": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform, TEA-Core/paperclip-agent-tools, TEA-Core/paperclip, TEA-Core/paperclip-smart-router observed 2026-11-25T07:02:08Z result: pass fresh read of latest alarm workflow run #45560189666 shows completed success at 2026-11-25T06:23:45Z; scan result from this cycle failed closed across all four repositories due unavailable check-run App token; armed=0, overrides=0. Existing TEA-Core/paperclip #1255 remains unqueued on fold/tea-patches-v2026.722.0. The sweep record is the deliverable.",
+          "SUP-25218": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform main, TEA-Core/paperclip-agent-tools main, TEA-Core/paperclip fold/tea-patches-v2026.722.0 queues and unenqueued-green-pr-alarm observed 2026-11-25T08:02:19Z-2026-11-25T08:02:48Z result: pass queue censuses remained empty and latest alarm run 45566757696 succeeded; scan failed in all four repos for unavailable check-run App token, armed=0, no step-5 overrides.",
+          "SUP-25220": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target GitHub merge queues and unenqueued-green-pr-alarm observed 2026-11-25T09:02:17Z-2026-11-25T09:02:51Z result: pass scan completed; armed=0 due to unavailable check-run App token; queues read; alarm success.",
+          "SUP-25223": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform, TEA-Core/paperclip-agent-tools, TEA-Core/paperclip, TEA-Core/paperclip-smart-router observed 2026-11-25T11:00:28Z-2026-11-25T11:03:15Z result: pass documented the scan failure (all four repos unevaluated: required check-run App token unavailable), armed=0, no step-5 refusals or overrides, alarm latest scheduled run success (2026-11-25T10:14:00Z), and confirmed existing TEA-Core/paperclip #1255 has no mergeQueueEntry and its base queue had zero entries. No arming authorization was inferred from status data; the pre-scan census was omitted because armed=0 and overrides=0.",
+          "SUP-25212": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target GitHub merge queues for TEA-Core/Trading-Signal-Platform/main, TEA-Core/paperclip-agent-tools/main, TEA-Core/paperclip/fold/tea-patches-v2026.722.0 and unenqueued-green-pr-alarm workflow observed 2026-11-25T06:04:00Z-2026-11-25T06:06:03Z result: pass scan exit 0, failed=0, armed=0, all sampled merge queues empty before and after, and latest alarm workflow run completed success",
+          "SUP-25225": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target four configured repositories and all matched heads observed 2026-11-25T12:09:14Z-2026-11-25T12:10:16Z result: pass scan completed across 4 repositories with 0 failures; all 15 matched heads were refused by sanctioned hand-vet and no arms were issued (`armed=0`); all eligible queues were empty before and after; TSP alarm latest run completed success at 11:13:37Z.",
+        };
+
+        it.each([
+          ["SUP-25216", false], ["SUP-25218", false], ["SUP-25220", false],
+          ["SUP-25223", false], ["SUP-25212", true], ["SUP-25225", false],
+        ] as const)("judges verbatim %s using only its asserted probe-run counters", async (card, allowed) => {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), windowDeclarations[card],
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(allowed);
+          if (allowed) {
+            expect(result.tier2Audit?.tierForm).toBe("record-only");
+          } else {
+            expect(result.code).toBe("done_transition_record_only_probe_missing_counter");
+            expect(result.remedy).toContain("exit <exit code>");
+            expect(result.tier2Audit).toBeUndefined();
+          }
+        });
+
+        it("accepts the truthful prose record after it declares its computed probe-run counters", async () => {
+          const declaration = windowDeclarations["SUP-25225"].replace(
+            "result: pass ", "result: pass failed=0 scanned=4 ",
+          );
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), declaration,
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(true);
+          expect(result.tier2Audit?.tierForm).toBe("record-only");
+        });
+
+        it("logs and accepts the verbatim truthful prose record in missing-counter fallback mode", async () => {
+          vi.stubEnv(SWITCH, "off");
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), windowDeclarations["SUP-25225"],
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(true);
+          expect(logger.warn).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: "done_transition_record_only_probe_missing_counter", mode: "log_only",
+            }),
+            expect.stringContaining("undetermined: no probe-run counter"),
+          );
+        });
+
+        it("refuses exit 2 and failed=4 with a counter reason, without failure prose", async () => {
+          const result = await evaluatePredicate("exit 2 failed=4");
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+          expect(result.reason).toContain("probe-run counter exit=2");
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
         it.each([
           ["exit 2; failed=4", "exit=2"],
           ["failed=4", "failed=4"],
