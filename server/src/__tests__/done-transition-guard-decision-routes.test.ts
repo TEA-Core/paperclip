@@ -990,7 +990,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   // naming the accepted form, and a repository_delivery card submitting the
   // record-only grammar is refused by name.
   const RECORD_ONLY_EVIDENCE =
-    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass exit 0 the sweep consumption point served 42 fresh records";
 
   function mockNoOpenPulls() {
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -1046,6 +1046,32 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   });
 
   describe("record-only pass contradictions", () => {
+    it("PATCH refuses a pass with only decision counters and records a missing-counter refusal", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("DPROBECOUNTERS", { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+      const probeEvidence = RECORD_ONLY_EVIDENCE.replace(
+        /result: pass .+$/, "result: pass overrides=0 armed=0",
+      );
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done", doneTier: { tier: "tier2", probeEvidence },
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_record_only_probe_missing_counter");
+      expect(res.body.details?.remedy).toContain("exit <exit code>");
+      const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "done_transition_record_only_probe_missing_counter", httpStatus: 422,
+      });
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+
     it.each([
       ["exit_nonzero", "exit 2"],
       ["exited_nonzero", "exited 2"],
@@ -1326,7 +1352,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>");
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
@@ -1373,11 +1399,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const remedy = String(res.body.details.remedy);
     // The structured record-only form, verbatim.
     expect(remedy).toContain(
-      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>" }',
     );
     // The comment form for a record_only card is the record-only grammar...
     expect(remedy).toContain(
-      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>',
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>',
     );
     // ...and the remedy demands no merge head anywhere.
     expect(remedy).not.toContain("post-merge");

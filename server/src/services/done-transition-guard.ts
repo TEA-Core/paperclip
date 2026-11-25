@@ -145,8 +145,8 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"' +
-  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>"' +
+  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -174,11 +174,11 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>" }';
 // Structured probeEvidence carries the grammar WITHOUT the Tier 2 prefix: the guard
 // composes the prefix itself (SUP-24079).
 export const DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE =
-  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range';
+  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range; include at least one probe-run counter: exit <exit code>, scanned=<count>, failed=<count>, or unevaluated=<count> (overrides and armed are decision counters, not probe-run counters)';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
   `${DONE_TIER_TIER2_RECORD_ONLY_JSON} (${DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE}); ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
@@ -461,7 +461,9 @@ export interface DoneTierDeclarationResult {
   // Set when the refusal carries its own route error code. A door that maps every
   // refused declaration to done_transition_missing_tier_declaration uses this one
   // instead when it is set.
-  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE | "done_transition_record_only_probe_contradiction";
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE
+    | "done_transition_record_only_probe_contradiction"
+    | "done_transition_record_only_probe_missing_counter";
 }
 
 interface DoneTierDeclarationOptions {
@@ -897,7 +899,8 @@ export async function writeDoneTransitionRefusedAuditLog(
         code:
           | "done_transition_missing_tier_declaration"
           | typeof DONE_TRANSITION_TIER_CONFLICT_CODE
-          | "done_transition_record_only_probe_contradiction";
+          | "done_transition_record_only_probe_contradiction"
+          | "done_transition_record_only_probe_missing_counter";
         httpStatus: 422;
         reason: string;
         decisionCarried: boolean;
@@ -2209,6 +2212,67 @@ const RECORD_ONLY_PASS_CONTRADICTIONS = [
   phraseMarker("partial_failure", /\bpartial[ \t]+failure\b/i),
 ] as const;
 
+// The primary evidence is the counters asserted in this declaration's predicate,
+// never the command, target, other comment lines, or historical invocations.
+// Retain the bounded marker list above unchanged as a secondary check.
+const RECORD_ONLY_PROBE_RUN_COUNTER_RE = new RegExp(
+  String.raw`\b(exit[ \t]+|(?:scanned|failed|unevaluated)=)${DECIMAL}`,
+  "gi",
+);
+const RECORD_ONLY_PROBE_COUNTERS_REQUIRED_ENV = "PAPERCLIP_RECORD_ONLY_PROBE_COUNTERS_REQUIRED";
+
+function checkRecordOnlyProbeCounters(predicateResult: string): DoneTierDeclarationResult | null {
+  let hasProbeRunCounter = false;
+  for (const match of predicateResult.matchAll(RECORD_ONLY_PROBE_RUN_COUNTER_RE)) {
+    hasProbeRunCounter = true;
+    const counter = match[1]!.trim().replace(/=$/, "").toLowerCase();
+    const value = match[2]!;
+    const contradicts = counter === "exit"
+      ? !isZeroDecimal(value)
+      : counter === "scanned"
+        ? isZeroDecimal(value)
+        : isPositiveDecimal(value);
+    if (contradicts) {
+      const marker = counter === "exit" ? "exit_nonzero"
+        : counter === "scanned" ? "scanned_zero" : `${counter}_positive`;
+      const remedy =
+        "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
+        `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+      return {
+        ...refuseTier2(
+          `record-only close Tier 2 result: pass contradicts probe-run counter ${counter}=${value} (${marker}); ` +
+          remedy,
+        ),
+        code: "done_transition_record_only_probe_contradiction",
+        remedy,
+      };
+    }
+  }
+  if (hasProbeRunCounter) return null;
+
+  const remedy =
+    "Add at least one observed probe-run counter to the declaration's result: pass predicate: " +
+    "exit <exit code>, scanned=<count>, failed=<count>, or unevaluated=<count>. " +
+    "Use the actual probe result; overrides=0 and armed=0 do not show that the probe ran. " +
+    `Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+  const reason = "record-only close Tier 2 result: pass is undetermined: no probe-run counter " +
+    `(exit, scanned, failed, unevaluated) was asserted. ${remedy}`;
+  // Fork kill-switch convention: unset/empty defaults ON; an explicit false
+  // value disables only the new missing-counter refusal, never contradictions.
+  if (/^(0|false|off|no)$/i.test(process.env[RECORD_ONLY_PROBE_COUNTERS_REQUIRED_ENV]?.trim() ?? "")) {
+    logger.warn(
+      { code: "done_transition_record_only_probe_missing_counter", mode: "log_only", remedy },
+      reason,
+    );
+    return null;
+  }
+  return {
+    ...refuseTier2(reason),
+    code: "done_transition_record_only_probe_missing_counter",
+    remedy,
+  };
+}
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -2338,7 +2402,7 @@ function utcInstantSortKey(observedAt: string): string {
   return `${second}.${fraction.padEnd(6, "0")}`;
 }
 
-// SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
+// SUP-22801: record-only Tier 2 live proof. Locally verified and fail-closed — a
 // record_only card has no repository landing to resolve, so nothing here touches
 // GitHub or the database; every component of the accepted form is checked
 // locally: the shape, non-blank command/target/predicate, real UTC instants,
@@ -2388,6 +2452,8 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
+  const counterRefusal = checkRecordOnlyProbeCounters(predicateResult!);
+  if (counterRefusal) return counterRefusal;
   for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
     if (marker.matches(predicateResult!)) {
       const remedy =

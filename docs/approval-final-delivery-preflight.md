@@ -65,9 +65,13 @@ The query reads one page of 100 check contexts. When GitHub reports a next page,
 
 ## Record-only Tier 2 pass contradictions
 
-A `record_only` live close uses `Closed at Tier 2 (live): record-only probe ` followed by a backticked command, `target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>` (or the existing UTC observation range). The structured `doneTier.probeEvidence` carries the same evidence without the close prefix. No merge head is required.
+A `record_only` live close uses `Closed at Tier 2 (live): record-only probe ` followed by a backticked command, `target <observed target> observed <UTC ISO-8601 timestamp> result: pass exit <exit code> <pass predicate and observed result>` (or the existing UTC observation range). The structured `doneTier.probeEvidence` carries the same evidence without the close prefix. No merge head is required.
 
-The guard refuses a `result: pass` declaration with `done_transition_record_only_probe_contradiction` when its trailing predicate/result contains one of these eight token-anchored markers (case-insensitive except `REFUSED`, which matches uppercase only):
+The primary check reads only probe-run counters asserted in the declaration's trailing predicate/result: `exit <number>`, `scanned=<number>`, `failed=<number>`, and `unevaluated=<number>`. A pass contradicts any asserted nonzero exit, zero scanned count, positive failed count, or positive unevaluated count. The refusal names the counter and value with code `done_transition_record_only_probe_contradiction`. All asserted counters count: a later clean counter does not erase an earlier contradictory counter in the same declaration.
+
+A pass with none of those probe-run counters is undetermined and refused with `done_transition_record_only_probe_missing_counter`. The remedy shows the counter slot and asks for at least one actual observed counter. `overrides=0`, `armed=0`, and other decision counters do not prove that the probe ran. The server switch `PAPERCLIP_RECORD_ONLY_PROBE_COUNTERS_REQUIRED` defaults on (unset or empty). Set it to `0`, `false`, `off`, or `no` in the server environment and restart the server to make missing-counter cases log-only without a code redeploy. This fallback logs a warning with the missing-counter code and remedy, then runs the unchanged secondary gate; it does not disable numeric contradictions or any existing marker.
+
+The existing secondary check remains unchanged. It refuses a `result: pass` declaration with `done_transition_record_only_probe_contradiction` when its trailing predicate/result contains one of these eight token-anchored markers (case-insensitive except `REFUSED`, which matches uppercase only):
 
 | Marker name | Recognized form |
 | --- | --- |
