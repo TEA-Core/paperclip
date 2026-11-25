@@ -79,18 +79,6 @@ async function workingCopyParents(agentRoot: string): Promise<number | null> {
       gid = null;
       await workingCopyPermissions(parent, null, false);
     });
-    if (segment === "file-sync") {
-      const manifest = path.join(parent, "canonical-manifest.json");
-      const existing = await fs.lstat(manifest).catch(error => {
-        if (error.code !== "ENOENT") throw error;
-        return null;
-      });
-      // A cache exposed by the old shared parent cannot be trusted. It is
-      // rebuildable metadata, not canonical content.
-      if (existing && (existing.mode & 0o022 || !existing.isFile() || existing.uid !== process.geteuid?.())) {
-        await fs.unlink(manifest);
-      }
-    }
   }
   return gid;
 }
@@ -126,7 +114,7 @@ function canonicalMode<T extends { kind: string; mode?: number }>(name: string, 
 }
 function stagingFormula(row: Copy): (mode: number) => number {
   if (typeof row.receipt?.stagedGid !== "number") {
-    return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? ownerOnlyMode : mode => mode & ~0o022;
+    return row.receipt?.stagedModeVersion === STAGED_MODE_VERSION ? ownerOnlyMode : mode => mode;
   }
   return typeof row.receipt?.stagedModeVersion === "number" ? stagedMode : legacyStagedMode;
 }

@@ -60,7 +60,7 @@ with its canonical mode; only a mode the run itself set is saved. Receipts recor
 the staging formula version, so copies staged by the earlier group build (`0640`
 files, `0750` executables) still map those modes back to the canonical mode.
 Version 3 also records the owner-only formula for private runs. Earlier private
-copies still use their original non-owner-write-stripping formula on save-back.
+copies kept canonical modes when staged, so their live modes are saved as they are.
 The canonical manifest cache and warm-run `owner.json` fence are created
 atomically as `0600`, including after a warm handoff. Their parent directories
 deny group write, so peers cannot create, replace, or unlink these files under

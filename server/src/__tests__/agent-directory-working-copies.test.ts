@@ -238,10 +238,12 @@ describe("persistent agent directories", () => {
         expect((await fs.stat(directory)).mode & 0o2022).toBe(0);
       }
       // Refresh and handoff also replace old permissive metadata privately.
+      await fs.writeFile(manifest, JSON.stringify({ version: 1, entries: [] }));
       await fs.chmod(manifest, 0o664);
       await fs.chmod(owner, 0o664);
       await run({ warm: true, reuseRunId: copy.runId });
       for (const filename of [manifest, owner]) expect((await fs.stat(filename)).mode & 0o7777).toBe(0o600);
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).entries.length).toBeGreaterThan(0);
     } finally {
       process.umask(previousUmask);
     }
@@ -405,6 +407,32 @@ describe("persistent agent directories", () => {
       expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(`after ${relative}`);
       expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(mode);
     }
+  });
+
+  it.skipIf(process.getuid?.() === 0)("saves the run's own mode changes for a legacy unversioned private copy", async () => {
+    let gid = 54_321;
+    while (gid === process.getegid!() || process.getgroups!().includes(gid)) gid++;
+    await fs.mkdir(path.join(root, "notes"), { recursive: true });
+    await fs.writeFile(path.join(root, "notes/shared.md"), "before");
+    await fs.chmod(path.join(root, "notes/shared.md"), 0o664);
+    const copy = await withAgentsGid(gid, () => run());
+    expect(copy.receipt?.stagedGid).toBeUndefined();
+    const { stagedModeVersion: _version, ...legacyReceipt } = copy.receipt!;
+    await db.update(agentInstructionWorkingCopies).set({ receipt: legacyReceipt }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    await fs.writeFile(path.join(copy.localRoot, "notes/shared.md"), "after");
+    await fs.chmod(path.join(copy.localRoot, "notes/shared.md"), 0o644);
+    expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, "notes/shared.md"), "utf8")).toBe("after");
+    expect((await fs.stat(path.join(root, "notes/shared.md"))).mode & 0o7777).toBe(0o644);
+  });
+
+  it("does not fail prepare when a directory occupies the manifest cache path", async () => {
+    await writeShared();
+    const manifest = path.join(path.dirname(root), "file-sync", "canonical-manifest.json");
+    await fs.mkdir(manifest, { recursive: true });
+    const copy = await run();
+    expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
+    expect((await fs.lstat(manifest)).isDirectory()).toBe(true);
   });
 
   it.each(["EPERM", "EACCES"])("falls back to an owner-only copy when the live tree cannot be shared (%s)", async (code) => {
