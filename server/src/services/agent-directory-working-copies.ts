@@ -47,9 +47,14 @@ async function workingCopyPermissions(filename: string, gid: number, recursive =
   const stat = await fs.lstat(filename);
   if (stat.isSymbolicLink()) return;
   if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
-  // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
+  try {
+    if (stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
+    // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
+    await fs.chmod(filename, stat.isDirectory() ? 0o2750 : stagedMode(stat.mode) & 0o7777);
+  } catch (error) {
+    // An entry this process cannot reassign keeps its owner-only mode.
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+  }
   if (recursive && stat.isDirectory()) {
     for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
   }
@@ -72,6 +77,7 @@ function canonicalMode<T extends { kind: string; mode?: number }>(name: string, 
   const before = base.entries.get(name);
   return entry.kind === "file" && before?.kind === "file" && entry.mode === stagedMode(before.mode) ? { ...entry, mode: before.mode } : entry;
 }
+const stagedForGroup = (row: Copy) => typeof row.receipt?.stagedGid === "number";
 function canonicalSnapshot(snapshot: DirectorySnapshot, base: DirectorySnapshot): DirectorySnapshot {
   return { ...snapshot, entries: new Map([...snapshot.entries].map(([name, entry]) => [name, canonicalMode(name, entry, base)])) };
 }
@@ -199,7 +205,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await db.insert(copies).values({ runId: input.runId, companyId: input.companyId, agentId: input.agentId, responsibleUserId: bound.onBehalfOfUserId!, ...preparing });
       row = (await get(input.companyId, input.runId))!;
     }
-    const { snapshot, storageWarning } = await store.locked(input.companyId, input.agentId, bound, false, async (_tx, _agent, canonical) => {
+    const { snapshot, storageWarning, stagedGid } = await store.locked(input.companyId, input.agentId, bound, false, async (_tx, _agent, canonical) => {
       // Storage quotas govern saves, never admission to a future run. Restore
       // existing bytes so the agent can work normally and remove excess files.
       // Path/link validation remains mandatory even for an over-quota folder.
@@ -211,7 +217,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       try {
         await fs.cp(canonical, localRoot, { recursive: true, preserveTimestamps: true });
         if (gid !== null) await workingCopyPermissions(localRoot, gid);
-        return inspected;
+        return { ...inspected, stagedGid: gid };
       } catch (error) {
         await fs.rm(path.dirname(localRoot), { recursive: true, force: true });
         throw error;
@@ -223,7 +229,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const loadedEntry = snapshot.entries.get(deriveBundleState(agent).entryFile);
     const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning,
+      receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning, ...(stagedGid !== null ? { stagedGid } : {}),
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
@@ -279,7 +285,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       try {
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
-        const manifest = canonicalManifest(captured.manifest, baseline(row));
+        const manifest = stagedForGroup(row) ? canonicalManifest(captured.manifest, baseline(row)) : captured.manifest;
         const snapshot = checkpointSnapshot(manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
@@ -327,7 +333,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       row = await patch(row, { attempts: row.attempts + 1 });
       try {
         inspected ??= await retrieve(row, target);
-        const snapshot = canonicalSnapshot(inspected.snapshot, baseline(row));
+        const snapshot = stagedForGroup(row) ? canonicalSnapshot(inspected.snapshot, baseline(row)) : inspected.snapshot;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
         if (candidateHash === row.baseHash) {

@@ -198,6 +198,7 @@ describe("persistent agent directories", () => {
       await fs.chmod(path.join(root, relative), mode);
     }
     const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
     expect((await fs.stat(path.join(copy.localRoot, "scripts/run.sh"))).mode & 0o7777).toBe(0o750);
     for (const relative of Object.keys(canonical)) await fs.writeFile(path.join(copy.localRoot, relative), `after ${relative}`);
     await fs.chmod(path.join(copy.localRoot, "notes/mode.md"), 0o600);
@@ -209,6 +210,36 @@ describe("persistent agent directories", () => {
       expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(mode);
     }
     if (warm) expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
+  });
+
+  it.skipIf(process.getuid?.() === 0)("saves the run's own mode changes for an owner-only copy", async () => {
+    let gid = 54_321;
+    while (gid === process.getegid!() || process.getgroups!().includes(gid)) gid++;
+    const canonical = { "scripts/run.sh": 0o755, "notes/x.md": 0o644, "notes/plain.md": 0o644 };
+    for (const [relative, mode] of Object.entries(canonical)) {
+      await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true });
+      await fs.writeFile(path.join(root, relative), "before");
+      await fs.chmod(path.join(root, relative), mode);
+    }
+    const copy = await withAgentsGid(gid, () => run());
+    expect(copy.receipt?.stagedGid).toBeUndefined();
+    for (const relative of Object.keys(canonical)) await fs.writeFile(path.join(copy.localRoot, relative), `after ${relative}`);
+    await fs.chmod(path.join(copy.localRoot, "scripts/run.sh"), 0o750);
+    await fs.chmod(path.join(copy.localRoot, "notes/x.md"), 0o640);
+    expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("saved");
+    for (const [relative, mode] of Object.entries({ "scripts/run.sh": 0o750, "notes/x.md": 0o640, "notes/plain.md": 0o644 })) {
+      expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(`after ${relative}`);
+      expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(mode);
+    }
+  });
+
+  it("keeps preparing when the agents group cannot be assigned to an entry", async () => {
+    await writeShared();
+    const denied = vi.spyOn(fs, "chmod").mockRejectedValue(Object.assign(new Error("denied"), { code: "EPERM" }));
+    let copy;
+    try { copy = await withAgentsGid(process.getegid!(), () => run()); } finally { denied.mockRestore(); }
+    expect((await fs.stat(path.join(path.dirname(root), "file-sync/runs", copy.runId))).mode & 0o077).toBe(0);
+    for (const relative of sharedFiles) expect((await fs.stat(path.join(copy.localRoot, relative))).mode & 0o7777).toBe(0o600);
   });
 
   it("does not change external targets of symlinks encountered while staging permissions", async () => {
