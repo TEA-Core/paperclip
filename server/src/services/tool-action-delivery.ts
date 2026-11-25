@@ -100,7 +100,7 @@ export function toolActionDeliveryService(
         );
       if (
         !agent ||
-        ["paused", "terminated", "pending_approval"].includes(agent.status)
+        ["paused", "terminated", "deleted", "pending_approval"].includes(agent.status)
       )
         return false;
       const [pending] = await tx

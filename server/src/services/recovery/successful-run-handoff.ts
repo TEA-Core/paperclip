@@ -602,7 +602,7 @@ export function decideSuccessfulRunHandoff(input: {
   if (isPluginManagedIssueLifecycle(issue)) {
     return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };
   }
-  if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+  if (agent.status === "paused" || (agent.status === "terminated" || agent.status === "deleted") || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
   }
   // SUP-9859. An external pull agent's run is a doorbell, not the work: the

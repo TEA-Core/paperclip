@@ -349,7 +349,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           releasePolicy: null,
         };
       }
-      const treeHoldInteractionWake = await isVerifiedIssueTreeControlInteractionWake(tx, {
+      const treeHoldInteractionWake = !activePauseHold.recoveryCarrierPark && await isVerifiedIssueTreeControlInteractionWake(tx, {
         companyId,
         issueId,
         agentId: wakeAgentId,

@@ -1,4 +1,4 @@
-import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, isNull, lt, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
@@ -86,7 +86,7 @@ export function companyService(db: Db) {
       })
       .where(and(
         eq(agents.companyId, id),
-        notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+        notInArray(agents.status, ["paused", "terminated", "pending_approval", "deleted"]),
       ))
       .returning({ id: agents.id });
 
@@ -605,6 +605,7 @@ export function companyService(db: Db) {
         db
           .select({ companyId: agents.companyId, count: count() })
           .from(agents)
+          .where(ne(agents.status, "deleted"))
           .groupBy(agents.companyId),
         db
           .select({ companyId: issues.companyId, count: count() })

@@ -340,6 +340,7 @@ const plugin = definePlugin({
         expectedHash: stringField(params.expectedHash),
         summary: stringField(params.summary),
         sourceRefs: params.sourceRefs,
+        create: true,
         writer: "board_ui",
       });
     });

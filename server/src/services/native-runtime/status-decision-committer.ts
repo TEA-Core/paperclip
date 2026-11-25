@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
@@ -55,6 +55,8 @@ import {
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
+import { issueTreeControlService } from "../issue-tree-control.js";
+import { RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED } from "../recovery-carrier-park-state.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -414,6 +416,13 @@ async function enqueueWake(input: {
   payload: Record<string, unknown>;
   contextSnapshot?: Record<string, unknown>;
 }) {
+  // Admission and park acceptance serialize on the carrier, including late
+  // native finalization after its provider run already finished.
+  await input.tx.select({ id: issues.id }).from(issues).where(and(
+    eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
+  )).for("update");
+  const parked = (await issueTreeControlService(input.tx)
+    .getActivePauseHoldGate(input.companyId, input.issueId))?.recoveryCarrierPark;
   const existing = await input.tx
     .select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -421,12 +430,11 @@ async function enqueueWake(input: {
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
-        inArray(agentWakeupRequests.status, [
-          "queued",
-          "deferred_issue_execution",
-          "claimed",
-          "completed",
-        ]),
+        or(
+          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed", "completed"]),
+          and(eq(agentWakeupRequests.status, "skipped"),
+            eq(agentWakeupRequests.error, RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED)),
+        ),
       ),
     )
     .limit(1)
@@ -440,6 +448,9 @@ async function enqueueWake(input: {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
+      status: parked ? "skipped" : "queued",
+      finishedAt: parked ? new Date() : null,
+      error: parked ? RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED : null,
       payload: {
         issueId: input.issueId,
         taskId: input.issueId,

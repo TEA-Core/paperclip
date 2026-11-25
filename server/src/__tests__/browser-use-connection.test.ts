@@ -22,6 +22,7 @@ import {
   issues,
   toolConnections,
   toolApplications,
+  toolInvocations,
   toolConnectionInstalls,
   toolProfiles,
   toolProfileBindings,
@@ -480,6 +481,30 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
         f.access.refreshCatalog(f.connection.connectionId, actor),
       ).rejects.toThrow();
     });
+    it("retries a Browser Use write after pre-dispatch credentials are restored and the replay window passes", async () => {
+      const f = await fixture();
+      const start = (await f.gateway.listToolsForSession(f.gatewaySession.token))
+        .find((tool) => tool.upstreamToolName === "browser_start")!;
+      await db.update(connectionGrants).set({ credentialSecretRefs: [] })
+        .where(eq(connectionGrants.id, f.grant.id));
+      f.request.mockClear();
+      const call = () => f.gateway.executeTool({
+        sessionToken: f.gatewaySession.token, tool: start.name,
+        parameters: { task: "Read example.com after credentials return" },
+      });
+      await expect(call()).rejects.toThrow("API key");
+      const [failed] = await db.select().from(toolInvocations)
+        .where(eq(toolInvocations.companyId, f.company.id));
+      expect(failed.startedAt).toBeNull();
+      expect(f.request).not.toHaveBeenCalled();
+      await db.update(connectionGrants).set({ credentialSecretRefs: f.grant.credentialSecretRefs })
+        .where(eq(connectionGrants.id, f.grant.id));
+      await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 6 * 60_000) })
+        .where(eq(toolInvocations.id, failed.id));
+      await expect(call()).resolves.toMatchObject({ status: "completed" });
+      expect(f.request.mock.calls.filter(([url, init]) => url.endsWith("/runs") && init.method === "POST")).toHaveLength(1);
+    });
+
     it("observes delayed browser.ready, hides viewer credentials, accounts once and cleans up", async () => {
       const f = await fixture();
       const invocation = randomUUID();

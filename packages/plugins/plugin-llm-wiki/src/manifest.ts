@@ -351,7 +351,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       name: "wiki_write_page",
       displayName: "Write Wiki Page",
-      description: "Atomically write a markdown wiki page in one wiki space after plugin path validation and optional hash conflict checks. Operation agents should pass the issue's spaceSlug; omitting it uses the default space. Protected control files such as AGENTS.md and IDEA.md are excluded from agent-tool writes.",
+      description: "Atomically write a markdown wiki page in one wiki space after plugin path validation and optional hash conflict checks. Pass create=true when intentionally creating a page that does not exist yet; writes to a missing page without create=true are rejected. Operation agents should pass the issue's spaceSlug; omitting it uses the default space. Protected control files such as AGENTS.md and IDEA.md are excluded from agent-tool writes.",
       parametersSchema: {
         type: "object",
         properties: {
@@ -361,9 +361,12 @@ const manifest: PaperclipPluginManifestV1 = {
           path: { type: "string" },
           contents: { type: "string" },
           expectedHash: { type: "string" },
-          summary: { type: "string" }
+          summary: { type: "string" },
+          sourceRefs: { type: "array" },
+          create: { type: "boolean" }
         },
-        required: ["companyId", "wikiId", "path", "contents"]
+        required: ["companyId", "wikiId", "path", "contents"],
+        additionalProperties: false
       }
     },
     {
