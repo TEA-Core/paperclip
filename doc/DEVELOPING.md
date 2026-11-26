@@ -1049,9 +1049,10 @@ unchanged and use layout-derived isolation. A colliding layout name receives a
 config-path-derived suffix; if no safe identity exists, boot refuses.
 Explicit operator instance IDs take precedence over own-file IDs, subject to
 the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
-identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
-the main home. A different transient runtime home does not replace persisted
-worktree paths.
+identify the already-selected `PAPERCLIP_HOME` as the worktree home only for a
+non-`default` instance. Exporting a claimed main home's `default` identity does
+not exempt that home from isolation checks or permit reuse of its database.
+A different transient runtime home does not replace persisted worktree paths.
 If the parent can be searched but not listed, reusable identity claims are
 refused and the config-path-derived identity is used; registered sibling
 collisions and main-home checks still apply. An own file that makes no

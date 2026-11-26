@@ -816,6 +816,86 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     }
   });
 
+  it("refuses a custom main database after importing real worktree env exports (N2)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      process.env.HOME = path.join(fixture.root, "home");
+      const mainHome = path.join(fixture.root, "custom-main-home");
+      const mainRoot = path.join(mainHome, "instances", "default");
+      const mainConfigPath = path.join(mainRoot, "config.json");
+      const mainConfig = JSON.stringify(buildLegacyConfig(mainRoot), null, 2) + "\n";
+      fs.mkdirSync(mainRoot, { recursive: true });
+      fs.writeFileSync(mainConfigPath, mainConfig);
+      fs.writeFileSync(fixture.configPath, mainConfig);
+      const contents = envFileContents({
+        PAPERCLIP_HOME: mainHome,
+        PAPERCLIP_INSTANCE_ID: "default",
+        PAPERCLIP_CONFIG: fixture.configPath,
+        PAPERCLIP_CONTEXT: path.join(mainHome, "context.json"),
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_WORKTREE_NAME: fixture.worktreeName,
+      });
+      fs.writeFileSync(fixture.ownEnvPath, contents);
+      operatorWorktreeLayout(fixture);
+      const { execFileSync } = await import("node:child_process");
+      const commandUrl = new URL("../../../cli/src/commands/worktree.ts", import.meta.url).href;
+      const exports = JSON.parse(execFileSync(process.execPath, [
+        "--import", "tsx", "--input-type=module", "-e",
+        `const { worktreeEnvCommand } = await import(${JSON.stringify(commandUrl)});
+         await worktreeEnvCommand({ config: ${JSON.stringify(fixture.configPath)}, json: true });`,
+      ], {
+        cwd: path.resolve(import.meta.dirname, "../.."),
+        env: process.env,
+        encoding: "utf8",
+        timeout: 20_000,
+      })) as Record<string, string>;
+      Object.assign(process.env, exports);
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "identity")).toBe(true);
+      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+        path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
+      );
+      expect(fs.readFileSync(mainConfigPath, "utf8")).toBe(mainConfig);
+      expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.each([
+    { name: "MC", nestedHome: true, exportedFlag: true },
+    { name: "MD", nestedHome: false, exportedFlag: false },
+  ])("refuses an unqualified exported-home exemption ($name)", async ({ nestedHome, exportedFlag }) => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      process.env.HOME = path.join(fixture.root, "home");
+      const mainHome = path.join(fixture.root, "custom-main-home");
+      const contents = envFileContents({
+        PAPERCLIP_HOME: nestedHome ? path.join(mainHome, "nested") : mainHome,
+        PAPERCLIP_INSTANCE_ID: fixture.worktreeName,
+        PAPERCLIP_IN_WORKTREE: "true",
+      });
+      fs.writeFileSync(fixture.ownEnvPath, contents);
+      operatorWorktreeLayout(fixture);
+      process.env.PAPERCLIP_HOME = mainHome;
+      process.env.PAPERCLIP_INSTANCE_ID = fixture.worktreeName;
+      process.env.PAPERCLIP_CONFIG = fixture.configPath;
+      if (exportedFlag) process.env.PAPERCLIP_IN_WORKTREE = "true";
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "identity")).toBe(true);
+      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+        path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
+      );
+      expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("preserves an operator-selected worktree instance ID", async () => {
     const fixture = await makeWorktreeFixture({
       ownEnvContents: "PAPERCLIP_IN_WORKTREE=true\nPAPERCLIP_INSTANCE_ID=previous-id\n",
