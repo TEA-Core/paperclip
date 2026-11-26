@@ -86,6 +86,8 @@ interface Rows {
   projectWorkspace: Record<string, unknown>;
   workProducts: Array<Record<string, unknown>>;
   otherCards: string[];
+  /** Branch names registered to other cards' execution workspaces. */
+  otherCardBranches: string[];
 }
 let rows: Rows;
 
@@ -96,7 +98,13 @@ const db = {
   select: (columns?: Record<string, unknown>) => ({
     from: (table: unknown) => ({
       where: () => {
-        if (table === executionWorkspaces) return Promise.resolve([rows.executionWorkspace]);
+        if (table === executionWorkspaces) {
+          // The registered-branch read selects only branchName.
+          const registered = columns && Object.keys(columns).length === 1 && "branchName" in columns
+            ? rows.otherCardBranches.map((branchName) => ({ branchName }))
+            : [];
+          return Promise.resolve([rows.executionWorkspace, ...registered]);
+        }
         if (table === projectWorkspaces) return Promise.resolve([rows.projectWorkspace]);
         if (table === issues) return Promise.resolve(rows.otherCards.map((identifier) => ({ identifier })));
         if (table === issueWorkProducts) {
@@ -253,6 +261,7 @@ beforeEach(() => {
     projectWorkspace: { id: "pw-1", defaultRef: "main", repoRef: "main", repoUrl: REPO_URL },
     workProducts: [],
     otherCards: [],
+    otherCardBranches: [],
   };
   mockGhFetch.mockReset();
   mockGhFetch.mockImplementation(async (url: string) => answerGitHub(String(url)));
@@ -592,6 +601,19 @@ describe("zero-delta NO-GO regressions (RA 1213)", () => {
     const result = await close();
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("stash");
+  });
+
+  // ZS-06: the record_only provenance rule never reaches a zero-delta close.
+  // Another registered card's stash still refuses it repository-wide.
+  it("refuses a registered sibling card's stash (the repository-wide stash rule stays)", async () => {
+    const sibling = "SUP-24396-sibling";
+    rows.otherCardBranches = [sibling];
+    const siblingWorktree = path.join(repoRoot, ".paperclip", "worktrees", sibling);
+    git(repoRoot, "worktree", "add", "-q", "-b", sibling, siblingWorktree, "origin/main");
+    writeFileSync(path.join(siblingWorktree, "a.txt"), "sibling's parked work\n");
+    git(siblingWorktree, "stash", "push", "-q");
+    expect(git(repoRoot, "log", "-1", "--format=%s", "refs/stash")).toContain(`WIP on ${sibling}:`);
+    expectZeroDeltaRefusal(await close(), "the recorded worktree has a stash of uncommitted work (refs/stash)");
   });
 
   it("refuses a hidden local branch holding commits while HEAD sits at the base", async () => {

@@ -2801,7 +2801,7 @@ async function proveZeroDeltaRepositoryClose(
   });
   if (!probe.ok) return refuse(probe.reason);
   const forge = githubForgeReader(token);
-  const forgeCard = { repo: { hostname, owner, repo }, baseBranch, declaredHead: probe.headSha, cardBranch: workspace.branchName, cardIdentifier: issue.identifier };
+  const forgeCard = { repo: { hostname, owner, repo }, baseBranch, declaredHead: probe.headSha, cardBranch: workspace.branchName, cardIdentifier: issue.identifier, otherCardBranches: new Set(attributedBranches) };
   const decided = await decideZeroDeltaFromForge(forgeCard, forge, ZERO_DELTA_MEASUREMENT_BUDGET);
   if (!decided.ok) return refuse(decided.reason);
   if (decided.proof.baseSha !== probe.baseSha.toLowerCase()) {

@@ -785,42 +785,82 @@ function indexEntryRefusal(entry: IndexEntry): string | null {
 
 type StashScope = Pick<NoRepositoryWorktreeProbeInput, "issueIdentifier" | "attributedBranches">;
 
-/** Shared stash entries can be skipped only when all belong to registered other-card branches. */
-async function scopedStashRefusal(
-  worktreePath: string,
+/** `WIP on <branch>: …` or `On <branch>: …`. A branch name holds no space and no colon; `(no branch)` does not match. */
+const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
+
+/**
+ * Record-only: why the shared stash holds work stashed on one of this card's
+ * branches; null when it holds none.
+ *
+ * Provenance rule. Every stash commit records, in its own subject, the branch
+ * HEAD was on when git made it. An entry is this card's when that recorded
+ * branch is `ownBranch` (the recorded worktree's branch, even when that name is
+ * also registered to another card), or carries this card's identifier and is
+ * not registered to another card. Only such an entry refuses, and it refuses
+ * only this card. Every other entry belongs to no card here and has no effect:
+ * a registered sibling's branch, a project branch, an unregistered or deleted
+ * branch naming no card of ours, `(no branch)`, any other subject, and any
+ * evidence that cannot be read (garbage ref, non-commit, missing or corrupt
+ * object, a reflog that is not a regular file).
+ *
+ * The entries are the union of the `refs/stash` tip as git resolves it (loose or
+ * packed) and the new-id column of every line of the stash reflog file, so an
+ * entry below the tip, a tip with no reflog line, and a packed tip all count.
+ * The reflog subject, which `git stash store -m` sets freely, is never read, so
+ * relabelling a stash changes no decision in either direction. Parents are
+ * never read: a record_only card's own stash shares its first parent with every
+ * sibling's stash on the same base commit.
+ *
+ * Residual blind spot, by design: a stash made while this card's worktree was
+ * on a detached HEAD (records `(no branch)`), on a temporary branch that does
+ * not carry this card's identifier and was then deleted, or on another card's
+ * registered branch, and a stash commit rebuilt with `git commit-tree` under
+ * another subject, all record a branch that is not this card's, so they do not
+ * refuse. A detached-HEAD stash of this card cannot be told from a sibling's.
+ */
+async function cardStashRefusal(
+  repoRoot: string,
+  commonDir: string,
   options: HardenedGitOptions,
   scope: StashScope,
-  tip: string,
+  ownBranch: string,
 ): Promise<string | null> {
-  const unknown = "has a shared stash whose card ownership could not be verified (refs/stash)";
-  let entries: string[];
-  try {
-    entries = (await runHardenedGit(
-      ["-C", worktreePath, "reflog", "show", "--format=%H%x00%gs", "refs/stash"],
-      options,
-    )).trim().split("\n");
-  } catch {
-    return unknown;
+  const ids = new Set<string>();
+  const tip = (
+    await runHardenedGit(["-C", repoRoot, "for-each-ref", "--format=%(objectname)", "refs/stash"], options).catch(() => "")
+  ).trim();
+  if (SHA_RE.test(tip)) ids.add(tip);
+  const log = await readOptionalRegularFile(path.join(commonDir, "logs", "refs", "stash"), MAX_EXCLUDE_FILE_BYTES)
+    .catch(() => null);
+  for (const line of log?.split("\n") ?? []) {
+    const id = line.split(" ", 2)[1] ?? "";
+    if (SHA_RE.test(id)) ids.add(id);
   }
-  if (!entries[0]?.startsWith(`${tip}\0`)) return unknown;
-  for (const entry of entries) {
-    const separator = entry.indexOf("\0");
-    if (separator < 0 || !SHA_RE.test(entry.slice(0, separator))) return unknown;
-    const branch = /^(?:WIP on|On) ([^:]+):/.exec(entry.slice(separator + 1))?.[1];
-    if (!branch) return unknown;
-    if (branchNamesIssue(branch, scope.issueIdentifier)) return "has stashed work for this card (refs/stash)";
-    if (!scope.attributedBranches.has(branch)) return unknown;
+  if (ids.size === 0) return null;
+  const subjects = await runHardenedGit(
+    ["-C", repoRoot, "log", "--no-walk=unsorted", "--ignore-missing", "--stdin", "--format=%H%x00%s"],
+    { ...options, input: `${[...ids].join("\n")}\n` },
+  ).catch(() => "");
+  for (const line of subjects.split("\n")) {
+    const separator = line.indexOf("\0");
+    if (separator < 0) continue;
+    const branch = STASH_COMMIT_BRANCH_RE.exec(line.slice(separator + 1))?.[1];
+    if (
+      branch !== undefined &&
+      (branch === ownBranch || (branchNamesIssue(branch, scope.issueIdentifier) && !scope.attributedBranches.has(branch)))
+    ) {
+      return `holds work stashed on this card's branch ${branch} (stash commit ${line.slice(0, 12)})`;
+    }
   }
   return null;
 }
 
 /**
- * Why the repository's stash is not provably empty or attributed elsewhere.
- * Record-only callers supply the closing card's scope; zero-delta callers
- * retain the repository-wide refusal. Broken, unowned or unreadable evidence
- * always refuses, including a loose ref hiding a packed stash.
+ * Zero-delta: why the repository's stash is not provably empty. Any stash, and
+ * any broken or unreadable stash evidence, refuses, including a loose ref
+ * hiding a packed stash. Record-only closes use `cardStashRefusal` instead.
  */
-async function stashRefusal(worktreePath: string, options: HardenedGitOptions, scope?: StashScope): Promise<string | null> {
+async function stashRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
   let commonDir: string;
   try {
     const raw = (await runHardenedGit(["-C", worktreePath, "rev-parse", "--git-common-dir"], options)).trim();
@@ -837,7 +877,7 @@ async function stashRefusal(worktreePath: string, options: HardenedGitOptions, s
   if (loose !== null) {
     const sha = loose.trim();
     if (!SHA_RE.test(sha)) return "has a stash that could not be read (refs/stash)";
-    return scope ? scopedStashRefusal(worktreePath, options, scope, sha) : "has a stash of uncommitted work (refs/stash)";
+    return "has a stash of uncommitted work (refs/stash)";
   }
   let packed: string | null;
   try {
@@ -848,7 +888,7 @@ async function stashRefusal(worktreePath: string, options: HardenedGitOptions, s
   if (packed !== null) {
     for (const line of packed.split("\n")) {
       const entry = /^([0-9a-f]{40,64}) refs\/stash$/.exec(line.trim());
-      if (entry) return scope ? scopedStashRefusal(worktreePath, options, scope, entry[1]!) : "has a stash of uncommitted work (refs/stash)";
+      if (entry) return "has a stash of uncommitted work (refs/stash)";
     }
   }
   let stash: string;
@@ -858,21 +898,21 @@ async function stashRefusal(worktreePath: string, options: HardenedGitOptions, s
     return "has a stash that could not be read (refs/stash)";
   }
   if (stash.length > 0 && !SHA_RE.test(stash)) return "has a stash that could not be read (refs/stash)";
-  return stash.length > 0
-    ? scope ? scopedStashRefusal(worktreePath, options, scope, stash) : "has a stash of uncommitted work (refs/stash)"
-    : null;
+  return stash.length > 0 ? "has a stash of uncommitted work (refs/stash)" : null;
 }
 
 /**
  * Identity, configuration, index and status checks for one linked worktree of
  * the managed checkout. Shared by the recorded worktree and any other
- * worktree checked out on a branch that names the issue.
+ * worktree checked out on a branch that names the issue. `repositoryStash`
+ * runs the zero-delta repository-wide stash refusal; record-only callers pass
+ * false and run `cardStashRefusal` once, for the recorded worktree's branch.
  */
 async function verifyCleanLinkedWorktree(
   worktreePath: string,
   expectedCommonDir: string,
   options: HardenedGitOptions,
-  stashScope?: StashScope,
+  repositoryStash: boolean,
 ): Promise<CleanWorktreeVerdict> {
   const worktreeOptions: HardenedGitOptions = { ...options, ceilingDirectory: path.dirname(worktreePath) };
   const shapeRefusal = await worktreeShapeRefusal(worktreePath, worktreeOptions);
@@ -902,7 +942,7 @@ async function verifyCleanLinkedWorktree(
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
-  const stash = await stashRefusal(worktreePath, worktreeOptions, stashScope);
+  const stash = repositoryStash ? await stashRefusal(worktreePath, worktreeOptions) : null;
   if (stash) return { ok: false, reason: stash };
   let exclude: string | null;
   try {
@@ -1018,7 +1058,7 @@ export async function probeNoRepositoryWorktree(
   }
   const options: HardenedGitOptions = { cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: managedRoot };
 
-  const own = await verifyCleanLinkedWorktree(candidate, commonDir, options, input);
+  const own = await verifyCleanLinkedWorktree(candidate, commonDir, options, false);
   if (!own.ok) return refuse(`the recorded worktree ${own.reason}`);
   if (!branchNamesIssue(own.branch, input.issueIdentifier)) {
     return refuse(`the recorded worktree's branch does not name ${input.issueIdentifier}`);
@@ -1089,17 +1129,19 @@ export async function probeNoRepositoryWorktree(
         continue; // prunable: the directory is gone, so it holds no uncommitted content
       }
       if (worktreePath === candidate) continue;
-      const other = await verifyCleanLinkedWorktree(worktreePath, commonDir, options, input);
+      const other = await verifyCleanLinkedWorktree(worktreePath, commonDir, options, false);
       if (!other.ok) return refuse(`another worktree on branch ${branch} ${other.reason}`);
     }
 
-    const final = await verifyCleanLinkedWorktree(candidate, commonDir, options, input);
+    const final = await verifyCleanLinkedWorktree(candidate, commonDir, options, false);
     if (!final.ok) return refuse(`the recorded worktree ${final.reason}`);
     if (final.branch !== own.branch || final.headSha !== own.headSha) {
       return refuse(
         `the recorded worktree moved from ${own.branch} at ${own.headSha.slice(0, 12)} to ${final.branch} at ${final.headSha.slice(0, 12)} while it was being verified`,
       );
     }
+    const stash = await cardStashRefusal(repoRoot, commonDir, options, input, own.branch);
+    if (stash) return refuse(`the shared stash ${stash}`);
     return {
       ok: true,
       branch: own.branch,
@@ -1130,7 +1172,11 @@ export async function recheckRecordedWorktree(input: {
   commonDir: string;
   branch: string;
   headSha: string;
-  /** Record-only closes may ignore stashes attributed to registered other-card branches. */
+  /**
+   * Record-only closes: refuse only a stash that records one of this card's
+   * branches (`cardStashRefusal`). Absent, the zero-delta repository-wide
+   * stash refusal applies.
+   */
   stashScope?: StashScope;
   siblings?: { issueIdentifier: string; refsDigest: string };
   /** The measured local base ref. A move or delete after measurement refuses. */
@@ -1146,11 +1192,21 @@ export async function recheckRecordedWorktree(input: {
     ok: false as const,
     reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
   };
-  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, options, input.stashScope);
+  const verdict = await verifyCleanLinkedWorktree(
+    input.worktreePath,
+    input.commonDir,
+    options,
+    input.stashScope === undefined,
+  );
   if (deadline.expired) return timedOut;
   if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
   if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
+  }
+  if (input.stashScope) {
+    const stash = await cardStashRefusal(repoRoot, input.commonDir, options, input.stashScope, input.branch);
+    if (deadline.expired) return timedOut;
+    if (stash) return { ok: false, reason: `the shared stash ${stash}` };
   }
   if (input.base) {
     const resolved = (
@@ -1185,7 +1241,12 @@ export async function recheckRecordedWorktree(input: {
   }
   if (deadline.expired) return timedOut;
   if (siblingRefusal) return { ok: false, reason: siblingRefusal };
-  const afterSiblings = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, options, input.stashScope);
+  const afterSiblings = await verifyCleanLinkedWorktree(
+    input.worktreePath,
+    input.commonDir,
+    options,
+    input.stashScope === undefined,
+  );
   if (deadline.expired) return timedOut;
   if (!afterSiblings.ok) return { ok: false, reason: `the recorded worktree ${afterSiblings.reason}` };
   if (afterSiblings.branch !== input.branch || afterSiblings.headSha !== input.headSha) {
@@ -1500,7 +1561,7 @@ async function siblingWorktreeRefusal(
       continue;
     }
     if (otherPath === worktreePath) continue;
-    const other = await verifyCleanLinkedWorktree(otherPath, commonDir, options);
+    const other = await verifyCleanLinkedWorktree(otherPath, commonDir, options, true);
     if (!other.ok) return `another worktree on branch ${branch} ${other.reason}`;
   }
   return null;

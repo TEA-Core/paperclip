@@ -2165,6 +2165,114 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(git(other, "rev-parse", "refs/stash")).toBe(stash);
   });
 
+  // The record_only provenance rule end to end: a stash refuses this card's
+  // close only when the stash commit itself records this card's branch. The
+  // `git stash store -m` label is never read. Row ids follow the frozen matrix.
+  describe("record_only stash provenance through the PATCH route", () => {
+    async function siblingWorktree(fixture: SeededIssue, branch: string) {
+      await registerSiblingCard(fixture, branch);
+      const other = path.join(fixture.repoRoot, ".paperclip", "worktrees", branch);
+      git(fixture.repoRoot, "worktree", "add", "-q", "-b", branch, other, "origin/main");
+      return other;
+    }
+
+    function stashCreate(dir: string, contents: string) {
+      writeFileSync(path.join(dir, "README.md"), contents);
+      const commit = git(dir, "stash", "create");
+      git(dir, "checkout", "-q", "--", "README.md");
+      return commit;
+    }
+
+    const siblingBranch = (fixture: SeededIssue) => `${fixture.identifier.replace(/-\d+$/, "")}-2-sibling`;
+
+    it.each([
+      ["R-02 this card's worktree stashes", async (fixture: SeededIssue) => {
+        writeFileSync(path.join(fixture.worktree, "README.md"), "this card's work\n");
+        git(fixture.worktree, "stash", "push", "-q");
+      }],
+      ["R-03 this card's stash relabelled as a registered sibling's", async (fixture: SeededIssue) => {
+        const sibling = siblingBranch(fixture);
+        await siblingWorktree(fixture, sibling);
+        git(fixture.worktree, "stash", "store", "-m", `On ${sibling}: draft`, stashCreate(fixture.worktree, "this card's work\n"));
+      }],
+      ["R-07 this card's stash behind a packed ref", async (fixture: SeededIssue) => {
+        writeFileSync(path.join(fixture.worktree, "README.md"), "this card's work\n");
+        git(fixture.worktree, "stash", "push", "-q");
+        git(fixture.repoRoot, "pack-refs", "--all");
+      }],
+    ] as const)("refuses %s", async (_id, arrange) => {
+      const fixture = await seed();
+      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+      await arrange(fixture);
+      const stashes = git(fixture.repoRoot, "stash", "list");
+
+      const res = await close(fixture.identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain(`stashed on this card's branch ${fixture.branch} `);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+      expect(git(fixture.repoRoot, "stash", "list")).toBe(stashes);
+    });
+
+    it.each([
+      ["R-04 a stash on the project branch in the managed checkout", async (fixture: SeededIssue) => {
+        writeFileSync(path.join(fixture.repoRoot, "README.md"), "unattributed work\n");
+        git(fixture.repoRoot, "stash", "push", "-q");
+      }],
+      ["R-05 a registered sibling's stash relabelled as this card's", async (fixture: SeededIssue) => {
+        const other = await siblingWorktree(fixture, siblingBranch(fixture));
+        git(other, "stash", "store", "-m", `On ${fixture.branch}: forged`, stashCreate(other, "sibling's work\n"));
+      }],
+      ["R-06 a registered sibling branch that mentions this card", async (fixture: SeededIssue) => {
+        const prefix = fixture.identifier.replace(/-\d+$/, "");
+        const other = await siblingWorktree(fixture, `${prefix}-2-follow-up-for-${fixture.identifier}`);
+        writeFileSync(path.join(other, "README.md"), "sibling's work\n");
+        git(other, "stash", "push", "-q");
+      }],
+    ] as const)("closes with %s", async (_id, arrange) => {
+      const fixture = await seed();
+      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+      await arrange(fixture);
+      const stashes = git(fixture.repoRoot, "stash", "list");
+
+      const res = await close(fixture.identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("done");
+      expect(git(fixture.repoRoot, "stash", "list")).toBe(stashes);
+    });
+  });
+
+  // The zero-delta mention rule end to end: another card's abandoned pull
+  // request whose branch mentions this card stops being this card's
+  // obligation only when the board registered that exact branch to the other
+  // card's workspace.
+  it.each([
+    ["FM-R1 registered to a sibling card", true],
+    ["FM-R2 registered to no card", false],
+  ] as const)("decides a zero-delta close beside another card's closed pull request that mentions this card: %s", async (_id, registered) => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    const followUp = `${fixture.identifier.replace(/-\d+$/, "")}-2-follow-up-for-${fixture.identifier}`;
+    if (registered) await registerSiblingCard(fixture, followUp);
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    const sha = git(currentOrigin, "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "sibling's abandoned work");
+    git(currentOrigin, "update-ref", "refs/pull/17/head", sha);
+    answerZeroDeltaGitHub([{
+      number: 17, state: "closed", merged_at: null, title: "Abandoned follow-up",
+      html_url: "https://github.com/TEA-Core/records/pull/17",
+      head: { ref: followUp, sha, repo: { full_name: "TEA-Core/records" } },
+    }]);
+    const res = await close(fixture.identifier, zeroDeltaDoneTier(fixture.worktree));
+    if (registered) {
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("done");
+    } else {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain("names this card and is not on the base line");
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    }
+  });
+
   async function seedFinalZeroDeltaApproval() {
     const fixture = await seed({ deliveryRequirement: "repository_delivery" });
     const stageId = randomUUID();

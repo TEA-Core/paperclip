@@ -236,7 +236,7 @@ export function githubForgeReader(token: string, clock: ForgeClock = monotonicNo
         // These refusal-only refs also bind name/merge changes into the digest.
         const unmerged = pull?.state === "open" || (pull?.state === "closed" && pull.merged_at == null);
         if (unmerged && branch) {
-          refs.push({ kind: "ref", name: `pull-request ${branch}`, sha });
+          refs.push({ kind: "ref", name: `${PULL_REQUEST_REF}${branch}`, sha });
         }
         if (stringField(head?.repo, "full_name")?.toLowerCase() === repositoryName) pullRequestHeads.add(sha);
       }
@@ -294,8 +294,36 @@ async function mapPool<T>(items: readonly T[], concurrency: number, fn: (item: T
   await Promise.all(workers);
 }
 
+/** Prefix of the synthetic ref rows that carry an unmerged pull request's branch name. A real ref starts with `refs/`. */
+const PULL_REQUEST_REF = "pull-request ";
+
+/**
+ * The branch name a snapshot ref carries when it is branch-shaped: a
+ * `refs/heads/` branch or a synthetic unmerged pull-request row. Null for tags
+ * and every other namespace.
+ */
+function branchShapedName(ref: ForgeRef): string | null {
+  if (ref.kind === "branch") return ref.name;
+  return ref.kind === "ref" && ref.name.startsWith(PULL_REQUEST_REF) ? ref.name.slice(PULL_REQUEST_REF.length) : null;
+}
+
 export async function decideZeroDeltaFromForge(
-  card: { repo: ForgeRepo; baseBranch: string; declaredHead: string; cardBranch: string; cardIdentifier: string },
+  card: {
+    repo: ForgeRepo;
+    baseBranch: string;
+    declaredHead: string;
+    cardBranch: string;
+    cardIdentifier: string;
+    /**
+     * Branch names the board registered to another card's execution workspace
+     * (agents cannot write them). A branch-shaped name that mentions this card
+     * but is registered, by exact string, to another card is that card's: it
+     * keeps the general on-base-or-pull-request-head rule and loses only the
+     * "names this card" obligation. This card's own recorded branch is never
+     * exempted.
+     */
+    otherCardBranches: ReadonlySet<string>;
+  },
   forge: ForgeReader,
   budget: ForgeBudget,
 ): Promise<ForgeVerdict> {
@@ -308,7 +336,9 @@ export async function decideZeroDeltaFromForge(
     const namedRefs: ForgeRef[] = [];
     let cardBranch: ForgeRef | undefined;
     for (const ref of snapshot.refs) {
-      const named = branchNamesIssue(ref.name, card.cardIdentifier);
+      const branchName = branchShapedName(ref);
+      const named = branchNamesIssue(ref.name, card.cardIdentifier) &&
+        !(branchName !== null && branchName !== card.cardBranch && card.otherCardBranches.has(branchName));
       const ownBranch = ref.kind === "branch" && ref.name === card.cardBranch;
       if (named) namedRefs.push(ref);
       if (ownBranch) cardBranch = ref;

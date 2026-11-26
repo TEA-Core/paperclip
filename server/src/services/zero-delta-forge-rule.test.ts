@@ -16,7 +16,14 @@ const base = "a".repeat(40);
 const ancestor = "b".repeat(40);
 const hidden = "c".repeat(40);
 const repo = { hostname: "github.com", owner: "test", repo: "project" };
-const card = { repo, baseBranch: "main", declaredHead: ancestor, cardBranch: "CARD-1-cycle", cardIdentifier: "CARD-1" };
+const card = {
+  repo,
+  baseBranch: "main",
+  declaredHead: ancestor,
+  cardBranch: "CARD-1-cycle",
+  cardIdentifier: "CARD-1",
+  otherCardBranches: new Set<string>() as ReadonlySet<string>,
+};
 const budget = { perCallMs: 1000, totalMs: 5000, concurrency: 2 };
 const api = "https://api.github.com/repos/test/project";
 let branches: Array<{ name: string; commit: { sha: string } }>;
@@ -469,5 +476,165 @@ describe("zero-delta forge evidence", () => {
       ]) : answer(url));
       expect(await decide()).toMatchObject({ ok: false, reason: "the forge reference snapshot omitted a commit" });
     }
+  });
+});
+
+// The mention rule with the registered-branch exemption. A branch-shaped name
+// (a remote branch or an unmerged pull request's head.ref) that mentions this
+// card but is registered by the board, by exact string, to another card's
+// workspace is that card's: it keeps the general rule (on the base line, or a
+// pull-request head) and loses only the "names this card" obligation. Row ids
+// follow the frozen grading matrix.
+describe("zero-delta mention rule: names registered to another card", () => {
+  const OTHER = "CARD-2-implement-card-1-followup";
+  const pullRefOnly = (sha = hidden) => otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha } });
+  const decideWith = (registered: readonly string[], overrides: Partial<typeof card> = {}) =>
+    decideZeroDeltaFromForge(
+      { ...card, ...overrides, otherCardBranches: new Set(registered) },
+      githubForgeReader("test-token"),
+      budget,
+    );
+  const unmergedPull = (ref: string, sha: string, fullName: string | null, state = "closed") => ({
+    state,
+    ...(state === "closed" ? { merged_at: null } : {}),
+    head: { ref, sha, repo: fullName === null ? null : { full_name: fullName } },
+  });
+
+  it.each([
+    ["closed", "test/project"], ["closed", "fork/project"], ["closed", null],
+    ["open", "test/project"], ["open", "fork/project"], ["open", null],
+  ] as const)("FM-01 admits another card's registered %s pull request that mentions this card (%s)", async (state, fullName) => {
+    pullRefOnly();
+    pulls.push(unmergedPull(OTHER, hidden, fullName, state));
+    expect(await decideWith([OTHER])).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    ["FM-02 registered to nobody", []],
+    ["FM-03 a different name is registered", ["CARD-2-something-else"]],
+  ] as const)("refuses an unmerged pull request that mentions this card: %s", async (_id, registered) => {
+    pullRefOnly();
+    pulls.push(unmergedPull(OTHER, hidden, "test/project"));
+    expect(await decideWith(registered)).toMatchObject({ ok: false, reason: `ref pull-request ${OTHER} names this card and is not on the base line` });
+  });
+
+  it("FM-04 admits a registered live branch accounted for as an open pull-request head", async () => {
+    branches.push({ name: OTHER, commit: { sha: hidden } });
+    pulls.push(unmergedPull(OTHER, hidden, "test/project", "open"));
+    expect(await decideWith([OTHER])).toMatchObject({ ok: true });
+  });
+
+  it("FM-05 still refuses a registered live branch off the base line that is not a pull-request head", async () => {
+    branches.push({ name: OTHER, commit: { sha: hidden } });
+    expect(await decideWith([OTHER])).toMatchObject({
+      ok: false,
+      reason: `branch ${OTHER} is not on the base line and is not a pull-request head`,
+    });
+  });
+
+  it("FM-06 refuses an unregistered live branch that mentions this card even with an open pull request", async () => {
+    branches.push({ name: OTHER, commit: { sha: hidden } });
+    pulls.push(unmergedPull(OTHER, hidden, "test/project", "open"));
+    expect(await decideWith([])).toMatchObject({ ok: false, reason: `branch ${OTHER} names this card and is not on the base line` });
+  });
+
+  it("FM-07 never registers away this card's recorded branch held only by a pull ref", async () => {
+    pullRefOnly();
+    pulls.push(unmergedPull("CARD-1-cycle", hidden, "test/project"));
+    expect(await decideWith(["CARD-1-cycle"])).toMatchObject({ ok: false });
+  });
+
+  it("FM-08 never registers away this card's recorded live branch", async () => {
+    branches.push({ name: "CARD-1-cycle", commit: { sha: hidden } });
+    pulls.push(unmergedPull("CARD-1-cycle", hidden, "test/project", "open"));
+    expect(await decideWith(["CARD-1-cycle"])).toMatchObject({ ok: false });
+  });
+
+  it("FM-09 still refuses this card's other name beside an exempted one", async () => {
+    pullRefOnly();
+    pulls.push(unmergedPull(OTHER, hidden, "test/project"), unmergedPull("CARD-1-retry", hidden, "test/project"));
+    expect(await decideWith([OTHER])).toMatchObject({
+      ok: false,
+      reason: "ref pull-request CARD-1-retry names this card and is not on the base line",
+    });
+  });
+
+  it("FM-10 does not let an exempted name launder a card-named one at the same SHA", async () => {
+    pullRefOnly();
+    pulls.push(unmergedPull(OTHER, hidden, "test/project"), unmergedPull("CARD-1-cycle", hidden, "fork/project"));
+    expect(await decideWith([OTHER])).toMatchObject({ ok: false });
+  });
+
+  it("FM-11 keeps the mention rule for a tag", async () => {
+    tags.push({ name: OTHER, commit: { sha: hidden } });
+    pulls.push({ state: "open", head: { sha: hidden, repo: { full_name: "test/project" } } });
+    expect(await decideWith([OTHER])).toMatchObject({ ok: false, reason: `tag ${OTHER} names this card and is not on the base line` });
+  });
+
+  it("FM-12 keeps the mention rule for another namespace", async () => {
+    otherRefs.push({ ref: `refs/preserved/CARD-2/${OTHER}`, object: { type: "commit", sha: hidden } });
+    expect(await decideWith([OTHER])).toMatchObject({ ok: false });
+  });
+
+  it.each([
+    ["FM-13 a registration differing only in case", [OTHER.toUpperCase()], OTHER],
+    ["FM-21a a name that only ends with a registered name", [OTHER], `wip/${OTHER}`],
+    ["FM-21b a name that only starts with a registered name", [OTHER], `${OTHER}-2`],
+  ] as const)("refuses %s (exact string equality)", async (_id, registered, name) => {
+    pullRefOnly();
+    pulls.push(unmergedPull(name, hidden, "test/project"));
+    expect(await decideWith(registered)).toMatchObject({ ok: false, reason: `ref pull-request ${name} names this card and is not on the base line` });
+  });
+
+  it("FM-14 adds no name for a merged pull request", async () => {
+    pullRefOnly();
+    pulls.push({ state: "closed", merged_at: "2026-11-26T00:00:00Z", head: { ref: OTHER, sha: hidden, repo: { full_name: "test/project" } } });
+    expect(await decideWith([OTHER])).toMatchObject({ ok: true });
+  });
+
+  it("FM-15 admits a registered pull request on the base line", async () => {
+    pullRefOnly(ancestor);
+    pulls.push(unmergedPull(OTHER, ancestor, "test/project"));
+    expect(await decideWith([OTHER])).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    ["FM-16 registered", ["SUP-21908-implement-sup-21901-followup"], true],
+    ["FM-17 unregistered", [], false],
+  ] as const)("decides the live shape of another card's abandoned pull request: %s", async (_id, registered, ok) => {
+    pullRefOnly();
+    pulls.push(unmergedPull("SUP-21908-implement-sup-21901-followup", hidden, "test/project"));
+    expect(await decideWith(registered, { cardIdentifier: "SUP-21901", cardBranch: "SUP-21901-cycle" })).toMatchObject({ ok });
+  });
+
+  it.each([
+    ["FM-18 the recorded branch without an identifier", "fm/cycle", { cardBranch: "fm/cycle" }],
+    ["FM-19 a hyphenless identifier", "fm/paperclip-card1-cycle", {}],
+  ] as const)("keeps the residual admit for %s (unchanged)", async (_id, name, overrides) => {
+    pullRefOnly();
+    pulls.push(unmergedPull(name, hidden, "fork/project"));
+    expect(await decideWith([], overrides)).toMatchObject({ ok: true });
+  });
+
+  it("FM-20 refuses the write when a registered pull request appears after measurement", async () => {
+    const registered = { ...card, otherCardBranches: new Set([OTHER]) };
+    const measured = await decideZeroDeltaFromForge(registered, githubForgeReader("test-token"), budget);
+    if (!measured.ok) throw new Error(measured.reason);
+    pullRefOnly();
+    pulls.push(unmergedPull(OTHER, hidden, "test/project"));
+    expect(await recheckZeroDeltaForgeAtWrite(registered, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false,
+      retriable: true,
+      reason: "the remote refs changed after the close was measured",
+    });
+  });
+
+  it.each([
+    ["RG-02 a deleted fork", { state: "closed", merged_at: null, head: { ref: "CARD-1-cycle", sha: hidden, repo: null } }],
+    ["RG-03 a row with no merged_at field", { state: "closed", head: { ref: "CARD-1-cycle", sha: hidden, repo: { full_name: "fork/project" } } }],
+  ])("refuses a closed-unmerged card pull request held only by a pull ref from %s", async (_id, pull) => {
+    pullRefOnly();
+    pulls.push(pull);
+    expect(await decideWith([])).toMatchObject({ ok: false });
   });
 });

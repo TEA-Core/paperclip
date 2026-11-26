@@ -433,13 +433,6 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     expect(await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set([otherBranch]) })).toMatchObject({ ok: false });
   });
 
-  it("refuses a shared stash whose branch is not registered to another card", async () => {
-    const layout = managedLayout();
-    writeFileSync(path.join(layout.repoRoot, "a.txt"), "unattributed work\n");
-    git(layout.repoRoot, "stash", "push", "-qm", "unattributed draft");
-    expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: false });
-  });
-
   // Repository-local configuration the server must never run, and must not let
   // make the form unavailable: a clean, level worktree still closes.
   it.each([
@@ -1492,6 +1485,356 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       const result = await probeNoRepositoryWorktree({ ...layout.input, timeoutMs: 500 });
       expect(result.ok).toBe(false);
       expect(Date.now() - started).toBeLessThan(15_000);
+    });
+  });
+});
+
+// The record_only stash provenance rule. A stash refuses a record_only close
+// only when the stash commit itself records one of this card's branches
+// (`WIP on <branch>:` / `On <branch>:`). The reflog label, which
+// `git stash store -m` rewrites freely, and the parents, which every card on
+// the same base commit shares, are never read. Row ids follow the frozen
+// grading matrix; every row also asserts that the close left the stash stack
+// exactly as it found it.
+describe("record_only stash provenance rule (frozen matrix)", () => {
+  const OWN = "SUP-7-record-ruling";
+  const SIBLING = "SUP-8-other-card";
+
+  interface StashFixture {
+    layout: ManagedLayout;
+    /** The managed checkout M. */
+    m: string;
+    /** This card's recorded worktree X. */
+    x: string;
+    /** The registered sibling worktree Y, created and registered on first use. */
+    y: () => string;
+    registered: Set<string>;
+    stashRef: string;
+    stashLog: string;
+    stash: (dir: string, ...args: string[]) => void;
+    create: (dir: string) => string;
+    store: (dir: string, label: string, commit: string) => void;
+    deleted: (branch: string, commit?: boolean) => void;
+    ff: (dir: string) => void;
+    input: () => ManagedLayout["input"];
+  }
+
+  function stashFixture(): StashFixture {
+    const layout = managedLayout();
+    const m = layout.repoRoot;
+    const registered = new Set<string>();
+    let change = 0;
+    let sibling: string | null = null;
+    const touch = (dir: string) => writeFileSync(path.join(dir, "a.txt"), `change ${++change}\n`);
+    const fixture: StashFixture = {
+      layout,
+      m,
+      x: layout.worktree,
+      registered,
+      y: () => {
+        if (sibling === null) {
+          sibling = layout.addWorktree(SIBLING);
+          registered.add(SIBLING);
+        }
+        return sibling;
+      },
+      stashRef: path.join(m, ".git", "refs", "stash"),
+      stashLog: path.join(m, ".git", "logs", "refs", "stash"),
+      stash: (dir, ...args) => {
+        touch(dir);
+        git(dir, "stash", "push", "-q", ...args);
+      },
+      create: (dir) => {
+        touch(dir);
+        const commit = git(dir, "stash", "create");
+        git(dir, "checkout", "-q", "--", "a.txt");
+        return commit;
+      },
+      store: (dir, label, commit) => {
+        git(dir, "stash", "store", "-m", label, commit);
+      },
+      deleted: (branch, commit = false) => {
+        git(m, "switch", "-q", "-c", branch);
+        if (commit) {
+          writeFileSync(path.join(m, "b.txt"), `${branch}\n`);
+          git(m, "add", "b.txt");
+          git(m, "commit", "-qm", `work on ${branch}`);
+        }
+        fixture.stash(m);
+        git(m, "switch", "-q", "main");
+        git(m, "branch", "-q", "-D", branch);
+      },
+      ff: (dir) => {
+        const clone = path.join(root, `ff-${++change}`);
+        git(root, "clone", "-q", layout.origin, clone);
+        writeFileSync(path.join(clone, "base.txt"), `base ${change}\n`);
+        git(clone, "add", "base.txt");
+        git(clone, "commit", "-qm", "base moves");
+        git(clone, "push", "-q", "origin", "main");
+        git(dir, "fetch", "-q", "origin");
+        git(dir, "merge", "-q", "--ff-only", "origin/main");
+      },
+      input: () => ({ ...layout.input, attributedBranches: new Set(registered) }),
+    };
+    return fixture;
+  }
+
+  const REFLOG_LINE = (id: string, subject: string) =>
+    `${"0".repeat(40)} ${id} t <t@example.com> 1700000000 +0000\t${subject}\n`;
+
+  /** `git stash list` as git sees it; a stack git cannot read is compared by its error. */
+  function stashList(m: string): string {
+    try {
+      return execFileSync("git", ["-C", m, "stash", "list", "--format=%H %gs"], {
+        env: fixtureEnv,
+        stdio: "pipe",
+        timeout: 3_000,
+      }).toString();
+    } catch (error) {
+      return `unreadable: ${(error as { status?: number }).status ?? "timeout"}`;
+    }
+  }
+
+  async function probeKeepingStash(fixture: StashFixture) {
+    const before = stashList(fixture.m);
+    const started = performance.now();
+    const result = await probeNoRepositoryWorktree(fixture.input());
+    // A FIFO or any other unreadable evidence must not hang the probe.
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(stashList(fixture.m)).toBe(before);
+    return result;
+  }
+
+  type Row = [id: string, setup: (fixture: StashFixture) => void];
+
+  const refuseRows: [id: string, branch: string, setup: (fixture: StashFixture) => void][] = [
+    ["ST-01 this card's stash, WIP on form", OWN, (f) => f.stash(f.x)],
+    ["ST-02 this card's stash, On form", OWN, (f) => f.stash(f.x, "-m", "this card draft")],
+    ["ST-03 this card's entry below a sibling's tip", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+    }],
+    ["ST-04 three-parent stash of an untracked file", OWN, (f) => {
+      writeFileSync(path.join(f.x, "u.txt"), "untracked\n");
+      git(f.x, "stash", "push", "-qu");
+    }],
+    ["ST-05 packed tip", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-05b only the packed tip names the commit (SS-PACKED)", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+      rmSync(f.stashLog);
+    }],
+    ["ST-05c the tip is read when the reflog cannot be", OWN, (f) => {
+      f.stash(f.x);
+      rmSync(f.stashLog);
+      mkdirSync(f.stashLog);
+    }],
+    ["ST-06 this card's entry below a packed tip", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-07a free-text reflog label (SS-UNPARSE)", OWN, (f) => f.store(f.x, "parked notes", f.create(f.x))],
+    ["ST-07b a failed autostash's label", OWN, (f) => f.store(f.x, "autostash", f.create(f.x))],
+    ["ST-08 relabelled as the registered sibling's, On form", OWN, (f) => {
+      f.y();
+      f.store(f.x, `On ${SIBLING}: draft`, f.create(f.x));
+    }],
+    ["ST-09 relabelled as the registered sibling's, WIP on form", OWN, (f) => {
+      f.y();
+      f.store(f.x, `WIP on ${SIBLING}: 1234567 init`, f.create(f.x));
+    }],
+    ["ST-10 relabelled as the project branch", OWN, (f) => f.store(f.x, "WIP on main: 1234567 init", f.create(f.x))],
+    ["ST-11 a tip with no reflog line (SS-TIP)", OWN, (f) => {
+      f.stash(f.y());
+      writeFileSync(f.stashRef, `${f.create(f.x)}\n`);
+    }],
+    ["ST-12 no reflog; the tip names the commit", OWN, (f) => {
+      f.stash(f.x);
+      rmSync(f.stashLog);
+    }],
+    ["ST-13 no ref; the reflog names the commit", OWN, (f) => {
+      f.stash(f.x);
+      rmSync(f.stashRef);
+    }],
+    ["ST-14 own branch wins over registration (SS-OWN)", OWN, (f) => {
+      f.registered.add(OWN);
+      f.stash(f.x);
+    }],
+    ["ST-15 recorded branch carries the identifier after a rename", OWN, (f) => {
+      f.stash(f.x);
+      git(f.x, "branch", "-m", OWN, `${OWN}-2`);
+    }],
+    ["ST-16 a second unregistered worktree carrying the identifier", "SUP-7-extra", (f) => {
+      f.stash(f.layout.addWorktree("SUP-7-extra"));
+    }],
+    ["ST-17 a deleted branch that carried the identifier", "SUP-7-scratch", (f) => f.deleted("SUP-7-scratch")],
+    ["ST-18 the identifier match ignores case", "sup-7-notes", (f) => f.deleted("sup-7-notes")],
+    ["ST-19 own stash, then the card fast-forwards", OWN, (f) => {
+      f.stash(f.x);
+      f.ff(f.x);
+    }],
+    ["ST-20 garbage loose ref over a packed tip; the reflog names the commit", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+      writeFileSync(f.stashRef, "garbage\n");
+    }],
+    ["ST-21 one missing object does not abort the read", OWN, (f) => {
+      f.stash(f.x);
+      appendFileSync(f.stashLog, REFLOG_LINE("e".repeat(40), "WIP on main: 1234567 x"));
+    }],
+    ["ST-22 work stashed while a sibling stood on this card's branch", OWN, (f) => {
+      const y = f.y();
+      git(y, "switch", "-q", "--ignore-other-worktrees", OWN);
+      f.stash(y);
+      git(y, "switch", "-q", SIBLING);
+    }],
+  ];
+
+  it.each(refuseRows)("refuses %s", async (_id, branch, setup) => {
+    const fixture = stashFixture();
+    setup(fixture);
+    const result = await probeKeepingStash(fixture);
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain(`stashed on this card's branch ${branch} `);
+  });
+
+  const admitRows: Row[] = [
+    ["ST-00 no stash", () => {}],
+    ["ST-30 the registered sibling's stash, WIP on form", (f) => f.stash(f.y())],
+    ["ST-31 the registered sibling's stash, On form", (f) => f.stash(f.y(), "-m", "other card draft")],
+    ["ST-32 a stash on the project branch", (f) => f.stash(f.m)],
+    ["ST-33 a deleted branch that names no card", (f) => f.deleted("scratch")],
+    ["ST-34 a deleted branch that names no card, on its own commit", (f) => f.deleted("scratch", true)],
+    ["ST-35 a sibling's detached-HEAD stash", (f) => {
+      const y = f.y();
+      git(y, "checkout", "-q", "--detach");
+      f.stash(y);
+      git(y, "checkout", "-q", SIBLING);
+    }],
+    ["ST-36 a sibling's stash relabelled as this card's, On form", (f) => {
+      f.store(f.y(), `On ${OWN}: forged`, f.create(f.y()));
+    }],
+    ["ST-37 a sibling's stash relabelled as this card's, WIP on form", (f) => {
+      f.store(f.y(), `WIP on ${OWN}: 1234567 init`, f.create(f.y()));
+    }],
+    ["ST-38 a registered branch that also mentions this card", (f) => {
+      const follow = "SUP-8-follow-up-for-SUP-7";
+      f.registered.add(follow);
+      f.stash(f.layout.addWorktree(follow));
+    }],
+    ["ST-39 a packed sibling stash", (f) => {
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-40a free-text label on a sibling's stash", (f) => f.store(f.y(), "parked notes", f.create(f.y()))],
+    ["ST-40b a sibling's failed autostash", (f) => f.store(f.y(), "autostash", f.create(f.y()))],
+    ["ST-41 an unreadable ref", (f) => writeFileSync(f.stashRef, "garbage\n")],
+    ["ST-42 an unreadable ref over a packed sibling stash", (f) => {
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+      writeFileSync(f.stashRef, "garbage\n");
+    }],
+    ["ST-43 a ref naming a blob", (f) => writeFileSync(f.stashRef, `${git(f.m, "rev-parse", "HEAD:a.txt")}\n`)],
+    ["ST-44 a missing object whose reflog label names this card", (f) => {
+      f.stash(f.y());
+      appendFileSync(f.stashLog, REFLOG_LINE("e".repeat(40), `WIP on ${OWN}: 1234567 x`));
+    }],
+    ["ST-45 a deleted branch carrying another card's identifier", (f) => f.deleted("SUP-9-x")],
+    ["ST-46a SUP-70 is not SUP-7", (f) => f.deleted("SUP-70-x")],
+    ["ST-46b xSUP-7 is not SUP-7", (f) => f.deleted("xSUP-7-y")],
+    ["ST-47 a sibling's stash after this card fast-forwards", (f) => {
+      f.stash(f.y());
+      f.ff(f.x);
+    }],
+    ["ST-49 a corrupt stash commit object", (f) => {
+      f.stash(f.y());
+      const commit = git(f.m, "rev-parse", "refs/stash");
+      const object = path.join(f.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+    }],
+    ["ST-50a a reflog that is a directory", (f) => mkdirSync(f.stashLog, { recursive: true })],
+    ["ST-50b a reflog that is a FIFO", (f) => {
+      f.stash(f.y());
+      rmSync(f.stashLog);
+      execFileSync("mkfifo", [f.stashLog]);
+    }],
+    // Admitted by design: each is the same repository state as an admit row
+    // above up to file contents, or a state record_only never inspects. They
+    // are pinned so nobody closes them by re-introducing the wedge.
+    ["HIDE-1 this card's detached-HEAD stash (same state as ST-35)", (f) => {
+      git(f.x, "checkout", "-q", "--detach");
+      f.stash(f.x);
+      git(f.x, "checkout", "-q", OWN);
+    }],
+    ["HIDE-2 this card's stash on a deleted temporary branch (same state as ST-33)", (f) => {
+      git(f.x, "switch", "-q", "-c", "tmp-scratch");
+      f.stash(f.x);
+      git(f.x, "switch", "-q", OWN);
+      git(f.x, "branch", "-q", "-D", "tmp-scratch");
+    }],
+    ["HIDE-3 a dangling stash commit with no ref", (f) => {
+      f.create(f.x);
+    }],
+    ["HIDE-4 work committed, then reset away", (f) => {
+      writeFileSync(path.join(f.x, "a.txt"), "committed then reset\n");
+      git(f.x, "commit", "-qam", "SUP-7 work");
+      git(f.x, "reset", "-q", "--hard", "origin/main");
+    }],
+  ];
+
+  it.each(admitRows)("admits %s", async (_id, setup) => {
+    const fixture = stashFixture();
+    setup(fixture);
+    expect(await probeKeepingStash(fixture)).toMatchObject({ ok: true, branch: OWN });
+  });
+
+  describe("at the close write", () => {
+    async function measuredWithSibling() {
+      const fixture = stashFixture();
+      fixture.registered.add(SIBLING);
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      if (!result.ok) throw new Error(result.reason);
+      const recheck = () =>
+        recheckRecordedWorktree({
+          worktreePath: result.worktreePath,
+          commonDir: result.commonDir,
+          branch: result.branch,
+          headSha: result.headSha,
+          stashScope: fixture.input(),
+        });
+      return { fixture, recheck };
+    }
+
+    it.each([
+      ["W-01 this card stashes after measurement", (f: StashFixture) => f.stash(f.x)],
+      ["W-04 this card's stash relabelled as the registered sibling's", (f: StashFixture) => {
+        f.y();
+        f.store(f.x, `On ${SIBLING}: draft`, f.create(f.x));
+      }],
+    ])("refuses %s", async (_id, step) => {
+      const { fixture, recheck } = await measuredWithSibling();
+      step(fixture);
+      const before = stashList(fixture.m);
+      const result = await recheck();
+      expect(stashList(fixture.m)).toBe(before);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain(`stashed on this card's branch ${OWN} `);
+    });
+
+    it.each([
+      ["W-02 the registered sibling stashes after measurement", (f: StashFixture) => f.stash(f.y())],
+      ["W-03 the managed checkout stashes on the project branch after measurement", (f: StashFixture) => f.stash(f.m)],
+    ])("admits %s", async (_id, step) => {
+      const { fixture, recheck } = await measuredWithSibling();
+      step(fixture);
+      const before = stashList(fixture.m);
+      expect(await recheck()).toEqual({ ok: true });
+      expect(stashList(fixture.m)).toBe(before);
     });
   });
 });
