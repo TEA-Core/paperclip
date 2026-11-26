@@ -411,10 +411,13 @@ The current `entry-ruling` revision must be substantive and independently author
 The current reviewed document revision must be separate from that ruling.
 
 Only the card's own active, managed isolated Git worktree is supported.
-The server looks up workspace, project, runtime-service, operation and live-run
-records (across companies) whose stored path is this worktree's canonical or
-recorded path, or a path inside it, and refuses another card, workspace or run
-sharing that directory.
+Workspace, runtime-service, operation and run-context paths are stored
+canonically (symlinks resolved) when written. Inside the locked transaction the
+server re-resolves the physical path (realpath and device:inode, including
+aliases) of every live workspace, project workspace, runtime service, operation
+and queued/running run across companies, and refuses another card, workspace or
+run sharing that directory or a directory inside it. A live path that cannot be
+resolved also refuses.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
 Provision summary-routine cards with their own isolated-worktree workspace after
@@ -442,7 +445,8 @@ branch-attribution and `git fsck --strict` proof runs before the transaction;
 inside it a cheap recheck requires the same HEAD, branch, index digest, refs digest
 and status-manifest digest (porcelain status plus the allowed ignored entries),
 under one 15-second Git budget. A provider refusal keeps its typed code
-(`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`).
+(`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`);
+a tip the provider does not know (404/422 compare) is owed repository work.
 Private or tag refs outside the initial attributed-branch contract also refuse;
 this first implementation does not infer their ownership from equal content.
 

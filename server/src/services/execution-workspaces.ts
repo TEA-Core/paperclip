@@ -1,3 +1,4 @@
+import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -4278,7 +4279,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     escalateStrandedTerminalCleanups,
 
-    create: async (data: typeof executionWorkspaces.$inferInsert) => {
+    create: async (input: typeof executionWorkspaces.$inferInsert) => {
+      const data = {
+        ...input, cwd: await canonicalStoredPath(input.cwd), providerRef: await canonicalStoredPath(input.providerRef),
+      };
       // The path-exclusivity check is a read; the insert that follows is a write.
       // Without serialization two concurrent allocations both pass the read and
       // both insert — the exact "two active rows over one directory" shape this
@@ -4309,7 +4313,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return row ? toExecutionWorkspace(row) : null;
     },
 
-    update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
+    update: async (id: string, input: Partial<typeof executionWorkspaces.$inferInsert>) => {
+      const patch = { ...input };
+      if (patch.cwd !== undefined) patch.cwd = await canonicalStoredPath(patch.cwd);
+      if (patch.providerRef !== undefined) patch.providerRef = await canonicalStoredPath(patch.providerRef);
       const row = await db.transaction(async (tx) => {
         const publishesPath = patch.cwd !== undefined || patch.providerRef !== undefined
           || patch.providerType !== undefined

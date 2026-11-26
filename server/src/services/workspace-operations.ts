@@ -1,3 +1,4 @@
+import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { workspaceOperations } from "@paperclipai/db";
@@ -534,7 +535,7 @@ export function workspaceOperationService(db: Db) {
               issueId: input.issueId ?? null,
               phase: recordInput.phase,
               command: recordInput.command ?? null,
-              cwd: recordInput.cwd ?? null,
+              cwd: await canonicalStoredPath(recordInput.cwd ?? null),
               status: "running",
               logStore: handle.store,
               logRef: handle.logRef,

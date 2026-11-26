@@ -73,14 +73,6 @@ CREATE FUNCTION "review_entry_run_paths"(context jsonb) RETURNS text[] LANGUAGE 
   ), '{}'::text[]), NULL)
 $$;
 --> statement-breakpoint
-CREATE FUNCTION "review_entry_path_overlaps"(candidate text, claimed text[]) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM unnest(claimed) AS claim(path)
-    WHERE review_entry_normalize_path(candidate) = claim.path
-      OR starts_with(review_entry_normalize_path(candidate), claim.path || '/')
-  )
-$$;
---> statement-breakpoint
 CREATE FUNCTION "review_entry_fence_writer"() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   claim jsonb := to_jsonb(NEW);

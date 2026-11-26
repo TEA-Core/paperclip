@@ -1,3 +1,4 @@
+import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1015,7 +1016,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
         .then((rows) => rows[0] ?? null);
       if (!project) return null;
 
-      const cwd = normalizeWorkspaceCwd(data.cwd);
+      const cwd = await canonicalStoredPath(normalizeWorkspaceCwd(data.cwd));
       const repoUrl = readNonEmptyString(data.repoUrl);
       const sourceType = readNonEmptyString(data.sourceType) ?? (repoUrl ? "git_repo" : cwd ? "local_path" : "remote_managed");
       const remoteWorkspaceRef = readNonEmptyString(data.remoteWorkspaceRef);
@@ -1109,7 +1110,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
 
       const nextCwd =
         data.cwd !== undefined
-          ? normalizeWorkspaceCwd(data.cwd)
+          ? await canonicalStoredPath(normalizeWorkspaceCwd(data.cwd))
           : normalizeWorkspaceCwd(existing.cwd);
       const nextRepoUrl =
         data.repoUrl !== undefined

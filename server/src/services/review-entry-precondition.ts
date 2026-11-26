@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { and, desc, eq, inArray, isNull, ne, or, sql, type SQLWrapper } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import {
   activityLog, agents, companyMemberships, documentRevisions, documents, executionWorkspaces, heartbeatRuns,
   issueDeliveryReceipts, issueDocuments, issueExecutionDecisions, issueReviewEntryReceipts,
@@ -138,9 +138,15 @@ export async function prepareReviewEntry(
     fail("published_base_unavailable", "The company GitHub credential could not be resolved within the provider deadline."));
   if (!credential.token) fail("published_base_unavailable", "A company-authorized GitHub credential is required for the published base.");
   const authenticatedHeaders = { ...headers, authorization: `Bearer ${credential.token}` };
-  async function get(url: string): Promise<Record<string, unknown>> {
+  async function get(url: string, unpublishedTip = false): Promise<Record<string, unknown>> {
+    let response: Response;
     try {
-      const response = await ghFetch(url, { headers: authenticatedHeaders, signal });
+      response = await ghFetch(url, { headers: authenticatedHeaders, signal });
+    } catch { return fail("published_base_unavailable", "The trusted published base or its ancestry could not be verified within the provider deadline."); }
+    if (unpublishedTip && (response.status === 404 || response.status === 422)) {
+      fail("repository_work_owed", "A workspace tip is not published on the trusted remote. Land or remove that work before first entry.");
+    }
+    try {
       if (!response.ok) throw new Error("provider refused");
       const body: unknown = await response.json();
       signal.throwIfAborted();
@@ -165,7 +171,7 @@ export async function prepareReviewEntry(
       .flatMap((row) => row.identifier ? [row.identifier] : [])),
     countCommitsAheadOfBase: async (sha) => {
       try {
-        const comparison = await get(`${baseUrl}/compare/${baseSha}...${sha}`);
+        const comparison = await get(`${baseUrl}/compare/${baseSha}...${sha}`, true);
         const remoteBase = comparison.base_commit as { sha?: unknown } | undefined;
         const mergeBase = comparison.merge_base_commit as { sha?: unknown } | undefined;
         if (comparison.ahead_by !== 0 || !["identical", "behind"].includes(String(comparison.status)) ||
@@ -218,49 +224,64 @@ async function assertExclusive(
   const own = await physicalPath(workspace.providerRef!).catch(() =>
     fail("workspace_unverified", "The isolated workspace path could not be verified."));
   if (own.path !== prepared.snapshot.worktreePath) fail("git_changed", "The physical worktree identity changed during proof.");
-  const claimed = claimedPaths(prepared);
-  const overlaps = (column: SQLWrapper) =>
-    sql`review_entry_path_overlaps(${column}, ARRAY[${sql.join(claimed.map((p) => sql`${p}`), sql`, `)}]::text[])`;
-  // Cross-company rows on the same path are still writers to the same bytes.
-  // Never return another company's identifiers or paths in the refusal.
-  const [sharedWorkspace] = await db.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(and(
-    ne(executionWorkspaces.id, workspace.id), or(overlaps(executionWorkspaces.cwd), overlaps(executionWorkspaces.providerRef)),
-  )).limit(1);
-  if (sharedWorkspace) fail("workspace_shared", "Another execution workspace shares this physical path. Provision a new isolated worktree for this card.");
-  const [sharedProject] = await db.select({ id: projectWorkspaces.id }).from(projectWorkspaces)
-    .where(overlaps(projectWorkspaces.cwd)).limit(1);
-  if (sharedProject) fail("workspace_shared", "A project workspace shares this physical path. Provision a separate isolated worktree.");
-  const [service] = await db.select({ id: workspaceRuntimeServices.id }).from(workspaceRuntimeServices).where(and(
-    isNull(workspaceRuntimeServices.stoppedAt),
-    or(eq(workspaceRuntimeServices.executionWorkspaceId, workspace.id), overlaps(workspaceRuntimeServices.cwd)),
-  )).limit(1);
-  if (service) fail("workspace_busy", "A runtime service can still write this worktree; wait for its confirmed stop.");
-  const [operation] = await db.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
-    isNull(workspaceOperations.finishedAt),
-    or(eq(workspaceOperations.executionWorkspaceId, workspace.id), overlaps(workspaceOperations.cwd)),
-  )).limit(1);
-  if (operation) fail("workspace_busy", "A workspace operation can still write this worktree; wait for it to finish.");
+  // Cross-company aliases are still writers to the same physical bytes. Never
+  // return another company's identifiers or paths in the refusal.
+  const sharesWorktree = async (candidate: unknown) => {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return false;
+    let other: PhysicalWorkspace;
+    try { other = await physicalPath(candidate); } catch {
+      return fail("workspace_unverified", "A live workspace path could not be resolved, so isolated ownership cannot be proved. Retire the stale record or wait for it to finish.");
+    }
+    return other.identity === own.identity || other.path === own.path || other.path.startsWith(`${own.path}${path.sep}`);
+  };
+  const liveWorkspaces = await db.select({ cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
+    .from(executionWorkspaces).where(and(
+      ne(executionWorkspaces.id, workspace.id), isNull(executionWorkspaces.closedAt),
+      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+    ));
+  for (const candidate of liveWorkspaces) {
+    if (await sharesWorktree(candidate.cwd) || await sharesWorktree(candidate.providerRef)) {
+      fail("workspace_shared", "Another execution workspace shares this physical path. Provision a new isolated worktree for this card.");
+    }
+  }
+  for (const project of await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)) {
+    if (await sharesWorktree(project.cwd)) {
+      fail("workspace_shared", "A project workspace shares this physical path. Provision a separate isolated worktree.");
+    }
+  }
+  for (const service of await db.select({
+    executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
+  }).from(workspaceRuntimeServices).where(isNull(workspaceRuntimeServices.stoppedAt))) {
+    if (service.executionWorkspaceId === workspace.id || await sharesWorktree(service.cwd)) {
+      fail("workspace_busy", "A runtime service can still write this worktree; wait for its confirmed stop.");
+    }
+  }
+  for (const operation of await db.select({
+    executionWorkspaceId: workspaceOperations.executionWorkspaceId, cwd: workspaceOperations.cwd,
+  }).from(workspaceOperations).where(isNull(workspaceOperations.finishedAt))) {
+    if (operation.executionWorkspaceId === workspace.id || await sharesWorktree(operation.cwd)) {
+      fail("workspace_busy", "A workspace operation can still write this worktree; wait for it to finish.");
+    }
+  }
   const bindings = await db.select({ id: issues.id }).from(issues).where(and(
     eq(issues.executionWorkspaceId, workspace.id), ne(issues.id, issue.id),
   ));
   if (bindings.length) fail("workspace_shared", "Another card uses this execution workspace. Provision a new isolated worktree.");
   const context = heartbeatRuns.contextSnapshot;
   const runs = await db.select({
-    id: heartbeatRuns.id,
-    holdsCard: sql<boolean>`${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
-      OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}`,
+    holdsCard: sql<boolean>`coalesce(${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
+      OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}, false)`,
+    paths: sql<string[]>`review_entry_run_paths(${context})`,
   }).from(heartbeatRuns).where(and(
     inArray(heartbeatRuns.status, ["queued", "running"]),
     actor.agentId && actor.runId ? ne(heartbeatRuns.id, actor.runId) : undefined,
-    or(
-      eq(heartbeatRuns.nativeIssueId, issue.id),
-      sql`${context}->>'issueId' = ${issue.id}`, sql`${context}->>'taskId' = ${issue.id}`,
-      sql`${context}->>'executionWorkspaceId' = ${workspace.id}`,
-      sql`EXISTS (SELECT 1 FROM unnest(review_entry_run_paths(${context})) AS hint(path) WHERE ${overlaps(sql`hint.path`)})`,
-    ),
-  )).limit(1);
-  if (runs[0]?.holdsCard) fail("workspace_busy", "Another run holds this card or workspace; wait for it to finish before first entry.");
-  if (runs[0]) fail("workspace_busy", "Another run shares this physical path; run this card alone in an isolated worktree.");
+  ));
+  for (const run of runs) {
+    if (run.holdsCard) fail("workspace_busy", "Another run holds this card or workspace; wait for it to finish before first entry.");
+    for (const candidate of run.paths) {
+      if (await sharesWorktree(candidate)) fail("workspace_busy", "Another run shares this physical path; run this card alone in an isolated worktree.");
+    }
+  }
   if (actor.agentId) {
     const [run] = await db.select({
       companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,

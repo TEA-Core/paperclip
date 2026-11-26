@@ -1,3 +1,4 @@
+import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { isTransactionHandle } from "./db-handle.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
@@ -27065,7 +27066,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : []),
       ];
       context.paperclipWorkspace = {
-        cwd: executionWorkspace.cwd,
+        cwd: await canonicalStoredPath(executionWorkspace.cwd),
         source: executionWorkspace.source,
         mode: effectiveExecutionWorkspaceMode,
         strategy: executionWorkspace.strategy,
@@ -27074,7 +27075,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoUrl: executionWorkspace.repoUrl,
         repoRef: executionWorkspace.repoRef,
         branchName: executionWorkspace.branchName,
-        worktreePath: executionWorkspace.worktreePath,
+        worktreePath: await canonicalStoredPath(executionWorkspace.worktreePath),
         realization: workspaceRealization,
         agentHome: await (async () => {
           const home = resolveDefaultAgentWorkspaceDir(agent.id);
@@ -27083,7 +27084,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return home;
         })(),
       };
-      context.paperclipWorkspaces = buildRunWorkspaceHints(resolvedWorkspace);
+      context.paperclipWorkspaces = await Promise.all(buildRunWorkspaceHints(resolvedWorkspace).map(async (hint) => {
+        const canonical = { ...hint };
+        for (const key of ["cwd", "worktreePath"] as const) {
+          const value = hint[key];
+          if (typeof value === "string") canonical[key] = await canonicalStoredPath(value);
+        }
+        return canonical;
+      }));
       // Emit exactly one requested-vs-synced observability line for the referenced-project set. A run
       // with no referenced project stays silent, so this adds no noise to the anchor-only default. The
       // per-drop human warning already rides `runtimeWorkspaceWarnings`; this line carries the counts

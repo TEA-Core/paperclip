@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -68,6 +68,7 @@ import type {
 import { companyService } from "../services/companies.js";
 import { documentService } from "../services/documents.js";
 import { issueService } from "../services/issues.js";
+import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import type { StorageService } from "../storage/types.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
@@ -597,7 +598,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(denied.body).not.toHaveProperty("evidence");
     });
 
-    it.each(["project_primary", "alias", "nested alias", "foreign alias", "project path", "another card", "another run", "run path", "run hint", "runtime service", "workspace operation"])(
+    it.each(["project_primary", "alias", "symlink alias", "nested alias", "foreign alias", "project path", "symlink run path", "another card", "another run", "run path", "run hint", "runtime service", "workspace operation"])(
       "refuses a shared workspace: %s", async (kind) => {
         const fixture = await reviewFixture();
         if (kind === "project_primary") {
@@ -614,14 +615,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
             phase: "sync", cwd: fixture.worktree, status: "running" });
         } else if (kind.includes("alias")) {
           const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
-          const aliasPath = kind === "nested alias" ? `${fixture.worktree}//sub/` : fixture.worktree;
+          let aliasPath = fixture.worktree;
+          if (kind === "symlink alias") {
+            aliasPath = `${fixture.worktree}-alias`;
+            symlinkSync(fixture.worktree, aliasPath);
+          } else if (kind === "nested alias") {
+            mkdirSync(path.join(fixture.worktree, "sub"));
+            aliasPath = `${fixture.worktree}//sub/`;
+          }
           const aliasCompanyId = kind === "foreign alias" ? await insertCompany(`ALIAS${seedSequence}`) : fixture.companyId;
           await db.insert(executionWorkspaces).values({ ...workspace!, id: randomUUID(), companyId: aliasCompanyId, cwd: aliasPath, providerRef: aliasPath });
         } else if (kind === "another card") {
           await db.insert(issues).values({ companyId: fixture.companyId, title: "Borrowed", executionWorkspaceId: fixture.executionWorkspaceId });
         } else {
           await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
-            status: "running", contextSnapshot: kind === "run path" ? { cwd: fixture.worktree } : kind === "run hint" ?
+            status: "running", contextSnapshot: kind === "run path" ? { cwd: fixture.worktree } : kind === "symlink run path" ?
+              { cwd: (symlinkSync(fixture.worktree, `${fixture.worktree}-link`), `${fixture.worktree}-link`) } : kind === "run hint" ?
               { paperclipWorkspaces: [{ cwd: fixture.worktree }] } : { executionWorkspaceId: fixture.executionWorkspaceId } });
         }
         const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
@@ -721,8 +730,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         expect(response.status, JSON.stringify(response.body)).toBe(409);
         const typedCode: Record<string, string> = {
           "published unlanded": "review_entry_repository_work_owed",
-          "poisoned local default": "review_entry_published_base_unavailable",
-          "unpublished same-tree merge": "review_entry_published_base_unavailable",
+          "poisoned local default": "review_entry_repository_work_owed",
+          "unpublished same-tree merge": "review_entry_repository_work_owed",
           "unavailable provider": "review_entry_published_base_unavailable",
         };
         if (typedCode[kind]) expect(response.body.code).toBe(typedCode[kind]);
@@ -807,6 +816,14 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           companyId: otherCompany, phase: "sync", cwd: fixture.worktree, status: "running" }),
       };
       const outcomes: Record<string, string> = {};
+      const aliasPath = `${fixture.worktree}-symlinked`;
+      symlinkSync(fixture.worktree, aliasPath);
+      let aliasCommitted = false;
+      const aliasWrite = executionWorkspaceService(db).create({
+        companyId: fixture.companyId, projectId: fixture.projectId, name: "Symlinked path claim",
+        mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
+        cwd: aliasPath, providerRef: aliasPath,
+      }).then((row) => { aliasCommitted = true; return row; });
       try {
         for (const [label, write] of Object.entries(phantoms)) {
           outcomes[label] = await db.transaction(async (tx) => {
@@ -814,6 +831,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
             await write(tx as unknown as Db);
           }).then(() => "written", () => "excluded");
         }
+        mkdirSync(`${fixture.worktree}-sibling`);
         await db.transaction(async (tx) => {
           await tx.execute(sql`SET LOCAL lock_timeout = '200ms'`);
           await tx.insert(executionWorkspaces).values({
@@ -826,9 +844,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         });
       } finally { release(); }
       expect(outcomes).toEqual(Object.fromEntries(Object.keys(phantoms).map((label) => [label, "excluded"])));
+      expect(aliasCommitted).toBe(false);
       const response = await entry;
       expect(response.status, JSON.stringify(response.body)).toBe(200);
-      expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.cwd, fixture.worktree))).toHaveLength(1);
+      expect(await aliasWrite).toMatchObject({ cwd: fixture.worktree, providerRef: fixture.worktree });
       expect(await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).toHaveLength(1);
     });
 
