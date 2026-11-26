@@ -1050,9 +1050,10 @@ config-path-derived suffix; if no safe identity exists, boot refuses.
 Explicit operator instance IDs take precedence over own-file IDs, subject to
 the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
 identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
-the main home. An instance whose own `instances/<id>/config.json` resolves its
-database inside that instance root is a main instance, whatever its ID, so
-exporting its identity never permits a worktree to reuse its database.
+the main home, only for a non-`default` instance. An instance whose own
+`instances/<id>/config.json` resolves its database inside that instance root is
+a main instance, whatever its ID, so exporting its identity never permits a
+worktree to reuse its database.
 A different transient runtime home does not replace persisted worktree paths.
 If the parent can be searched but not listed, reusable identity claims are
 refused and the config-path-derived identity is used; registered sibling

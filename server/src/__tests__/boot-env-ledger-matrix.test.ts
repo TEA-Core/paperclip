@@ -816,13 +816,17 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     }
   });
 
-  it.each(["default", "dev"])("refuses a custom main %s database after importing real worktree env exports (N2)", async (mainId) => {
+  it.each([
+    { mainId: "default", configInRoot: true },
+    { mainId: "dev", configInRoot: true },
+    { mainId: "default", configInRoot: false },
+  ])("refuses a custom main $mainId database after importing real worktree env exports (N2, config in root: $configInRoot)", async ({ mainId, configInRoot }) => {
     const fixture = await makeWorktreeFixture({});
     try {
       process.env.HOME = path.join(fixture.root, "home");
       const mainHome = path.join(fixture.root, "custom-main-home");
       const mainRoot = path.join(mainHome, "instances", mainId);
-      const mainConfigPath = path.join(mainRoot, "config.json");
+      const mainConfigPath = configInRoot ? path.join(mainRoot, "config.json") : path.join(mainHome, "main-config.json");
       const mainConfig = JSON.stringify(buildLegacyConfig(mainRoot), null, 2) + "\n";
       fs.mkdirSync(mainRoot, { recursive: true });
       fs.writeFileSync(mainConfigPath, mainConfig);

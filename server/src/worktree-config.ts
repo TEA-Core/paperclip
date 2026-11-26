@@ -202,7 +202,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   const mainHomes = [path.join(os.homedir(), ".paperclip")];
   const operatorHome = operatorOrLayout("PAPERCLIP_HOME");
   const exportedWorktreeHome = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
-    operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
+    instanceId !== "default" && operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
   if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
   const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
   const parent = path.dirname(path.dirname(stateRoot));
