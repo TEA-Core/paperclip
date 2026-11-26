@@ -6022,8 +6022,22 @@ registry.registerPath({
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],
   summary: "List company activity",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Returns a JSON array of activity rows, newest first. There is no offset or cursor paging: a request carrying `offset` or `cursor` is rejected with 400 rather than silently returning the newest page. Page by narrowing the `from`/`to` window. `limit` defaults to 100 and is silently clamped to 500; the array response carries no total or hasMore.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().optional().describe("Filter to rows attributed to this agent."),
+      entityType: z.string().optional().describe("Filter by entity type (for example `issue`)."),
+      entityId: z.string().optional().describe("Filter to a single entity."),
+      action: z.string().optional().describe("Filter by action; comma-separated for several."),
+      actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
+      from: z.string().datetime().optional().describe("Inclusive lower bound on createdAt (ISO-8601)."),
+      to: z.string().datetime().optional().describe("Inclusive upper bound on createdAt (ISO-8601)."),
+      limit: z.coerce.number().int().optional().describe("Rows to return; default 100, clamped to 1-500."),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
