@@ -839,12 +839,12 @@ const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
 async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
   const info = await lstat(file).catch(() => null);
   if (info?.isSymbolicLink()) return UNVERIFIED_STASH_REFLOG;
-  const regular = () => lstat(file).then((entry) => entry.isFile(), () => false);
   if (!info?.isFile()) return null;
   try {
     return await readOptionalRegularFile(file, MAX_BUFFER);
   } catch {
-    return (await regular()) ? UNVERIFIED_STASH_REFLOG : null;
+    const unverified = await lstat(file).then((entry) => entry.isFile() || entry.isSymbolicLink(), () => false);
+    return unverified ? UNVERIFIED_STASH_REFLOG : null;
   }
 }
 
