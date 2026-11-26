@@ -452,8 +452,15 @@ and status-manifest digest (porcelain status plus the allowed ignored entries),
 under one 15-second Git budget. A provider refusal keeps its typed code
 (`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`);
 a tip the provider does not know (404/422 compare) is owed repository work.
-Private or tag refs outside the initial attributed-branch contract also refuse;
-this first implementation does not infer their ownership from equal content.
+A `refs/tags/*` ref is admitted only when its peeled target is an ancestor of the
+pinned published base, checked against private snapshot metadata; any other tag,
+and any private ref outside branches, remote-tracking refs and covered tags
+(including a sibling worktree's `refs/stash`), refuses with
+`review_entry_git_refused`. Ownership is never inferred from equal content.
+Disclosed residuals: the refs digest and locked recheck cover the whole shared
+common Git directory, so a sibling worktree's commit or fetch between capture and
+the transaction yields a retriable `review_entry_git_changed`, and a sibling
+`refs/stash` keeps refusing until it is removed.
 
 The handoff, submission comment, `issue.review_entry_accepted` activity and
 append-only `issue_review_entry_receipts` row commit together. The response

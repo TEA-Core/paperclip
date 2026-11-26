@@ -185,7 +185,7 @@ export async function prepareReviewEntry(
       }
     },
   };
-  const snapshot = await captureReviewEntryWorktree(input);
+  const snapshot = await captureReviewEntryWorktree({ ...input, publishedBaseSha: baseSha });
   if (!snapshot.ok) {
     if (providerRefusal) throw providerRefusal;
     fail("git_refused", snapshot.reason);

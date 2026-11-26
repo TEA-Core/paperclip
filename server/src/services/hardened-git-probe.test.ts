@@ -802,7 +802,7 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
 
     it("refuses a same-size tracked edit at the locked recheck", async () => {
       const layout = managedLayout();
-      const first = await captureReviewEntryWorktree(layout.input);
+      const first = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
       if (!first.ok) throw new Error(first.reason);
       const tracked = git(layout.worktree, "ls-files").split("\n")[0]!;
       const original = readFileSync(path.join(layout.worktree, tracked));
@@ -814,12 +814,12 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       const layout = managedLayout();
       trackIgnoreRules(layout, "node_modules/\ndist/\n");
       writeTree(layout.worktree, "node_modules/pkg/index.js", "module.exports = 1;\n");
-      const first = await captureReviewEntryWorktree(layout.input);
+      const first = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
       if (!first.ok) throw new Error(first.reason);
-      expect(await captureReviewEntryWorktree(layout.input)).toEqual(first);
+      expect(await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") })).toEqual(first);
       expect(await recheckReviewEntryWorktree(first)).toEqual({ ok: true });
       writeTree(layout.worktree, "dist/bundle.js", "built\n");
-      const changed = await captureReviewEntryWorktree(layout.input);
+      const changed = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
       if (!changed.ok) throw new Error(changed.reason);
       expect(changed.statusManifestDigest).not.toBe(first.statusManifestDigest);
       expect({ ...changed, statusManifestDigest: first.statusManifestDigest }).toEqual(first);

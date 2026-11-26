@@ -1124,15 +1124,19 @@ async function reviewEntryFingerprint(
  * Repository drivers never run: fsck, index and tree reads use private metadata.
  */
 export async function captureReviewEntryWorktree(
-  input: NoRepositoryWorktreeProbeInput,
+  input: NoRepositoryWorktreeProbeInput & { publishedBaseSha: string },
 ): Promise<ReviewEntryWorktreeSnapshot> {
   const deadline: ProbeDeadline = { at: performance.now() + REVIEW_ENTRY_BUDGET_MS, expired: false };
   const options: HardenedGitOptions = { cwd: "/", deadline };
+  const unattributed = { ok: false as const, reason: "Unattributed private or tag refs prevent strict first-entry proof" };
   try {
     const beforeRefs = await readRefs(input.recordedWorktreePath, options);
-    if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes)\//.test(ref))) {
-      return { ok: false, reason: "Unattributed private or tag refs prevent strict first-entry proof" };
+    if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes|tags)\//.test(ref))) {
+      return unattributed;
     }
+    const tagTargets = (await runHardenedGit(
+      ["-C", input.recordedWorktreePath, "for-each-ref", "--format=%(objectname) %(*objectname)", "refs/tags/"], options,
+    )).split("\n").filter(Boolean).map((line) => line.split(" ").filter(Boolean).at(-1)!);
     const probe = await probeNoRepositoryWorktree({ ...input, deadline });
     if (!probe.ok) return probe;
     const identity = await readWorktreeIdentity(probe.worktreePath, options);
@@ -1142,9 +1146,16 @@ export async function captureReviewEntryWorktree(
         await runHardenedGit(
           ["--git-dir", snapshot, "fsck", "--strict", "--no-reflogs", "--no-dangling", ...probe.comparedTips], options,
         );
+        for (const target of new Set(tagTargets)) {
+          const covered = await runHardenedGit(
+            ["--git-dir", snapshot, "merge-base", "--is-ancestor", target, input.publishedBaseSha], options,
+          ).then(() => true, () => false);
+          if (!covered) return null;
+        }
         return (await runHardenedGit(["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options)).trim();
       },
     );
+    if (treeSha === null) return unattributed;
     const measured = await reviewEntryFingerprint(probe.worktreePath, probe.commonDir, options);
     if (!measured.ok) return measured;
     if (measured.fingerprint.refsDigest !== createHash("sha256").update(beforeRefs).digest("hex") ||

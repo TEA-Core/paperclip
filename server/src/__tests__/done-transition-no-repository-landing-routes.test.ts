@@ -63,7 +63,7 @@ import {
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
 import type {
-  NoRepositoryWorktreeProbeInput, ReviewEntryWorktreeSnapshot, recheckRecordedWorktree, recheckReviewEntryWorktree,
+  captureReviewEntryWorktree, ReviewEntryWorktreeSnapshot, recheckRecordedWorktree, recheckReviewEntryWorktree,
 } from "../services/hardened-git-probe.js";
 import { companyService } from "../services/companies.js";
 import { documentService } from "../services/documents.js";
@@ -93,7 +93,7 @@ const realMeasureNoRepositoryLandingRef = vi.hoisted(() => ({
 
 const mockCaptureReviewEntry = vi.hoisted(() => vi.fn());
 const realCaptureReviewEntry = vi.hoisted(() => ({
-  current: null as ((input: NoRepositoryWorktreeProbeInput) => Promise<ReviewEntryWorktreeSnapshot>) | null,
+  current: null as typeof captureReviewEntryWorktree | null,
 }));
 const mockRecheckReviewEntry = vi.hoisted(() => vi.fn());
 const realRecheckReviewEntry = vi.hoisted(() => ({ current: null as typeof recheckReviewEntryWorktree | null }));
@@ -549,6 +549,28 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
     }
 
+    it.each([
+      ["a lightweight release tag on the published base", 200],
+      ["an annotated release tag on the published base", 200],
+      ["a tag on an unpublished commit", 409],
+    ] as const)("judges %s by published-base ancestry", async (kind, status) => {
+      const fixture = await reviewFixture();
+      const head = git(fixture.worktree, "rev-parse", "HEAD");
+      if (kind.startsWith("a lightweight")) git(fixture.worktree, "tag", "v1.0.0", head);
+      else if (kind.startsWith("an annotated")) git(fixture.worktree, "tag", "-a", "v1.0.0", "-m", "release", head);
+      else {
+        const tree = git(fixture.worktree, "rev-parse", "HEAD^{tree}");
+        git(fixture.worktree, "tag", "owed-work", git(fixture.worktree, "commit-tree", tree, "-p", head, "-m", "unpublished"));
+      }
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(status);
+      if (status === 409) {
+        expect(response.body).toMatchObject({ code: "review_entry_git_refused",
+          error: "Unattributed private or tag refs prevent strict first-entry proof" });
+        await noAcceptedEntry(fixture.issueId);
+      }
+    });
+
     it("atomically hands the pinned artifact to an independent reviewer without closing or approving", async () => {
       const fixture = await reviewFixture();
       const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
@@ -742,7 +764,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     it.each(["classification", "policy", "assignee", "run", "workspace", "base", "ruling", "artifact", "debt", "dirt", "HEAD", "alias", "terminal"])(
       "rejects a %s race after capture without a partial handoff", async (kind) => {
         const fixture = await reviewFixture();
-        mockCaptureReviewEntry.mockImplementationOnce(async (input: NoRepositoryWorktreeProbeInput) => {
+        mockCaptureReviewEntry.mockImplementationOnce(async (input: Parameters<typeof captureReviewEntryWorktree>[0]) => {
           const snapshot = await realCaptureReviewEntry.current!(input);
           if (kind === "classification") await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
           else if (kind === "policy") await db.update(issues).set({ executionPolicy: { ...fixture.policy, commentRequired: false } }).where(eq(issues.id, fixture.issueId));
