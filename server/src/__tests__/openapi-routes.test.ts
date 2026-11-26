@@ -371,6 +371,8 @@ describe("openapi routes", () => {
       apiUrl: "http://localhost:3100/api",
       apiKey: "test-token",
       companyId: "11111111-1111-4111-8111-111111111111",
+      agentId: null,
+      runId: null,
     })).find((candidate) => candidate.name === "paperclipCreateIssue")!;
     const objectSchema = z.object({
       properties: z.record(z.string(), z.unknown()),
