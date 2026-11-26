@@ -4435,6 +4435,7 @@ export async function verifyNoRepositoryLandingAtTransition(
     commonDir: measurement.probe.commonDir,
     branch: measurement.probe.branch,
     headSha: measurement.probe.headSha,
+    stashScope: { issueIdentifier: read.record.identifier, attributedBranches: new Set(read.record.attributedBranches) },
   });
   if (!recheck.ok) {
     return noRepositoryRefusal(`refused at the close write: ${recheck.reason}.`);

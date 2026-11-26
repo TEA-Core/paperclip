@@ -227,13 +227,15 @@ export function githubForgeReader(token: string, clock: ForgeClock = monotonicNo
       const pullRequestHeads = new Set<string>();
       const repositoryName = `${repo.owner}/${repo.repo}`.toLowerCase();
       for (const row of pullRows) {
-        const head = asRecord(asRecord(row)?.head);
+        const pull = asRecord(row);
+        const head = asRecord(pull?.head);
         const sha = stringField(head, "sha")?.toLowerCase();
         if (!sha || !/^[0-9a-f]{40}$/.test(sha)) continue;
         const branch = stringField(head, "ref");
-        // Retain open PR names even when the source branch was deleted. These
-        // refusal-only refs also bind name changes into the close-write digest.
-        if (asRecord(row)?.state === "open" && branch) {
+        // Retain unmerged PR names even after the source branch was deleted.
+        // These refusal-only refs also bind name/merge changes into the digest.
+        const unmerged = pull?.state === "open" || (pull?.state === "closed" && pull.merged_at == null);
+        if (unmerged && branch) {
           refs.push({ kind: "ref", name: `pull-request ${branch}`, sha });
         }
         if (stringField(head?.repo, "full_name")?.toLowerCase() === repositoryName) pullRequestHeads.add(sha);

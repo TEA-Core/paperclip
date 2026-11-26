@@ -2016,7 +2016,14 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     } as const;
   }
 
-  function answerZeroDeltaGitHub() {
+  function answerZeroDeltaGitHub(pulls: Array<{
+    number: number;
+    state: "open" | "closed";
+    merged_at: string | null;
+    title: string;
+    html_url: string;
+    head: { ref: string; sha: string; repo: { full_name: string } };
+  }> = []) {
     mockGhFetch.mockImplementation(async (url: string) => {
       const text = String(url);
       if (/\/git\/matching-refs\/$/.test(text)) {
@@ -2035,7 +2042,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         return new Response(JSON.stringify(body), { status: 200 });
       }
       if (/\/tags(?:\?|$)/.test(text)) return new Response(JSON.stringify([]), { status: 200 });
-      if (/\/pulls(?:\?|$)/.test(text)) return new Response(JSON.stringify([]), { status: 200 });
+      if (/\/pulls(?:\?|$)/.test(text)) {
+        const u = new URL(text);
+        const state = u.searchParams.get("state") ?? "open";
+        const head = u.searchParams.get("head");
+        const listed = pulls.filter((pr) =>
+          (state === "all" || pr.state === state) &&
+          (!head || head === `${pr.head.repo.full_name.split("/")[0]}:${pr.head.ref}`));
+        const page = Number(u.searchParams.get("page") ?? "1");
+        const size = Number(u.searchParams.get("per_page") ?? "30");
+        const headers = new Headers();
+        if (page * size < listed.length) {
+          u.searchParams.set("page", String(page + 1));
+          headers.set("link", `<${u}>; rel="next"`);
+        }
+        return Response.json(listed.slice((page - 1) * size, page * size), { headers });
+      }
       const commit = /\/commits\/([^/?]+)$/.exec(text);
       if (commit) {
         try {
@@ -2068,6 +2090,79 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
     expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
+  });
+
+  it.each(["TEA-Core/records", "fork/records"])("refuses a zero-delta close with closed-unmerged card work held only by a pull ref (%s)", async (fullName) => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    const sha = git(currentOrigin, "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "unmerged card work");
+    git(currentOrigin, "update-ref", "refs/pull/17/head", sha);
+    answerZeroDeltaGitHub([{
+      number: 17, state: "closed", merged_at: null, title: "Closed proposal",
+      html_url: "https://github.com/TEA-Core/records/pull/17",
+      head: { ref: `${fixture.identifier}-cycle`, sha, repo: { full_name: fullName } },
+    }]);
+    const res = await close(fixture.identifier, zeroDeltaDoneTier(fixture.worktree));
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+  });
+
+  it("lets the board cancel knowingly abandoned closed-PR work without claiming delivery", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    const sha = git(currentOrigin, "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "abandoned proposal");
+    git(currentOrigin, "update-ref", "refs/pull/17/head", sha);
+    answerZeroDeltaGitHub([{
+      number: 17, state: "closed", merged_at: null, title: "Abandoned proposal",
+      html_url: "https://github.com/TEA-Core/records/pull/17",
+      head: { ref: `${fixture.identifier}-cycle`, sha, repo: { full_name: "TEA-Core/records" } },
+    }]);
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "cancelled", comment: "The board abandons this proposal; no delivery is claimed.",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("cancelled");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+    expect(git(currentOrigin, "rev-parse", "refs/pull/17/head")).toBe(sha);
+  });
+
+  it("refuses a card-named open PR beyond the legacy open-PR probe page", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    const sha = git(currentOrigin, "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "open card work");
+    git(currentOrigin, "update-ref", "refs/pull/200/head", sha);
+    const unrelated = Array.from({ length: 120 }, (_, i) => ({
+      number: i + 1, state: "open" as const, merged_at: null, title: "Other work",
+      html_url: `https://github.com/TEA-Core/records/pull/${i + 1}`,
+      head: { ref: `other-work-${i}`, sha: baseSha, repo: { full_name: "TEA-Core/records" } },
+    }));
+    answerZeroDeltaGitHub([...unrelated, {
+      number: 200, state: "open", merged_at: null, title: "Proposal",
+      html_url: "https://github.com/TEA-Core/records/pull/200",
+      head: { ref: `${fixture.identifier}-cycle`, sha, repo: { full_name: "TEA-Core/records" } },
+    }]);
+    const res = await close(fixture.identifier, zeroDeltaDoneTier(fixture.worktree));
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("not on the base line");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("closes a record_only card while another registered card keeps its stash", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const branch = `${fixture.identifier.replace(/-\d+$/, "")}-2-sibling`;
+    await registerSiblingCard(fixture, branch);
+    const other = path.join(fixture.repoRoot, ".paperclip", "worktrees", branch);
+    git(fixture.repoRoot, "worktree", "add", "-q", "-b", branch, other, "origin/main");
+    writeFileSync(path.join(other, "README.md"), "other card's work\n");
+    git(other, "stash", "push", "-qm", "other card draft");
+    const stash = git(other, "rev-parse", "refs/stash");
+    const res = await close(fixture.identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+    expect(git(other, "rev-parse", "refs/stash")).toBe(stash);
   });
 
   async function seedFinalZeroDeltaApproval() {

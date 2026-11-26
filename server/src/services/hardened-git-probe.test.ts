@@ -412,6 +412,34 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     expect(result).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
   });
 
+  it("keeps a record_only close available when another registered card has stashed work", async () => {
+    const layout = managedLayout();
+    const otherBranch = "SUP-8-other-card";
+    const other = layout.addWorktree(otherBranch);
+    writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+    git(other, "stash", "push", "-qm", "other card draft");
+    const result = await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set([otherBranch]) });
+    expect(result).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
+  });
+
+  it("refuses this card's stash even when another card's stash is on top", async () => {
+    const layout = managedLayout();
+    writeFileSync(path.join(layout.worktree, "a.txt"), "this card's work\n");
+    git(layout.worktree, "stash", "push", "-qm", "this card draft");
+    const otherBranch = "SUP-8-other-card";
+    const other = layout.addWorktree(otherBranch);
+    writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+    git(other, "stash", "push", "-qm", "other card draft");
+    expect(await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set([otherBranch]) })).toMatchObject({ ok: false });
+  });
+
+  it("refuses a shared stash whose branch is not registered to another card", async () => {
+    const layout = managedLayout();
+    writeFileSync(path.join(layout.repoRoot, "a.txt"), "unattributed work\n");
+    git(layout.repoRoot, "stash", "push", "-qm", "unattributed draft");
+    expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: false });
+  });
+
   // Repository-local configuration the server must never run, and must not let
   // make the form unavailable: a clean, level worktree still closes.
   it.each([
@@ -1140,6 +1168,25 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     it("passes a clean worktree on the measured branch and commit within the normal budget", async () => {
       const layout = managedLayout();
       expect(await recheckRecordedWorktree(await measured(layout))).toEqual({ ok: true });
+    });
+
+    it("keeps the record_only write available when another registered card stashes after measurement", async () => {
+      const layout = managedLayout();
+      const otherBranch = "SUP-8-other-card";
+      const other = layout.addWorktree(otherBranch);
+      layout.input.attributedBranches = new Set([otherBranch]);
+      const input = await measured(layout);
+      writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+      git(other, "stash", "push", "-qm", "other card draft");
+      expect(await recheckRecordedWorktree({ ...input, stashScope: layout.input })).toEqual({ ok: true });
+    });
+
+    it("refuses this card's stash created after record_only measurement", async () => {
+      const layout = managedLayout();
+      const input = await measured(layout);
+      writeFileSync(path.join(layout.worktree, "a.txt"), "this card's work\n");
+      git(layout.worktree, "stash", "push", "-qm", "this card draft");
+      expect(await recheckRecordedWorktree({ ...input, stashScope: layout.input })).toMatchObject({ ok: false });
     });
 
     it("refuses with a timed-out reason, not a status one, when the shared budget is spent", async () => {
