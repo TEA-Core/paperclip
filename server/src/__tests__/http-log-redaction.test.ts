@@ -780,6 +780,7 @@ describe("HTTP logger redaction", () => {
 // never reach the 4xx log line, while the surrounding prose stays diagnosable.
 describe("HTTP logger redaction of credential-shaped free text (SUP-25336)", () => {
   const BEARER = "Bearer abcdef1234567890ABCDEFtoken";
+  // paperclip:allow-security secret-literal: synthetic fixture, not a credential; the test asserts the logger strips it
   const GITHUB = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
   const OPENAI = "sk-live-9f8e7d6c5b4a39281706aBcDeF";
   const planted = (label: string) =>
