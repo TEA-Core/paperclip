@@ -1648,6 +1648,22 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
+  // Fork (two-fleet routing): an agent that declares `external_pull` work
+  // delivery runs outside Paperclip and pulls its own queue, so a card it
+  // parks is not stranded. The stillborn-backlog sweep, the stranded-assigned
+  // sweep and the exhausted-recovery drain must leave such a card with its
+  // owner, never route it up the manager ladder to a Paperclip agent. Keyed on
+  // the agent's own declaration (see agent-work-delivery.ts), not on agent ids.
+  async function isExternalPullAgentId(
+    companyId: string,
+    agentId: string | null | undefined,
+    runner: Db = db,
+  ) {
+    if (!agentId) return false;
+    const agent = await getAgent(agentId, runner);
+    return !!agent && agent.companyId === companyId && isExternalPullAgent(agent);
+  }
+
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db): Promise<AgentInvokability> {
     return evaluateAgentInvokabilityFromDb(runner, agent);
   }
@@ -6877,6 +6893,14 @@ export function recoveryService(
         return;
       }
 
+      // Fork (two-fleet routing): an `external_pull` owner pulls this card out
+      // of band, so it is not stranded and must not be escalated to the
+      // manager ladder.
+      if (await isExternalPullAgentId(issue.companyId, agentId)) {
+        result.skipped += 1;
+        return;
+      }
+
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       // A native chat can finish between the earlier settlement read and this
       // fresh run read, before its response is materialized. Its trusted
@@ -10368,6 +10392,12 @@ export function recoveryService(
       return { kind: "carrier", issueId: reusableRecoveryIssue.id };
     }
 
+    // Fork (two-fleet routing): never mint a ladder-owned recovery card for a
+    // source owned by an `external_pull` agent; the board action stays the
+    // decision item and the card stays with its owner.
+    if (await isExternalPullAgentId(input.issue.companyId, input.issue.assigneeAgentId, db)) {
+      return EXHAUSTED_RECOVERY_UNAVAILABLE;
+    }
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);
     if (!ownerAgentId) return EXHAUSTED_RECOVERY_UNAVAILABLE;
 
@@ -13001,6 +13031,11 @@ export function recoveryService(
 
     for (const candidate of candidates) {
       const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_stillborn_assigned_backlog", async () => {
+      if (await isExternalPullAgentId(candidate.companyId, candidate.assigneeAgentId)) {
+        result.skipped += 1;
+        return;
+      }
+
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
         return;
