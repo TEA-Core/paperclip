@@ -4869,6 +4869,31 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("GIT_OBJECT_DIRECTORY");
       expect(result.skipReason).toContain("legacy_worktree_probe_unverified:attribution");
       expect(result.skipReason ?? "").not.toContain("branch_absent_on_remote:");
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(true);
+    });
+
+    it("allows a branch-absent close with landingVerified when a merged carrier PR names the issue, even though the attribution probe cannot run safely (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 1, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await withInheritedObjectDirectory(() => evaluateDoneTransitionGuard(mockDb, issue, null));
+      expect(result.allowed).toBe(true);
+      expect(result.landingVerified).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_landed_via_merged_pr:SUP-12345:1");
+      expect(result.skipReason ?? "").not.toContain("legacy_worktree_probe_unverified");
     });
 
     it("allows transition when compare API returns 404 and the worktree carries zero issue-attributable commits despite being several commits ahead (base drift only)", async () => {

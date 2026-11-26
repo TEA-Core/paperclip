@@ -6535,23 +6535,9 @@ async function evaluateDoneTransitionGuardCore(
       const attributionResult = ctx.worktreePath
         ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
         : null;
-      // SUP-23163: an attribution probe that could not run safely or to
-      // completion may hide attributable commits, so it refuses (fail closed)
-      // instead of falling through to the fail-open allow below. A
-      // decision-carrying transition keeps its exemption, as it does when the
-      // commits are measured.
-      if (isLegacyProbeUnverified(attributionResult) && !decisionCarried) {
-        return legacyProbeUnverifiedRefusal(db, issue, "attribution", attributionResult, {
-          aheadBy: null,
-          branch,
-          defaultRef: ctx.defaultRef,
-          owner: parsed.owner,
-          repo: parsed.repo,
-          skipReason: prSkipReason,
-        });
-      }
+      const attributionUnverified = isLegacyProbeUnverified(attributionResult) ? attributionResult : null;
       const attribution = isLegacyProbeUnverified(attributionResult) ? null : attributionResult;
-      if (attribution && attribution.attributableCount > 0) {
+      if (attributionUnverified || (attribution && attribution.attributableCount > 0)) {
         // Carrier delivery: the deliverable is routinely merged from a shared
         // carrier branch or a differently-named head while this issue's own
         // execution branch is never pushed. The local worktree still carries the
@@ -6571,14 +6557,7 @@ async function evaluateDoneTransitionGuardCore(
               ctx.defaultRef,
             )
           : null;
-        if (mergedPrCount === null) {
-          return fallback(
-            `Branch ${branch} is absent from the remote and the merged-PR probe for ${issue.identifier ?? "the issue"} could not be measured; transition allowed`,
-            true,
-            `branch_absent_merged_pr_probe_failed:${branch}`,
-          );
-        }
-        if (mergedPrCount > 0) {
+        if (mergedPrCount !== null && mergedPrCount > 0) {
           return {
             ...fallback(
               `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
@@ -6588,6 +6567,34 @@ async function evaluateDoneTransitionGuardCore(
             landingVerified: true,
             landingProof: deliveryHead ?? undefined,
           };
+        }
+        // SUP-23163: an attribution probe that could not run safely or to
+        // completion may hide attributable commits, so with no merged PR naming
+        // the issue it refuses (fail closed) instead of failing open. A
+        // decision-carrying transition keeps its exemption.
+        if (attributionUnverified && !decisionCarried) {
+          return legacyProbeUnverifiedRefusal(db, issue, "attribution", attributionUnverified, {
+            aheadBy: null,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            skipReason: prSkipReason,
+          });
+        }
+        if (!attribution) {
+          return fallback(
+            `Branch ${branch} is absent from the remote; transition allowed`,
+            true,
+            `branch_absent_on_remote:${branch}`,
+          );
+        }
+        if (mergedPrCount === null) {
+          return fallback(
+            `Branch ${branch} is absent from the remote and the merged-PR probe for ${issue.identifier ?? "the issue"} could not be measured; transition allowed`,
+            true,
+            `branch_absent_merged_pr_probe_failed:${branch}`,
+          );
         }
         if (decisionCarried) {
           // Defense-in-depth (SUP-13691): a 404 here means the branch was not
