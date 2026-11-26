@@ -159,6 +159,7 @@ import {
 import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
   resolveProjectDefaultIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { isTerminalRecoveryAction as isTerminalRecoveryActionShared } from "./issue-continuation-path.js";
@@ -12013,6 +12014,7 @@ export function issueService(
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        actorAgentApiKeyId?: string | null;
         boardApiKeyId?: string | null;
         /**
          * Internal only. Set by `provisionIssueExecutionWorkspace` when it writes
@@ -12094,6 +12096,7 @@ export function issueService(
         actorRunId,
         actorRunStopId,
         actorUserId,
+        actorAgentApiKeyId,
         boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
@@ -12800,6 +12803,37 @@ export function issueService(
           return null;
         }
         await recordChatCompletion(tx, receiptExisting, updated);
+        const lostFutureMonitorCheckAt =
+          receiptExisting.status !== updated.status &&
+          (updated.status === "done" || updated.status === "cancelled") &&
+          !updated.monitorNextCheckAt &&
+          receiptExisting.monitorNextCheckAt &&
+          receiptExisting.monitorNextCheckAt.getTime() > updated.updatedAt.getTime()
+            ? receiptExisting.monitorNextCheckAt
+            : null;
+        if (lostFutureMonitorCheckAt) {
+          const lostMonitorPolicy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null)?.monitor;
+          const lostMonitorState = parseIssueExecutionState(receiptExisting.executionState)?.monitor;
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+            actorId: actorAgentId ?? actorUserId ?? "issue_service",
+            boardApiKeyId: boardApiKeyId ?? null,
+            agentApiKeyId: actorAgentApiKeyId ?? null,
+            agentId: actorAgentId ?? null,
+            runId: actorAgentId ? actorRunId ?? null : null,
+            action: "issue.monitor_cleared",
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              identifier: updated.identifier ?? null,
+              previousNextCheckAt: lostFutureMonitorCheckAt.toISOString(),
+              recoveryPolicy: lostMonitorPolicy?.recoveryPolicy ?? lostMonitorState?.recoveryPolicy ?? null,
+              reason: "cleared_by_close_future_check",
+              notes: lostMonitorPolicy?.notes ?? receiptExisting.monitorNotes ?? lostMonitorState?.notes ?? null,
+            },
+          }, activityPublications);
+        }
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
         if (actorUserId && issueData.status !== undefined) {

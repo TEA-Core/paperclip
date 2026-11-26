@@ -944,8 +944,9 @@ letting the former assignee change the monitor.
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
-Closing through the issue PATCH API still clears a future-dated monitor, but its
-`issue.monitor_cleared` activity records `previousNextCheckAt`, the prior
+Closing an issue still clears a future-dated monitor, but the issue update that
+closes it (PATCH, a review-approval comment, a stage decision, or any other
+service caller) writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
 `recoveryPolicy` (nullable), the existing actor/run attribution, and
 `reason: cleared_by_close_future_check`. This is a searchable cancellation record,
 not a transfer or a later wake. Past-due watchdogs retain their ordinary clear

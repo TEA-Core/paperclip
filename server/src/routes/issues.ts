@@ -21765,6 +21765,7 @@ export function issueRoutes(
       actorRunId: actor.agentId ? actor.runId : null,
       actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorAgentApiKeyId: actor.agentApiKeyId ?? null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       ...(expectedUpdatedAtRaw !== undefined
         ? { expectedUpdatedAt: new Date(expectedUpdatedAtRaw) }
@@ -23263,11 +23264,16 @@ export function issueRoutes(
           recoveryPolicy: nextMonitor.recoveryPolicy,
         },
       });
-    } else if (!nextMonitor.nextCheckAt && previousMonitor.nextCheckAt) {
-      const lostFutureCheck =
+    } else if (
+      !nextMonitor.nextCheckAt &&
+      previousMonitor.nextCheckAt &&
+      !(
         existing.status !== issue.status &&
         (issue.status === "done" || issue.status === "cancelled") &&
-        Date.parse(previousMonitor.nextCheckAt) > issue.updatedAt.getTime();
+        existing.monitorNextCheckAt &&
+        existing.monitorNextCheckAt.getTime() > issue.updatedAt.getTime()
+      )
+    ) {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -23282,8 +23288,7 @@ export function issueRoutes(
         details: {
           identifier: issue.identifier,
           previousNextCheckAt: previousMonitor.nextCheckAt,
-          reason: lostFutureCheck ? "cleared_by_close_future_check" : nextMonitor.clearReason ?? "manual",
-          ...(lostFutureCheck ? { recoveryPolicy: previousMonitor.recoveryPolicy } : {}),
+          reason: nextMonitor.clearReason ?? "manual",
           notes: previousMonitor.notes,
         },
       });
@@ -27383,6 +27388,7 @@ export function issueRoutes(
           : {}),
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        actorAgentApiKeyId: actor.agentApiKeyId ?? null,
         boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       };
 
