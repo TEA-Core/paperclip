@@ -1,3 +1,6 @@
+import { RecoveryCarrierParkForm } from "@/components/RecoveryCarrierParkForm";
+import { TaskChatPausedTakeover } from "@/components/task-chat/TaskChatPausedTakeover";
+import { recoveryCarrierParkFixture } from "@/fixtures/recoveryCarrierParkFixture";
 import { AgentMailApiKeyField } from "@/features/connections/AgentMailApiKeyField";
 import { TaskBrowserFooter } from "@/components/task-side-panel/TaskBrowserFooter";
 import { TaskBrowserActivity } from "@/components/task-side-panel/TaskBrowserActivity";
@@ -427,6 +430,14 @@ function Swatch({ name, cssVar }: { name: string; cssVar: string }) {
 /*  Page                                                               */
 /* ------------------------------------------------------------------ */
 
+function RecoveryCarrierParkExample() {
+  const [reason, setReason] = useState<string | null>(null);
+  return <div className="max-w-xl">
+    {reason ? <TaskChatPausedTakeover scope="leaf" carrierPark={{ state: "accepted", reason }} onResume={() => setReason(null)} /> :
+      <RecoveryCarrierParkForm candidate={recoveryCarrierParkFixture} onPark={input => setReason(input.reason)} />}
+  </div>;
+}
+
 function TaskExecutionControlsExample() {
   const [running, setRunning] = useState(true);
   const [dialogMode, setDialogMode] = useState<"resume" | "cancel" | "restore" | null>(null);
@@ -577,6 +588,9 @@ export function DesignGuide() {
 
       <Section title="Task Execution Controls">
         <TaskExecutionControlsExample />
+        <SubSection title="Board-accepted unresolved recovery">
+          <RecoveryCarrierParkExample />
+        </SubSection>
       </Section>
 
       <Section title="Composer actions">

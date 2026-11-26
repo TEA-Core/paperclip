@@ -45,7 +45,7 @@ export function listAttentionExhaustedRuns(db: Db, companyId: string) {
     .where(and(
       eq(heartbeatRuns.companyId, companyId),
       eq(agents.companyId, companyId),
-      notInArray(agents.status, ["terminated"]),
+      notInArray(agents.status, ["terminated", "deleted"]),
       inArray(heartbeatRuns.status, ["failed", "timed_out"]),
     ))
     .orderBy(desc(heartbeatRuns.createdAt), desc(latestExhaustion.eventId));

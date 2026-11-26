@@ -121,7 +121,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "retry_lineage_invalid";
 
 export type StalenessDecision =
   | { stale: false }
@@ -142,6 +143,7 @@ export type QueuedRunFacts = {
   /** Armed worktree cutoff; a queued run created before it must not dispatch. */
   worktreeExecutionCutoff?: Date | null;
   runCreatedAt?: Date | null;
+  retryOfRunId?: string | null;
   runId: string;
   runAgentId: string;
   issueId: string;
@@ -568,6 +570,18 @@ export function decideQueuedRunStaleness(
         maxAgeMs: MAX_QUEUED_ISSUE_RUN_AGE_MS,
         scheduledRetryAt: facts.scheduledRetryAt?.toISOString() ?? null,
       },
+    };
+  }
+
+  // SUP-24883: a run cannot be its own retry predecessor. The claim's lineage
+  // walk never resolves that, so the run would hold the issue lock without
+  // ever starting until the queue-age bound above.
+  if (facts.runStatus === "queued" && facts.retryOfRunId === facts.runId) {
+    return {
+      stale: true,
+      errorCode: "retry_lineage_invalid",
+      reason: "Cancelled because the queued run names itself as its retry predecessor",
+      details: { issueId: facts.issueId, retryOfRunId: facts.retryOfRunId },
     };
   }
 

@@ -728,6 +728,9 @@ export function companySkillRoutes(db: Db) {
             details: {
               title: created.title,
               identifier: created.identifier,
+              projectId: created.projectId ?? null,
+              projectWorkspaceId: created.projectWorkspaceId ?? null,
+              description: created.description ?? null,
               harnessKind: "skill_test",
               source: "company_skill_test_run",
               skillId,

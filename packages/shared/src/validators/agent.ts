@@ -160,7 +160,7 @@ export const updateAgentSchema = objectWithoutDefaults(
   .extend({
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
-    status: z.enum(AGENT_STATUSES).optional(),
+    status: z.enum(AGENT_STATUSES).refine((status) => status !== "deleted", "Use DELETE to delete an agent").optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
   });
 

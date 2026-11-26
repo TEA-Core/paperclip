@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -184,14 +185,23 @@ export function publishActivity(publication: ActivityPublication) {
 export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const run = await lookupActivityRun(db, input);
+  // An issue.updated run id is ownership proof, so only an authenticated run
+  // claim is stamped there: an agent JWT is minted for one run, and
+  // system/internal callers name runs directly. A board/user actor or an
+  // agent API key can only claim a run through the unauthenticated
+  // x-paperclip-run-id header, so that header is never copied into an
+  // issue.updated activity row. Other actions keep their attribution.
+  const authenticatedRun = run?.row
+    ? (input.action === "issue.updated" && (input.actorType === "user" || input.agentApiKeyId) ? null : run)
+    : null;
   const responsibleUserId = input.responsibleUserIdOverride !== undefined
     ? readNonEmptyString(input.responsibleUserIdOverride)
     : input.actorType === "user"
       ? readNonEmptyString(input.actorId)
-      : await resolveResponsibleUserIdWithRun(db, input, run);
+      : await resolveResponsibleUserIdWithRun(db, input, authenticatedRun);
   // Only stamp run_id when the run actually exists here; a dangling reference would trip the
   // `activity_log_run_id_heartbeat_runs_id_fk` foreign key and cost us the whole audit row.
-  const runId = run?.row ? run.runId : null;
+  const runId = authenticatedRun ? authenticatedRun.runId : null;
   if (run && !run.row) {
     logger.warn(
       {
@@ -281,7 +291,7 @@ export async function logActivity(
   postCommitPublications?: ActivityPublication[],
 ) {
   try {
-    const { activity, publication } = await persistActivity(db, input);
+    const { activity, publication } = await persistBestEffortActivity(db, input);
     if (postCommitPublications) {
       postCommitPublications.push(publication);
     } else {
@@ -307,6 +317,11 @@ export async function logActivity(
   }
 }
 
+async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
+  if (!(db instanceof PgTransaction)) return persistActivity(db, input);
+  return db.transaction(async (savepoint) => persistActivity(savepoint as unknown as Db, input));
+}
+
 /**
  * Transaction-scoped variant that propagates failures. Swallowing an error inside a
  * transaction is not an option: Postgres marks the transaction aborted, so every later
@@ -325,4 +340,45 @@ export async function logActivityInTransaction(
     publishActivity(publication);
   }
   return activity;
+}
+
+/**
+ * Transaction-scoped best-effort variant (SUP-23956). The audit row is written on the
+ * caller's transaction — it commits with the mutation — but the insert runs inside a
+ * savepoint, so a failing audit write rolls back only to the savepoint and cannot
+ * abort the transaction the way a bare best-effort `logActivity` call would. That is
+ * why the static guard in `activity-log-transaction-guard.test.ts` rejects a bare
+ * `logActivity` on a transaction handle: in-transaction callers that need best-effort
+ * semantics must use this entry point instead.
+ */
+export async function logActivityInTransactionBestEffort(
+  tx: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
+  try {
+    const { activity, publication } = await persistBestEffortActivity(tx, input);
+    if (postCommitPublications) {
+      postCommitPublications.push(publication);
+    } else {
+      publishActivity(publication);
+    }
+    return activity;
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        companyId: input.companyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        issueId: input.issueId ?? null,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+      },
+      "activity log write failed; the audited mutation is unaffected",
+    );
+  }
 }

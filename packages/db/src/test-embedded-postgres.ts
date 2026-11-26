@@ -29,6 +29,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  createPostgresUser?: boolean;
   initdbFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
@@ -128,6 +129,9 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
     password: "paperclip",
     port,
     persistent: true,
+    // Postgres refuses to run as root. Only under root, let embedded-postgres
+    // create and run as a `postgres` user; non-root behaviour is unchanged.
+    createPostgresUser: process.getuid?.() === 0,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
     onLog: (message) => logBuffer.append(message),
     onError: (message) => logBuffer.append(message),

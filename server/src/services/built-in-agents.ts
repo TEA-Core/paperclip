@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers } from "@paperclipai/db";
 import { syncRoutineVariablesWithTemplate } from "@paperclipai/shared";
@@ -778,7 +778,7 @@ export function builtInAgentService(db: Db) {
     const roots = await db
       .select()
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     const nonBuiltInRoots = roots.filter((agent) => !readBuiltInAgentMarker(agent.metadata) && !agent.reportsTo);
     return nonBuiltInRoots.length === 1 ? nonBuiltInRoots[0]!.id : null;
   }
@@ -795,7 +795,7 @@ export function builtInAgentService(db: Db) {
   }
 
   async function ensureBuiltInAgentDefaultGrants(agent: Agent, definition: BuiltInAgentDefinition) {
-    if (agent.status === "pending_approval" || agent.status === "terminated") return 0;
+    if (agent.status === "pending_approval" || agent.status === "terminated" || agent.status === "deleted") return 0;
     return ensureAgentDefaultGrants(
       agent.companyId,
       agent.id,
@@ -807,7 +807,7 @@ export function builtInAgentService(db: Db) {
     const rows = await db
       .select()
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     const rootCeoRows = rows.filter((agent) =>
       !readBuiltInAgentMarker(agent.metadata) &&
       !agent.reportsTo &&
@@ -844,7 +844,7 @@ export function builtInAgentService(db: Db) {
         adapterConfig: agents.adapterConfig,
       })
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     const candidate = rows.find((row) =>
       definition.allowedAdapterTypes?.includes(row.adapterType)
       && hasCompleteAdapterConfig(row.adapterType, row.adapterConfig)
@@ -1473,9 +1473,14 @@ export function builtInAgentService(db: Db) {
       mode === "reset"
       || currentState.stockStatus === "missing"
       || currentState.stockStatus === "stock_update_available";
-    const nextRoutine = shouldWrite
+    let nextRoutine = shouldWrite
       ? await createOrResetRoutine(agent, definition, routine, mode)
       : routine!;
+    if (!shouldWrite && nextRoutine.assigneeAgentId !== agent.id) {
+      const rebound = await routineSvc.update(nextRoutine.id, { assigneeAgentId: agent.id }, { agentId: null, userId: "built-in-bundles" });
+      if (!rebound) throw notFound("Built-in routine not found");
+      nextRoutine = rebound;
+    }
     await upsertManagedResourceBinding({
       companyId: agent.companyId,
       bundleKey: definition.key,
@@ -1618,7 +1623,7 @@ export function builtInAgentService(db: Db) {
     const rows = await db
       .select()
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     return rows
       .filter((row) => rowIsBuiltInAgent(row, key))
       .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id));
@@ -2106,7 +2111,7 @@ export async function reconcileBuiltInAgentsOnStartup(db: Db) {
       status: agents.status,
     })
     .from(agents)
-    .where(ne(agents.status, "terminated"));
+    .where(notInArray(agents.status, ["terminated", "deleted"]));
   const seen = new Set<string>();
   let scanned = 0;
   let reconciled = 0;

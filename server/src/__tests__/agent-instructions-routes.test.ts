@@ -30,9 +30,10 @@ const mockInstructionWorkingCopies = vi.hoisted(() => ({ list: vi.fn(), resolve:
 vi.mock("../services/agent-instruction-working-copies.js", () => ({ agentInstructionWorkingCopyService: () => mockInstructionWorkingCopies }));
 
 const mockDownloadAgentFile = vi.hoisted(() => vi.fn());
+const mockWriteAgentFile = vi.hoisted(() => vi.fn());
 vi.mock("../services/agent-file-store.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/agent-file-store.js")>();
-  return { ...actual, agentFileStore: (...args: Parameters<typeof actual.agentFileStore>) => ({ ...actual.agentFileStore(...args), download: mockDownloadAgentFile }) };
+  return { ...actual, agentFileStore: (...args: Parameters<typeof actual.agentFileStore>) => ({ ...actual.agentFileStore(...args), download: mockDownloadAgentFile, write: mockWriteAgentFile }) };
 });
 
 const mockInstructionRevisions = vi.hoisted(() => ({ readCurrent: vi.fn(), commit: vi.fn(), restore: vi.fn(), history: vi.fn(), readRevision: vi.fn(), diff: vi.fn(), materializeCurrent: vi.fn() }));
@@ -638,7 +639,7 @@ describe("agent instructions bundle routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockInstructionRevisions.commit).toHaveBeenCalledWith(expect.objectContaining({
       agentId: "11111111-1111-4111-8111-111111111111", entryFile: "AGENTS.md", content: "# Updated Agent\n", baseRevisionId: null, source: "board",
-    }), expect.objectContaining({ type: "board" }));
+    }), expect.objectContaining({ type: "board" }), undefined);
     expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
     expect(res.body.receipt.revision.id).toBe("33333333-3333-4333-8333-333333333333");
   });
@@ -794,6 +795,55 @@ describe("agent instructions bundle routes", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.details).toEqual({ reason: "deny_missing_consent" });
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
+
+    // SUP-24773: the route consumes the accepted confirmation once and hands that
+    // consumed consent to the service door instead of letting it assert again.
+    describe("hands the route-consumed consent to the service door", () => {
+      const consumed = Object.freeze({ interactionId: "44444444-4444-4444-8444-444444444444" });
+      beforeEach(() => {
+        mockAgentService.getById.mockImplementation(async (id: string) =>
+          id === "coach-agent"
+            ? makeReflectionCoachAgent({ id: "coach-agent" })
+            : { ...makeAgent(), adapterConfig: { instructionsBundleMode: "managed" } });
+        mockAccessService.decide.mockImplementation(async (input: { scope?: Record<string, unknown> }) => input.scope?.consentedChange === true
+          ? { allowed: true, reason: "allow_explicit_grant", explanation: "Consented" }
+          : { allowed: false, reason: "deny_missing_consent", explanation: "Accepted consent is required for this suggested change." });
+        mockChangeConsentGate.assertConsented.mockResolvedValueOnce(consumed);
+        mockWriteAgentFile.mockResolvedValue({ contentHash: null, changed: true });
+        mockInstructionWorkingCopies.acknowledgeExplicitSave.mockResolvedValue(undefined);
+      });
+
+      it.each([
+        ["PUT", (baseUrl: string) => request(baseUrl)
+          .put(`/api/agents/${targetAgentId}/instructions-bundle/file`)
+          .send({ path: "notes/extra.md", content: "# Extra\n", baseHash: "a".repeat(64) })],
+        ["DELETE", (baseUrl: string) => request(baseUrl)
+          .delete(`/api/agents/${targetAgentId}/instructions-bundle/file`)
+          .query({ path: "notes/extra.md", baseHash: "a".repeat(64) })],
+      ])("%s of a non-entry managed file", async (_label, perform) => {
+        const res = await requestApp(await createApp(coachActor), perform);
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockChangeConsentGate.assertConsented).toHaveBeenCalledOnce();
+        expect(mockWriteAgentFile).toHaveBeenCalledWith(
+          expect.objectContaining({ agentId: targetAgentId, path: "notes/extra.md" }),
+          expect.objectContaining({ agentId: "coach-agent" }),
+          consumed,
+        );
+      });
+
+      it("entry commit that clears the legacy prompt template", async () => {
+        const res = await requestApp(await createApp(coachActor), (baseUrl) => request(baseUrl)
+          .put(`/api/agents/${targetAgentId}/instructions-bundle/file`)
+          .send({ path: "AGENTS.md", content: "# Updated Agent\n", baseRevisionId: null, clearLegacyPromptTemplate: true }));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockChangeConsentGate.assertConsented).toHaveBeenCalledOnce();
+        expect(mockInstructionRevisions.commit).toHaveBeenCalledWith(
+          expect.objectContaining({ agentId: targetAgentId, entryFile: "AGENTS.md" }),
+          expect.objectContaining({ agentId: "coach-agent" }),
+          consumed,
+        );
+      });
     });
   });
 

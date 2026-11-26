@@ -220,12 +220,12 @@ describe("hardened git runner (SUP-22880)", () => {
 
   it("gives each process only the time left on a shared deadline, so spent time is not given back", async () => {
     const repo = plainRepo("repo");
-    const deadline = { at: Date.now() + 60_000, expired: false };
+    const deadline = { at: performance.now() + 60_000, expired: false };
     const args = ["-C", repo, "rev-parse", "--is-inside-work-tree"];
     expect((await runHardenedGit(args, { cwd: "/", deadline })).trim()).toBe("true");
     expect(deadline.expired).toBe(false);
 
-    deadline.at = Date.now() - 1;
+    deadline.at = performance.now() - 1;
     await expect(runHardenedGit(args, { cwd: "/", deadline }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
     expect(deadline.expired).toBe(true);
@@ -236,7 +236,7 @@ describe("hardened git runner (SUP-22880)", () => {
     const fifo = path.join(root, "blocking-include");
     execFileSync("mkfifo", [fifo]);
     git(repo, "config", "include.path", fifo);
-    const deadline = { at: Date.now() + 500, expired: false };
+    const deadline = { at: performance.now() + 500, expired: false };
     await expect(runHardenedGit(["-C", repo, "config", "--list"], { cwd: "/", deadline }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
     expect(deadline.expired).toBe(true);
@@ -636,6 +636,105 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
       ok: false,
       reason: "the recorded worktree has info/exclude ignore rules the server did not write",
+    });
+  });
+
+  // The managed checkout's info/exclude is shared by every linked worktree:
+  // `git rev-parse --git-path info/exclude` in a worktree names the common dir's
+  // file, and the heartbeat appends its line there. A line counts as written by
+  // the server only when it is byte-for-byte that line.
+  describe("info/exclude in the managed checkout's common dir (SUP-24849)", () => {
+    const SERVER_LINE = "/.paperclip-repositories/";
+    const NOT_WRITTEN = {
+      ok: false,
+      reason: "the recorded worktree has info/exclude ignore rules the server did not write",
+    } as const;
+
+    /** The shared exclude file, resolved the way the heartbeat resolves it. */
+    function sharedExclude(layout: ManagedLayout): string {
+      const file = path.resolve(layout.worktree, git(layout.worktree, "rev-parse", "--git-path", "info/exclude"));
+      expect(file).toBe(path.join(layout.repoRoot, ".git", "info", "exclude"));
+      return file;
+    }
+
+    it("accepts a non-shallow, clean, zero-ahead linked worktree whose shared exclude holds the server's line", async () => {
+      const layout = managedLayout();
+      const file = sharedExclude(layout);
+      expect(readFileSync(file, "utf8")).toMatch(/^#/);
+      // Two heartbeats preparing at once both miss the line and both append it.
+      appendFileSync(file, `\n${SERVER_LINE}\n`);
+      appendFileSync(file, `\n${SERVER_LINE}\n`);
+      mkdirSync(path.join(layout.worktree, ".paperclip-repositories", "other"), { recursive: true });
+      writeFileSync(path.join(layout.worktree, ".paperclip-repositories", "other", "README.md"), "a referenced repository\n");
+      expect(git(layout.worktree, "rev-parse", "--is-shallow-repository")).toBe("false");
+      expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
+    });
+
+    it.each([
+      ["is empty", ""],
+      ["holds only comments and blank lines", "# a comment\n\n#another\n"],
+    ])("accepts a shared exclude that %s", async (_label, content) => {
+      const layout = managedLayout();
+      writeFileSync(sharedExclude(layout), content);
+      expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+
+    it.each([
+      ["an agent-authored rule beside the server's line", `${SERVER_LINE}\nnotes/\n`],
+      ["the server's line with a trailing space", `${SERVER_LINE} \n`],
+      ["the server's line in a different case", "/.Paperclip-Repositories/\n"],
+      ["the server's line with an extra path segment", "/.paperclip-repositories/extra/\n"],
+      ["the server's line negated", `!${SERVER_LINE}\n`],
+      ["the server's line with a CRLF ending", `${SERVER_LINE}\r\n`],
+      ["an indented comment, which Git reads as a rule", `${SERVER_LINE}\n  # notes/\n`],
+      ["a whitespace-only line", `${SERVER_LINE}\n \t\n`],
+    ])("refuses %s", async (_label, content) => {
+      const layout = managedLayout();
+      writeFileSync(sharedExclude(layout), content);
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
+    });
+
+    // Git keeps leading whitespace, so this is a different rule: it ignores a
+    // `.paperclip-repositories` directory under a directory named by two spaces.
+    // The exclude check names it before any ignored entry is looked at.
+    it("refuses the server's line indented, as an exclude rule rather than as the work it ignores", async () => {
+      const layout = managedLayout();
+      writeFileSync(sharedExclude(layout), `  ${SERVER_LINE}\n`);
+      mkdirSync(path.join(layout.worktree, "  ", ".paperclip-repositories"), { recursive: true });
+      writeFileSync(path.join(layout.worktree, "  ", ".paperclip-repositories", "deliverable.md"), "undelivered\n");
+      expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
+    });
+
+    // A live shared exclude seen in production: the git template, then rules an
+    // agent harness (Claude Code's `# claude-code-runtime` block) and a person
+    // appended. No Paperclip operation writes these, so the close refuses; the
+    // recovery is an operator cleanup of the file, not a wider allowlist, since
+    // an agent-side rule could hide undelivered work from the clean-tree check.
+    it("refuses agent-harness and hand-made rules in the shared exclude, even with the server's line present", async () => {
+      const layout = managedLayout();
+      const file = sharedExclude(layout);
+      const agentAndHandMade = [
+        "# claude-code-runtime",
+        "**/.claude/scheduled_tasks.lock",
+        "**/.claude/scheduled_tasks.json",
+        "**/.claude/routines/.state/",
+        "**/.claude/worktrees/",
+        "**/.claude/checkpoints/",
+        "**/.claude/mailbox/",
+        "**/.claude/agent-registry.json",
+        "**/.claude/agent-memory-local",
+        "**/.claude/first-run",
+        "**/.claude/assistant-daemon-state.json",
+        "node_modules.broken-nodeuser/",
+      ].join("\n");
+      appendFileSync(file, `${agentAndHandMade}\n`);
+      mkdirSync(path.join(layout.worktree, ".claude", "worktrees"), { recursive: true });
+      writeFileSync(path.join(layout.worktree, ".claude", "worktrees", "deliverable.md"), "undelivered\n");
+      expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
+      appendFileSync(file, `\n${SERVER_LINE}\n`);
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NOT_WRITTEN);
     });
   });
 

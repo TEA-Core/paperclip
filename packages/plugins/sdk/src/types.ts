@@ -1425,6 +1425,31 @@ export interface PluginIssueAttachmentContent {
 }
 
 /**
+ * The issue fields a plugin may write through `ctx.issues.update`. The host
+ * forwards only these keys; every other key in a patch is dropped.
+ */
+export type PluginIssueUpdatePatch = Partial<Pick<
+  Issue,
+  | "title"
+  | "description"
+  | "status"
+  | "priority"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "billingCode"
+  | "originKind"
+  | "originId"
+  | "originRunId"
+  | "requestDepth"
+  | "executionWorkspaceId"
+  | "executionWorkspacePreference"
+>> & {
+  blockedByIssueIds?: string[];
+  labelIds?: string[];
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+};
+
+/**
  * `ctx.issues` — read and mutate issues plus comments.
  *
  * Requires:
@@ -1487,26 +1512,7 @@ export interface PluginIssuesClient {
   }): Promise<Issue>;
   update(
     issueId: string,
-    patch: Partial<Pick<
-      Issue,
-      | "title"
-      | "description"
-      | "status"
-      | "priority"
-      | "assigneeAgentId"
-      | "assigneeUserId"
-      | "billingCode"
-      | "originKind"
-      | "originId"
-      | "originRunId"
-      | "requestDepth"
-      | "executionWorkspaceId"
-      | "executionWorkspacePreference"
-    >> & {
-      blockedByIssueIds?: string[];
-      labelIds?: string[];
-      executionWorkspaceSettings?: Record<string, unknown> | null;
-    },
+    patch: PluginIssueUpdatePatch,
     companyId: string,
     actor?: PluginIssueMutationActor,
   ): Promise<Issue>;

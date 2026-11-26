@@ -614,6 +614,8 @@ export const issueExecutionStateSchema = z.object({
    * ladder intact.
    */
   delivery: z.unknown().optional(),
+  // Preserve the untrusted claim, without admitting other unknown state keys.
+  childCarrierClaim: z.unknown().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({

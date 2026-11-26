@@ -182,6 +182,8 @@ import {
   // Issue tree
   createIssueTreeHoldSchema,
   previewIssueTreeControlSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
   releaseIssueTreeHoldSchema,
   // Issue interactions
   createIssueThreadInteractionSchema,
@@ -1721,6 +1723,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/tree-control/state",
   "GET /api/issues/{id}/tree-holds",
   "GET /api/issues/{id}/tree-holds/{holdId}",
+  "GET /api/issues/{id}/recovery-carrier-park/candidate",
+  "POST /api/issues/{id}/recovery-carrier-park",
+  "POST /api/issues/{id}/recovery-carrier-park/{holdId}/release",
   "POST /api/issues/{id}/tree-control/preview",
   "POST /api/issues/{id}/tree-holds",
   "POST /api/issues/{id}/tree-holds/{holdId}/release",
@@ -4413,7 +4418,7 @@ registry.registerPath({
         .optional()
         .nullable()
         .describe(
-          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, or `control-plane-operation-no-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
+          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, `control-plane-operation-no-deliverable`, or `decision-only-no-repository-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). The decision-only disposition requires `Closed at Tier 0 (decision-only): <reason>` in the close comment. A no-deliverable-head override does not clear a review-ladder refusal.",
         ),
       deliveryIdentity: z
         .object({
@@ -4437,7 +4442,7 @@ registry.registerPath({
         .strict()
         .optional()
         .describe(
-          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is refused with 422 `workspace_issue_override_disallowed` whether or not the request names an `executionWorkspaceId`: the route re-supplies the stored workspace id on that write, and the policy check counts it as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are independently optional in this schema; a record with only one of them is not a PR binding, and approval refuses such a record where a PR binding is required. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
+          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and, without PR fields, `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). To bind an existing pull request (AS-05), send `prNumber` and `prUrl` TOGETHER (exactly one of them is 422 `delivery_identity_write_rejected`): `branch` is then the pull request's head branch, the server verifies the exact open, non-draft PR — canonical URL, live head branch, live head SHA — with the same verifier approval time uses (any mismatch or missing GitHub token is 422 `delivery_identity_write_rejected`), and stamps `kind=as05_bound_pr` plus the control-plane-derived `cardBranch` server-side; `kind`/`cardBranch` are server-owned and rejected if client-supplied. The live write-time verification and the AS-05 stamp apply to the lease-holding run's entry-into-review write; a board refresh on a card already `in_review` keeps the exact-branch rule above for a both-fields record — it is stored as sent, without a live write-time PR check and without the AS-05 stamp, and approval time re-verifies the binding as usual. `sourceIssueId` is optional and must name this card when supplied. `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is refused with 422 `workspace_issue_override_disallowed` whether or not the request names an `executionWorkspaceId`: the route re-supplies the stored workspace id on that write, and the policy check counts it as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are each optional in this schema but must be sent together: a record with exactly one of them is refused at write time with 422 `delivery_identity_write_rejected`, before anything is persisted. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
       expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
         "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
@@ -8337,7 +8342,7 @@ registry.registerPath({
       owner: z.string().trim().min(1),
       repo: z.string().trim().min(1),
       pullRequestNumber: z.number().int().positive(),
-      headSha: z.string().regex(/^[0-9a-f]{40,64}$/),
+      headSha: z.string().regex(/^[0-9a-f]{40}$/),
       reason: z.string().trim().min(1),
       idempotencyKey: z.string().trim().min(1).max(255),
     }).strict()),
@@ -8593,6 +8598,39 @@ registry.registerPath({
   summary: "Get issue tree control state",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/recovery-carrier-park/candidate",
+  tags: ["issues"],
+  summary: "Get recovery carrier park candidate",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park",
+  tags: ["issues"],
+  summary: "Park a recovery carrier by board decision",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(parkRecoveryCarrierSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park/{holdId}/release",
+  tags: ["issues"],
+  summary: "Release a board-parked recovery carrier",
+  request: {
+    params: z.object({ id: z.string(), holdId: z.string() }),
+    body: jsonBody(releaseRecoveryCarrierParkSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({

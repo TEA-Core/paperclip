@@ -1606,6 +1606,7 @@ function buildCompletedState(
     changesRequestedCount: 0,
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
+    childCarrierClaim: previous?.childCarrierClaim,
     ...carriedStallFields(previous, null),
   };
 }
@@ -1632,6 +1633,7 @@ function buildStateWithCompletedStages(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    childCarrierClaim: input.previous?.childCarrierClaim,
     ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
@@ -1658,6 +1660,7 @@ function buildSkippedStageCompletedState(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    childCarrierClaim: input.previous?.childCarrierClaim,
     ...carriedStallFields(input.previous, null),
   };
 }
@@ -1690,6 +1693,7 @@ function buildPendingState(input: {
     pendingSince: new Date().toISOString(),
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    childCarrierClaim: input.previous?.childCarrierClaim,
     ...carriedStallFields(input.previous, input.stage.id),
   };
 }

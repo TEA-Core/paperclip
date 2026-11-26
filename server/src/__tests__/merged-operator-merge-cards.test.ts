@@ -300,6 +300,31 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     await tempDb?.cleanup();
   });
 
+  it.each([false, true])("enforces durable landing debt on a record-only merge card (owed=%s)", async (owed) => {
+    const company = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, company, {
+      cardTitle: "Record the completed operator merge",
+      cardDescription: mergeGateMarker([404]),
+    });
+    await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, fixture.cardId));
+    if (owed) await db.insert(activityLog).values({
+      companyId: fixture.companyId, actorType: "system", actorId: "test",
+      action: "issue.delivery_requirement_reclassified", entityType: "issue", entityId: fixture.cardId,
+      details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" },
+    });
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: async () => ({ ...MERGED_EVIDENCE }),
+    });
+    const result = await service.sweepMergedOperatorMergeCards();
+    expect(result.closed).toBe(owed ? 0 : 1);
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.cardId));
+    expect(stored?.status).toBe(owed ? "todo" : "done");
+    if (owed) {
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, fixture.cardId));
+      expect(rows.find((row) => row.action === "issue.delivery_requirement_reclassified")?.details?.landingDebtDisposition).toBe("outstanding");
+    }
+  });
+
   it("closes a card whose named pull request merged, records evidence, and wakes the dependent", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
@@ -760,6 +785,47 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       .where(eq(issues.id, fixture.cardId))
       .then((rows) => rows[0] ?? null);
     expect(card?.status).toBe("done");
+  });
+
+  it("wakes a dependent re-blocked after a completed wake requested in its earlier blocked generation", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+      cardDescription: mergeGateMarker([404]),
+    });
+    // Generation 2 began an hour ago; the completed canonical wake was
+    // requested in generation 1 and only finished after the re-block.
+    const generationTwoAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: generationTwoAt })
+      .where(eq(issues.id, fixture.dependentId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: fixture.dependentId,
+        blockerIssueIds: [fixture.cardId],
+      }),
+      requestedAt: new Date(generationTwoAt.getTime() - 60 * 60 * 1000),
+      updatedAt: new Date(generationTwoAt.getTime() + 30 * 60 * 1000),
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async () => ({ ...MERGED_EVIDENCE })),
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("defers a card whose pull-request evidence is unmeasurable instead of closing it", async () => {

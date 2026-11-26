@@ -570,6 +570,10 @@ export {
 
 export {
   createIssueTreeHoldSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
+  type ParkRecoveryCarrier,
+  type ReleaseRecoveryCarrierPark,
   issueTreeControlModeSchema,
   issueTreeHoldReleasePolicySchema,
   previewIssueTreeControlSchema,

@@ -12,6 +12,7 @@ import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-in
 import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
+import type { ConsumedChangeConsent } from "./change-consent-gate.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Agent = typeof agents.$inferSelect;
@@ -163,11 +164,11 @@ export async function snapshotAgentFiles(root: string, enforceLimits = true): Pr
 
 export function agentFileStore(db: Db) {
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
-    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor) => Promise<T>) {
+    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor) => Promise<T>, consent?: ConsumedChangeConsent) {
     return db.transaction(async tx => {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
       if (!agent) throw notFound("Agent not found");
-      const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
+      const bound = write ? await authorizeInstructionCommit(tx, actor, agent, consent) : await authorizeInstructionRead(tx, actor, agent);
       const root = await adoptAgentFiles(tx, agent);
       return fn(tx, agent, root, bound);
     });
@@ -196,7 +197,8 @@ export function agentFileStore(db: Db) {
     },
     read: (companyId: string, agentId: string, relative: string, actor: AuthorizationActor) =>
       locked(companyId, agentId, actor, false, (_tx, _agent, root) => readAgentFile(root, instructionPath(relative))),
-    write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor) =>
+    /** `consent`: the receipt the route got when it consumed this request's accepted confirmation. */
+    write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor, consent?: ConsumedChangeConsent) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         const relative = agentFilePath(input.path);
         if (input.bytes) assertFileSize(input.bytes.length, relative);
@@ -219,10 +221,10 @@ export function agentFileStore(db: Db) {
         else await materializeInstructionBytes(root, relative, input.bytes);
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash });
         return { contentHash: incomingHash, changed: true };
-      }),
-    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
+      }, consent),
+    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest; snapshot?: DirectorySnapshot }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
-        const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
+        const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : input.snapshot ?? await snapshotAgentFiles(input.sourceDir);
         const entryPath = deriveBundleState(agent).entryFile;
         if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
         if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
@@ -279,8 +281,9 @@ export function agentFileStore(db: Db) {
           total += size;
         }
         assertDirectorySize(total, finalEntries.size);
-        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
-          ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
+        // Folders a run creates never get group write in the canonical tree.
+        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root, newDirectoryMode: 0o750,
+          ...(input.checkpoint || input.snapshot ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
       }),
