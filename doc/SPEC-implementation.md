@@ -418,11 +418,15 @@ aliases) of every possible local writer across companies: live local execution
 workspaces, project workspaces of non-archived projects (not remote-managed),
 live non-adapter-managed runtime services, live operations and queued/running
 runs outside remote environments. It refuses another card, workspace or run
-sharing that directory or a directory inside it. A path that does not exist
-(ENOENT/ENOTDIR) is judged by its nearest existing ancestor: it refuses when it
-would lie inside the worktree and is ignored otherwise. A dangling symlink at
-the path or any ancestor, or any other resolution error, refuses with
-`review_entry_workspace_unverified`.
+sharing that directory, a directory inside it, or an ancestor directory from
+which it can write the tree. Only the card's own project-workspace binding is
+exempt metadata; a live run or another workspace at that primary checkout is
+still a writer. A path that does not exist (ENOENT/ENOTDIR) is judged by its
+nearest existing ancestor: it refuses when the reconstructed path overlaps the
+worktree and is ignored otherwise. A dangling symlink or other resolution error
+refuses with `review_entry_workspace_unverified` only when its deepest existing
+ancestor resolves under the instance managed projects root. Broken paths outside
+that root do not block unrelated companies; valid physical aliases still do.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
 Provision summary-routine cards with their own isolated-worktree workspace after
@@ -436,9 +440,16 @@ keyed by the issue, its execution workspace and the worktree's paths before it
 locks the issue row, then row-locks the workspace binding, ruling, owning run,
 artifact and reviewer rows in one fixed order. Database triggers make any insert
 (or path re-point) of a workspace, project workspace, runtime service, operation
-or queued/running run on the same issue, workspace or path take the same keys,
-so such a phantom waits for the commit. No table lock is taken; lock contention
-and unsupported paths fail closed.
+or queued/running run on the same issue, workspace or overlapping path take
+conflicting keys, so such a phantom waits for the commit. Descendant writers
+share path-prefix keys; ancestor writers share a separate exact-path key for
+their cwd while admission holds exact keys for its ancestors. These exact keys
+can serialize concurrent admissions, not ordinary writes at unrelated paths.
+No table lock is taken; lock contention and unsupported paths fail closed.
+
+The linked-worktree admin directory must also have a bounded, regular `gitdir`
+back-pointer resolving to this tree's own `.git` file; borrowing a sibling's
+Git directory cannot establish ownership.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
@@ -487,6 +498,15 @@ without the precondition. A receipt cannot be consumed again after reopening,
 changes requested, policy edits or reassignment. Revised-artifact resubmission
 uses the existing review workflow. Final closure still needs fresh, lawful Tier
 evidence and all existing landing checks; an entry receipt is not that evidence.
+
+`GET /api/issues/{id}/review-entry-blockers` is a board-only operator diagnostic
+for an active isolated-worktree binding. It lists blocking rows from the issue's
+company only, using the same liveness and physical-path predicates as admission:
+`source` table, row `id`, recorded `path` (null for an issue/workspace claim),
+`code` and `reason`. It never exposes another company's row IDs or paths.
+Admission still checks cross-company writers and returns a generic refusal.
+The diagnostic performs no Git/provider proof, locking or mutation; its result
+is not an admission token or a complete eligibility decision.
 
 
 For a stranded pending execution-policy review/approval stage whose recorded

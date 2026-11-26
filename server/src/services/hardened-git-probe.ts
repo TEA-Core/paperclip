@@ -52,6 +52,7 @@ const MAX_BUFFER = 16 * 1024 * 1024;
 const MAX_COMPARED_TIPS = 5;
 const MAX_EXCLUDE_FILE_BYTES = 1024 * 1024;
 const MAX_INDEX_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_GITDIR_FILE_BYTES = 64 * 1024;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // The two overrides that stop repository-local configuration from running a
@@ -793,6 +794,16 @@ async function verifyCleanLinkedWorktree(
   }
   if (identity.commonDir !== expectedCommonDir || path.dirname(identity.gitDir) !== path.join(expectedCommonDir, "worktrees")) {
     return { ok: false, reason: "is not a linked worktree of the managed checkout" };
+  }
+  try {
+    const backlink = await readOptionalRegularFile(path.join(identity.gitDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
+    const target = backlink?.endsWith("\n") ? backlink.slice(0, -1) : backlink;
+    if (!target || !path.isAbsolute(target) || /[\0\r\n]/.test(target) ||
+        await realpath(target) !== path.join(worktreePath, ".git")) {
+      return { ok: false, reason: "has a linked-worktree Git directory registered to a different path" };
+    }
+  } catch {
+    return { ok: false, reason: "has an unverifiable linked-worktree Git directory back-pointer" };
   }
   const headSha = await readHeadCommit(worktreePath, worktreeOptions);
   if (!headSha) return { ok: false, reason: "has no HEAD commit" };

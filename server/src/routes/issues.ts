@@ -2,6 +2,7 @@ import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import {
   assertReviewEntryRequest,
+  listReviewEntryBlockers,
   lockReviewEntryAuthority,
   prepareReviewEntry,
   verifyReviewEntryAtTransition,
@@ -17587,6 +17588,14 @@ export function issueRoutes(
       eq(issueReviewEntryReceipts.issueId, issue.id),
     ));
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, receipts));
+  });
+
+  router.get("/issues/:id/review-entry-blockers", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const blockers = await listReviewEntryBlockers(db, issue);
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, blockers));
   });
 
   router.post(

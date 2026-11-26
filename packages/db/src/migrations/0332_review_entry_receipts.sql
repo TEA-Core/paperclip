@@ -89,6 +89,7 @@ BEGIN
   END LOOP;
   FOREACH candidate IN ARRAY array_remove(ARRAY[claim->>'cwd', claim->>'provider_ref'], NULL) || review_entry_run_paths(context) LOOP
     IF review_entry_normalize_path(candidate) IS NOT NULL THEN
+      PERFORM pg_advisory_xact_lock_shared(review_entry_lock_key('path-exact:' || review_entry_normalize_path(candidate)));
       prefix := '';
       FOREACH part IN ARRAY array_remove(string_to_array(candidate, '/'), '') LOOP
         prefix := prefix || '/' || part;

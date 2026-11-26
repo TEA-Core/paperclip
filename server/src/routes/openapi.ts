@@ -1472,6 +1472,7 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  "GET /api/issues/{id}/review-entry-blockers",
   // Added upstream in the 2026-09-19 slice-2d fold range (#13284, Agent Chat).
   // Every ai-connections handler calls assertBoard() unconditionally, so the
   // fork's SUP-16341 regression guard requires them listed here.
@@ -4518,6 +4519,16 @@ registry.registerPath({
   description: "Company-scoped historical admission evidence. Retains the pinned ruling and reviewed artifact revisions and server-owned isolated-worktree, repository/base, actor/run and stage identities. A receipt is not an approval or reusable terminal-close proof.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-blockers",
+  tags: ["issues"],
+  summary: "Inspect company-scoped first-review entry blockers",
+  description: "Board-only diagnostic for an issue with an active isolated-worktree binding. Returns blocking rows from this issue's company only: source table, row id, recorded path (or null for an issue/workspace claim), review_entry_* code and reason. Admission still checks all companies and never exposes foreign row identities. Unresolvable paths block only when their deepest existing ancestor is under the instance managed projects root; valid physical aliases and ancestor/descendant writers remain blockers anywhere. This read performs no Git/provider proof, locks or mutation and grants no admission token.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

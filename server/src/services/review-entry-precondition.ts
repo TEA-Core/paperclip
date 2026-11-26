@@ -10,7 +10,7 @@ import {
 } from "@paperclipai/db";
 import type { UpdateIssue } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
-import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { readNoRepositoryReviewEntryRecord, unpaidLandingDebt, type NoRepositoryLandingRecord } from "./done-transition-guard.js";
 import { resolveGitHubToken } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
@@ -199,14 +199,25 @@ function claimedPaths(prepared: PreparedReviewEntry) {
     .map((candidate) => `/${candidate.split("/").filter(Boolean).join("/")}`))].sort();
 }
 
-/** Taken before the issue row lock. Fence triggers make every writer that
- * inserts or re-points a workspace, runtime service, operation or active run at
- * this issue, workspace or path (or a path inside it) take the same keys shared,
- * so such a phantom waits for this transaction instead of racing the proof.
+/** Taken before the issue row lock. Prefix keys fence descendants; the separate
+ * exact-path namespace fences writers at ancestors without blocking ordinary
+ * writes in unrelated directories.
  */
 export async function lockReviewEntryAuthority(tx: Db, issueId: string, prepared: PreparedReviewEntry) {
   await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
-  const keys = [`issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`, ...claimedPaths(prepared).map((p) => `path:${p}`)];
+  const paths = claimedPaths(prepared);
+  const ancestors = new Set<string>();
+  for (const candidate of paths) {
+    for (let ancestor = candidate; ; ancestor = path.dirname(ancestor)) {
+      ancestors.add(ancestor);
+      if (ancestor === path.dirname(ancestor)) break;
+    }
+  }
+  const keys = [
+    `issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`,
+    ...paths.map((candidate) => `path:${candidate}`),
+    ...[...ancestors].sort().map((ancestor) => `path-exact:${ancestor}`),
+  ];
   for (const key of keys) await tx.execute(sql`SELECT pg_advisory_xact_lock(review_entry_lock_key(${key}))`);
 }
 
@@ -217,6 +228,162 @@ async function physicalPath(candidate: string): Promise<PhysicalWorkspace> {
   return { path: resolved, identity: `${info.dev}:${info.ino}` };
 }
 
+export interface ReviewEntryBlocker {
+  source: "execution_workspaces" | "project_workspaces" | "workspace_runtime_services" | "workspace_operations" | "issues" | "heartbeat_runs";
+  id: string;
+  path: string | null;
+  code: "review_entry_workspace_shared" | "review_entry_workspace_busy" | "review_entry_workspace_unverified";
+  reason: string;
+}
+
+function containsPath(parent: string, candidate: string) {
+  return candidate === parent || candidate.startsWith(parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`);
+}
+
+/** Missing suffixes can still claim the tree. Uncertainty is different: only a
+ * deepest resolvable ancestor under the managed projects root can make an
+ * unrelated dangling link prevent admission. Valid aliases remain global.
+ */
+async function worktreePathRelation(candidate: unknown, own: PhysicalWorkspace, managedRoot: string) {
+  if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return null;
+  const overlaps = (other: string) => containsPath(own.path, other) || containsPath(other, own.path);
+  const absent = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "");
+  let uncertain = false;
+  try {
+    const otherPath = await realpath(candidate);
+    const info = await stat(otherPath);
+    return `${info.dev}:${info.ino}` === own.identity || overlaps(otherPath) ? "shared" : null;
+  } catch (error) {
+    uncertain = !absent(error);
+  }
+  const missing: string[] = [];
+  for (let ancestor = path.resolve(candidate); ; ancestor = path.dirname(ancestor)) {
+    try {
+      const resolved = await realpath(ancestor);
+      if (uncertain) return containsPath(managedRoot, resolved) ? "unverified" : null;
+      return overlaps(path.join(resolved, ...missing)) ? "shared" : null;
+    } catch (error) {
+      if (!absent(error)) uncertain = true;
+      else if (await lstat(ancestor).then(() => true, (missingEntry) => !absent(missingEntry))) uncertain = true;
+      if (ancestor === path.dirname(ancestor)) return "unverified";
+      missing.unshift(path.basename(ancestor));
+    }
+  }
+}
+
+/** Admission consumes only the first blocker; the operator read enumerates
+ * caller-company rows. Keep both on the same path and liveness predicates.
+ */
+async function* reviewEntryBlockers(
+  db: Db, issue: Subject, workspace: typeof executionWorkspaces.$inferSelect,
+  own: PhysicalWorkspace, owningRunId: string | null, companyId?: string,
+): AsyncGenerator<ReviewEntryBlocker> {
+  const managedRoot = await realpath(path.join(resolvePaperclipInstanceRoot(), "projects")).catch(() =>
+    fail("workspace_unverified", "The managed projects root could not be verified."));
+  const pathBlocker = async (
+    source: ReviewEntryBlocker["source"], id: string, candidates: unknown[],
+    code: ReviewEntryBlocker["code"], reason: string,
+  ): Promise<ReviewEntryBlocker | null> => {
+    for (const candidate of candidates) {
+      const relation = await worktreePathRelation(candidate, own, managedRoot);
+      if (relation) return {
+        source, id, path: candidate as string,
+        code: relation === "unverified" ? "review_entry_workspace_unverified" : code,
+        reason: relation === "unverified"
+          ? "A live workspace path under the managed projects root could not be resolved. Inspect this company's review-entry-blockers read, retire the stale record or wait for it to finish."
+          : reason,
+      };
+    }
+    return null;
+  };
+  const liveWorkspaces = await db.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
+    .from(executionWorkspaces).where(and(
+      ne(executionWorkspaces.id, workspace.id), isNull(executionWorkspaces.closedAt),
+      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+      inArray(executionWorkspaces.providerType, ["local_fs", "git_worktree"]),
+      companyId ? eq(executionWorkspaces.companyId, companyId) : undefined,
+    ));
+  for (const candidate of liveWorkspaces) {
+    const blocker = await pathBlocker("execution_workspaces", candidate.id, [candidate.cwd, candidate.providerRef],
+      "review_entry_workspace_shared", "Another execution workspace can write this physical tree. Provision a new isolated worktree for this card.");
+    if (blocker) yield blocker;
+  }
+  for (const project of await db.select({ id: projectWorkspaces.id, cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
+    .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
+    .where(and(isNull(projects.archivedAt), ne(projectWorkspaces.sourceType, "remote_managed"),
+      ne(projectWorkspaces.id, workspace.projectWorkspaceId!),
+      companyId ? eq(projectWorkspaces.companyId, companyId) : undefined))) {
+    // The card's own source binding is metadata, not an additional writer.
+    const blocker = await pathBlocker("project_workspaces", project.id, [project.cwd],
+      "review_entry_workspace_shared", "Another project workspace can write this physical tree. Provision a separate isolated worktree.");
+    if (blocker) yield blocker;
+  }
+  for (const service of await db.select({
+    id: workspaceRuntimeServices.id, executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
+  }).from(workspaceRuntimeServices).where(and(
+    isNull(workspaceRuntimeServices.stoppedAt), ne(workspaceRuntimeServices.provider, "adapter_managed"),
+    companyId ? eq(workspaceRuntimeServices.companyId, companyId) : undefined,
+  ))) {
+    const reason = "A runtime service can still write this worktree; wait for its confirmed stop.";
+    const blocker = service.executionWorkspaceId === workspace.id
+      ? { source: "workspace_runtime_services" as const, id: service.id, path: service.cwd, code: "review_entry_workspace_busy" as const, reason }
+      : await pathBlocker("workspace_runtime_services", service.id, [service.cwd], "review_entry_workspace_busy", reason);
+    if (blocker) yield blocker;
+  }
+  for (const operation of await db.select({
+    id: workspaceOperations.id, executionWorkspaceId: workspaceOperations.executionWorkspaceId, cwd: workspaceOperations.cwd,
+  }).from(workspaceOperations).where(and(isNull(workspaceOperations.finishedAt),
+    companyId ? eq(workspaceOperations.companyId, companyId) : undefined))) {
+    const reason = "A workspace operation can still write this worktree; wait for it to finish.";
+    const blocker = operation.executionWorkspaceId === workspace.id
+      ? { source: "workspace_operations" as const, id: operation.id, path: operation.cwd, code: "review_entry_workspace_busy" as const, reason }
+      : await pathBlocker("workspace_operations", operation.id, [operation.cwd], "review_entry_workspace_busy", reason);
+    if (blocker) yield blocker;
+  }
+  const bindings = await db.select({ id: issues.id }).from(issues).where(and(
+    eq(issues.executionWorkspaceId, workspace.id), ne(issues.id, issue.id),
+    companyId ? eq(issues.companyId, companyId) : undefined,
+  ));
+  for (const binding of bindings) yield {
+    source: "issues", id: binding.id, path: null, code: "review_entry_workspace_shared",
+    reason: "Another card uses this execution workspace. Provision a new isolated worktree.",
+  };
+  const context = heartbeatRuns.contextSnapshot;
+  const runs = await db.select({
+    id: heartbeatRuns.id,
+    holdsCard: sql<boolean>`coalesce(${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
+      OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}, false)`,
+    paths: sql<string[]>`review_entry_run_paths(${context})`,
+    local: sql<boolean>`coalesce(${context}->'paperclipEnvironment'->>'driver', 'local') = 'local'`,
+  }).from(heartbeatRuns).where(and(
+    inArray(heartbeatRuns.status, ["queued", "running"]),
+    owningRunId ? ne(heartbeatRuns.id, owningRunId) : undefined,
+    companyId ? eq(heartbeatRuns.companyId, companyId) : undefined,
+  ));
+  for (const run of runs) {
+    if (run.holdsCard) yield {
+      source: "heartbeat_runs", id: run.id, path: null, code: "review_entry_workspace_busy",
+      reason: "Another run holds this card or workspace; wait for it to finish before first entry.",
+    };
+    else {
+      const blocker = await pathBlocker("heartbeat_runs", run.id, run.local ? run.paths : [],
+        "review_entry_workspace_busy", "Another run can write this physical tree; run this card alone in an isolated worktree.");
+      if (blocker) yield blocker;
+    }
+  }
+}
+
+/** Diagnostic only: no Git/provider proof, locks, mutation or admission token. */
+export async function listReviewEntryBlockers(db: Db, issue: Subject) {
+  const { workspace } = await readBinding(db, issue);
+  const own = await physicalPath(workspace.providerRef!).catch(() =>
+    fail("workspace_unverified", "The isolated workspace path could not be verified."));
+  const blockers: ReviewEntryBlocker[] = [];
+  for await (const blocker of reviewEntryBlockers(db, issue, workspace, own,
+    issue.assigneeAgentId ? issue.executionRunId : null, issue.companyId)) blockers.push(blocker);
+  return blockers;
+}
+
 async function assertExclusive(
   db: Db, issue: Subject, actor: ReviewEntryActor, prepared: PreparedReviewEntry,
   workspace: typeof executionWorkspaces.$inferSelect,
@@ -224,84 +391,9 @@ async function assertExclusive(
   const own = await physicalPath(workspace.providerRef!).catch(() =>
     fail("workspace_unverified", "The isolated workspace path could not be verified."));
   if (own.path !== prepared.snapshot.worktreePath) fail("git_changed", "The physical worktree identity changed during proof.");
-  // Cross-company aliases are still writers to the same physical bytes. Never
-  // return another company's identifiers or paths in the refusal.
-  const unresolved = () => fail("workspace_unverified", "A live workspace path could not be resolved, so isolated ownership cannot be proved. Retire the stale record or wait for it to finish.");
-  const absent = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "");
-  const inside = (candidate: string) => candidate === own.path || candidate.startsWith(`${own.path}${path.sep}`);
-  const sharesWorktree = async (candidate: unknown) => {
-    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return false;
-    try {
-      const otherPath = await realpath(candidate);
-      const info = await stat(otherPath);
-      return `${info.dev}:${info.ino}` === own.identity || inside(otherPath);
-    } catch (error) {
-      if (!absent(error)) return unresolved();
-    }
-    const missing: string[] = [];
-    for (let ancestor = path.resolve(candidate); ; ancestor = path.dirname(ancestor)) {
-      try {
-        return inside(path.join(await realpath(ancestor), ...missing));
-      } catch (error) {
-        if (!absent(error) || ancestor === path.dirname(ancestor)) return unresolved();
-        if (await lstat(ancestor).then(() => true, (missingEntry) => !absent(missingEntry))) return unresolved();
-        missing.unshift(path.basename(ancestor));
-      }
-    }
-  };
-  const liveWorkspaces = await db.select({ cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
-    .from(executionWorkspaces).where(and(
-      ne(executionWorkspaces.id, workspace.id), isNull(executionWorkspaces.closedAt),
-      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-      inArray(executionWorkspaces.providerType, ["local_fs", "git_worktree"]),
-    ));
-  for (const candidate of liveWorkspaces) {
-    if (await sharesWorktree(candidate.cwd) || await sharesWorktree(candidate.providerRef)) {
-      fail("workspace_shared", "Another execution workspace shares this physical path. Provision a new isolated worktree for this card.");
-    }
-  }
-  for (const project of await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
-    .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
-    .where(and(isNull(projects.archivedAt), ne(projectWorkspaces.sourceType, "remote_managed")))) {
-    if (await sharesWorktree(project.cwd)) {
-      fail("workspace_shared", "A project workspace shares this physical path. Provision a separate isolated worktree.");
-    }
-  }
-  for (const service of await db.select({
-    executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
-  }).from(workspaceRuntimeServices).where(and(
-    isNull(workspaceRuntimeServices.stoppedAt), ne(workspaceRuntimeServices.provider, "adapter_managed"),
-  ))) {
-    if (service.executionWorkspaceId === workspace.id || await sharesWorktree(service.cwd)) {
-      fail("workspace_busy", "A runtime service can still write this worktree; wait for its confirmed stop.");
-    }
-  }
-  for (const operation of await db.select({
-    executionWorkspaceId: workspaceOperations.executionWorkspaceId, cwd: workspaceOperations.cwd,
-  }).from(workspaceOperations).where(isNull(workspaceOperations.finishedAt))) {
-    if (operation.executionWorkspaceId === workspace.id || await sharesWorktree(operation.cwd)) {
-      fail("workspace_busy", "A workspace operation can still write this worktree; wait for it to finish.");
-    }
-  }
-  const bindings = await db.select({ id: issues.id }).from(issues).where(and(
-    eq(issues.executionWorkspaceId, workspace.id), ne(issues.id, issue.id),
-  ));
-  if (bindings.length) fail("workspace_shared", "Another card uses this execution workspace. Provision a new isolated worktree.");
-  const context = heartbeatRuns.contextSnapshot;
-  const runs = await db.select({
-    holdsCard: sql<boolean>`coalesce(${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
-      OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}, false)`,
-    paths: sql<string[]>`review_entry_run_paths(${context})`,
-    local: sql<boolean>`coalesce(${context}->'paperclipEnvironment'->>'driver', 'local') = 'local'`,
-  }).from(heartbeatRuns).where(and(
-    inArray(heartbeatRuns.status, ["queued", "running"]),
-    actor.agentId && actor.runId ? ne(heartbeatRuns.id, actor.runId) : undefined,
-  ));
-  for (const run of runs) {
-    if (run.holdsCard) fail("workspace_busy", "Another run holds this card or workspace; wait for it to finish before first entry.");
-    for (const candidate of run.local ? run.paths : []) {
-      if (await sharesWorktree(candidate)) fail("workspace_busy", "Another run shares this physical path; run this card alone in an isolated worktree.");
-    }
+  // Admission scans cross-company writers, but never returns their IDs/paths.
+  for await (const blocker of reviewEntryBlockers(db, issue, workspace, own, actor.agentId ? actor.runId : null)) {
+    throw conflict(blocker.reason, { code: blocker.code });
   }
   if (actor.agentId) {
     const [run] = await db.select({
