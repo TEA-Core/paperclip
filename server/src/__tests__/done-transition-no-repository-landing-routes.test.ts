@@ -906,6 +906,26 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(receipts).toMatchObject([{ artifactRevisionId: fixture.artifact.id }]);
     });
 
+    it.each([
+      ["nonexistent descendant", (worktree: string) => path.join(worktree, "missing", "deeper"), 409],
+      ["nonexistent descendant through a symlink", (worktree: string) => {
+        symlinkSync(worktree, `${worktree}-descendant-link`);
+        return path.join(`${worktree}-descendant-link`, "missing");
+      }, 409],
+      ["nonexistent sibling", (worktree: string) => path.join(`${worktree}-missing`, "sub"), 200],
+    ] as const)("judges a foreign run's %s path by its existing ancestor", async (_label, runPath, status) => {
+      const fixture = await reviewFixture();
+      const otherCompany = await insertCompany(`DESC${seedSequence}`);
+      await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Future writer"),
+        status: "queued", contextSnapshot: { cwd: runPath(fixture.worktree) } });
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(status);
+      if (status === 409) {
+        expect(response.body.code).toBe("review_entry_workspace_busy");
+        await noAcceptedEntry(fixture.issueId);
+      }
+    });
+
     it.each(["deleted foreign project path", "archived project", "cloud sandbox workspace", "remote environment run"])(
       "does not count %s as a local writer", async (kind) => {
         const fixture = await reviewFixture();

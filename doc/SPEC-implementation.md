@@ -419,7 +419,8 @@ workspaces, project workspaces of non-archived projects (not remote-managed),
 live non-adapter-managed runtime services, live operations and queued/running
 runs outside remote environments. It refuses another card, workspace or run
 sharing that directory or a directory inside it. A path that does not exist
-(ENOENT/ENOTDIR) cannot alias the worktree and is ignored; any other resolution
+(ENOENT/ENOTDIR) is judged by its nearest existing ancestor: it refuses when it
+would lie inside the worktree and is ignored otherwise; any other resolution
 error refuses with `review_entry_workspace_unverified`.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.

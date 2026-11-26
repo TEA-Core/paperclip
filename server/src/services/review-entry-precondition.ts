@@ -226,19 +226,27 @@ async function assertExclusive(
   if (own.path !== prepared.snapshot.worktreePath) fail("git_changed", "The physical worktree identity changed during proof.");
   // Cross-company aliases are still writers to the same physical bytes. Never
   // return another company's identifiers or paths in the refusal.
+  const unresolved = () => fail("workspace_unverified", "A live workspace path could not be resolved, so isolated ownership cannot be proved. Retire the stale record or wait for it to finish.");
+  const absent = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "");
+  const inside = (candidate: string) => candidate === own.path || candidate.startsWith(`${own.path}${path.sep}`);
   const sharesWorktree = async (candidate: unknown) => {
     if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return false;
-    let otherPath: string;
-    let identity: string;
     try {
-      otherPath = await realpath(candidate);
+      const otherPath = await realpath(candidate);
       const info = await stat(otherPath);
-      identity = `${info.dev}:${info.ino}`;
+      return `${info.dev}:${info.ino}` === own.identity || inside(otherPath);
     } catch (error) {
-      if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
-      return fail("workspace_unverified", "A live workspace path could not be resolved, so isolated ownership cannot be proved. Retire the stale record or wait for it to finish.");
+      if (!absent(error)) return unresolved();
     }
-    return identity === own.identity || otherPath === own.path || otherPath.startsWith(`${own.path}${path.sep}`);
+    const missing: string[] = [];
+    for (let ancestor = path.resolve(candidate); ; ancestor = path.dirname(ancestor)) {
+      try {
+        return inside(path.join(await realpath(ancestor), ...missing));
+      } catch (error) {
+        if (!absent(error) || ancestor === path.dirname(ancestor)) return unresolved();
+        missing.unshift(path.basename(ancestor));
+      }
+    }
   };
   const liveWorkspaces = await db.select({ cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
     .from(executionWorkspaces).where(and(
