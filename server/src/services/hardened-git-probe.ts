@@ -616,19 +616,39 @@ export async function runLegacyWorktreeProbe<T>(
 export async function legacyWorktreeIsDirty(worktreePath: string, options: HardenedGitOptions): Promise<boolean> {
   const identity = await readWorktreeIdentity(worktreePath, options);
   const headSha = await readHeadCommit(worktreePath, options);
-  const exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
-  return withSnapshotGitDir(
-    { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: options.deadline },
-    async (snapshot) => {
-      const entries = await listIndexEntries(snapshot, identity.topLevel, options);
-      if (entries.some((entry) => entry.mode === "160000")) {
-        throw new HardenedGitError(
-          "refused",
-          "the worktree has submodules, whose status Git reads through each submodule's own configuration",
-        );
-      }
-      return snapshotStatusIsDirty(snapshot, identity.topLevel, "all", options);
-    },
+  let exclude: string | null;
+  try {
+    exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
+  } catch (error) {
+    throw refusedSnapshotInput("the repository's info/exclude", error);
+  }
+  let snapshotReady = false;
+  try {
+    return await withSnapshotGitDir(
+      { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: options.deadline },
+      async (snapshot) => {
+        snapshotReady = true;
+        const entries = await listIndexEntries(snapshot, identity.topLevel, options);
+        if (entries.some((entry) => entry.mode === "160000")) {
+          throw new HardenedGitError(
+            "refused",
+            "the worktree has submodules, whose status Git reads through each submodule's own configuration",
+          );
+        }
+        return snapshotStatusIsDirty(snapshot, identity.topLevel, "all", options);
+      },
+    );
+  } catch (error) {
+    if (snapshotReady) throw error;
+    throw refusedSnapshotInput("the snapshot git dir (the worktree's index and shared indexes)", error);
+  }
+}
+
+function refusedSnapshotInput(what: string, error: unknown): HardenedGitError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new HardenedGitError(
+    "refused",
+    `could not read ${what} safely (a symlink, FIFO, non-regular or oversize file, or a file that changed while it was copied): ${detail}`,
   );
 }
 

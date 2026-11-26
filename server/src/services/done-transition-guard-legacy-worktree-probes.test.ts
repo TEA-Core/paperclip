@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -343,5 +343,33 @@ describe("legacy status probe keeps the git status --porcelain answer for ordina
     git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "sub");
     git(repo, "commit", "-qm", "add submodule");
     expect(await worktreeHasUncommittedContent(repo)).toMatchObject({ unverified: true });
+  });
+});
+
+describe("legacy status probe fails closed when it cannot build its snapshot safely (SUP-23163)", () => {
+  it("reports a dirty worktree whose info/exclude is a symlink unverified", async () => {
+    const repo = plainRepo("repo");
+    writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+    const target = path.join(root, "exclude-target");
+    writeFileSync(target, "a.txt\n");
+    const exclude = path.join(repo, ".git", "info", "exclude");
+    rmSync(exclude, { force: true });
+    symlinkSync(target, exclude);
+    expect(await worktreeHasUncommittedContent(repo)).toMatchObject({
+      unverified: true,
+      reason: expect.stringContaining("info/exclude"),
+    });
+  });
+
+  it("reports a dirty worktree whose index is a FIFO unverified", async () => {
+    const repo = plainRepo("repo");
+    writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+    const index = path.join(repo, ".git", "index");
+    rmSync(index);
+    execFileSync("mkfifo", [index]);
+    expect(await worktreeHasUncommittedContent(repo)).toMatchObject({
+      unverified: true,
+      reason: expect.stringContaining("index"),
+    });
   });
 });
