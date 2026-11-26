@@ -11252,7 +11252,7 @@ registerCurrentRoute({
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
     "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
-    "reason, the call is 409 `landing_proof_cannot_close` before GitHub is asked and nothing is recorded. The body names one pull request in the card's " +
+    "reason, the call is 409 `landing_proof_cannot_close` before the submitted proof is verified and nothing is recorded. The body names one pull request in the card's " +
     "project repository (`owner`, `repo`, `pullRequestNumber`), at least one of `mergeCommitSha` / `headSha` (full shas), and a " +
     "`reason`. The server verifies the proof live against GitHub: the repository is the card's project repository " +
     "(422 `landing_proof_wrong_repo`), the card resolves a control-plane base branch (422 `landing_proof_no_base`), the PR exists " +
