@@ -6543,8 +6543,10 @@ async function evaluateDoneTransitionGuardCore(
         // execution branch is never pushed. The local worktree still carries the
         // pre-merge, issue-attributable commits, so attribution alone would block
         // work that is already merged and live. A merged PR naming the identifier
-        // is positive evidence of landing — fail open on it. An unmeasurable probe
-        // also fails open: never block on a signal we could not measure (SUP-13199).
+        // is positive evidence of landing — fail open on it. A null attribution or
+        // merged-PR result (git or GitHub ran and could not answer) still fails open
+        // (SUP-13199); an unverified attribution fails closed, but only after the
+        // merged-PR check finds no PR naming the issue (SUP-23163).
         const deliveryHead = landingDebtOwed && issue.identifier ? await carrierDeliveryHead(ctx, parsed, token) : undefined;
         const mergedPrCount = issue.identifier
           ? await githubMergedPrCountForIdentifier(
