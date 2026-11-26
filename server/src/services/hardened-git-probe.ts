@@ -534,9 +534,13 @@ async function snapshotStatusIsDirty(
 // could not answer (null), but a probe that could not run safely or to
 // completion is unverified, and the callers fail closed on it: the timeout
 // fired, no root-owned git is installed, the worktree holds more initialized
-// submodules than the probe measures (each initialized submodule is measured by the same
-// hardened probe, never by Git recursing into it), or the server process
-// inherits `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY`.
+// submodules than the probe measures or a submodule reached through a symlink
+// or naming another work tree (each initialized submodule is measured by the
+// same hardened probe, never by Git recursing into it), a repository file the
+// snapshot reads (`info/exclude`, the index, a shared index) is not a regular
+// file within its size limit or the snapshot could not be built, or the server
+// process inherits `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY`. The full list
+// of cases is owned by docs/approval-final-delivery-preflight.md.
 
 const LEGACY_PROBE_BUDGET_MS = DEFAULT_TIMEOUT_MS;
 const LEGACY_SUBMODULE_LIMIT = 64;
