@@ -400,10 +400,17 @@ function applyStringChecks(
   jsonSchema: JsonSchema,
   checks: ReadonlyArray<unknown>,
 ) {
+  let trimmed = false;
+  let trimmedBeforeMin = false;
   for (const check of checks) {
     const def = checkDef(check);
     if (!def) continue;
-    if (def.check === "min_length") jsonSchema.minLength = def.minimum;
+    if (def.check === "overwrite" && typeof def.tx === "function") {
+      trimmed ||= def.tx(" ") === "";
+    } else if (def.check === "min_length") {
+      jsonSchema.minLength = def.minimum;
+      trimmedBeforeMin = trimmed;
+    }
     else if (def.check === "max_length") jsonSchema.maxLength = def.maximum;
     else if (def.check === "string_format") {
       if (def.format === "email") jsonSchema.format = "email";
@@ -413,7 +420,10 @@ function applyStringChecks(
       // change.
       else if (def.format === "uuid" || def.format === "guid")
         jsonSchema.format = "uuid";
-      else if (def.format === "datetime") jsonSchema.format = "date-time";
+      else if (def.format === "datetime") {
+        jsonSchema.format = "date-time";
+        if (def.pattern instanceof RegExp) jsonSchema.pattern = def.pattern.source;
+      }
       // Zod 4 stores a `.regex()` pattern as a `RegExp`; publish its source.
       else if (def.format === "regex") {
         if (def.pattern instanceof RegExp)
@@ -422,6 +432,14 @@ function applyStringChecks(
           jsonSchema.pattern = def.pattern;
       }
     }
+  }
+  if (
+    trimmedBeforeMin &&
+    typeof jsonSchema.minLength === "number" &&
+    jsonSchema.minLength > 0 &&
+    jsonSchema.pattern === undefined
+  ) {
+    jsonSchema.pattern = "\\S";
   }
 }
 
@@ -4343,7 +4361,20 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     // The route's status-default preprocessor has an unconstrained input
     // schema. Publish the same wire object as MCP, not that transform.
-    body: jsonBody(createIssueInputSchema),
+    body: {
+      content: {
+        "application/json": {
+          schema: {
+            ...zodToOpenApiSchema(createIssueInputSchema),
+            anyOf: (["title", "description"] as const).map((field) => ({
+              required: [field],
+              properties: { [field]: { type: "string", pattern: "\\S" } },
+            })),
+          },
+        },
+      },
+      required: true as const,
+    },
   },
   responses: {
     200: r.ok(),

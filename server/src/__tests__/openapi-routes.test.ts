@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
-import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { createIssueSchema, gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
 import { z } from "zod";
 import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
 import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
@@ -425,6 +427,46 @@ describe("openapi routes", () => {
       const parsed = tool.schema.safeParse({ title: "Monitor", [field]: value });
       expect(parsed.success).toBe(false);
       if (!parsed.success) expect(parsed.error.message).toContain(field);
+    }
+  });
+
+  it("rejects the same create monitor and title values in the served schema as the runtime validator", async () => {
+    const response = await request(createApp()).get("/api/openapi.json").expect(200);
+    const schema = response.body.paths["/api/companies/{companyId}/issues"].post
+      .requestBody.content["application/json"].schema;
+    const monitor = schema.properties.executionPolicy.properties.monitor.properties;
+    const ajv = new Ajv({ strict: false });
+    addFormats(ajv);
+    const served = (fragment: unknown, value: unknown) => ajv.validate(fragment as object, value);
+    const bodyRule = { anyOf: schema.anyOf };
+    const monitorBody = (fields: Record<string, unknown>) => ({
+      title: "Monitor",
+      executionPolicy: { monitor: { nextCheckAt: "2099-12-01T12:00:00.000Z", ...fields } },
+    });
+    const cases: Array<[string, unknown, unknown, Record<string, unknown>]> = [
+      ["offset nextCheckAt", monitor.nextCheckAt, "2099-12-01T12:00:00+02:00", monitorBody({ nextCheckAt: "2099-12-01T12:00:00+02:00" })],
+      ["offset timeoutAt", monitor.timeoutAt, "2099-12-02T12:00:00+02:00", monitorBody({ timeoutAt: "2099-12-02T12:00:00+02:00" })],
+      ["whitespace serviceName", monitor.serviceName, "   ", monitorBody({ serviceName: "   " })],
+      ["whitespace externalRef", monitor.externalRef, "   ", monitorBody({ externalRef: "   " })],
+      ["empty body", bodyRule, {}, {}],
+      ["empty title", bodyRule, { title: "" }, { title: "" }],
+      ["whitespace title", bodyRule, { title: "   " }, { title: "   " }],
+    ];
+    for (const [label, fragment, value, body] of cases) {
+      expect({ label, served: served(fragment, value) }).toEqual({ label, served: false });
+      expect({ label, runtime: createIssueSchema.safeParse(body).success }).toEqual({ label, runtime: false });
+    }
+    const accepted: Array<[string, unknown, unknown, Record<string, unknown>]> = [
+      ["Z nextCheckAt", monitor.nextCheckAt, "2099-12-01T12:00:00.000Z", monitorBody({})],
+      ["Z timeoutAt", monitor.timeoutAt, "2099-12-02T12:00:00Z", monitorBody({ timeoutAt: "2099-12-02T12:00:00Z" })],
+      ["padded serviceName", monitor.serviceName, " svc ", monitorBody({ serviceName: " svc " })],
+      ["padded externalRef", monitor.externalRef, " ref ", monitorBody({ externalRef: " ref " })],
+      ["title only", bodyRule, { title: "Task" }, { title: "Task" }],
+      ["description only", bodyRule, { title: "", description: "Do it" }, { title: "", description: "Do it" }],
+    ];
+    for (const [label, fragment, value, body] of accepted) {
+      expect({ label, served: served(fragment, value) }).toEqual({ label, served: true });
+      expect({ label, runtime: createIssueSchema.safeParse(body).success }).toEqual({ label, runtime: true });
     }
   });
 
