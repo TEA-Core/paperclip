@@ -59,6 +59,8 @@ Remote SSH and sandbox restores use the same rule: the run directory closes
 before the transport writes any bytes, then the permission walk removes remote
 group/world write bits before the run directory opens again. Restore-created
 directories have the staged directory mode, never a published `02775`.
+Legacy private copies staged before formula versioning kept canonical modes;
+their restore stays behind the `0700` run directory without a mode-changing walk.
 Warm remote checkpoints download into an owner-only `0700` scratch directory
 inside the run directory, and the permission walk removes every group and world
 bit from the downloaded entries before validation and save.

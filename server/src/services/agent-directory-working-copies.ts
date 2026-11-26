@@ -303,7 +303,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await fs.chmod(runDir, 0o700);
       await runtime.restoreWorkspace();
       const gid = typeof row.receipt?.stagedGid === "number" ? row.receipt.stagedGid : null;
-      await workingCopyPermissions(row.localRoot, gid);
+      if (gid !== null || row.receipt?.stagedModeVersion === STAGED_MODE_VERSION) await workingCopyPermissions(row.localRoot, gid);
       if (gid !== null) await workingCopyPermissions(runDir, gid, false);
     }
     return inspectAgentDirectory(row.localRoot);

@@ -728,6 +728,41 @@ describe("persistent agent directories", () => {
     expect((await fs.stat(path.join(root, "notes/shared.md"))).mode & 0o7777).toBe(0o644);
   });
 
+  it.skipIf(process.getuid?.() === 0)("keeps unchanged canonical modes for a legacy private remote copy", async () => {
+    let gid = 54_321;
+    while (gid === process.getegid!() || process.getgroups!().includes(gid)) gid++;
+    await fs.writeFile(path.join(root, "AGENTS.md"), "shared");
+    await fs.chmod(path.join(root, "AGENTS.md"), 0o644);
+    const remoteCwd = path.join(home, "legacy-private-remote");
+    await fs.mkdir(remoteCwd);
+    const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), remoteCwd };
+    const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand")
+      .mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() });
+    const runtime = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+      const remote = input.workspaceRemoteDir!;
+      await fs.mkdir(path.dirname(remote), { recursive: true });
+      await fs.cp(input.workspaceLocalDir, remote, { recursive: true });
+      return { target: executionTarget, workspaceRemoteDir: remote, runtimeRootDir: null,
+        assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+        restoreWorkspace: () => mergeDirectoryWithBaseline({ baseline: input.workspaceBaseline!, sourceDir: remote, targetDir: input.workspaceLocalDir }) };
+    });
+    try {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const copy = (await withAgentsGid(gid, () => copies.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget })))!;
+      expect(copy.receipt?.stagedGid).toBeUndefined();
+      const { stagedModeVersion: _version, ...legacyReceipt } = copy.receipt!;
+      await db.update(agentInstructionWorkingCopies).set({ receipt: legacyReceipt }).where(eq(agentInstructionWorkingCopies.runId, runId));
+      for (const relative of ["AGENTS.md", entryFile]) {
+        const mode = (await fs.stat(path.join(root, relative))).mode & 0o7777;
+        for (const dir of [copy.localRoot, copy.executionRoot]) await fs.chmod(path.join(dir, relative), mode);
+      }
+      const result = await copies.collectStopped({ companyId, runId, target: executionTarget });
+      expect(result?.state).toBe("unchanged");
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).mode & 0o7777).toBe(0o644);
+    } finally { runtime.mockRestore(); shell.mockRestore(); }
+  });
+
   it("does not fail prepare when a directory occupies the manifest cache path", async () => {
     await writeShared();
     const manifest = path.join(path.dirname(root), "file-sync", "canonical-manifest.json");
