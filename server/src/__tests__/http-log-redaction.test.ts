@@ -313,7 +313,7 @@ describe("HTTP logger redaction", () => {
       .send({ title: "ordinary task", token: "redact-me" });
     const log = JSON.parse(chunks.join("").trim());
     expect(log.reqBody).toEqual({
-      title: "[free text redacted, 13 chars]",
+      title: "ordinary task",
       token: "[REDACTED]",
     });
     expect(log.reqParams).toEqual({ id: "issue-1" });
@@ -825,8 +825,7 @@ describe("HTTP logger redaction of credential-shaped free text (SUP-25336)", () 
     const res = await (method === "PATCH" ? agent.patch(path) : agent.post(path)).send(body);
     expect(res.status).toBe(422);
     const log = chunks.join("");
-    expect(log).toContain('"probeEvidence":"[free text redacted, ');
-    expect(log).not.toContain("probeEvidence: ran curl");
+    expect(log).toContain("probeEvidence: ran curl");
     expectNoCredential(log);
   });
 
@@ -838,38 +837,25 @@ describe("HTTP logger redaction of credential-shaped free text (SUP-25336)", () 
       .patch("/api/issues/SUP-1")
       .send({ status: "done", comment: planted("comment"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } });
     const log = chunks.join("");
-    expect(log).toContain(`"comment":"[free text redacted, ${planted("comment").length} chars]"`);
-    expect(log).not.toContain("comment: ran curl");
+    expect(log).toContain("comment: ran curl");
     expectNoCredential(log);
   });
 
-  it("keeps a plain-prose field's key and drops its raw text", async () => {
-    const { app, chunks } = captureApp((_req, res) => {
-      res.status(422).json({ error: "refused" });
+  it("leaves a non-conflict 4xx response body on a secret-sensitive route unchanged", async () => {
+    const { app, chunks } = captureApp(() => undefined);
+    app.post("/api/chat-endpoints/:id/setup", (_req, _res, next) => {
+      next(new HttpError(422, `Provider rejected ${BEARER} for workspace`, { code: "setup_rejected", hint: `retry with ${OPENAI}` }));
     });
-    const reason = "operator wrote a long explanation of the close";
-    await request(app)
-      .patch("/api/issues/SUP-1")
-      .send({ status: "done", reason, title: "Sweep close", description: "Plain prose" });
-    const log = chunks.join("");
-    expect(log).toContain(`"reason":"[free text redacted, ${reason.length} chars]"`);
-    expect(log).toContain('"title":"[free text redacted, 11 chars]"');
-    expect(log).toContain('"description":"[free text redacted, 11 chars]"');
-    expect(log).not.toContain(reason);
-    expect(log).not.toContain("Sweep close");
-    expect(log).toContain('"status":"done"');
-  });
-
-  it("logs a non-sensitive operational field such as sessionId unchanged", async () => {
-    const { app, chunks } = captureApp((_req, res) => {
-      res.status(422).json({ error: "refused" });
+    app.use(errorHandler);
+    const res = await request(app)
+      .post("/api/chat-endpoints/ep-1/setup")
+      .send({ label: "workspace" });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({
+      error: `Provider rejected ${BEARER} for workspace`,
+      code: "setup_rejected",
+      details: { code: "setup_rejected", hint: `retry with ${OPENAI}` },
     });
-    const sessionId = "sk_session_1234567890abcdefghij";
-    await request(app)
-      .patch("/api/issues/SUP-1")
-      .send({ status: "done", sessionId, source: "https://svc.example/path" });
-    const log = chunks.join("");
-    expect(log).toContain(`"sessionId":"${sessionId}"`);
-    expect(log).toContain('"source":"https://svc.example/path"');
+    expectNoCredential(chunks.join(""));
   });
 });

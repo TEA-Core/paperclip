@@ -1377,6 +1377,72 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ]);
     });
 
+    it("POST comment: a conflicting interrupt+approval comment cancels no run and writes nothing", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier, firstStageId, implementerAgentId } =
+        await seedIssueAwaitingReview("D25336I", { deliveryRequirement: "record_only" });
+      const boardParticipant = { type: "user" as const, agentId: null, userId: "cloud-user-1" };
+      const liveRunId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db
+        .update(issues)
+        .set({
+          executionRunId: liveRunId,
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [{ id: firstStageId, type: "review", approvalsNeeded: 1, participants: [boardParticipant] }],
+            returnAssigneeAgentId: implementerAgentId,
+          },
+          executionState: {
+            status: "pending",
+            currentStageId: firstStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: boardParticipant,
+            returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: null,
+            changesRequestedCount: 0,
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({
+          body: `## Review: APPROVED\n\nShip it.\n\n${RECORD_ONLY_LINE}`,
+          interrupt: true,
+          doneTier: { tier: "tier2", probeEvidence: PROSE_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      const runRows = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, liveRunId));
+      expect(runRows[0]?.status).toBe("running");
+      expect(await auditRows(companyId, liveRunId, "heartbeat.cancelled")).toHaveLength(0);
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect((await commentBodies(issueId)).filter((body) => body.startsWith("## Review: APPROVED"))).toHaveLength(0);
+      expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused.map((row) => row.details)).toEqual([
+        expect.objectContaining({ code: "done_tier_dual_source_conflict", door: "comment_auto_approval" }),
+      ]);
+    });
+
     it("POST comment: auto-approval with an exactly equivalent dual source closes and keeps one declaration", async () => {
       const { companyId, reviewerAgentId, issueId, identifier } =
         await seedIssueAwaitingReview("D25336G", { deliveryRequirement: "record_only" });

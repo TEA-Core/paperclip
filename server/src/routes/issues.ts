@@ -27147,6 +27147,21 @@ export function issueRoutes(
       return;
     }
     if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment"))) return;
+    const issueExecutionStateBeforeComment = parseIssueExecutionState(issue.executionState);
+    const resolvedDoneTierCommentBody =
+      doneTier !== undefined &&
+      issue.status === "in_review" &&
+      issueExecutionStateBeforeComment?.status === "pending" &&
+      actorMatchesExecutionParticipant(actor, issueExecutionStateBeforeComment.currentParticipant ?? null) &&
+      isApprovalReviewComment(req.body.body)
+        ? await resolveDoneTierSourcesOrRefuse({
+          issue,
+          commentBody,
+          doneTier,
+          door: "comment_auto_approval",
+          runId: actor.runId ?? null,
+        })
+        : undefined;
     // Reopen the closed isolated workspace only after every access, resume-intent,
     // blocker, and run-cap gate passes. A rejected comment must not rebuild and
     // republish the workspace as active, because the issue stays terminal and the
@@ -27391,13 +27406,15 @@ export function issueRoutes(
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
       if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
-        commentBody = await resolveDoneTierSourcesOrRefuse({
-          issue: currentIssue,
-          commentBody,
-          doneTier,
-          door: "comment_auto_approval",
-          runId: actor.runId ?? null,
-        });
+        commentBody = resolvedDoneTierCommentBody !== undefined
+          ? resolvedDoneTierCommentBody
+          : await resolveDoneTierSourcesOrRefuse({
+            issue: currentIssue,
+            commentBody,
+            doneTier,
+            door: "comment_auto_approval",
+            runId: actor.runId ?? null,
+          });
         if (transition.decision) transition.decision.body = commentBody;
       }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {

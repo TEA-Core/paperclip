@@ -9,7 +9,6 @@ import {
 } from "./http-log-policy.js";
 import {
   redactHttpLogPayload,
-  redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
 import { redactSecretTokens } from "../log-redaction.js";
@@ -95,19 +94,6 @@ function requestLogUrl(req: {
   return isPrivateWebhook(req)
     ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
-}
-
-function redactErrorContext(error: unknown): unknown {
-  const redacted = redactSensitive(error);
-  if (
-    redacted &&
-    typeof redacted === "object" &&
-    typeof (redacted as { message?: unknown }).message === "string"
-  ) {
-    const withMessage = redacted as { message: string };
-    withMessage.message = redactSecretTokens(withMessage.message);
-  }
-  return redacted;
 }
 
 export function createHttpLogger(baseLogger: Logger) {
@@ -220,7 +206,7 @@ export function createHttpLogger(baseLogger: Logger) {
             // for setup routes; the status, route, and redacted body remain.
             errorContext: secretSensitiveRoute
               ? { name: "Error" }
-              : redactErrorContext(ctx.error),
+              : redactHttpLogPayload(ctx.error),
             reqBody: redactHttpLogPayload(ctx.reqBody),
             reqParams: redactHttpLogPayload(ctx.reqParams),
           };
