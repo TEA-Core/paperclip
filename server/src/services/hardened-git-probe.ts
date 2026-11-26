@@ -830,14 +830,17 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
 const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
 
 /**
- * The stash reflog's text; null when there is none or it is not a regular file
- * (a directory or FIFO in its place is unreadable evidence, nobody's).
- * `UNVERIFIED_STASH_REFLOG` when it is a regular file that is over the bound or
- * cannot be read whole.
+ * The stash reflog's text; null when there is none or it is a directory or FIFO
+ * (unreadable evidence, nobody's). `UNVERIFIED_STASH_REFLOG` when it is a
+ * symbolic link (git reads through the link, so its entries are real to git but
+ * are never read here), or a regular file that is over the bound or cannot be
+ * read whole.
  */
 async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
-  const regular = () => lstat(file).then((info) => info.isFile(), () => false);
-  if (!(await regular())) return null;
+  const info = await lstat(file).catch(() => null);
+  if (info?.isSymbolicLink()) return UNVERIFIED_STASH_REFLOG;
+  const regular = () => lstat(file).then((entry) => entry.isFile(), () => false);
+  if (!info?.isFile()) return null;
   try {
     return await readOptionalRegularFile(file, MAX_BUFFER);
   } catch {
@@ -859,7 +862,7 @@ async function cardStashRefusal(
   if (SHA_RE.test(tip)) ids.add(tip);
   const log = await readStashReflog(path.join(commonDir, "logs", "refs", "stash"));
   if (log === UNVERIFIED_STASH_REFLOG) {
-    return `holds a stash reflog that could not be verified (a regular file larger than ${MAX_BUFFER} bytes or unreadable)`;
+    return `holds a stash reflog that could not be verified (a symbolic link, a regular file larger than ${MAX_BUFFER} bytes, or unreadable)`;
   }
   for (const line of log?.split("\n") ?? []) {
     const id = line.split(" ", 2)[1] ?? "";

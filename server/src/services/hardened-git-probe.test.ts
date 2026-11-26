@@ -1840,6 +1840,56 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
     expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
   });
 
+  describe("a stash reflog that is a symbolic link", () => {
+    /** Move the reflog out of the repository and leave a symlink to it in its place. */
+    function symlinkReflog(fixture: StashFixture, contents?: string): string {
+      const target = path.join(mkdtempSync(path.join(root, "stash-reflog-target-")), "stash");
+      writeFileSync(target, contents ?? readFileSync(fixture.stashLog));
+      rmSync(fixture.stashLog);
+      symlinkSync(target, fixture.stashLog);
+      return target;
+    }
+
+    async function refusesUnverified(fixture: StashFixture) {
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+      expect((result as { reason: string }).reason).toContain("a symbolic link");
+    }
+
+    it("ST-53 refuses a symlinked reflog that holds this card's stash below a sibling's top", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture);
+      // Git reads through the link: this card's stash is still on the stack.
+      expect(stashList(fixture.m).split("\n")).toContain(own);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-54 refuses a symlinked reflog holding only a registered sibling's stash", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-55 refuses a symlink to an empty reflog", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture, "");
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-56 refuses a dangling reflog symlink", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      rmSync(symlinkReflog(fixture));
+      await refusesUnverified(fixture);
+    });
+  });
+
   describe("at the close write", () => {
     async function measuredWithSibling() {
       const fixture = stashFixture();
