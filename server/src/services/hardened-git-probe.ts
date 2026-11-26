@@ -1095,7 +1095,7 @@ type ReviewEntryFingerprint = Pick<
 const REVIEW_ENTRY_BUDGET_MS = 15_000;
 
 async function readRefs(worktreePath: string, options: HardenedGitOptions): Promise<string> {
-  return runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options);
+  return runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname) %(refname) %(*objectname)"], options);
 }
 
 /** HEAD, index bytes, porcelain status (tracked, untracked and ignored) and refs of one worktree. */
@@ -1134,9 +1134,10 @@ export async function captureReviewEntryWorktree(
     if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes|tags)\//.test(ref))) {
       return unattributed;
     }
-    const tagTargets = (await runHardenedGit(
-      ["-C", input.recordedWorktreePath, "for-each-ref", "--format=%(objectname) %(*objectname)", "refs/tags/"], options,
-    )).split("\n").filter(Boolean).map((line) => line.split(" ").filter(Boolean).at(-1)!);
+    const tagTargets = [...new Set(beforeRefs.split("\n").flatMap((line) => {
+      const [objectName, refName, peeled] = line.split(" ");
+      return refName?.startsWith("refs/tags/") ? [peeled || objectName!] : [];
+    }))];
     const probe = await probeNoRepositoryWorktree({ ...input, deadline });
     if (!probe.ok) return probe;
     const identity = await readWorktreeIdentity(probe.worktreePath, options);
@@ -1146,11 +1147,24 @@ export async function captureReviewEntryWorktree(
         await runHardenedGit(
           ["--git-dir", snapshot, "fsck", "--strict", "--no-reflogs", "--no-dangling", ...probe.comparedTips], options,
         );
-        for (const target of new Set(tagTargets)) {
-          const covered = await runHardenedGit(
-            ["--git-dir", snapshot, "merge-base", "--is-ancestor", target, input.publishedBaseSha], options,
-          ).then(() => true, () => false);
-          if (!covered) return null;
+        if (tagTargets.length > 0) {
+          const types = (await runHardenedGit(
+            ["--git-dir", snapshot, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            { ...options, input: `${tagTargets.join("\n")}\n` },
+          )).split("\n").filter(Boolean);
+          if (types.length !== tagTargets.length || types.some((line) => !line.endsWith(" commit"))) return null;
+          const baseIsLocal = await runHardenedGit(
+            ["--git-dir", snapshot, "cat-file", "-e", `${input.publishedBaseSha}^{commit}`], options,
+          ).then(() => true, (error: unknown) => {
+            if (deadline.expired) throw error;
+            return false;
+          });
+          const roots = [...probe.comparedTips, ...(baseIsLocal ? [input.publishedBaseSha] : [])];
+          const uncovered = (await runHardenedGit(
+            ["--git-dir", snapshot, "rev-list", "--count", "--stdin"],
+            { ...options, input: `${[...tagTargets, "--not", ...roots].join("\n")}\n` },
+          )).trim();
+          if (uncovered !== "0") return null;
         }
         return (await runHardenedGit(["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options)).trim();
       },

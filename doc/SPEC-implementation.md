@@ -452,8 +452,11 @@ and status-manifest digest (porcelain status plus the allowed ignored entries),
 under one 15-second Git budget. A provider refusal keeps its typed code
 (`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`);
 a tip the provider does not know (404/422 compare) is owed repository work.
-A `refs/tags/*` ref is admitted only when its peeled target is an ancestor of the
-pinned published base, checked against private snapshot metadata; any other tag,
+A `refs/tags/*` ref is admitted only when its peeled target is a commit reachable
+from the provider-attested compared tips (or from the pinned published base when
+that commit exists locally), checked in one batched traversal against private
+snapshot metadata; a provider base newer than the local clone does not block a
+tag already in proven ancestry. Any other tag,
 and any private ref outside branches, remote-tracking refs and covered tags
 (including a sibling worktree's `refs/stash`), refuses with
 `review_entry_git_refused`. Ownership is never inferred from equal content.

@@ -553,12 +553,25 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       ["a lightweight release tag on the published base", 200],
       ["an annotated release tag on the published base", 200],
       ["a tag on an unpublished commit", 409],
+      ["a tag on a tree", 409],
+      ["a release tag in proven HEAD ancestry after the provider base moved past the local clone", 200],
+      ["a few hundred release tags on the published base", 200],
     ] as const)("judges %s by published-base ancestry", async (kind, status) => {
       const fixture = await reviewFixture();
       const head = git(fixture.worktree, "rev-parse", "HEAD");
       if (kind.startsWith("a lightweight")) git(fixture.worktree, "tag", "v1.0.0", head);
       else if (kind.startsWith("an annotated")) git(fixture.worktree, "tag", "-a", "v1.0.0", "-m", "release", head);
-      else {
+      else if (kind === "a tag on a tree") git(fixture.worktree, "tag", "tree-only", git(fixture.worktree, "rev-parse", "HEAD^{tree}"));
+      else if (kind.startsWith("a release tag in proven")) {
+        git(fixture.worktree, "tag", "v1.0.0", head);
+        const upstream = git(currentOrigin, "commit-tree", "main^{tree}", "-p", "main", "-m", "merged elsewhere");
+        git(currentOrigin, "update-ref", "refs/heads/main", upstream);
+        expect(() => git(fixture.worktree, "cat-file", "-e", upstream)).toThrow();
+      } else if (kind.startsWith("a few hundred")) {
+        execFileSync("git", ["-C", fixture.worktree, "update-ref", "--stdin"], {
+          input: Array.from({ length: 300 }, (_, index) => `create refs/tags/v0.${index}.0 ${head}\n`).join(""), stdio: ["pipe", "pipe", "pipe"],
+        });
+      } else {
         const tree = git(fixture.worktree, "rev-parse", "HEAD^{tree}");
         git(fixture.worktree, "tag", "owed-work", git(fixture.worktree, "commit-tree", tree, "-p", head, "-m", "unpublished"));
       }
