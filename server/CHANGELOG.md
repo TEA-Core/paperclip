@@ -4,6 +4,8 @@
 
 ### Patch Changes
 
+- Add conditional first-review entry for recorded deliverables in exclusively owned isolated Git worktrees. The transaction retains immutable document revisions and an append-only receipt without creating close-tier evidence or discharging repository landing debt.
+
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
 ## 0.3.1

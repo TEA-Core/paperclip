@@ -4401,7 +4401,8 @@ registry.registerPath({
     "Closing to done or cancelled still clears the monitor. If its prior nextCheckAt is later than the close write, issue.monitor_cleared records details.previousNextCheckAt, details.recoveryPolicy (nullable), details.reason=cleared_by_close_future_check and the existing actorType/actorId/agentId/runId attribution. This records cancellation of the future check; it does not re-register it. Past-due monitors retain their ordinary clear behavior. " +
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
-    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
+    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee. " +
+    "reviewEntryPrecondition is an entry-only conditional request for the current assignee's recorded deliverable. Send only status=done, comment and the precondition, with the exact stored policy/state, status version, workspace and independent ruling/artifact revision IDs. A clean exclusively owned isolated Git worktree must be positively covered by a trusted published base. Shared primary directories, repository debt, re-entry and mixed mutations refuse with review_entry_* conflicts. The transaction commits in_review, the reviewer, inline comment and an immutable receipt together; reviewEntryReceiptId is returned. This is not close-tier or approval evidence. Reconcile unknown transport outcomes through the issue and review-entry-receipts reads.",
   request: {
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
@@ -4507,6 +4508,16 @@ registry.registerPath({
     },
     422: r.unprocessable,
   },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-receipts",
+  tags: ["issues"],
+  summary: "Read immutable first-review entry receipts",
+  description: "Company-scoped historical admission evidence. Retains the pinned ruling and reviewed artifact revisions and server-owned isolated-worktree, repository/base, actor/run and stage identities. A receipt is not an approval or reusable terminal-close proof.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

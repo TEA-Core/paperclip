@@ -375,6 +375,88 @@ bindings require a board delivery receipt. An existing receipt for the PR must
 still authorize the published head. A later head on the certified PR may be
 re-stamped only after Guard A verifies unchanged content.
 
+### Conditional first review entry for recorded deliverables
+
+`PATCH /api/issues/{id}` accepts an entry-only `reviewEntryPrecondition` with
+`status: done` and one inline submission `comment`. No other mutation may ride
+that request, including `doneTier`, classification, policy, assignment or delivery
+identity. The operation must leave the issue `in_review` at its first pending
+independent review stage. It is not a close, review decision, approval stamp,
+acceptance ruling or waiver of repository landing debt.
+
+The strict request pins:
+
+```json
+{
+  "status": "done",
+  "comment": "Submit the recorded summary for independent review.",
+  "reviewEntryPrecondition": {
+    "kind": "noRepositoryDelivery",
+    "expectedStatusVersion": 7,
+    "expectedExecutionWorkspaceId": "<workspace UUID>",
+    "expectedExecutionPolicy": {},
+    "expectedExecutionState": null,
+    "entryRulingRevisionId": "<revision UUID>",
+    "artifact": { "documentKey": "summary", "revisionId": "<revision UUID>" }
+  }
+}
+```
+
+Use the exact stored policy and execution state from the issue read, not the
+illustrative empty policy above. The current assignee must submit the request.
+An agent must own the issue's live execution and checkout run. The issue must
+already be `record_only`, with a never-entered ladder, an eligible independent
+reviewer, no linked repository delivery and no outstanding landing debt.
+The current `entry-ruling` revision must be substantive and independently authored.
+The current reviewed document revision must be separate from that ruling.
+
+Only the card's own active, managed isolated Git worktree is supported.
+The server resolves physical paths (including aliases) across workspace and live
+run records and refuses another card, workspace or run sharing that directory.
+`review_entry_workspace_not_isolated` names the remedy: provision an isolated
+worktree for this card. A `project_primary` directory cannot qualify, even clean.
+Provision summary-routine cards with their own isolated-worktree workspace after
+deployment; this change does not edit or migrate live routines.
+
+The owner yields its isolated directory while its conditional PATCH runs.
+This is a sole-owner local-worktree contract, not a privileged host freeze or a
+claim that database locks fence arbitrary host filesystem writers. Do not use it
+for shared folders or out-of-band writers. Authority-table writer locks exclude
+managed run/workspace aliases and evidence insertion through the commit. These
+conservative locks can briefly delay unrelated authority writes; lock contention
+and unsupported paths fail closed.
+
+GitHub credentialed reads pin the project's published base to a commit before
+the transaction. Every checked tip must be positively covered by that base;
+local default refs, equal trees and synthetic merge histories are not authority.
+The issue-locked transaction rechecks classification, debt, policy/state, owning
+run, repository binding, pinned revisions and physical exclusivity, recomputes
+the ordinary stage transition, and repeats the hardened clean/index/ignored-file,
+branch-attribution and Git-integrity proof under one 15-second Git budget.
+Private or tag refs outside the initial attributed-branch contract also refuse;
+this first implementation does not infer their ownership from equal content.
+
+The handoff, submission comment, `issue.review_entry_accepted` activity and
+append-only `issue_review_entry_receipts` row commit together. The response
+includes `reviewEntryReceiptId`, also with `Prefer: return=minimal`.
+`GET /api/issues/{id}/review-entry-receipts` is an ordinary company-scoped evidence
+read. It retains the immutable ruling and artifact revisions, actor/run, before
+and after versions, selected reviewer, repository/base identities and bounded Git
+snapshot digests. `capturedAt` and `recordedAt` are capture and transaction-write
+times, not an external clock's assertion of the exact commit instant.
+Receipt and pinned revision updates/deletes are refused by the database.
+As with the release-assurance ledger, a serving role cannot truncate it;
+privileged database administration remains outside the append-only guarantee.
+
+A stale, busy or unverified request returns a typed `review_entry_*` conflict
+without a successful receipt, inline comment or handoff. If the transport outcome
+is unknown, read the issue and receipts before deciding what to do; never resend
+without the precondition. A receipt cannot be consumed again after reopening,
+changes requested, policy edits or reassignment. Revised-artifact resubmission
+uses the existing review workflow. Final closure still needs fresh, lawful Tier
+evidence and all existing landing checks; an entry receipt is not that evidence.
+
+
 For a stranded pending execution-policy review/approval stage whose recorded
 agent participant is not its assignee, a board actor authorized to assign to
 that participant may call `POST /api/issues/{id}/restore-participant` with

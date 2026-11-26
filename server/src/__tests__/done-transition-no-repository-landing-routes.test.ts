@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -32,6 +32,7 @@ import {
   issueDocuments,
   issueDeliveryReceipts,
   issues,
+  issueReviewEntryReceipts,
   issueWorkProducts,
   nativeRunResults,
   completionContracts,
@@ -61,7 +62,7 @@ import {
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
-import type { recheckRecordedWorktree } from "../services/hardened-git-probe.js";
+import type { NoRepositoryWorktreeProbeInput, ReviewEntryWorktreeSnapshot, recheckRecordedWorktree } from "../services/hardened-git-probe.js";
 import type { StorageService } from "../storage/types.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
@@ -84,6 +85,10 @@ const realMeasureNoRepositoryLandingRef = vi.hoisted(() => ({
   current: null as typeof measureNoRepositoryLandingForClose | null,
 }));
 
+const mockCaptureReviewEntry = vi.hoisted(() => vi.fn());
+const realCaptureReviewEntry = vi.hoisted(() => ({
+  current: null as ((input: NoRepositoryWorktreeProbeInput) => Promise<ReviewEntryWorktreeSnapshot>) | null,
+}));
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
     getByName: mockGetByName,
@@ -99,9 +104,11 @@ vi.mock("../services/github-fetch.js", () => ({
 
 vi.mock("../services/hardened-git-probe.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/hardened-git-probe.js")>();
+  realCaptureReviewEntry.current = actual.captureReviewEntryWorktree;
+  mockCaptureReviewEntry.mockImplementation(actual.captureReviewEntryWorktree);
   realRecheckRecordedWorktreeRef.current = actual.recheckRecordedWorktree;
   mockRecheckRecordedWorktree.mockImplementation(actual.recheckRecordedWorktree);
-  return { ...actual, recheckRecordedWorktree: mockRecheckRecordedWorktree };
+  return { ...actual, recheckRecordedWorktree: mockRecheckRecordedWorktree, captureReviewEntryWorktree: mockCaptureReviewEntry };
 });
 
 vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
@@ -207,11 +214,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         status: repositoryAnswer.status,
       });
     }
+    const commit = /\/commits\/([^/]+)$/.exec(url);
+    if (commit) {
+      try {
+        return new Response(JSON.stringify({ sha: git(currentOrigin, "rev-parse", `${decodeURIComponent(commit[1]!)}^{commit}`) }));
+      } catch { return new Response("{}", { status: 404 }); }
+    }
     const match = /\/compare\/([^/]+)\.\.\.([0-9a-f]{40})$/.exec(url);
     if (!match) return new Response(JSON.stringify({}), { status: 404 });
     try {
       const ahead = Number.parseInt(git(currentOrigin, "rev-list", "--count", `${decodeURIComponent(match[1]!)}..${match[2]}`), 10);
-      return new Response(JSON.stringify({ ahead_by: ahead }), { status: 200 });
+      const baseSha = git(currentOrigin, "rev-parse", `${decodeURIComponent(match[1]!)}^{commit}`);
+      const mergeBase = git(currentOrigin, "merge-base", baseSha, match[2]!);
+      return new Response(JSON.stringify({
+        ahead_by: ahead, status: ahead > 0 ? "ahead" : baseSha === match[2] ? "identical" : "behind",
+        base_commit: { sha: baseSha }, merge_base_commit: { sha: mergeBase },
+      }), { status: 200 });
     } catch {
       return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
     }
@@ -238,6 +256,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockMeasureNoRepositoryLanding.mockImplementation(realMeasureNoRepositoryLandingRef.current!);
     mockRecheckRecordedWorktree.mockReset();
     mockRecheckRecordedWorktree.mockImplementation(realRecheckRecordedWorktreeRef.current!);
+    mockCaptureReviewEntry.mockReset();
+    mockCaptureReviewEntry.mockImplementation(realCaptureReviewEntry.current!);
   });
 
   async function insertCompany(prefix: string) {
@@ -472,6 +492,348 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   }
 
   const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch";
+
+  describe("conditional first review entry", () => {
+    async function reviewFixture() {
+      const fixture = await seed();
+      const policy = {
+        mode: "normal", commentRequired: true, stages: [{
+          id: randomUUID(), type: "review", participants: [{
+            type: "agent", agentId: fixture.rulerAgentId, userId: null,
+          }],
+        }],
+      };
+      await db.update(issues).set({
+        executionPolicy: policy, executionRunId: fixture.actor.runId, checkoutRunId: fixture.actor.runId,
+      }).where(eq(issues.id, fixture.issueId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId: fixture.issueId, executionWorkspaceId: fixture.executionWorkspaceId,
+      } }).where(eq(heartbeatRuns.id, fixture.actor.runId!));
+      const rulingId = await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+      const artifactId = await insertRuling({
+        companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId,
+        key: "summary", body: "Recorded summary: the work is the attached document, not a repository change.",
+      });
+      const [ruling] = await db.select().from(documentRevisions).where(eq(documentRevisions.documentId, rulingId));
+      const [artifact] = await db.select().from(documentRevisions).where(eq(documentRevisions.documentId, artifactId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      return { ...fixture, ruling: ruling!, artifact: artifact!, policy, body: {
+        status: "done", comment: "Submit the recorded summary for independent review.",
+        reviewEntryPrecondition: {
+          kind: "noRepositoryDelivery", expectedStatusVersion: issue!.statusVersion,
+          expectedExecutionWorkspaceId: fixture.executionWorkspaceId,
+          expectedExecutionPolicy: issue!.executionPolicy, expectedExecutionState: issue!.executionState,
+          entryRulingRevisionId: ruling!.id, artifact: { documentKey: "summary", revisionId: artifact!.id },
+        },
+      } };
+    }
+
+    async function noAcceptedEntry(issueId: string) {
+      expect(await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, issueId))).toEqual([]);
+      expect(await activityCount(issueId, "issue.review_entry_accepted")).toBe(0);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
+    }
+
+    it("atomically hands the pinned artifact to an independent reviewer without closing or approving", async () => {
+      const fixture = await reviewFixture();
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "in_review", assigneeAgentId: fixture.rulerAgentId, completedAt: null,
+        executionState: { status: "pending", currentStageId: fixture.policy.stages[0]!.id,
+          currentStageIndex: 0, completedStageIds: [], skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null },
+      });
+      const readback = await request(app).get(`/api/issues/${fixture.identifier}/review-entry-receipts`);
+      expect(readback.status).toBe(200);
+      expect(readback.body).toMatchObject([{
+        id: response.body.reviewEntryReceiptId, rulingRevisionId: fixture.ruling.id, artifactRevisionId: fixture.artifact.id,
+        beforeStatusVersion: fixture.body.reviewEntryPrecondition.expectedStatusVersion,
+        afterStatusVersion: fixture.body.reviewEntryPrecondition.expectedStatusVersion + 1,
+        evidence: { kind: "noRepositoryDelivery", noLandingDebt: true,
+          baseSha: git(currentOrigin, "rev-parse", "main"), snapshot: { ok: true, headSha: git(fixture.worktree, "rev-parse", "HEAD") } },
+      }]);
+      expect(await activityCount(fixture.issueId, "issue.review_entry_accepted")).toBe(1);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issueId));
+      expect(comments.map((comment) => comment.body)).toEqual([fixture.body.comment]);
+      for (const action of ["issue.done_transition_tier1_close", "issue.done_transition_tier2_close", "issue.execution_stage_approved"]) {
+        expect(await activityCount(fixture.issueId, action)).toBe(0);
+      }
+      expect(await db.select().from(issueDeliveryReceipts).where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issueId))).toEqual([]);
+      await expect(db.update(issueReviewEntryReceipts).set({ afterStatusVersion: 99 })
+        .where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).rejects.toThrow();
+      await expect(db.delete(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).rejects.toThrow();
+      await expect(db.update(documentRevisions).set({ body: "Changed after entry" })
+        .where(eq(documentRevisions.id, fixture.artifact.id))).rejects.toThrow();
+      await expect(db.delete(documentRevisions).where(eq(documentRevisions.id, fixture.ruling.id))).rejects.toThrow();
+      const foreignCompany = await insertCompany(`READ${seedSequence}`);
+      const foreignAgent = await insertAgent(foreignCompany, "Foreign reader");
+      const denied = await request(app).get(`/api/issues/${fixture.identifier}/review-entry-receipts`).set("x-test-actor",
+        JSON.stringify({ type: "agent", source: "agent_key", companyId: foreignCompany, agentId: foreignAgent }));
+      expect([403, 404]).toContain(denied.status);
+      expect(denied.body).not.toHaveProperty("evidence");
+    });
+
+    it.each(["project_primary", "alias", "symlink alias", "foreign alias", "project path", "another card", "another run", "run path", "run hint", "runtime service", "workspace operation"])(
+      "refuses a shared workspace: %s", async (kind) => {
+        const fixture = await reviewFixture();
+        if (kind === "project_primary") {
+          await db.update(executionWorkspaces).set({ strategyType: "project_primary", mode: "project_workspace" })
+            .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+        } else if (kind === "project path") {
+          await db.insert(projectWorkspaces).values({ companyId: fixture.companyId, projectId: fixture.projectId, name: "Alias project source", cwd: fixture.worktree });
+        } else if (kind === "runtime service") {
+          await db.insert(workspaceRuntimeServices).values({ id: randomUUID(), companyId: fixture.companyId,
+            executionWorkspaceId: fixture.executionWorkspaceId, scopeType: "execution_workspace", serviceName: "writer",
+            status: "running", lifecycle: "persistent", provider: "local", cwd: fixture.worktree });
+        } else if (kind === "workspace operation") {
+          await db.insert(workspaceOperations).values({ companyId: fixture.companyId, executionWorkspaceId: fixture.executionWorkspaceId,
+            phase: "sync", cwd: fixture.worktree, status: "running" });
+        } else if (kind.includes("alias")) {
+          const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+          let aliasPath = fixture.worktree;
+          if (kind === "symlink alias") {
+            aliasPath = `${fixture.worktree}-alias`;
+            symlinkSync(fixture.worktree, aliasPath);
+          }
+          const aliasCompanyId = kind === "foreign alias" ? await insertCompany(`ALIAS${seedSequence}`) : fixture.companyId;
+          await db.insert(executionWorkspaces).values({ ...workspace!, id: randomUUID(), companyId: aliasCompanyId, cwd: aliasPath, providerRef: aliasPath });
+        } else if (kind === "another card") {
+          await db.insert(issues).values({ companyId: fixture.companyId, title: "Borrowed", executionWorkspaceId: fixture.executionWorkspaceId });
+        } else {
+          await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
+            status: "running", contextSnapshot: kind === "run path" ? { cwd: fixture.worktree } : kind === "run hint" ?
+              { paperclipWorkspaces: [{ cwd: fixture.worktree }] } : { executionWorkspaceId: fixture.executionWorkspaceId } });
+        }
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toMatch(/^review_entry_workspace_/);
+        expect(response.body.error).toMatch(/isolated|finish|stop/);
+        expect(await statusOf(fixture.issueId)).toBe("in_progress");
+        await noAcceptedEntry(fixture.issueId);
+      },
+    );
+
+    it.each(["deliveryRequirement", "executionPolicy", "assigneeAgentId", "projectId", "executionWorkspaceId", "doneTier", "deliveryIdentity"])(
+      "refuses a simultaneous %s mutation before side effects", async (field) => {
+        const fixture = await reviewFixture();
+        const value = field === "deliveryRequirement" ? "record_only" : field === "executionPolicy" ? fixture.policy :
+          field === "doneTier" ? NO_REPOSITORY_DONE_TIER : field === "deliveryIdentity" ?
+            { repo: { owner: "TEA-Core", repo: "records" }, branch: fixture.branch, headSha: git(fixture.worktree, "rev-parse", "HEAD") } : randomUUID();
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ ...fixture.body, [field]: value });
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toBe("review_entry_request_refused");
+        await noAcceptedEntry(fixture.issueId);
+      },
+    );
+
+    it.each(["repository_delivery", "completed", "pending", "changes_requested", "orphaned", "parked", "self reviewer", "self ruling", "stale artifact", "stale ruling", "unpaid debt", "closed-tier comment", "wrong actor", "wrong workspace", "linked PR"])(
+      "fails closed on %s", async (kind) => {
+        const fixture = await reviewFixture();
+        if (kind === "repository_delivery") await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
+        else if (["completed", "pending", "changes_requested", "orphaned", "parked"].includes(kind)) {
+          await db.update(issues).set({ executionState: { status: kind, currentStageId: fixture.policy.stages[0]!.id } }).where(eq(issues.id, fixture.issueId));
+          const [row] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+          fixture.body.reviewEntryPrecondition.expectedExecutionState = row!.executionState;
+        } else if (kind === "self reviewer") {
+          fixture.policy.stages[0]!.participants[0]!.agentId = fixture.closerAgentId;
+          await db.update(issues).set({ executionPolicy: fixture.policy }).where(eq(issues.id, fixture.issueId));
+          fixture.body.reviewEntryPrecondition.expectedExecutionPolicy = fixture.policy;
+        } else if (kind === "self ruling") await db.update(documentRevisions).set({ createdByAgentId: fixture.closerAgentId }).where(eq(documentRevisions.id, fixture.ruling.id));
+        else if (kind === "stale artifact") fixture.body.reviewEntryPrecondition.artifact.revisionId = randomUUID();
+        else if (kind === "stale ruling") fixture.body.reviewEntryPrecondition.entryRulingRevisionId = randomUUID();
+        else if (kind === "unpaid debt") await db.insert(activityLog).values({
+          companyId: fixture.companyId, actorType: "system", actorId: "landing-debt", entityType: "issue", entityId: fixture.issueId,
+          action: "issue.repository_landing_debt", details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" },
+        });
+        else if (kind === "closed-tier comment") fixture.body.comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing";
+        else if (kind === "wrong actor") currentActor = { ...fixture.actor, agentId: fixture.rulerAgentId };
+        else if (kind === "wrong workspace") fixture.body.reviewEntryPrecondition.expectedExecutionWorkspaceId = randomUUID();
+        else if (kind === "linked PR") await db.insert(issueDeliveryReceipts).values({
+          companyId: fixture.companyId, sourceIssueId: fixture.issueId, provider: "github", owner: "TEA-Core", repo: "records",
+          pullRequestNumber: 1, headSha: git(fixture.worktree, "rev-parse", "HEAD"), branchName: fixture.branch,
+          recoveryReason: "Existing delivery", authorizedByActorType: "board", authorizedByActorId: "cloud-user-1",
+          idempotencyKey: randomUUID(),
+        });
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBeGreaterThanOrEqual(400);
+        expect(response.status).toBeLessThan(500);
+        await noAcceptedEntry(fixture.issueId);
+        if (kind === "unpaid debt") {
+          const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, fixture.issueId));
+          expect(rows.find((row) => row.action === "issue.repository_landing_debt")!.details).toMatchObject({ landingDebtDisposition: "outstanding" });
+        }
+      },
+    );
+
+    it.each(["tracked", "staged", "untracked", "ignored", "hidden index", "detached", "unknown branch", "private ref", "shallow", "bare", "unresolvable", "unpublished same-tree merge", "poisoned local default", "unavailable provider"])(
+      "refuses uncertain Git proof: %s", async (kind) => {
+        const fixture = await reviewFixture();
+        if (["tracked", "staged", "hidden index"].includes(kind)) {
+          writeFileSync(path.join(fixture.worktree, "README.md"), "owed bytes\n");
+          if (kind === "staged") git(fixture.worktree, "add", "README.md");
+          if (kind === "hidden index") git(fixture.worktree, "update-index", "--assume-unchanged", "README.md");
+        } else if (kind === "untracked") writeFileSync(path.join(fixture.worktree, "owed.txt"), "owed\n");
+        else if (kind === "ignored") {
+          writeFileSync(path.join(fixture.repoRoot, ".git", "info", "exclude"), "owed.txt\n");
+          writeFileSync(path.join(fixture.worktree, "owed.txt"), "owed\n");
+        } else if (kind === "detached") git(fixture.worktree, "checkout", "--detach", "-q");
+        else if (kind === "unknown branch") git(fixture.repoRoot, "branch", "unattributed");
+        else if (kind === "private ref") git(fixture.worktree, "update-ref", "refs/private/owed", git(fixture.worktree, "rev-parse", "HEAD"));
+        else if (kind === "shallow") writeFileSync(path.join(fixture.repoRoot, ".git", "shallow"), `${git(fixture.worktree, "rev-parse", "HEAD")}\n`);
+        else if (kind === "bare") await db.update(executionWorkspaces).set({ cwd: currentOrigin, providerRef: currentOrigin })
+          .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+        else if (kind === "unresolvable") rmSync(path.join(fixture.worktree, ".git"));
+        else if (kind === "unpublished same-tree merge") {
+          const head = git(fixture.worktree, "rev-parse", "HEAD");
+          const tree = git(fixture.worktree, "rev-parse", "HEAD^{tree}");
+          const side1 = git(fixture.worktree, "commit-tree", tree, "-p", head, "-m", "side one");
+          const side2 = git(fixture.worktree, "commit-tree", tree, "-p", head, "-m", "side two");
+          const merge = git(fixture.worktree, "commit-tree", tree, "-p", head, "-p", side1, "-p", side2, "-m", "same tree synthetic history");
+          git(fixture.worktree, "reset", "--hard", merge);
+        } else if (kind === "poisoned local default") {
+          git(fixture.worktree, "commit", "--allow-empty", "-qm", "not published");
+          git(fixture.worktree, "update-ref", "refs/remotes/origin/main", git(fixture.worktree, "rev-parse", "HEAD"));
+        } else repositoryAnswer.status = 503;
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        await noAcceptedEntry(fixture.issueId);
+      },
+    );
+
+    it.each(["classification", "policy", "assignee", "run", "workspace", "base", "ruling", "artifact", "debt", "dirt", "HEAD", "alias", "terminal"])(
+      "rejects a %s race after capture without a partial handoff", async (kind) => {
+        const fixture = await reviewFixture();
+        mockCaptureReviewEntry.mockImplementationOnce(async (input: NoRepositoryWorktreeProbeInput) => {
+          const snapshot = await realCaptureReviewEntry.current!(input);
+          if (kind === "classification") await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
+          else if (kind === "policy") await db.update(issues).set({ executionPolicy: { ...fixture.policy, commentRequired: false } }).where(eq(issues.id, fixture.issueId));
+          else if (kind === "assignee") await db.update(issues).set({ assigneeAgentId: fixture.rulerAgentId }).where(eq(issues.id, fixture.issueId));
+          else if (kind === "run") await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, fixture.issueId));
+          else if (kind === "workspace") await db.update(executionWorkspaces).set({ sourceIssueId: null }).where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+          else if (kind === "base") await db.update(projectWorkspaces).set({ defaultRef: "release" }).where(eq(projectWorkspaces.id, fixture.projectWorkspaceId));
+          else if (kind === "ruling" || kind === "artifact") await db.update(documents).set({ latestRevisionNumber: 2 })
+            .where(eq(documents.id, kind === "ruling" ? fixture.ruling.documentId : fixture.artifact.documentId));
+          else if (kind === "debt") await db.insert(activityLog).values({ companyId: fixture.companyId, actorType: "system", actorId: "landing-debt",
+            entityType: "issue", entityId: fixture.issueId, action: "issue.repository_landing_debt",
+            details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" } });
+          else if (kind === "dirt") writeFileSync(path.join(fixture.worktree, "README.md"), "race\n");
+          else if (kind === "HEAD") git(fixture.worktree, "commit", "--allow-empty", "-qm", "race");
+          else if (kind === "alias") {
+            const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+            await db.insert(executionWorkspaces).values({ ...workspace!, id: randomUUID() });
+          } else await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, fixture.issueId));
+          return snapshot;
+        });
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        await noAcceptedEntry(fixture.issueId);
+      },
+    );
+
+    it("excludes a competing physical-path claim through the commit barrier", async () => {
+      const fixture = await reviewFixture();
+      // The project's ES2022 type library has no Promise.withResolvers.
+      let release!: () => void;
+      let captured!: () => void;
+      const captureReached = new Promise<void>((resolve) => { captured = resolve; });
+      const canCommit = new Promise<void>((resolve) => { release = resolve; });
+      mockCaptureReviewEntry.mockImplementationOnce(realCaptureReviewEntry.current!)
+        .mockImplementationOnce(async (input: NoRepositoryWorktreeProbeInput) => {
+          const snapshot = await realCaptureReviewEntry.current!(input);
+          captured();
+          await canCommit;
+          return snapshot;
+        });
+      const entry = request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body).then((response) => response);
+      await captureReached;
+      try {
+        await expect(db.transaction(async (tx) => {
+          await tx.execute(sql`SET LOCAL lock_timeout = '100ms'`);
+          await tx.insert(executionWorkspaces).values({
+            companyId: fixture.companyId, projectId: fixture.projectId, name: "Competing path claim",
+            mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
+            cwd: fixture.worktree, providerRef: fixture.worktree,
+          });
+        })).rejects.toThrow();
+      } finally { release(); }
+      const response = await entry;
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.cwd, fixture.worktree))).toHaveLength(1);
+      expect(await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).toHaveLength(1);
+    });
+
+    it("preserves revised-artifact resubmission and fresh record-only final evidence", async () => {
+      const fixture = await reviewFixture();
+      expect((await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body)).status).toBe(200);
+      const reviewed = await request(app).get(`/api/issues/${fixture.identifier}/documents/summary`);
+      expect(reviewed.status).toBe(200);
+      expect(reviewed.body.body ?? reviewed.body.latestBody).toBe(fixture.artifact.body);
+      async function bindRun(agentId: string) {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, fixture.companyId));
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runId, companyId: fixture.companyId, agentId, status: "running",
+          startedAt: new Date(Date.now() - 1000), contextSnapshot: { issueId: fixture.issueId, executionWorkspaceId: fixture.executionWorkspaceId } });
+        await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, fixture.issueId));
+        currentActor = { type: "agent", source: "agent_key", companyId: fixture.companyId, agentId, runId };
+      }
+      await bindRun(fixture.rulerAgentId);
+      const bounced = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+        status: "in_progress", comment: "Please clarify the summary's conclusion.",
+      });
+      expect(bounced.status, JSON.stringify(bounced.body)).toBe(200);
+      expect(bounced.body).toMatchObject({ assigneeAgentId: fixture.closerAgentId, executionState: { status: "changes_requested" } });
+      const revisedBody = "Revised recorded summary: the conclusion is explicit and meets the document request.";
+      const [revised] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId: fixture.artifact.documentId,
+        revisionNumber: 2, body: revisedBody, createdByAgentId: fixture.closerAgentId }).returning();
+      await db.update(documents).set({ latestRevisionNumber: 2, latestBody: revisedBody, updatedByAgentId: fixture.closerAgentId })
+        .where(eq(documents.id, fixture.artifact.documentId));
+      await bindRun(fixture.closerAgentId);
+      const resubmitted = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+        status: "done", comment: "The revised summary clarifies the conclusion.",
+      });
+      expect(resubmitted.status, JSON.stringify(resubmitted.body)).toBe(200);
+      expect(resubmitted.body.status).toBe("in_review");
+      await bindRun(fixture.rulerAgentId);
+      const absent = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done", comment: "The entry receipt is present." });
+      expect(absent.status).toBe(422);
+      for (const probeEvidence of [
+        "record-only probe `node document-check` target document:" + revised!.id + " observed 2000-01-01T00:00:00Z result: pass reviewed document is correct",
+        "record-only probe `node document-check` target document:" + revised!.id + ` observed ${new Date().toISOString()} result: fail reviewed document is incorrect`,
+      ]) {
+        const refused = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done", doneTier: { tier: "tier2", probeEvidence } });
+        expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      }
+      const script = "if (!JSON.parse(process.argv[1]).includes('Revised')) process.exit(1)";
+      execFileSync(process.execPath, ["-e", script, JSON.stringify(revisedBody)], { stdio: "pipe" });
+      const probeEvidence = "record-only probe `node -e \"" + script + "\" '" + JSON.stringify(revisedBody) +
+        "'` target document:" + revised!.id + ` observed ${new Date().toISOString()} result: pass reviewed document contains the requested revision`;
+      const approved = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+        status: "done", doneTier: { tier: "tier2", probeEvidence },
+      });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      expect(approved.body.status).toBe("done");
+      expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
+      const receipts = await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId));
+      expect(receipts).toMatchObject([{ artifactRevisionId: fixture.artifact.id }]);
+    });
+
+    it("allows exactly one concurrent first entry and refuses receipt reuse after reopen", async () => {
+      const fixture = await reviewFixture();
+      const responses = await Promise.all([0, 1].map(() => request(app).patch(`/api/issues/${fixture.identifier}`)
+        .set("x-test-actor", JSON.stringify(fixture.actor)).send(fixture.body)));
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+      expect(await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).toHaveLength(1);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issueId))).toHaveLength(1);
+      await db.update(issues).set({ status: "in_progress", executionState: null, assigneeAgentId: fixture.closerAgentId,
+        executionRunId: fixture.actor.runId, checkoutRunId: fixture.actor.runId }).where(eq(issues.id, fixture.issueId));
+      const [reopened] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      fixture.body.reviewEntryPrecondition.expectedStatusVersion = reopened!.statusVersion;
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+      expect(await activityCount(fixture.issueId, "issue.review_entry_accepted")).toBe(1);
+    });
+  });
 
   it("closes a record_only issue whose own worktree is empty and whose entry ruling another agent wrote", async () => {
     const fixture = await seed();

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
 import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
@@ -722,6 +723,8 @@ export interface NoRepositoryWorktreeProbeInput {
    */
   countCommitsAheadOfBase: (sha: string) => Promise<number>;
   timeoutMs?: number;
+  /** One shared budget, including all subprocesses and index snapshot copies. */
+  deadline?: ProbeDeadline;
 }
 
 export type NoRepositoryWorktreeProbeResult =
@@ -912,7 +915,9 @@ export async function probeNoRepositoryWorktree(
   } catch {
     return refuse("the managed checkout has no .git directory");
   }
-  const options: HardenedGitOptions = { cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: managedRoot };
+  const options: HardenedGitOptions = {
+    cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: managedRoot, deadline: input.deadline,
+  };
 
   const own = await verifyCleanLinkedWorktree(candidate, commonDir, options);
   if (!own.ok) return refuse(`the recorded worktree ${own.reason}`);
@@ -1044,4 +1049,67 @@ export async function recheckRecordedWorktree(input: {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
   return { ok: true };
+}
+
+export type ReviewEntryWorktreeSnapshot =
+  | {
+      ok: true;
+      branch: string;
+      headSha: string;
+      treeSha: string;
+      worktreePath: string;
+      commonDir: string;
+      comparedTips: string[];
+      indexDigest: string;
+      refsDigest: string;
+      statusManifestDigest: string;
+    }
+  | { ok: false; reason: string };
+
+/** Entry uses the established clean/attribution predicate, plus object integrity
+ * and content-addressed metadata. No tree-equivalence or local-base shortcut.
+ * Repository drivers never run: fsck, index and tree reads use private metadata.
+ */
+export async function captureReviewEntryWorktree(
+  input: NoRepositoryWorktreeProbeInput,
+): Promise<ReviewEntryWorktreeSnapshot> {
+  const deadline: ProbeDeadline = { at: performance.now() + 15_000, expired: false };
+  const options: HardenedGitOptions = { cwd: "/", deadline };
+  try {
+    const beforeRefs = await runHardenedGit(
+      ["-C", input.recordedWorktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options,
+    );
+    if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes)\//.test(ref))) {
+      return { ok: false, reason: "Unattributed private or tag refs prevent strict first-entry proof" };
+    }
+    const probe = await probeNoRepositoryWorktree({ ...input, deadline });
+    if (!probe.ok) return probe;
+    const identity = await readWorktreeIdentity(probe.worktreePath, options);
+    return await withSnapshotGitDir(
+      { identity, headSha: probe.headSha, config: snapshotConfig(identity.objectFormat), exclude: null, deadline },
+      async (snapshot) => {
+        await runHardenedGit(
+          ["--git-dir", snapshot, "fsck", "--strict", "--no-reflogs", "--no-dangling", ...probe.comparedTips], options,
+        );
+        const treeSha = (await runHardenedGit(
+          ["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options,
+        )).trim();
+        const hash = createHash("sha256");
+        await withRegularFile(path.join(snapshot, "index"), MAX_INDEX_FILE_BYTES, async (handle) => {
+          for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
+        });
+        const afterRefs = await runHardenedGit(
+          ["-C", probe.worktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options,
+        );
+        if (beforeRefs !== afterRefs) return { ok: false as const, reason: "Git refs changed during first-entry capture" };
+        return {
+          ...probe, treeSha, indexDigest: hash.digest("hex"),
+          refsDigest: createHash("sha256").update(afterRefs).digest("hex"),
+          statusManifestDigest: createHash("sha256").update("clean;index-checked;ignored-artifact-allowlist-v1").digest("hex"),
+        };
+      },
+    );
+  } catch {
+    return { ok: false, reason: deadline.expired ? "First-entry Git proof timed out" : "First-entry Git integrity could not be verified" };
+  }
 }

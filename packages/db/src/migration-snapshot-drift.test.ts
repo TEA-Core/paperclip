@@ -15,7 +15,7 @@ import { generateDrizzleJson, generateMigration } from "drizzle-kit/api";
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const schemaDir = fileURLToPath(new URL("./schema", import.meta.url));
 
-type JournalEntry = { idx: number; tag: string };
+type JournalEntry = { tag: string };
 
 async function readNewestSnapshot(): Promise<{ file: string; snapshot: Record<string, unknown> }> {
   const journal = JSON.parse(
@@ -23,7 +23,8 @@ async function readNewestSnapshot(): Promise<{ file: string; snapshot: Record<st
   ) as { entries: JournalEntry[] };
   const newest = journal.entries.at(-1);
   if (!newest) throw new Error("migration journal has no entries");
-  const file = `${String(newest.idx).padStart(4, "0")}_snapshot.json`;
+  // Folded history can leave gaps between journal ordinals and migration numbers.
+  const file = `${newest.tag.split("_", 1)[0]}_snapshot.json`;
   const snapshot = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8")) as Record<
     string,
     unknown
