@@ -12501,7 +12501,16 @@ export function issueService(
             parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
             isolatedWorkspacesEnabled,
           ),
-          suppliedExecutionWorkspaceId: issueData.executionWorkspaceId,
+          // SUP-24798: re-supplying the id the issue already holds changes no
+          // binding, so it is not an override. The delivery-identity stamp on a
+          // project_primary row re-supplies the stored id (board refresh and the
+          // agent's entry into review); counting it refused that write in every
+          // allowIssueOverride:false project. A different id, or any
+          // preference, is still checked as before.
+          suppliedExecutionWorkspaceId:
+            issueData.executionWorkspaceId === existing.executionWorkspaceId
+              ? undefined
+              : issueData.executionWorkspaceId,
           suppliedExecutionWorkspacePreference: issueData.executionWorkspacePreference,
         });
       }
