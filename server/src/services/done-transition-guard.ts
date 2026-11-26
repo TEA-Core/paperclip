@@ -268,18 +268,13 @@ function canonicalDeclarationTier(trimmedLine: string): DoneTierSourceTier | nul
 
 const DONE_TIER_COMMAND_REDACTED = "`<command redacted>`";
 
-function boundDoneTierExcerpt(text: string): string {
-  const redacted = text
-    .replace(/`[^`]*`?/g, DONE_TIER_COMMAND_REDACTED)
-    .replace(/\s+/g, " ")
-    .trim();
-  return redacted.length > DONE_TIER_CONFLICT_EXCERPT_LIMIT
-    ? `${redacted.slice(0, DONE_TIER_CONFLICT_EXCERPT_LIMIT - 1)}…`
-    : redacted;
+function redactedDoneTierField(name: string, value: string): string {
+  return `<${name} redacted, ${value.length} chars>`;
 }
 
 // A conflict response never echoes caller free text: a parsed declaration is
-// rebuilt from its non-command fields, anything unparsed becomes a marker.
+// rebuilt from its structural, enumerated and validated fields only, and every
+// free-text field (and anything unparsed) becomes a length marker.
 function doneTierConflictExcerpt(tier: DoneTierSourceTier, trimmedLine: string): string {
   const prefix = tier === "tier2" ? TIER_2_PREFIX : tier === "tier1" ? TIER_1_PREFIX : TIER_0_PREFIX;
   const fields = tier === "tier0" ? null : declarationLineFields(tier, trimmedLine);
@@ -289,16 +284,20 @@ function doneTierConflictExcerpt(tier: DoneTierSourceTier, trimmedLine: string):
   }
   const rest =
     fields.form === "record-only"
-      ? `record-only probe ${DONE_TIER_COMMAND_REDACTED} target ${fields.target} observed ${fields.observedStart}` +
-        `${fields.observedEnd ? `-${fields.observedEnd}` : ""} result: ${fields.result} ${fields.predicate}`
+      ? `record-only probe ${DONE_TIER_COMMAND_REDACTED} target ${redactedDoneTierField("target", fields.target)} ` +
+        `observed ${fields.observedStart}${fields.observedEnd ? `-${fields.observedEnd}` : ""} ` +
+        `result: ${fields.result} ${redactedDoneTierField("predicate", fields.predicate)}`
       : fields.form === "merge-head"
-        ? `probe ${DONE_TIER_COMMAND_REDACTED} head ${fields.head} post-merge: ${fields.postMerge}`
+        ? `probe ${DONE_TIER_COMMAND_REDACTED} head ${fields.head} post-merge: ${redactedDoneTierField("postMerge", fields.postMerge)}`
         : `${fields["landing.mode"] === "landedAtTip"
           ? `landed-at-tip ${fields["landing.mergeCommit"]}`
           : fields["landing.mode"] === "landingDelegated"
-            ? `landing-delegated PR #${fields["landing.prNumber"]} via ${fields["landing.carrier"]}`
-            : "no-repository-landing"} — ${fields.reason}. ${TIER_1_SUFFIX}`;
-  return boundDoneTierExcerpt(`${prefix} ${rest}`);
+            ? `landing-delegated PR #${fields["landing.prNumber"]} via ${redactedDoneTierField("carrier", fields["landing.carrier"])}`
+            : "no-repository-landing"} — ${redactedDoneTierField("reason", fields.reason)}. ${TIER_1_SUFFIX}`;
+  const excerpt = `${prefix} ${rest}`;
+  return excerpt.length > DONE_TIER_CONFLICT_EXCERPT_LIMIT
+    ? `${excerpt.slice(0, DONE_TIER_CONFLICT_EXCERPT_LIMIT - 1)}…`
+    : excerpt;
 }
 
 function containsCanonicalPrefix(text: string): boolean {

@@ -1240,6 +1240,29 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ]);
     });
 
+    it("PATCH: a conflict never echoes free-text declaration fields in the response or the refusal audit", async () => {
+      const { companyId, issueId, identifier } = await seedRecordOnlyClose("D25336L");
+      const leakyLine =
+        "Closed at Tier 2 (live): record-only probe `probe-cmd` target svc-sk-live-LEAK-target observed 2026-11-04T09:15:00Z result: pass ran curl -H Authorization: Bearer sk-live-LEAK-predicate";
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Sweep consumed.\n\n${leakyLine}`,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused).toHaveLength(1);
+      for (const serialized of [JSON.stringify(res.body), JSON.stringify(refused)]) {
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+      }
+      expect((await commentBodies(issueId)).filter((body) => body.includes("Sweep consumed"))).toHaveLength(0);
+    });
+
     it("PATCH: a different record-only observation time is refused, never silently replaced", async () => {
       const { issueId, identifier } = await seedRecordOnlyClose("D25336B");
       const res = await request(app)

@@ -5698,6 +5698,49 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(structured.sources.comment.declarations[0]?.excerpt).toContain("record-only probe `<command redacted>` target ");
     });
 
+    it.each([
+      [
+        "record-only target and predicate",
+        "record-only probe `probe-cmd` target svc-Bearer-sk-live-LEAK-target observed 2026-11-04T09:15:00Z result: pass ran curl -H Authorization: Bearer sk-live-LEAK-predicate",
+      ],
+      [
+        "merge-head postMerge",
+        "probe `probe-cmd` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: ran curl -H Authorization: Bearer sk-live-LEAK-postmerge",
+      ],
+    ])("rebuilt Tier 2 excerpts redact free-text fields (%s) on both sides", (_label, evidence) => {
+      const fromComment = conflictOf(`Closed at Tier 2 (live): ${evidence}`, { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE });
+      const fromStructured = conflictOf(TIER1_LINE, { tier: "tier2", probeEvidence: evidence });
+      expect(fromComment.sources.comment.status).toBe("valid");
+      expect(fromStructured.sources.structured.status).toBe("valid");
+      for (const conflict of [fromComment, fromStructured]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+        expect(serialized).toMatch(/redacted, \d+ chars>/);
+      }
+    });
+
+    it("rebuilt Tier 1 excerpts redact the reason and carrier on both sides", () => {
+      const leaky = {
+        tier: "tier1" as const,
+        reason: "ran curl -H Authorization: Bearer sk-live-LEAK-reason",
+        landing: { mode: "landingDelegated" as const, prNumber: 42, carrier: "done-close-landing-backstop" as const },
+      };
+      const leakyLine =
+        "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #42 via sk-live-LEAK-carrier — ran curl -H Authorization: Bearer sk-live-LEAK-reason. Liveness unverified.";
+      const fromComment = conflictOf(leakyLine, TIER1_DECLARATION);
+      const fromStructured = conflictOf(TIER1_LINE, leaky);
+      expect(fromComment.sources.comment.status).toBe("valid");
+      expect(fromStructured.sources.structured.excerpt).toContain(
+        "landing-delegated PR #42 via <carrier redacted, 27 chars> — <reason redacted,",
+      );
+      for (const conflict of [fromComment, fromStructured]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+      }
+    });
+
     it("accepts an exactly equivalent dual source and keeps the original comment with one declaration", () => {
       const comment = `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}\n\nFollow-up: none.`;
       const resolution = resolveDoneTierDeclarationSources(comment, {
