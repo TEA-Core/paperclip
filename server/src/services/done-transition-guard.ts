@@ -31,12 +31,17 @@ import { conflict } from "../errors.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { readBuildCommit } from "../build-commit.js";
 import {
-  LEGACY_WORKTREE_GIT_OPTIONS,
+  HardenedGitError,
+  isLegacyProbeUnverified,
+  type LegacyProbeResult,
+  type LegacyProbeUnverified,
+  legacyWorktreeIsDirty,
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
   recheckRecordedWorktree,
   runHardenedGit,
+  runLegacyWorktreeProbe,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { detectEvidence } from "./card-evidence.js";
@@ -617,45 +622,42 @@ async function resolveGitHubRefHeadSha(
   return sha.toLowerCase();
 }
 
-// SUP-22880: the local-worktree probes below read an agent-writable workspace.
-// They keep the server's own git environment and configuration, so
-// safe.directory and global config still apply and an unmeasured probe is no
-// likelier than before, and lose only the GIT_DIR, GIT_WORK_TREE and
-// GIT_INDEX_FILE variables that would redirect which repository they read.
-// fsmonitor and hooks are forced off, and the process cwd is "/", never the
-// probed workspace. As before, no timeout applies: a slow status must finish
-// and block, not time out into a fail-open. Both callers fail open on an
-// unmeasured result.
-function runGit(args: string[], cwd: string): Promise<string> {
-  return runHardenedGit(["-C", cwd, ...args], LEGACY_WORKTREE_GIT_OPTIONS);
-}
+// SUP-22880 / SUP-23163: the local-worktree probes below read an
+// agent-writable workspace, so they run under the hardened runner
+// (hardened-git-probe.ts `runLegacyWorktreeProbe`): a root-owned git, a
+// from-scratch environment carrying only the server's safe.directory list, no
+// transport or lazy fetch, a snapshot git dir for the status, and a timeout
+// that kills the process group. Both callers still fail open on null (git ran
+// and could not answer) and fail closed on an unverified result (the probe
+// could not run safely or to completion).
 
 /**
  * Count commits ahead of the remote base ref that are attributable to the given
- * issue identifier (subject or trailer match). Returns null when the probe is
- * unreachable (missing worktree, git failure, unresolvable base ref) so callers
- * can fail open instead of blocking on a signal they could not measure.
+ * issue identifier (subject or trailer match). Returns null when git could not
+ * answer (missing worktree, git failure, unresolvable base ref) so callers can
+ * fail open, and an unverified result, on which callers fail closed, when the
+ * probe could not run safely or to completion.
  */
 export async function countIssueAttributableCommits(
   worktreePath: string,
   defaultRef: string,
   identifier: string | null,
-): Promise<{ aheadCount: number; attributableCount: number } | null> {
+): Promise<LegacyProbeResult<{ aheadCount: number; attributableCount: number }>> {
   if (!identifier) return null;
-  try {
+  return runLegacyWorktreeProbe(async (options) => {
     const range = `${defaultRef}..HEAD`;
-    const aheadRaw = await runGit(["rev-list", "--count", range], worktreePath);
-    const attributableRaw = await runGit(
-      ["rev-list", "--fixed-strings", "--count", "--grep", identifier, range],
-      worktreePath,
+    const aheadRaw = await runHardenedGit(["-C", worktreePath, "rev-list", "--count", range], options);
+    const attributableRaw = await runHardenedGit(
+      ["-C", worktreePath, "rev-list", "--fixed-strings", "--count", "--grep", identifier, range],
+      options,
     );
     const aheadCount = Number.parseInt(aheadRaw.trim(), 10);
     const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
-    if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
+    if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) {
+      throw new HardenedGitError("failed", "unparseable commit count");
+    }
     return { aheadCount, attributableCount };
-  } catch {
-    return null;
-  }
+  });
 }
 
 /**
@@ -664,17 +666,53 @@ export async function countIssueAttributableCommits(
  * discriminator for the foreign-branch block: a clean worktree with zero
  * attributable commits and no merged PR owes no observable repo content — the
  * no-repo-deliverable shape (design/spec cards whose acceptance is a recorded
- * decision, SUP-13873). Returns null when the probe is unreachable (path
- * missing, git failure) so callers fail open instead of blocking on an
- * unmeasured signal.
+ * decision, SUP-13873). Returns null when git could not answer (path missing,
+ * git failure) so callers fail open, and an unverified result, on which
+ * callers fail closed, when the probe could not run safely or to completion.
  */
-export async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
-  try {
-    const out = await runGit(["status", "--porcelain"], worktreePath);
-    return out.split(/\r?\n/).some((line) => line.trim().length > 0);
-  } catch {
-    return null;
-  }
+export async function worktreeHasUncommittedContent(worktreePath: string): Promise<LegacyProbeResult<boolean>> {
+  return runLegacyWorktreeProbe((options) => legacyWorktreeIsDirty(worktreePath, options));
+}
+
+/**
+ * The repository_delivery refusal for a legacy worktree probe that could not
+ * run safely or to completion (SUP-23163): the close is refused, never allowed
+ * on a signal the probe could not verify.
+ */
+function legacyProbeUnverifiedRefusal(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  probe: "attribution" | "worktree status",
+  unverified: LegacyProbeUnverified,
+  at: { aheadBy: number | null; branch: string; defaultRef: string; owner: string; repo: string; skipReason: string | null },
+): DoneTransitionGuardResult {
+  const token = `legacy_worktree_probe_unverified:${probe === "attribution" ? "attribution" : "status"}`;
+  void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    reason: token,
+    skipReason: appendSkipReason(at.skipReason, token),
+    probeReason: unverified.reason,
+    branch: at.branch,
+    defaultRef: at.defaultRef,
+    owner: at.owner,
+    repo: at.repo,
+    aheadBy: at.aheadBy,
+  });
+  return {
+    allowed: false,
+    reason:
+      `The ${probe} probe of the issue's worktree for branch ${at.branch} could not be verified ` +
+      `(${unverified.reason}), so the transition is refused rather than allowed on an unverified signal. ` +
+      "Retry the close once the probe can run, or set doneTransitionOverride to a sanctioned " +
+      "no-deliverable-head disposition.",
+    aheadBy: at.aheadBy,
+    branch: at.branch,
+    defaultRef: at.defaultRef,
+    owner: at.owner,
+    repo: at.repo,
+    mechanism: "delivery",
+    skipped: false,
+    skipReason: appendSkipReason(at.skipReason, token),
+  };
 }
 
 /**
@@ -6494,9 +6532,25 @@ async function evaluateDoneTransitionGuardCore(
       }
       // probe.outcome === "absent": the dedicated ref probe confirms the branch
       // is genuinely absent from the remote. Existing attribution logic below.
-      const attribution = ctx.worktreePath
+      const attributionResult = ctx.worktreePath
         ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
         : null;
+      // SUP-23163: an attribution probe that could not run safely or to
+      // completion may hide attributable commits, so it refuses (fail closed)
+      // instead of falling through to the fail-open allow below. A
+      // decision-carrying transition keeps its exemption, as it does when the
+      // commits are measured.
+      if (isLegacyProbeUnverified(attributionResult) && !decisionCarried) {
+        return legacyProbeUnverifiedRefusal(db, issue, "attribution", attributionResult, {
+          aheadBy: null,
+          branch,
+          defaultRef: ctx.defaultRef,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          skipReason: prSkipReason,
+        });
+      }
+      const attribution = isLegacyProbeUnverified(attributionResult) ? null : attributionResult;
       if (attribution && attribution.attributableCount > 0) {
         // Carrier delivery: the deliverable is routinely merged from a shared
         // carrier branch or a differently-named head while this issue's own
@@ -6662,9 +6716,11 @@ async function evaluateDoneTransitionGuardCore(
   // `foreign_workspace_branch:<branch>:<identifier>` in skipReason so it is countable.
   if (identifier !== null && !branchReferencesIdentifier) {
     const foreignToken = `foreign_workspace_branch:${branch}:${identifier}`;
-    const attribution = ctx.worktreePath
+    const attributionResult = ctx.worktreePath
       ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, identifier)
       : null;
+    const attributionUnverified = isLegacyProbeUnverified(attributionResult) ? attributionResult : null;
+    const attribution = isLegacyProbeUnverified(attributionResult) ? null : attributionResult;
     const attributableCount = attribution?.attributableCount ?? 0;
 
     if (attributableCount > 0 && !landingDebtOwed) {
@@ -6743,6 +6799,18 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
+    // SUP-23163: refuse where an unmeasured attribution would have failed open.
+    if (attributionUnverified) {
+      return legacyProbeUnverifiedRefusal(db, issue, "attribution", attributionUnverified, {
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipReason: appendSkipReason(prSkipReason, foreignToken),
+      });
+    }
+
     if (attribution === null || mergedPrCount === null) {
       const unmeasured = attribution === null ? "attribution" : "merged_pr";
       return fallback(
@@ -6763,6 +6831,18 @@ async function evaluateDoneTransitionGuardCore(
     const uncommitted = ctx.worktreePath
       ? await worktreeHasUncommittedContent(ctx.worktreePath)
       : null;
+    // SUP-23163: a status probe that could not run safely or to completion
+    // refuses; only a git that ran and could not answer still fails open.
+    if (isLegacyProbeUnverified(uncommitted)) {
+      return legacyProbeUnverifiedRefusal(db, issue, "worktree status", uncommitted, {
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipReason: appendSkipReason(prSkipReason, foreignToken),
+      });
+    }
     if (uncommitted === null) {
       return fallback(
         `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch) ` +
