@@ -1,5 +1,3 @@
-import { redactSecretTokens } from "../log-redaction.js";
-
 // Redaction for HTTP log payloads.
 //
 // `customProps` in logger.ts copies `req.body` / `req.params` / `req.query`
@@ -116,6 +114,22 @@ function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEYS.has(key.toLowerCase());
 }
 
+// Caller-authored prose carried by request bodies. These are not secrets, so
+// they are not in SENSITIVE_KEYS, but they may quote one.
+const FREE_TEXT_KEYS = new Set<string>([
+  "body",
+  "comment",
+  "description",
+  "probeevidence",
+  "reason",
+  "resolutionnote",
+  "title",
+]);
+
+function isFreeTextKey(key: string): boolean {
+  return FREE_TEXT_KEYS.has(key.toLowerCase());
+}
+
 function isUrlishKey(key: string): boolean {
   return URLISH_KEYS.has(key.toLowerCase());
 }
@@ -138,17 +152,16 @@ export function stripSecretBearingUrlParts(value: string): string {
   }
 }
 
-export function redactSensitive(value: unknown, depth = 0): unknown {
+function redactWalk(
+  value: unknown,
+  depth: number,
+  maskFreeText: boolean,
+): unknown {
   if (depth > MAX_DEPTH) return undefined;
-  // SUP-25336 (RA F2): free-text fields such as a close comment or a done-tier
-  // `probeEvidence` are not sensitive keys, but a caller can paste a bearer
-  // token or API key into them. Mask credential-shaped tokens in every string
-  // leaf so a 4xx/5xx log line never keeps one.
-  if (typeof value === "string") return redactSecretTokens(value);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (depth + 1 > MAX_DEPTH) return undefined;
-    return value.map((entry) => redactSensitive(entry, depth + 1));
+    return value.map((entry) => redactWalk(entry, depth + 1, maskFreeText));
   }
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
@@ -157,12 +170,30 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
       continue;
     }
     if (typeof entry === "string" && isUrlishKey(key)) {
-      out[key] = redactSecretTokens(stripSecretBearingUrlParts(entry));
+      out[key] = stripSecretBearingUrlParts(entry);
       continue;
     }
-    out[key] = redactSensitive(entry, depth + 1);
+    if (maskFreeText && typeof entry === "string" && isFreeTextKey(key)) {
+      out[key] = `[free text redacted, ${entry.length} chars]`;
+      continue;
+    }
+    out[key] = redactWalk(entry, depth + 1, maskFreeText);
   }
   return out;
+}
+
+export function redactSensitive(value: unknown, depth = 0): unknown {
+  return redactWalk(value, depth, false);
+}
+
+/**
+ * Request-payload redaction for HTTP log lines. Applies {@link redactSensitive}
+ * and also replaces caller-authored prose fields (a close comment, a done-tier
+ * `probeEvidence`, a resolution note) with a length marker, because a caller
+ * can paste a credential into them. Every other field logs unchanged.
+ */
+export function redactHttpLogPayload(value: unknown): unknown {
+  return redactWalk(value, 0, true);
 }
 
 function collectSensitiveStringValuesInto(

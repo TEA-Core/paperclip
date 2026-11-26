@@ -8,6 +8,7 @@ import {
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
+  redactHttpLogPayload,
   redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
@@ -94,6 +95,19 @@ function requestLogUrl(req: {
   return isPrivateWebhook(req)
     ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
+}
+
+function redactErrorContext(error: unknown): unknown {
+  const redacted = redactSensitive(error);
+  if (
+    redacted &&
+    typeof redacted === "object" &&
+    typeof (redacted as { message?: unknown }).message === "string"
+  ) {
+    const withMessage = redacted as { message: string };
+    withMessage.message = redactSecretTokens(withMessage.message);
+  }
+  return redacted;
 }
 
 export function createHttpLogger(baseLogger: Logger) {
@@ -206,22 +220,22 @@ export function createHttpLogger(baseLogger: Logger) {
             // for setup routes; the status, route, and redacted body remain.
             errorContext: secretSensitiveRoute
               ? { name: "Error" }
-              : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
-            reqParams: redactSensitive(ctx.reqParams),
+              : redactErrorContext(ctx.error),
+            reqBody: redactHttpLogPayload(ctx.reqBody),
+            reqParams: redactHttpLogPayload(ctx.reqParams),
           };
         }
         const props: Record<string, unknown> = {};
         const { body, params } = req as any;
         if (body && typeof body === "object" && Object.keys(body).length > 0) {
-          props.reqBody = redactSensitive(body);
+          props.reqBody = redactHttpLogPayload(body);
         }
         if (
           params &&
           typeof params === "object" &&
           Object.keys(params).length > 0
         ) {
-          props.reqParams = redactSensitive(params);
+          props.reqParams = redactHttpLogPayload(params);
         }
         if ((req as any).route?.path) {
           props.routePath = (req as any).route.path;
