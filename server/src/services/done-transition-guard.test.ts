@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -4574,6 +4574,56 @@ describe("evaluateDoneTransitionGuard", () => {
           details: expect.objectContaining({ reason: "legacy_worktree_probe_unverified:status" }),
         }),
       );
+    });
+
+    it("refuses, naming the bound, when the foreign-branch worktree holds more than 64 initialized submodules (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      const top = realpathSync(mkdtempSync(path.join(os.tmpdir(), "paperclip-guard-submodules-")));
+      const names = Array.from({ length: 65 }, (_, i) => `lib${i}`);
+      for (const name of names) {
+        mkdirSync(path.join(top, name));
+        writeFileSync(path.join(top, name, ".git"), "gitdir: elsewhere\n");
+      }
+      const measured: string[] = [];
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          const dir = args[args.indexOf("-C") + 1] ?? "";
+          const tree = dir.startsWith(`${top}${path.sep}`) ? dir : top;
+          if (args.includes("--show-object-format")) {
+            if (tree !== top) measured.push(tree);
+            cb(null, `${tree}\n${tree}\n${tree}\nsha1\n`);
+            return;
+          }
+          if (args.includes("HEAD^{commit}")) {
+            cb(null, `${"a".repeat(40)}\n`);
+            return;
+          }
+          if (args.includes("ls-files")) {
+            cb(null, tree === top ? names.map((name) => `H 160000 ${"b".repeat(40)} 0\t${name}\0`).join("") : "");
+            return;
+          }
+          if (args.includes("status")) {
+            cb(null, "");
+            return;
+          }
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
+      ghFetchMock.mockImplementation(foreignCompareFetch);
+      let result: Awaited<ReturnType<typeof evaluateDoneTransitionGuard>>;
+      try {
+        result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      } finally {
+        rmSync(top, { recursive: true, force: true });
+      }
+      expect(measured).toHaveLength(64);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("more than 64 initialized submodules");
+      expect(result.reason).not.toMatch(/retry/i);
+      expect(result.skipReason).toContain("legacy_worktree_probe_unverified:status");
     });
 
     it("fails open when the foreign-branch worktree status probe cannot be measured (SUP-13873)", async () => {
