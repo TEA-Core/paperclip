@@ -3982,6 +3982,8 @@ const MAX_STALE_DRAFT_MENTION_READS = 5;
  *  - the refusal came from cached drafts alone (no live-discovered draft);
  *  - every cached draft is the card's own delivery (cached repo+branch pass
  *    narrowToDelivered), so a foreign PR the card merely cites cannot carry it;
+ *    SUP-25333: a draft cached without a head branch is narrowed on the head
+ *    branch its live read reports (a cached branch is never overridden);
  *  - the card cites at most MAX_STALE_DRAFT_MENTION_READS PRs (bounded reads);
  *  - every mention reads live (no unreadable), none is a live open draft, and
  *    exactly one is live-merged;
@@ -3998,11 +4000,24 @@ async function resolveStaleDraftMergedCarrier(
   if (!drafts || drafts.length === 0) return null;
   const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
   if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
-  const owned = await narrowToDelivered(db, companyId, issueId, drafts);
-  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
-  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason, mentioned);
+  const liveHeadRefs = new Map<string, string>();
+  const carrier = await resolveSingleMergedMentionCarrier(
+    db, companyId, issueId, refusal.reason, mentioned, liveHeadRefs,
+  );
   if (carrier.kind !== "resolved") return null;
+  // SUP-25333: narrow after the live reads so a draft cached without a head
+  // branch is judged on its live head branch instead of failing on null.
+  const anchored = drafts.map((draft) => ({
+    ...draft,
+    headRefName: draft.headRefName ?? liveHeadRefs.get(pullRequestKey(draft)) ?? null,
+  }));
+  const owned = await narrowToDelivered(db, companyId, issueId, anchored);
+  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
   return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
+}
+
+function pullRequestKey(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner}/${pr.repo}#${pr.number}`.toLowerCase();
 }
 
 /**
@@ -4029,6 +4044,8 @@ async function resolveSingleMergedMentionCarrier(
   // SUP-24033: the stale-draft path passes the list it already cap-checked so the
   // live reads cannot run over a second, uncapped read of the mentions.
   checkedMentions?: LinkedPullRequest[],
+  // SUP-25333: when given, receives each successfully read mention's live head branch.
+  liveHeadRefs?: Map<string, string>,
 ): Promise<
   | { kind: "none" }
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
@@ -4052,6 +4069,7 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
+        if (live.headRef) liveHeadRefs?.set(pullRequestKey(pr), live.headRef);
         if (liveDraftRefusal !== null && live.merged !== true && live.open === true && live.draft === true) {
           liveDraft = true;
         }

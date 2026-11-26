@@ -5831,6 +5831,11 @@ export function issueRoutes(
       {
         allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable",
         zeroDeltaRecheckedAtWrite: input.zeroDeltaRecheckedAtWrite === true,
+        recordOnlyReviewDecision:
+          issue.deliveryRequirement === "record_only" &&
+          decisionCarried &&
+          guardResult.skipped &&
+          guardResult.skipReason === "record_only_delivery_skipped",
       },
     );
     if (tierResult.skipped) {
