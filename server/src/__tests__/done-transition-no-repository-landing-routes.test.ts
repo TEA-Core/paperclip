@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -904,6 +904,65 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(1);
       const receipts = await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId));
       expect(receipts).toMatchObject([{ artifactRevisionId: fixture.artifact.id }]);
+    });
+
+    it.each(["deleted foreign project path", "archived project", "cloud sandbox workspace", "remote environment run"])(
+      "does not count %s as a local writer", async (kind) => {
+        const fixture = await reviewFixture();
+        const otherCompany = await insertCompany(`IDLE${seedSequence}`);
+        const otherProject = randomUUID();
+        await db.insert(projects).values({ id: otherProject, companyId: otherCompany, name: "Elsewhere", status: "active",
+          archivedAt: kind === "archived project" ? new Date() : null });
+        if (kind === "deleted foreign project path" || kind === "archived project") {
+          await db.insert(projectWorkspaces).values({ companyId: otherCompany, projectId: otherProject, name: "Stale source",
+            cwd: kind === "archived project" ? fixture.worktree : path.join(fixture.worktree, "..", `gone-${randomUUID()}`) });
+        } else if (kind === "cloud sandbox workspace") {
+          await db.insert(executionWorkspaces).values({ companyId: otherCompany, projectId: otherProject, name: "Remote sandbox",
+            mode: "isolated_workspace", strategyType: "cloud_sandbox", providerType: "cloud_sandbox",
+            cwd: fixture.worktree, providerRef: fixture.worktree });
+        } else {
+          await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Remote runner"),
+            status: "running", contextSnapshot: { cwd: fixture.worktree, paperclipEnvironment: { driver: "ssh" } } });
+        }
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+      },
+    );
+
+    it("refuses a new allocation over a legacy live workspace stored under a symlinked path", async () => {
+      const fixture = await seed();
+      const target = mkdtempSync(path.join(os.tmpdir(), "review-entry-legacy-"));
+      const legacyPath = `${target}-link`;
+      symlinkSync(target, legacyPath);
+      const allocation = {
+        companyId: fixture.companyId, projectId: fixture.projectId, projectWorkspaceId: fixture.projectWorkspaceId,
+        mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree", status: "active",
+      };
+      await db.insert(executionWorkspaces).values({ ...allocation, name: "Legacy holder", cwd: legacyPath, providerRef: legacyPath });
+      await expect(executionWorkspaceService(db).create({
+        ...allocation, name: "Second holder", cwd: legacyPath, providerRef: legacyPath, sourceIssueId: fixture.issueId,
+      })).rejects.toMatchObject({ status: 409 });
+      expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.cwd, target))).toEqual([]);
+    });
+
+    it.skipIf(process.getuid?.() === 0)("refuses a live writer path it cannot resolve for a reason other than absence", async () => {
+      const fixture = await reviewFixture();
+      const sealed = mkdtempSync(path.join(os.tmpdir(), "review-entry-sealed-"));
+      mkdirSync(path.join(sealed, "inner"));
+      chmodSync(sealed, 0);
+      try {
+        await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
+          status: "running", contextSnapshot: { cwd: path.join(sealed, "inner") } });
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toBe("review_entry_workspace_unverified");
+        await noAcceptedEntry(fixture.issueId);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(sql`${heartbeatRuns.contextSnapshot}->>'cwd' = ${path.join(sealed, "inner")}`);
+        chmodSync(sealed, 0o700);
+        rmSync(sealed, { recursive: true, force: true });
+      }
     });
 
     it("allows exactly one concurrent first entry and refuses receipt reuse after reopen", async () => {

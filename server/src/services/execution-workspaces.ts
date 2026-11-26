@@ -1760,6 +1760,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       "companyId" | "projectWorkspaceId" | "strategyType" | "cwd" | "sourceIssueId"
     >,
     dbOrTx: Db = db,
+    requestedCwd: string | null | undefined = data.cwd,
   ) {
     if (data.strategyType !== "git_worktree" || !data.projectWorkspaceId || !data.cwd) return;
     const holders = await dbOrTx
@@ -1772,7 +1773,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         and(
           eq(executionWorkspaces.companyId, data.companyId),
           eq(executionWorkspaces.projectWorkspaceId, data.projectWorkspaceId),
-          eq(executionWorkspaces.cwd, data.cwd),
+          inArray(executionWorkspaces.cwd, [...new Set([data.cwd, requestedCwd ?? data.cwd])]),
           inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
         ),
       );
@@ -2998,10 +2999,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       liveBranchName: string | null;
       excludingExecutionWorkspaceId?: string | null;
     }): Promise<ExecutionWorkspaceGitWorktreeContention> => {
-      const resolvedWorktreePath = path.resolve(input.worktreePath);
+      const worktreePaths = [...new Set([
+        path.resolve(input.worktreePath), await canonicalStoredPath(path.resolve(input.worktreePath)),
+      ])];
       const pathOrBranchConditions = [
-        eq(executionWorkspaces.providerRef, input.worktreePath),
-        eq(executionWorkspaces.cwd, input.worktreePath),
+        inArray(executionWorkspaces.providerRef, [input.worktreePath, ...worktreePaths]),
+        inArray(executionWorkspaces.cwd, [input.worktreePath, ...worktreePaths]),
       ];
       if (input.liveBranchName) {
         pathOrBranchConditions.push(eq(executionWorkspaces.branchName, input.liveBranchName));
@@ -3040,7 +3043,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       let liveMatch: ExecutionWorkspaceGitWorktreeContention = null;
       for (const candidate of candidates) {
         const candidatePath = readNullableString(candidate.providerRef) ?? readNullableString(candidate.cwd);
-        const matchesPath = candidatePath ? path.resolve(candidatePath) === resolvedWorktreePath : false;
+        const matchesPath = candidatePath ? worktreePaths.includes(path.resolve(candidatePath)) : false;
         const matchesBranch = Boolean(input.liveBranchName && candidate.branchName === input.liveBranchName);
         if (!matchesPath && !matchesBranch) continue;
 
@@ -4303,7 +4306,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (pathGuardKey) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
         }
-        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
+        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db, input.cwd);
         return tx
           .insert(executionWorkspaces)
           .values(data)

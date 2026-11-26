@@ -6,7 +6,7 @@ import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import {
   activityLog, agents, companyMemberships, documentRevisions, documents, executionWorkspaces, heartbeatRuns,
   issueDeliveryReceipts, issueDocuments, issueExecutionDecisions, issueReviewEntryReceipts,
-  issues, projectWorkspaces, workspaceOperations, workspaceRuntimeServices, type Db,
+  issues, projects, projectWorkspaces, workspaceOperations, workspaceRuntimeServices, type Db,
 } from "@paperclipai/db";
 import type { UpdateIssue } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
@@ -228,30 +228,41 @@ async function assertExclusive(
   // return another company's identifiers or paths in the refusal.
   const sharesWorktree = async (candidate: unknown) => {
     if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return false;
-    let other: PhysicalWorkspace;
-    try { other = await physicalPath(candidate); } catch {
+    let otherPath: string;
+    let identity: string;
+    try {
+      otherPath = await realpath(candidate);
+      const info = await stat(otherPath);
+      identity = `${info.dev}:${info.ino}`;
+    } catch (error) {
+      if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
       return fail("workspace_unverified", "A live workspace path could not be resolved, so isolated ownership cannot be proved. Retire the stale record or wait for it to finish.");
     }
-    return other.identity === own.identity || other.path === own.path || other.path.startsWith(`${own.path}${path.sep}`);
+    return identity === own.identity || otherPath === own.path || otherPath.startsWith(`${own.path}${path.sep}`);
   };
   const liveWorkspaces = await db.select({ cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
     .from(executionWorkspaces).where(and(
       ne(executionWorkspaces.id, workspace.id), isNull(executionWorkspaces.closedAt),
       inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+      inArray(executionWorkspaces.providerType, ["local_fs", "git_worktree"]),
     ));
   for (const candidate of liveWorkspaces) {
     if (await sharesWorktree(candidate.cwd) || await sharesWorktree(candidate.providerRef)) {
       fail("workspace_shared", "Another execution workspace shares this physical path. Provision a new isolated worktree for this card.");
     }
   }
-  for (const project of await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)) {
+  for (const project of await db.select({ cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
+    .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
+    .where(and(isNull(projects.archivedAt), ne(projectWorkspaces.sourceType, "remote_managed")))) {
     if (await sharesWorktree(project.cwd)) {
       fail("workspace_shared", "A project workspace shares this physical path. Provision a separate isolated worktree.");
     }
   }
   for (const service of await db.select({
     executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
-  }).from(workspaceRuntimeServices).where(isNull(workspaceRuntimeServices.stoppedAt))) {
+  }).from(workspaceRuntimeServices).where(and(
+    isNull(workspaceRuntimeServices.stoppedAt), ne(workspaceRuntimeServices.provider, "adapter_managed"),
+  ))) {
     if (service.executionWorkspaceId === workspace.id || await sharesWorktree(service.cwd)) {
       fail("workspace_busy", "A runtime service can still write this worktree; wait for its confirmed stop.");
     }
@@ -272,13 +283,14 @@ async function assertExclusive(
     holdsCard: sql<boolean>`coalesce(${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
       OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}, false)`,
     paths: sql<string[]>`review_entry_run_paths(${context})`,
+    local: sql<boolean>`coalesce(${context}->'paperclipEnvironment'->>'driver', 'local') = 'local'`,
   }).from(heartbeatRuns).where(and(
     inArray(heartbeatRuns.status, ["queued", "running"]),
     actor.agentId && actor.runId ? ne(heartbeatRuns.id, actor.runId) : undefined,
   ));
   for (const run of runs) {
     if (run.holdsCard) fail("workspace_busy", "Another run holds this card or workspace; wait for it to finish before first entry.");
-    for (const candidate of run.paths) {
+    for (const candidate of run.local ? run.paths : []) {
       if (await sharesWorktree(candidate)) fail("workspace_busy", "Another run shares this physical path; run this card alone in an isolated worktree.");
     }
   }

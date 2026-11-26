@@ -414,10 +414,13 @@ Only the card's own active, managed isolated Git worktree is supported.
 Workspace, runtime-service, operation and run-context paths are stored
 canonically (symlinks resolved) when written. Inside the locked transaction the
 server re-resolves the physical path (realpath and device:inode, including
-aliases) of every live workspace, project workspace, runtime service, operation
-and queued/running run across companies, and refuses another card, workspace or
-run sharing that directory or a directory inside it. A live path that cannot be
-resolved also refuses.
+aliases) of every possible local writer across companies: live local execution
+workspaces, project workspaces of non-archived projects (not remote-managed),
+live non-adapter-managed runtime services, live operations and queued/running
+runs outside remote environments. It refuses another card, workspace or run
+sharing that directory or a directory inside it. A path that does not exist
+(ENOENT/ENOTDIR) cannot alias the worktree and is ignored; any other resolution
+error refuses with `review_entry_workspace_unverified`.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
 Provision summary-routine cards with their own isolated-worktree workspace after
