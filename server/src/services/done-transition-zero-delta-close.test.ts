@@ -17,6 +17,7 @@ import { zeroDeltaWorktreeRefusal } from "./hardened-git-probe.js";
 import type * as MergeArming from "./merge-arming.js";
 import { resolveGitHubToken } from "./github-credential.js";
 import { resetZeroDeltaForgeCache } from "./zero-delta-forge-rule.js";
+import { preserveUnpushedWorktreeCommits } from "./workspace-runtime.js";
 
 // SUP-24402: the zero-delta repository_delivery Tier 2 close, measured with
 // real git against a real worktree. GitHub is a bare "origin" repository the
@@ -164,7 +165,7 @@ function answerGitHub(url: string): Response {
       : json({ message: "Not Found" }, 404);
   }
   if (u.pathname === `${repoPath}/git/matching-refs/`) {
-    const listed = originGit("for-each-ref", "--format=%(refname) %(objecttype) %(objectname)", "refs/heads", "refs/tags");
+    const listed = originGit("for-each-ref", "--format=%(refname) %(objecttype) %(objectname)");
     return json(listed.length === 0 ? [] : listed.split("\n").map((line) => {
       const [ref, type, sha] = line.split(" ");
       return { ref, object: { type, sha } };
@@ -1267,5 +1268,86 @@ describe("zeroDeltaWorktreeRefusal (SUP-24402)", () => {
 
   it("refuses untracked status records", () => {
     expect(zeroDeltaWorktreeRefusal({ ...clean, statusRecords: ["?? notes.md"] }, base)).toBe("has untracked files");
+  });
+});
+
+describe("forge preservation and unreadable object inventory", () => {
+  async function preserveThenExpireLocalWork() {
+    const start = headSha();
+    writeFileSync(path.join(worktree, "archive-only.txt"), "undelivered archived work\n");
+    git(worktree, "add", "archive-only.txt");
+    git(worktree, "commit", "-qm", "work preserved by archive");
+    const sha = headSha();
+    const ref = `refs/preserved/${CARD.identifier}/${BRANCH}`;
+    const preserved = await preserveUnpushedWorktreeCommits({
+      workspacePath: worktree,
+      branchName: BRANCH,
+      issueIdentifier: CARD.identifier,
+      repoRoot,
+      resolveGitAuth: async () => ({ configArgs: [], env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }),
+    });
+    expect(preserved).toMatchObject({ preserved: true, preservedRef: ref, commitSha: sha, warning: null });
+    git(worktree, "reset", "--hard", start);
+    git(repoRoot, "reflog", "expire", "--expire=now", "--all");
+    git(repoRoot, "gc", "--prune=now");
+    expect(() => git(repoRoot, "cat-file", "-e", `${sha}^{commit}`)).toThrow();
+    expect(originGit("rev-list", "--count", `main..${ref}`)).toBe("1");
+    expect(originGit("show", `${ref}:archive-only.txt`)).toBe("undelivered archived work");
+    return ref;
+  }
+
+  it("refuses archived preservation once the local copy has expired", async () => {
+    const ref = await preserveThenExpireLocalWork();
+    expectZeroDeltaRefusal(await close(), `ref ${ref}`);
+  });
+
+  it("refuses preservation pushed after measurement from a separate checkout", async () => {
+    const measured = await close();
+    expect(measured.allowed, measured.reason).toBe(true);
+    if (!measured.zeroDeltaMeasurement) throw new Error(measured.reason);
+    expect(await doneTransitionGuard.verifyZeroDeltaCloseAtTransition(db, card(), measured.zeroDeltaMeasurement)).toMatchObject({ ok: true });
+    git(seed, "remote", "add", "origin", origin);
+    git(seed, "fetch", "-q", "origin");
+    writeFileSync(path.join(seed, "archive-only.txt"), "new archive work\n");
+    git(seed, "add", "archive-only.txt");
+    git(seed, "commit", "-qm", "work in another checkout");
+    const sha = git(seed, "rev-parse", "HEAD");
+    const preserved = await preserveUnpushedWorktreeCommits({
+      workspacePath: seed,
+      branchName: BRANCH,
+      issueIdentifier: CARD.identifier,
+      repoRoot: seed,
+      resolveGitAuth: async () => ({ configArgs: [], env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }),
+    });
+    expect(preserved).toMatchObject({ preserved: true, commitSha: sha, warning: null });
+    expect(() => git(repoRoot, "cat-file", "-e", `${sha}^{commit}`)).toThrow();
+    expect(originGit("rev-list", "--count", `main..${preserved.preservedRef}`)).toBe("1");
+    expect(await doneTransitionGuard.verifyZeroDeltaCloseAtTransition(db, card(), measured.zeroDeltaMeasurement)).toMatchObject({ ok: false });
+  });
+
+  it("accepts a delivered card branch that is also a repository pull-request head", async () => {
+    originGit("update-ref", `refs/heads/${BRANCH}`, headSha());
+    pullRequestHeads.push(headSha());
+    const result = await close();
+    expect(result.allowed, result.reason).toBe(true);
+    expect(result.tier).toBe("tier2");
+  });
+
+  it("refuses when fsck fails at measurement", async () => {
+    gitFault.onGit = (args) => args.includes("fsck") ? "fail" : undefined;
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.tier).toBe(null);
+    expect(result.reason).toContain("the recorded worktree could not be measured");
+  });
+
+  it("refuses when fsck fails inside the close write", async () => {
+    const measured = await close();
+    expect(measured.allowed, measured.reason).toBe(true);
+    if (!measured.zeroDeltaMeasurement) throw new Error(measured.reason);
+    gitFault.onGit = (args) => args.includes("fsck") ? "fail" : undefined;
+    expect(await doneTransitionGuard.verifyZeroDeltaCloseAtTransition(db, card(), measured.zeroDeltaMeasurement)).toMatchObject({
+      ok: false, reason: expect.stringContaining("the repository's other branches and worktrees could not be re-checked"),
+    });
   });
 });

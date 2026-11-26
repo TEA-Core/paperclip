@@ -2020,10 +2020,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockGhFetch.mockImplementation(async (url: string) => {
       const text = String(url);
       if (/\/git\/matching-refs\/$/.test(text)) {
-        const listed = git(currentOrigin, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads");
+        const listed = git(currentOrigin, "for-each-ref", "--format=%(refname) %(objecttype) %(objectname)");
         return Response.json(listed.length === 0 ? [] : listed.split("\n").map((line) => {
-          const space = line.indexOf(" ");
-          return { ref: line.slice(0, space), object: { type: "commit", sha: line.slice(space + 1) } };
+          const [ref, type, sha] = line.split(" ");
+          return { ref, object: { type, sha } };
         }));
       }
       if (/\/branches(?:\?|$)/.test(text)) {
@@ -2222,6 +2222,37 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain("merge_commit_unrecorded");
     expect(git(currentOrigin, "rev-list", "--count", "main..parked-work")).toBe("1");
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(stored?.status).toBe("in_review");
+    expect(stored?.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId))).toEqual([]);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+  });
+
+  it("rolls back a final-stage zero-delta approval when archive refs appear before the close write", async () => {
+    const fixture = await seedFinalZeroDeltaApproval();
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    const ref = `refs/preserved/${fixture.identifier}/cycle`;
+    let planted = false;
+    mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+      const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+      expect(result.allowed, result.reason).toBe(true);
+      if (!planted) {
+        const sha = git(currentOrigin, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+          "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "preserved archive work");
+        git(currentOrigin, "update-ref", ref, sha);
+        planted = true;
+      }
+      return result;
+    });
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "done",
+      comment: "Independent final approval.",
+      doneTier: zeroDeltaDoneTier(fixture.worktree),
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("merge_commit_unrecorded");
+    expect(git(currentOrigin, "rev-list", "--count", `main..${ref}`)).toBe("1");
     const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
     expect(stored?.status).toBe("in_review");
     expect(stored?.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });

@@ -22,6 +22,7 @@ const api = "https://api.github.com/repos/test/project";
 let branches: Array<{ name: string; commit: { sha: string } }>;
 let tags: typeof branches;
 let pulls: Array<{ state: string; merged_at?: string; head: { sha: string; repo: { full_name: string } | null } }>;
+let otherRefs: Array<{ ref: string; object: { type: string; sha: string } }>;
 
 function answer(url: string): Response {
   const { pathname } = new URL(url);
@@ -29,6 +30,7 @@ function answer(url: string): Response {
   if (pathname.endsWith("/git/matching-refs/")) return Response.json([
     ...branches.map(({ name, commit }) => ({ ref: `refs/heads/${name}`, object: { type: "commit", sha: commit.sha } })),
     ...tags.map(({ name, commit }) => ({ ref: `refs/tags/${name}`, object: { type: "commit", sha: commit.sha } })),
+    ...otherRefs,
   ]);
   if (pathname.endsWith("/branches")) return Response.json(branches);
   if (pathname.endsWith("/tags")) return Response.json(tags);
@@ -37,13 +39,14 @@ function answer(url: string): Response {
   throw new Error(`Unexpected forge read ${url}`);
 }
 
-const decide = () => decideZeroDeltaFromForge(card, githubForgeReader("test-token"), budget);
+const decide = (clock?: () => number) => decideZeroDeltaFromForge(card, githubForgeReader("test-token", clock), budget);
 
 beforeEach(() => {
   resetZeroDeltaForgeCache();
   branches = [{ name: "main", commit: { sha: base } }];
   tags = [];
   pulls = [];
+  otherRefs = [];
   fetch.mockReset();
   fetch.mockImplementation(async (url: string) => answer(url));
 });
@@ -208,7 +211,6 @@ describe("zero-delta forge evidence", () => {
 
   it("refuses when paging consumes the total snapshot budget", async () => {
     let now = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => now);
     fetch.mockImplementation(async (url: string) => {
       if (url.includes("/pulls?")) {
         now = 5001;
@@ -216,7 +218,7 @@ describe("zero-delta forge evidence", () => {
       }
       return answer(url);
     });
-    expect(await decide()).toMatchObject({ ok: false, retriable: true, reason: "the forge read ran out of its time budget" });
+    expect(await decide(() => now)).toMatchObject({ ok: false, retriable: true, reason: "the forge read ran out of its time budget" });
   });
 
   it.each(["other/project", null])("refuses a pull-request exemption from a foreign or unknown head repository (%s)", async (fullName) => {
@@ -256,5 +258,131 @@ describe("zero-delta forge evidence", () => {
       ? Response.json({}, { status: 503 }) : answer(url));
 
     expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: false, retriable: true });
+  });
+
+  it.each(["refs/preserved/CARD-1/cycle", "refs/keep/CARD-1", "refs/CARD-1/work"])("refuses undelivered card-named non-branch ref %s", async (ref) => {
+    otherRefs.push({ ref, object: { type: "commit", sha: hidden } });
+    expect(await decide()).toMatchObject({ ok: false, reason: expect.stringContaining(ref) });
+    pulls.push({ state: "open", head: { sha: hidden, repo: { full_name: "test/project" } } });
+    expect(await decide()).toMatchObject({ ok: false, reason: expect.stringContaining(ref) });
+  });
+
+  it("refuses a preserved ref added before the close write", async () => {
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    otherRefs.push({ ref: "refs/preserved/CARD-1/cycle", object: { type: "commit", sha: hidden } });
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false, retriable: true,
+    });
+  });
+
+  it.each(["refs/preserved/CARD-2/cycle", "refs/pull/7/head"])("does not globally block the card on unrelated non-branch ref %s", async (ref) => {
+    otherRefs.push({ ref, object: { type: "commit", sha: hidden } });
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: true });
+  });
+
+  it.each(["branch", "tag"] as const)("accepts a delivered card-named %s even when its SHA is a pull-request head", async (kind) => {
+    (kind === "branch" ? branches : tags).push({ name: "CARD-1-cycle", commit: { sha: ancestor } });
+    expect(await decide()).toMatchObject({ ok: true });
+    pulls.push({ state: "open", head: { sha: ancestor, repo: { full_name: "test/project" } } });
+    expect(await decide()).toMatchObject({ ok: true });
+  });
+
+  it.each(["default", "injected"])("uses monotonic time at the close write when the wall clock jumps forward (%s)", async (mode) => {
+    let wall = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => wall);
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    const reader = githubForgeReader("test-token", mode === "injected" ? () => 0 : undefined);
+    const measured = await decideZeroDeltaFromForge(card, reader, budget);
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith("/git/matching-refs/")) wall = 25_000;
+      return answer(url);
+    });
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, reader, {
+      perCallMs: 10_000, totalMs: 20_000, concurrency: 1,
+    })).toMatchObject({ ok: true });
+  });
+
+  it("exhausts the injected write budget despite a backward wall-clock jump", async () => {
+    let elapsed = 0;
+    let wall = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => wall);
+    const reader = githubForgeReader("test-token", () => elapsed);
+    const measured = await decideZeroDeltaFromForge(card, reader, budget);
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith("/git/matching-refs/")) {
+        elapsed = 20_001;
+        wall = -25_000;
+      }
+      return answer(url);
+    });
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, reader, {
+      perCallMs: 10_000, totalMs: 20_000, concurrency: 1,
+    })).toMatchObject({ ok: false, retriable: true, reason: "the forge read ran out of its time budget" });
+  });
+
+  it("refuses when the base moves while pull pages are read inside the close-write bracket", async () => {
+    pulls = [base, ancestor].map((sha) => ({ state: "open", head: { sha, repo: { full_name: "test/project" } } }));
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    let currentBase = base;
+    fetch.mockImplementation(async (url: string) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith("/commits/main")) return Response.json({ sha: currentBase });
+      if (u.pathname.endsWith("/pulls")) {
+        if (u.searchParams.get("page") === "2") {
+          currentBase = hidden;
+          return Response.json([pulls[1]]);
+        }
+        return Response.json([pulls[0]], { headers: { link: `<${api}/pulls?state=all&per_page=1&page=2>; rel="next"` } });
+      }
+      return answer(url);
+    });
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false, retriable: true, reason: "the remote base main moved while it was listed",
+    });
+  });
+
+  it("refuses a ref row without the refs namespace prefix instead of silently dropping it", async () => {
+    otherRefs.push({ ref: "heads/undelivered", object: { type: "commit", sha: hidden } });
+    expect(await decide()).toMatchObject({ ok: false, reason: "the forge reference snapshot had invalid or duplicate names" });
+  });
+
+  it("refuses a tag cycle before spending the full snapshot budget", async () => {
+    const a = "d".repeat(40);
+    const b = "e".repeat(40);
+    let elapsed = 0;
+    fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith("/git/matching-refs/")) return Response.json([
+        { ref: "refs/heads/main", object: { type: "commit", sha: base } },
+        { ref: "refs/tags/cycle", object: { type: "tag", sha: a } },
+      ]);
+      if (url.includes("/git/tags/")) {
+        elapsed += 1000;
+        return Response.json({ object: { type: "tag", sha: url.endsWith(a) ? b : a } });
+      }
+      return answer(url);
+    });
+    expect(await decide(() => elapsed)).toMatchObject({ ok: false, retriable: false });
+    expect(elapsed).toBeLessThan(budget.totalMs);
+  });
+
+  it.each(["branch", "tag"] as const)("refuses an invalid %s row object type even when its SHA is the delivered base", async (kind) => {
+    for (const type of ["tree", "blob", undefined]) {
+      fetch.mockImplementation(async (url: string) => url.endsWith("/git/matching-refs/") ? Response.json([
+        { ref: "refs/heads/main", object: { type: "commit", sha: base } },
+        { ref: `refs/${kind === "branch" ? "heads" : "tags"}/invalid`, object: { sha: base, ...(type ? { type } : {}) } },
+      ]) : answer(url));
+      expect(await decide()).toMatchObject({ ok: false, reason: "the forge reference snapshot omitted a commit" });
+    }
   });
 });
