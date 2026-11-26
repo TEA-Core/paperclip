@@ -1609,6 +1609,14 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
 
   const refuseRows: [id: string, branch: string, setup: (fixture: StashFixture) => void][] = [
     ["ST-01 this card's stash, WIP on form", OWN, (f) => f.stash(f.x)],
+    ["ST-01b this card's stash beside a sibling's corrupt stash commit", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+      const commit = git(f.m, "rev-parse", "refs/stash");
+      const object = path.join(f.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+    }],
     ["ST-02 this card's stash, On form", OWN, (f) => f.stash(f.x, "-m", "this card draft")],
     ["ST-03 this card's entry below a sibling's tip", OWN, (f) => {
       f.stash(f.x);

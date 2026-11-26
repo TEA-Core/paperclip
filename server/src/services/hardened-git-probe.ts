@@ -803,6 +803,10 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * evidence that cannot be read (garbage ref, non-commit, missing or corrupt
  * object, a reflog that is not a regular file).
  *
+ * Subjects are read in one batched `git log`. When that read fails (a corrupt
+ * object aborts it whole), each entry is read again on its own, so an
+ * unreadable entry contributes nothing while every other entry still counts.
+ *
  * The entries are the union of the `refs/stash` tip as git resolves it (loose or
  * packed) and the new-id column of every line of the stash reflog file, so an
  * entry below the tip, a tip with no reflog line, and a packed tip all count.
@@ -837,10 +841,18 @@ async function cardStashRefusal(
     if (SHA_RE.test(id)) ids.add(id);
   }
   if (ids.size === 0) return null;
-  const subjects = await runHardenedGit(
-    ["-C", repoRoot, "log", "--no-walk=unsorted", "--ignore-missing", "--stdin", "--format=%H%x00%s"],
-    { ...options, input: `${[...ids].join("\n")}\n` },
-  ).catch(() => "");
+  const readSubjects = (batch: string[]) =>
+    runHardenedGit(
+      ["-C", repoRoot, "log", "--no-walk=unsorted", "--ignore-missing", "--stdin", "--format=%H%x00%s"],
+      { ...options, input: `${batch.join("\n")}\n` },
+    );
+  let subjects: string;
+  try {
+    subjects = await readSubjects([...ids]);
+  } catch {
+    subjects = "";
+    for (const id of ids) subjects += await readSubjects([id]).catch(() => "");
+  }
   for (const line of subjects.split("\n")) {
     const separator = line.indexOf("\0");
     if (separator < 0) continue;
