@@ -10,6 +10,7 @@ import {
   integer,
   bigint,
   boolean,
+  check,
   unique,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
@@ -26,6 +27,8 @@ export const heartbeatRuns = pgTable(
     invocationSource: text("invocation_source").notNull().default("on_demand"),
     triggerDetail: text("trigger_detail"),
     status: text("status").notNull().default("queued"),
+    // Database trigger stamps each queue entry, including writers from older images.
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
     responsibleUserId: text("responsible_user_id"),
     // The service validates the company/run boundary; avoid a cyclic schema import.
     activeIdentityContextId: uuid("active_identity_context_id"),
@@ -98,6 +101,10 @@ export const heartbeatRuns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    queuedAtRequired: check(
+      "heartbeat_runs_queued_at_required",
+      sql`${table.status} <> 'queued' OR ${table.queuedAt} IS NOT NULL`,
+    ),
     executionStatusDeliveryIdx: index("heartbeat_runs_execution_status_delivery_idx")
       .on(table.executionStatusDeliveryId).where(sql`${table.executionStatusDeliveryId} is not null`),
     executionControlDeadlineIdx: index("heartbeat_runs_execution_control_deadline_idx")
