@@ -228,9 +228,15 @@ export function githubForgeReader(token: string, clock: ForgeClock = monotonicNo
       const repositoryName = `${repo.owner}/${repo.repo}`.toLowerCase();
       for (const row of pullRows) {
         const head = asRecord(asRecord(row)?.head);
-        if (stringField(head?.repo, "full_name")?.toLowerCase() !== repositoryName) continue;
         const sha = stringField(head, "sha")?.toLowerCase();
-        if (sha && /^[0-9a-f]{40}$/.test(sha)) pullRequestHeads.add(sha);
+        if (!sha || !/^[0-9a-f]{40}$/.test(sha)) continue;
+        const branch = stringField(head, "ref");
+        // Retain open PR names even when the source branch was deleted. These
+        // refusal-only refs also bind name changes into the close-write digest.
+        if (asRecord(row)?.state === "open" && branch) {
+          refs.push({ kind: "ref", name: `pull-request ${branch}`, sha });
+        }
+        if (stringField(head?.repo, "full_name")?.toLowerCase() === repositoryName) pullRequestHeads.add(sha);
       }
       const after = await forgeGet(token, baseUrl, budget, startedAt, clock);
       if (!after.ok) throw new ForgeReadError(`the remote base ${baseBranch} could not be read`, after.status >= 500);

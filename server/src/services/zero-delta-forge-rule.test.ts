@@ -21,7 +21,7 @@ const budget = { perCallMs: 1000, totalMs: 5000, concurrency: 2 };
 const api = "https://api.github.com/repos/test/project";
 let branches: Array<{ name: string; commit: { sha: string } }>;
 let tags: typeof branches;
-let pulls: Array<{ state: string; merged_at?: string; head: { sha: string; repo: { full_name: string } | null } }>;
+let pulls: Array<{ state: string; merged_at?: string; head: { ref?: string; sha: string; repo: { full_name: string } | null } }>;
 let otherRefs: Array<{ ref: string; object: { type: string; sha: string } }>;
 
 function answer(url: string): Response {
@@ -70,6 +70,42 @@ describe("zero-delta forge evidence", () => {
     (kind === "branch" ? branches : tags).push({ name: "CARD-1-hidden", commit: { sha: hidden } });
     pulls.push({ state: "open", head: { sha: hidden, repo: { full_name: "test/project" } } });
     expect(await decide()).toMatchObject({ ok: false, reason: `${kind} CARD-1-hidden names this card and is not on the base line` });
+  });
+
+  it.each(["test/project", "fork/project"])("refuses an off-base card-named open pull-request head retained only by a pull ref (%s)", async (fullName) => {
+    otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha: hidden } });
+    pulls.push({ state: "open", head: { ref: "CARD-1-cycle", sha: hidden, repo: { full_name: fullName } } });
+    expect(await decide()).toMatchObject({ ok: false });
+  });
+
+  it.each(["CARD-2-cycle", "CARD-10-cycle", "xCARD-1-cycle"])("does not block on an unrelated open pull-request name %s", async (name) => {
+    otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha: hidden } });
+    pulls.push({ state: "open", head: { ref: name, sha: hidden, repo: { full_name: "test/project" } } });
+    expect(await decide()).toMatchObject({ ok: true });
+  });
+
+  it("accepts a card-named open pull-request head already on the base line", async () => {
+    otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha: ancestor } });
+    pulls.push({ state: "open", head: { ref: "CARD-1-cycle", sha: ancestor, repo: { full_name: "test/project" } } });
+    expect(await decide()).toMatchObject({ ok: true });
+  });
+
+  it("keeps the existing accounting rule for a closed card-named pull request", async () => {
+    otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha: hidden } });
+    pulls.push({ state: "closed", head: { ref: "CARD-1-cycle", sha: hidden, repo: { full_name: "test/project" } } });
+    expect(await decide()).toMatchObject({ ok: true });
+  });
+
+  it("refuses at the close write when an unchanged pull-request head is renamed for this card", async () => {
+    otherRefs.push({ ref: "refs/pull/17/head", object: { type: "commit", sha: hidden } });
+    pulls.push({ state: "open", head: { ref: "CARD-2-cycle", sha: hidden, repo: { full_name: "test/project" } } });
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    pulls[0]!.head.ref = "CARD-1-cycle";
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false, retriable: true,
+    });
   });
 
   it("refuses an unaccounted forge tag even with a clean branch list", async () => {
