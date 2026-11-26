@@ -84,4 +84,63 @@ describe("mapOpenCodeServeEvent (recorded 2.2.4 streams)", () => {
     expect(mapOpenCodeServeEvent({ type: "mcp.status.changed", data: { server: "x" } }, state)).toEqual({ lines: [], outcome: null });
     expect(mapOpenCodeServeEvent({ type: "session.inbox.enqueued", data: { sessionID: "ses_1" } }, state)).toEqual({ lines: [], outcome: null });
   });
+
+  it("captures the session's cumulative usage, last event winning", () => {
+    // The recorded streams emit one cumulative session.usage.updated per step:
+    // text=100/7/20, shell=100->200, length=100->200->300.
+    expect(replay("text").parsed.sessionUsage).toEqual({
+      usage: { inputTokens: 100, cachedInputTokens: 20, outputTokens: 7 },
+      costUsd: 0,
+    });
+    expect(replay("shell").parsed.sessionUsage).toEqual({
+      usage: { inputTokens: 200, cachedInputTokens: 40, outputTokens: 14 },
+      costUsd: 0,
+    });
+    expect(replay("length").parsed.sessionUsage).toEqual({
+      usage: { inputTokens: 300, cachedInputTokens: 60, outputTokens: 21 },
+      costUsd: 0,
+    });
+    // No transport baseline was replayed alongside these recordings.
+    expect(replay("text").parsed.sessionUsageBaseline).toBeNull();
+  });
+
+  it("maps a session.usage.updated event onto a session_usage line", () => {
+    const state = createOpenCodeServeEventState();
+    const mapped = mapOpenCodeServeEvent(
+      {
+        type: "session.usage.updated",
+        data: { sessionID: "ses_1", cost: 0.25, tokens: { input: 120, output: 9, reasoning: 2, cache: { read: 30, write: 5 } } },
+      },
+      state,
+    );
+    expect(mapped.outcome).toBeNull();
+    expect(JSON.parse(mapped.lines[0])).toEqual({
+      type: "session_usage",
+      sessionID: "ses_1",
+      part: { type: "session-usage", usage: { inputTokens: 125, cachedInputTokens: 30, outputTokens: 11 }, costUsd: 0.25 },
+    });
+  });
+
+  it("drops a session.usage.updated event with unusable counters", () => {
+    const state = createOpenCodeServeEventState();
+    expect(
+      mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1", tokens: { input: "lots" } } }, state),
+    ).toEqual({ lines: [], outcome: null });
+    expect(mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1" } }, state)).toEqual({
+      lines: [],
+      outcome: null,
+    });
+  });
+
+  it("keeps the last session_usage line and ignores malformed ones", () => {
+    const stream = [
+      JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 2 }, costUsd: 0.01 } }),
+      JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: "no" }, costUsd: 0 } }),
+      JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 30, cachedInputTokens: 4, outputTokens: 6 }, costUsd: 0.02 } }),
+      JSON.stringify({ type: "session_usage_baseline", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 1 }, costUsd: 0.01 } }),
+    ].join("\n");
+    const parsed = parseOpenCodeJsonl(stream);
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 30, cachedInputTokens: 4, outputTokens: 6 }, costUsd: 0.02 });
+    expect(parsed.sessionUsageBaseline).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 1 }, costUsd: 0.01 });
+  });
 });

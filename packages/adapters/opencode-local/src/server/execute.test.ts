@@ -1065,7 +1065,10 @@ describe("execute — OpenCode V2 serve transport", () => {
   const token = "serve-runtime-mcp-secret";
   const mcpServer = { name: "Paperclip projects", url: "https://paperclip.example/mcp", token, connectionId: "connection-serve" };
 
-  async function runServe(fake: Record<string, string> = {}, { mcp = true }: { mcp?: boolean } = {}) {
+  async function runServe(
+    fake: Record<string, string> = {},
+    { mcp = true, sessionId = null, timeoutSec }: { mcp?: boolean; sessionId?: string | null; timeoutSec?: number } = {},
+  ) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-serve-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "opencode");
@@ -1084,12 +1087,13 @@ describe("execute — OpenCode V2 serve transport", () => {
       const result = await execute({
         runId: `run-v2-serve-${Math.random().toString(36).slice(2)}`,
         agent: { id: "agent-v2-serve", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        runtime: { sessionId, sessionParams: sessionId ? { sessionId, cwd: path.join(path.dirname(commandPath), "workspace") } : null, sessionDisplayId: null, taskKey: null },
         config: {
           command: commandPath,
           cliVersion: "2.2.4",
           cwd: workspace,
           model: "openai/gpt-5",
+          ...(timeoutSec !== undefined ? { timeoutSec } : {}),
           env: { OPENCODE_ALLOW_ALL_MODELS: "1", FAKE_LOG: logFile, FAKE_MCP_NAME: mcpServer.name, ...fake },
         },
         context: {},
@@ -1118,6 +1122,48 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for 1 injected MCP server(s) to report connected and remain quiet");
     expect(logs).not.toContain("one-shot");
     expect(JSON.stringify({ logs, result })).not.toContain(token);
+  });
+
+  it("reports per-run usage from the session's usage records, not the step sums", async () => {
+    const { result } = await runServe();
+
+    // The turn's step also reports 5/2/1, but the session.usage.updated events
+    // (partial 2/1/0, then cumulative 5/2/1, last one winning) are the record
+    // the result must carry, marked per_run so the server does not delta it.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    // The unpriced fixture model reports cost 0 with tokens spent: unpriced,
+    // not free.
+    expect(result.costUsd).toBeNull();
+    expect((result.resultJson as Record<string, unknown>).usageSource).toBe("session_usage");
+  });
+
+  it("reports a priced turn's session cost as the run's cost", async () => {
+    const { result } = await runServe({ FAKE_USAGE_COST: "0.001" });
+
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.costUsd).toBe(0.001);
+    expect(result.usageBasis).toBe("per_run");
+  });
+
+  it("subtracts a resumed session's pre-run baseline from its cumulative usage", async () => {
+    const { result, requests } = await runServe({}, { sessionId: "ses_known" });
+
+    expect(requests.some((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toBe(true);
+    // The session's cumulative totals after the turn are 505/62/41 on top of
+    // the pre-run baseline 500/60/40; only the delta is this run's.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBeNull();
+    expect((result.resultJson as Record<string, unknown>).usageSource).toBe("session_usage");
+  });
+
+  it("keeps the usage already spent when a serve run times out", async () => {
+    const { result } = await runServe({ FAKE_HANG_TURN: "1" }, { timeoutSec: 1 });
+
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
   });
 
   it("says PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path, once", async () => {

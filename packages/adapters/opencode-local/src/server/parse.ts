@@ -1,4 +1,9 @@
 import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import {
+  parseOpenCodeSessionUsageEvent,
+  parseOpenCodeSessionUsagePart,
+  type OpenCodeSessionTotals,
+} from "./session-usage.js";
 
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -72,6 +77,11 @@ export function parseOpenCodeJsonl(stdout: string) {
     outputTokens: 0,
   };
   let costUsd = 0;
+  // Cumulative session usage from `session.usage.updated` events, plus the
+  // pre-run baseline the serve transport reads from `GET /api/session/{id}`.
+  // Both are OpenCodeSessionTotals, not step sums: see session-usage.ts.
+  let sessionUsage: OpenCodeSessionTotals | null = null;
+  let sessionUsageBaseline: OpenCodeSessionTotals | null = null;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -122,6 +132,20 @@ export function parseOpenCodeJsonl(stdout: string) {
       continue;
     }
 
+    if (type === "session_usage") {
+      // Cumulative for the whole session; the last event wins, and the
+      // reconciliation step subtracts the pre-run baseline.
+      const totals = parseOpenCodeSessionUsagePart(event.part);
+      if (totals) sessionUsage = totals;
+      continue;
+    }
+
+    if (type === "session_usage_baseline") {
+      const totals = parseOpenCodeSessionUsagePart(event.part);
+      if (totals) sessionUsageBaseline = totals;
+      continue;
+    }
+
     if (type === "tool_use" || type === "tool") {
       const part = parseObject(event.part);
       const state = parseObject(part.state);
@@ -153,6 +177,8 @@ export function parseOpenCodeJsonl(stdout: string) {
     summary: messages.map((m) => m.text).join("\n\n").trim(),
     usage,
     costUsd,
+    sessionUsage,
+    sessionUsageBaseline,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
     paperclipToolCallCount: paperclipToolCallIds.size,
@@ -334,6 +360,20 @@ export function mapOpenCodeServeEvent(
         })],
         outcome: null,
       };
+    case "session.usage.updated": {
+      // The session's cumulative usage and cost, emitted after each model
+      // response. Durable where a dropped `step_finish` is not; carried as a
+      // synthetic line so the stdout parser stays the single contract.
+      const totals = parseOpenCodeSessionUsageEvent(data);
+      if (!totals) return none;
+      return {
+        lines: [line({
+          type: "session_usage",
+          part: { type: "session-usage", usage: totals.usage, costUsd: totals.costUsd },
+        })],
+        outcome: null,
+      };
+    }
     case "session.execution.failed":
       return {
         lines: [line({ type: "error", error: parseObject(data.error) })],

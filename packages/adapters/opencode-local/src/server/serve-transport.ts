@@ -15,6 +15,7 @@ import {
   parseOpenCodeJsonl,
   type OpenCodeServeTurnOutcome,
 } from "./parse.js";
+import { parseOpenCodeSessionTotals } from "./session-usage.js";
 import {
   OPENCODE_MCP_QUIESCENCE_MS,
   OPENCODE_MCP_READY_DEADLINE_MS,
@@ -393,6 +394,21 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       const existing = await request(`/api/session/${encodeURIComponent(sessionId)}`);
       if (existing.status === 404) throw new ServeTransportError(`OpenCode session ${sessionId} not found (unknown session)`);
       if (existing.status !== 200) throw new ServeTransportError(`OpenCode could not load session ${sessionId}: HTTP ${existing.status}`);
+      // Snapshot the session's cumulative usage before the prompt so the run's
+      // result can report only what this attempt spent (session-usage.ts). A
+      // payload without complete counters emits nothing, and the run falls
+      // back to the per-step stdout sums.
+      const baseline = parseOpenCodeSessionTotals(existing.text);
+      if (baseline) {
+        await emit(
+          "stdout",
+          `${redact(JSON.stringify({
+            type: "session_usage_baseline",
+            sessionID: sessionId,
+            part: { type: "session-usage", usage: baseline.usage, costUsd: baseline.costUsd },
+          }))}\n`,
+        );
+      }
       const switched = await request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: "POST",
         body: JSON.stringify({ model }),

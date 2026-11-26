@@ -183,6 +183,25 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect(seen.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(false);
   });
 
+  it("emits a session usage baseline before the turn's usage on resume", async () => {
+    const result = await runOpenCodeServeProcess(input({ resumeSessionId: "ses_known" }));
+    expect(result.exitCode).toBe(0);
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    // Snapshot from GET /api/session, then the turn's cumulative totals.
+    expect(parsed.sessionUsageBaseline).toEqual({ usage: { inputTokens: 500, cachedInputTokens: 40, outputTokens: 60 }, costUsd: 0.05 });
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 505, cachedInputTokens: 41, outputTokens: 62 }, costUsd: 0.05 });
+    expect(result.stdout.indexOf("session_usage_baseline")).toBeGreaterThanOrEqual(0);
+    expect(result.stdout.indexOf("session_usage_baseline")).toBeLessThan(result.stdout.indexOf('"session_usage"'));
+  });
+
+  it("does not emit a session usage baseline for a fresh session", async () => {
+    const result = await runOpenCodeServeProcess(input());
+    expect(result.exitCode).toBe(0);
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    expect(parsed.sessionUsageBaseline).toBeNull();
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, costUsd: 0 });
+  });
+
   it("never leaks the server password, its Authorization header or the MCP bearer token", async () => {
     // The fake echoes all three into its output, its stderr and an event text.
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_SECRET: TOKEN }) }));
@@ -205,6 +224,10 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   it("keeps the wall-clock timeout and frees the server", async () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_TURN: "1" }), timeoutSec: 1 }));
     expect(result.timedOut).toBe(true);
+    // The turn's usage records were already emitted; a timed-out run keeps
+    // them so the result can still report what was spent.
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, costUsd: 0 });
     await expectServerStopped();
   });
 

@@ -15,6 +15,25 @@ const push = (type, data) => {
   for (const res of clients) res.write(`data: ${JSON.stringify({ id: `evt_${Math.random()}`, type, data })}\n\n`);
 };
 
+// Session usage: `ses_known` pretends to be a resumed session that already
+// spent 500/60/40 tokens and $0.05; a fresh `ses_fake` starts at zero. Each
+// prompt turn then adds 5/2/1 tokens, so a reconciled run result must report
+// 5/2/1 on both paths. FAKE_USAGE_COST prices the turn (default 0 = unpriced).
+const priorUsage = (id) =>
+  id === "ses_known"
+    ? { input: 500, output: 60, reasoning: 0, cache: { read: 40, write: 0 } }
+    : { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+const priorCost = (id) => (id === "ses_known" ? 0.05 : 0);
+const addTokens = (a, b) => ({
+  input: a.input + b.input,
+  output: a.output + b.output,
+  reasoning: a.reasoning + b.reasoning,
+  cache: { read: a.cache.read + b.cache.read, write: a.cache.write + b.cache.write },
+});
+const turnCost = () => Number(process.env.FAKE_USAGE_COST ?? "0");
+const usageEvent = (id, tokens, cost) =>
+  push("session.usage.updated", { sessionID: id, cost, tokens: addTokens(priorUsage(id), tokens) });
+
 const server = http.createServer(async (req, res) => {
   let body = "";
   for await (const chunk of req) body += chunk;
@@ -55,7 +74,9 @@ const server = http.createServer(async (req, res) => {
   if (sessionMatch) {
     const [, id, rest] = sessionMatch;
     if (!rest && req.method === "GET") {
-      return id === "ses_known" || id === "ses_fake" ? json(200, { data: { id } }) : json(404, { _tag: "SessionNotFoundError", message: `Session not found: ${id}` });
+      return id === "ses_known" || id === "ses_fake"
+        ? json(200, { data: { id, tokens: priorUsage(id), cost: priorCost(id) } })
+        : json(404, { _tag: "SessionNotFoundError", message: `Session not found: ${id}` });
     }
     const permissionReply = /^\/permission\/([^/]+)\/reply$/.exec(rest ?? "");
     if (permissionReply && req.method === "POST") {
@@ -68,6 +89,7 @@ const server = http.createServer(async (req, res) => {
         if (id !== "ses_fake") return;
         push("session.tool.failed", { ...base, id: "call_1", error: { type: "permission.rejected", message: JSON.parse(body).message } });
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0 });
+        usageEvent(id, { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, priorCost(id) + turnCost());
         push("session.execution.succeeded", { sessionID: id });
       }, 10);
       return;
@@ -83,6 +105,7 @@ const server = http.createServer(async (req, res) => {
         if (id !== "ses_fake") return;
         push("session.tool.failed", { ...base, id: "call_q", error: { type: "aborted", message: "The user dismissed this question" } });
         push("session.step.failed", { ...base, error: { message: "Step interrupted" } });
+        usageEvent(id, { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, priorCost(id));
         push("session.execution.interrupted", { sessionID: id });
       }, 10);
       return;
@@ -129,7 +152,11 @@ const server = http.createServer(async (req, res) => {
         push("session.execution.started", { sessionID: id });
         push("session.step.started", base);
         push("session.text.ended", { ...base, ordinal: 0, text: `fake reply${leakToken ? ` ${password} ${leakToken}` : ""}${"x".repeat(Number(process.env.FAKE_BIG_TEXT_BYTES ?? 0))}` });
+        // Partial cumulative usage mid-turn, then the full total after the
+        // step: the parser must keep the last event, not sum them.
+        usageEvent(id, { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, priorCost(id));
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, cost: 0 });
+        usageEvent(id, { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, priorCost(id) + turnCost());
         if (process.env.FAKE_HANG_TURN === "1") return;
         if (process.env.FAKE_ENDS_MID_TURN === "close-stream") {
           for (const res of clients) res.end();
