@@ -180,6 +180,20 @@ function contextFromWorktreeLayout(_env: NodeJS.ProcessEnv): WorktreeRuntimeCont
 }
 
 
+function explicitOwnEmbeddedDataDir(configPath: string, ownRoot: string, excludedRoots: string[]): string | null {
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as PaperclipConfig;
+    if (config.database?.mode !== "embedded-postgres") return null;
+    const configured = nonEmpty(config.database.embeddedPostgresDataDir);
+    if (!configured) return null;
+    const dataDir = resolveHomeAwarePath(configured);
+    if (!isPathInside(dataDir, ownRoot) || dataDir === path.resolve(ownRoot)) return null;
+    return excludedRoots.some((root) => isPathInside(dataDir, root) || isPathInside(root, dataDir)) ? null : dataDir;
+  } catch {
+    return null;
+  }
+}
+
 function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   const plan = currentBootEnvPlan();
   if (!plan || plan.mode !== "worktree") return null;
@@ -194,7 +208,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     (stale ? null : staged("PAPERCLIP_INSTANCE_ID")) ?? sanitizeWorktreeInstanceId(worktreeName);
   const homeDir = resolveHomeAwarePath((stale ? null : staged("PAPERCLIP_HOME")) ?? fallback.homeDir);
   const instanceRoot = path.join(homeDir, "instances", instanceId);
-  const claimed: WorktreeRuntimeContext = {
+  let claimed: WorktreeRuntimeContext = {
     ...fallback, worktreeName, instanceId, homeDir, instanceRoot,
     contextPath: path.join(homeDir, "context.json"),
     embeddedPostgresDataDir: path.join(instanceRoot, "db"),
@@ -207,13 +221,20 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   const operatorHome = operatorOrLayout("PAPERCLIP_HOME");
   const exportedHomeMatch = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
     instanceId !== "default" && operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
-  const explicitOwnDatabase = operatorOrLayout("DATABASE_URL") !== null;
+  const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
+  const explicitEmbeddedDir = explicitOwnEmbeddedDataDir(
+    plan.configPath,
+    path.dirname(stateRoot),
+    [...mainHomes, path.join(homeDir, "instances"), path.join(fallback.homeDir, "instances")],
+  );
+  const explicitOwnDatabase = operatorOrLayout("DATABASE_URL") !== null || explicitEmbeddedDir !== null;
   const exportedWorktreeHome = exportedHomeMatch && explicitOwnDatabase;
+  if (exportedWorktreeHome && explicitEmbeddedDir) claimed = { ...claimed, embeddedPostgresDataDir: explicitEmbeddedDir };
   const remedy = exportedHomeMatch && !explicitOwnDatabase
-    ? "; set an explicit own database for the worktree with an operator DATABASE_URL"
+    ? "; set an explicit own database for the worktree with an operator DATABASE_URL or a " +
+      "database.embeddedPostgresDataDir inside the worktree checkout"
     : "";
   if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
-  const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
   const parent = path.dirname(path.dirname(stateRoot));
   let parentEntries: fs.Dirent[] | null;
   try {
@@ -247,7 +268,12 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
         const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as PaperclipConfig;
         const dataDir = config.database?.embeddedPostgresDataDir ??
           (configPath === instanceConfigPath ? resolveDefaultEmbeddedPostgresDir(mainInstance) : undefined);
-        if (dataDir && isPathInside(resolveHomeAwarePath(dataDir), candidate.instanceRoot)) return true;
+        const resolvedDataDir = dataDir ? resolveHomeAwarePath(dataDir) : null;
+        if (resolvedDataDir && (
+          isPathInside(resolvedDataDir, candidate.instanceRoot) ||
+          isPathInside(resolvedDataDir, candidate.embeddedPostgresDataDir) ||
+          isPathInside(candidate.embeddedPostgresDataDir, resolvedDataDir)
+        )) return true;
       } catch {
         // Missing or malformed sibling configs do not claim an instance.
       }
@@ -482,7 +508,10 @@ function needsWorktreeConfigRepair(
     if (config.database.backup.enabled) {
       return true;
     }
-    if (!isPathInside(config.database.embeddedPostgresDataDir, context.instanceRoot)) {
+    if (
+      !isPathInside(config.database.embeddedPostgresDataDir, context.instanceRoot) &&
+      resolveHomeAwarePath(config.database.embeddedPostgresDataDir) !== context.embeddedPostgresDataDir
+    ) {
       return true;
     }
     if (!isPathInside(config.database.backup.dir, context.instanceRoot)) {
