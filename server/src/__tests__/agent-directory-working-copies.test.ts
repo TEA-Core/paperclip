@@ -196,6 +196,64 @@ describe("persistent agent directories", () => {
     } finally { planting.mockRestore(); }
   });
 
+  async function onPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+    const previous = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...previous, value: platform });
+    try { return await fn(); } finally { Object.defineProperty(process, "platform", previous); }
+  }
+
+  it("stages group permissions through the no-follow walk on POSIX hosts without /proc", async () => {
+    await writeShared();
+    await fs.writeFile(path.join(root, "doctrine/run.sh"), "#!/bin/sh\n", { mode: 0o775 });
+    await fs.chmod(path.join(root, "doctrine/run.sh"), 0o775);
+    const gid = process.getegid!();
+    const touched: string[] = [];
+    const open = fs.open.bind(fs), readdir = fs.readdir.bind(fs), lstat = fs.lstat.bind(fs);
+    const spies = [
+      vi.spyOn(fs, "open").mockImplementation((...args) => { touched.push(String(args[0])); return open(...args); }),
+      vi.spyOn(fs, "readdir").mockImplementation(((...args: Parameters<typeof fs.readdir>) => { touched.push(String(args[0])); return readdir(...args); }) as typeof fs.readdir),
+      vi.spyOn(fs, "lstat").mockImplementation(((...args: Parameters<typeof fs.lstat>) => { touched.push(String(args[0])); return lstat(...args); }) as typeof fs.lstat),
+    ];
+    try {
+      const copy = await onPlatform("darwin", () => withAgentsGid(gid, () => run()));
+      expect(copy.state).toBe("prepared");
+      expect(copy.receipt?.stagedGid).toBe(gid);
+      expect(touched.filter(name => name.startsWith("/proc/self/fd") || name.startsWith("/dev/fd"))).toEqual([]);
+      for (const [relative, mode] of [["doctrine", 0o2750], ["doctrine/mission.md", 0o640], ["doctrine/run.sh", 0o750]] as const) {
+        const stat = await fs.stat(path.join(copy.localRoot, relative));
+        expect([stat.mode & 0o7777, stat.gid]).toEqual([mode, gid]);
+      }
+      expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o750);
+    } finally { for (const spy of spies) spy.mockRestore(); }
+
+    const outside = path.join(home, "fallback-hardlink-outside.md");
+    await fs.writeFile(outside, "outside");
+    await fs.chmod(outside, 0o664);
+    const before = await fs.stat(outside);
+    const cp = fs.cp.bind(fs);
+    const planting = vi.spyOn(fs, "cp").mockImplementation(async (source, destination, options) => {
+      await cp(source, destination, options);
+      if (path.basename(String(destination)) === "live") await fs.link(outside, path.join(String(destination), "doctrine/planted.md"));
+    });
+    try {
+      await expect(onPlatform("darwin", () => withAgentsGid(gid, () => run()))).rejects.toMatchObject({ status: 422 });
+      const after = await fs.stat(outside);
+      expect([after.mode, after.gid]).toEqual([before.mode, before.gid]);
+    } finally { planting.mockRestore(); }
+  });
+
+  it("keeps Windows staging owner-only without a group or permission walk", async () => {
+    await writeShared();
+    const open = vi.spyOn(fs, "open");
+    try {
+      const copy = await onPlatform("win32", () => withAgentsGid(process.getegid!(), () => run()));
+      expect(copy.state).toBe("prepared");
+      expect(copy.receipt?.stagedGid).toBeUndefined();
+      expect(open.mock.calls.filter(([name]) => String(name).startsWith(path.dirname(copy.localRoot)))).toEqual([]);
+      expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o700);
+    } finally { open.mockRestore(); }
+  });
+
   it("refuses a directory swapped for an outside symlink between lookup and permission mutation", async () => {
     await writeShared();
     const outside = path.join(home, "swap-outside");
@@ -294,6 +352,38 @@ describe("persistent agent directories", () => {
       saving.mockRestore(); runtime.mockRestore(); restore.mockRestore(); stage.mockRestore(); shell.mockRestore();
       process.umask(previousUmask);
     }
+  });
+
+  it("refuses a link restored from a sandbox run once with the named refusal", async () => {
+    const remoteCwd = path.join(home, "restore-link");
+    await fs.mkdir(remoteCwd);
+    const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), remoteCwd };
+    const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand")
+      .mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() });
+    let restores = 0;
+    const runtime = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+      const remote = input.workspaceRemoteDir!;
+      await fs.mkdir(path.dirname(remote), { recursive: true });
+      await fs.cp(input.workspaceLocalDir, remote, { recursive: true });
+      return { target: executionTarget, workspaceRemoteDir: remote, runtimeRootDir: null,
+        assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+        restoreWorkspace: async () => {
+          restores += 1;
+          await mergeDirectoryWithBaseline({ baseline: input.workspaceBaseline!, sourceDir: remote, targetDir: input.workspaceLocalDir });
+        } };
+    });
+    try {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const copy = (await withAgentsGid(process.getegid!(), () =>
+        copies.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget })))!;
+      await fs.symlink("/etc/hostname", path.join(copy.executionRoot, "escape.md"));
+      const result = await copies.collectStopped({ companyId, runId, target: executionTarget });
+      expect(restores).toBe(1);
+      expect(result?.state).toBe("unavailable");
+      expect(result?.errorMessage).toMatch(/^Agent directories support regular files and directories, without links or special files\. /);
+      await expect(fs.lstat(path.join(root, "escape.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { runtime.mockRestore(); shell.mockRestore(); }
   });
 
   it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {

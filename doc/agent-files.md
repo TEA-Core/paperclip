@@ -59,11 +59,14 @@ Remote SSH and sandbox restores use the same rule: the run directory closes
 before the transport writes any bytes, then the permission walk removes remote
 group/world write bits before the run directory opens again. Restore-created
 directories have the staged directory mode, never a published `02775`.
-The permission walk rejects hard links and changed inode identities. It opens
-entries without following symlinks, pins parent directories through the host's
-fd filesystem (`/proc/self/fd` on Linux, `/dev/fd` elsewhere), and changes modes
-and groups through file handles. If the fd filesystem cannot verify an entry,
-preparation or restoration fails closed; there is no path-based mutation fallback.
+The permission walk refuses links and special files with the named
+`422` refusal, so a link restored from a remote or sandbox run is not retried.
+It rejects changed inode identities, opens entries without following symlinks,
+and changes modes and groups through file handles. On Linux it also pins parent
+directories through `/proc/self/fd`. Other POSIX hosts, such as macOS, compare
+each opened handle's device, inode, and link count with its `lstat` result and
+rely on the private `0700` run directory for ancestor stability. Windows has no
+POSIX modes, so it skips group staging and the run stays owner-only.
 Staging never changes canonical files: a file still at its staged mode is saved
 with its canonical mode; only a mode the run itself set is saved. Receipts record
 the staging formula version, so copies staged by the earlier group build (`0640`

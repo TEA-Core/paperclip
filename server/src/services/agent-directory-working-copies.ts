@@ -13,7 +13,7 @@ import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorage
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
-import { HttpError, conflict, notFound } from "../errors.js";
+import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
@@ -39,7 +39,7 @@ async function workingCopyGid(): Promise<number | null> {
     const named = stdout.trim().split(":")[2];
     if (named && /^\d+$/.test(named)) gid = Number(named);
   }
-  if (gid === null) return null;
+  if (gid === null || process.platform === "win32") return null;
   return process.getuid?.() === 0 || process.getegid?.() === gid || process.getgroups?.().includes(gid) ? gid : null;
 }
 
@@ -51,23 +51,27 @@ const STAGED_MODE_VERSION = 3;
 const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
 const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
 
+const LINK_REFUSAL = "Agent directories support regular files and directories, without links or special files";
+
 async function workingCopyPermissions(filename: string, gid: number | null, recursive = true, parentFd?: number): Promise<void> {
-  // Pin each parent while walking. O_NOFOLLOW alone protects only the leaf,
-  // not an ancestor replaced between lookup and open.
-  const fdRoot = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
-  const entryPath = parentFd === undefined ? filename : path.join(fdRoot, String(parentFd), path.basename(filename));
+  // Windows has no POSIX modes or groups to stage.
+  if (process.platform === "win32") return;
+  // Linux pins each parent through /proc/self/fd while walking. Other POSIX
+  // hosts open each entry without following links and verify its identity.
+  const pinned = process.platform === "linux";
+  const fdPath = (fd: number) => path.join("/proc/self/fd", String(fd));
+  const entryPath = parentFd === undefined ? filename : path.join(fdPath(parentFd), path.basename(filename));
   const expected = await fs.lstat(entryPath);
-  if (!expected.isDirectory() && !expected.isFile()) throw new Error("Agent working copy contains a link or non-regular entry");
+  if (!expected.isDirectory() && !expected.isFile()) throw unprocessable(LINK_REFUSAL);
   const handle = await fs.open(entryPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
     (expected.isDirectory() ? constants.O_DIRECTORY : 0));
   try {
     const stat = await handle.stat();
-    if (stat.dev !== expected.dev || stat.ino !== expected.ino || stat.isFile() && stat.nlink !== 1) {
-      throw new Error("Agent working copy entry changed or contains a hard link");
+    if (stat.dev !== expected.dev || stat.ino !== expected.ino) {
+      throw new Error("Agent working copy entry changed during permission assignment");
     }
-    // Fail closed when the fd filesystem is unavailable; never fall back to a
-    // path-based chown/chmod. Also reject a parent moved out of the live tree.
-    if (await fs.realpath(path.join(fdRoot, String(handle.fd))) !== await fs.realpath(filename)) {
+    if (stat.isFile() && stat.nlink !== 1) throw unprocessable(LINK_REFUSAL);
+    if (pinned && await fs.realpath(fdPath(handle.fd)) !== await fs.realpath(filename)) {
       throw new Error("Agent working copy entry moved during permission assignment");
     }
     if (gid !== null && stat.gid !== gid) await handle.chown(stat.uid, gid);
@@ -78,8 +82,8 @@ async function workingCopyPermissions(filename: string, gid: number | null, recu
       : stagedMode(stat.mode) & 0o7777;
     if (gid !== null || mode !== (stat.mode & 0o7777)) await handle.chmod(mode);
     if (recursive && stat.isDirectory()) {
-      for (const entry of await fs.readdir(path.join(fdRoot, String(handle.fd)))) {
-        await workingCopyPermissions(path.join(filename, entry), gid, true, handle.fd);
+      for (const entry of await fs.readdir(pinned ? fdPath(handle.fd) : filename)) {
+        await workingCopyPermissions(path.join(filename, entry), gid, true, pinned ? handle.fd : undefined);
       }
     }
   } finally { await handle.close(); }
