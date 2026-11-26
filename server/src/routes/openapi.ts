@@ -11249,19 +11249,23 @@ registerCurrentRoute({
   description:
     "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
     "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
-    "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The body names one pull request in the card's " +
+    "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
+    "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
+    "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
+    "reason, the call is 409 `landing_proof_cannot_close` before GitHub is asked and nothing is recorded. The body names one pull request in the card's " +
     "project repository (`owner`, `repo`, `pullRequestNumber`), at least one of `mergeCommitSha` / `headSha` (full shas), and a " +
     "`reason`. The server verifies the proof live against GitHub: the repository is the card's project repository " +
     "(422 `landing_proof_wrong_repo`), the card resolves a control-plane base branch (422 `landing_proof_no_base`), the PR exists " +
     "(422 `landing_proof_pr_not_found`), it is merged (422 `landing_proof_pr_not_merged`, or `landing_proof_pr_closed_unmerged` " +
     "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), and the " +
-    "merge commit is contained in the base branch (422 `landing_proof_not_on_base`). A missing credential or unreadable GitHub " +
-    "answer is 422 `landing_proof_unverifiable`. A refusal records nothing. On success (201) the server records an " +
+    "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
+    "not contained). A missing credential, a network error, a non-OK GitHub answer or an unresolvable base branch is 422 " +
+    "`landing_proof_unverifiable`, which may succeed on retry. A refusal records nothing. On success (201) the server records an " +
     "`issue.landing_proof_attached` activity row naming the actor and the evidence, plus a `pull_request` work product with the " +
-    "merge and head commits; replaying the same evidence returns 200 with the recorded proof. Attaching discharges no landing " +
-    "debt. A later board `PATCH /api/issues/{id}` with `status: done` re-verifies the latest attached proof and, when the card owes " +
-    "repository landing debt (for example from a `record_only` reclassification), discharges it atomically with that accepted " +
-    "close. Non-board close doors do not accept the proof.",
+    "merge and head commits. The call is idempotent for retries: replaying the same evidence returns 200 with `replayed: true` " +
+    "and the recorded proof, and writes nothing. Attaching discharges no landing debt. A later board `PATCH /api/issues/{id}` with " +
+    "`status: done` re-verifies the latest attached proof and discharges the repository landing debt (for example from a " +
+    "`record_only` reclassification) atomically with that accepted close. Non-board close doors do not accept the proof.",
   body: attachIssueLandingProofSchema,
   responses: {
     200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,

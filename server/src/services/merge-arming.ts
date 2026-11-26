@@ -2611,7 +2611,7 @@ export function deliveryBindingValidationError(
 
 type MergedDeliveryVerification =
   | { outcome: "proven" }
-  | { outcome: "unproven"; reason: string }
+  | { outcome: "unproven"; reason: string; notOnBase?: true }
   | { outcome: "auth-failed"; status: number };
 
 /**
@@ -2673,12 +2673,14 @@ export async function verifyMergedPullRequestOnBaseBranch(
   if (typeof aheadBy === "number" ? aheadBy === 0 : status === "identical" || status === "behind") {
     return { outcome: "proven" };
   }
-  return {
-    outcome: "unproven",
-    reason: status
-      ? `merge commit ${mergeCommitSha.slice(0, 7)} is not on base branch ${baseRef} (compare status: ${status})`
-      : "merge-commit containment check returned an unreadable compare response",
-  };
+  if (status) {
+    return {
+      outcome: "unproven",
+      reason: `merge commit ${mergeCommitSha.slice(0, 7)} is not on base branch ${baseRef} (compare status: ${status})`,
+      notOnBase: true,
+    };
+  }
+  return { outcome: "unproven", reason: "merge-commit containment check returned an unreadable compare response" };
 }
 
 /**

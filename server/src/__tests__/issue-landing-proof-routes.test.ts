@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueWorkProducts,
   issues,
@@ -55,6 +56,7 @@ const MERGE_ON_BASE = sha("a1");
 const HEAD_OF_MERGED = sha("b2");
 const MERGE_OFF_BASE = sha("c3");
 const OTHER_SHA = sha("d4");
+const FEATURE_HEAD = sha("e5");
 
 interface FakePr {
   state: "open" | "closed";
@@ -70,6 +72,7 @@ const github = {
   prs: new Map<number, FakePr>(),
   branches: new Map<string, string>(),
   onBase: new Set<string>(),
+  compareStatus: null as number | null,
 };
 
 function json(body: unknown, status = 200) {
@@ -91,9 +94,15 @@ async function fakeGitHub(url: string): Promise<Response> {
     const head = github.branches.get(ref[1]!);
     return head ? json({ ref: `refs/heads/${ref[1]}`, object: { sha: head } }) : json({ message: "Not Found" }, 404);
   }
+  const commit = /^\/commits\/(.+)$/.exec(rest);
+  if (commit) {
+    const head = github.branches.get(commit[1]!);
+    return head ? json({ sha: head }) : json({ message: "Not Found" }, 404);
+  }
   const compare = /^\/compare\/(.+)\.\.\.(.+)$/.exec(rest);
   if (compare) {
     if (!github.branches.has(compare[1]!)) return json({ message: "Not Found" }, 404);
+    if (github.compareStatus !== null) return json({ message: "Server Error" }, github.compareStatus);
     return github.onBase.has(compare[2]!)
       ? json({ status: "behind", ahead_by: 0 })
       : json({ status: "diverged", ahead_by: 2 });
@@ -107,6 +116,7 @@ function resetGitHub() {
   github.prs.clear();
   github.branches.clear();
   github.onBase.clear();
+  github.compareStatus = null;
   github.branches.set(BASE, MERGE_ON_BASE);
   github.onBase.add(MERGE_ON_BASE);
   const pr = (over: Partial<FakePr>): FakePr => ({
@@ -174,7 +184,11 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   const stageId = "cccccccc-0000-4000-8000-000000000001";
 
   /** The stuck shape: completed user-only review stage, no deliveryIdentity, no execution workspace. */
-  async function seedStuckCard(options: { participant?: "user" | "agent"; workflow?: "completed" | "pending" } = {}) {
+  async function seedStuckCard(options: {
+    participant?: "user" | "agent";
+    workflow?: "completed" | "pending";
+    executionBranchAhead?: boolean;
+  } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
     const companyId = randomUUID();
@@ -199,13 +213,24 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       id: agentId, companyId, name: "Coder", role: "engineer", status: "active", adapterType: "codex_local",
       adapterConfig: {}, runtimeConfig: {}, permissions: {},
     });
+    const executionWorkspaceId = options.executionBranchAhead ? randomUUID() : null;
+    if (options.executionBranchAhead) {
+      github.branches.set(`deliver/${identifier}`, FEATURE_HEAD);
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId!, companyId, projectId, projectWorkspaceId, sourceIssueId: null,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: "landing-proof-ws", status: "active",
+        cwd: "/tmp/landing-proof-ws", repoUrl: `https://github.com/${OWNER}/${REPO}`, baseRef: BASE,
+        branchName: `deliver/${identifier}`, providerType: "git_worktree", providerRef: "/tmp/landing-proof-ws",
+        lastUsedAt: now, openedAt: now, createdAt: now, updatedAt: now,
+      });
+    }
     const participant = options.participant === "agent"
       ? { type: "agent", agentId }
       : { type: "user", userId: "local-board" };
     await db.insert(issues).values({
       id: issueId, companyId, identifier, title: "Delivered card with a user-only review stage",
       status: "in_progress", priority: "medium", assigneeAgentId: agentId, createdByUserId: "local-board",
-      projectId, projectWorkspaceId, executionWorkspaceId: null, deliveryRequirement: "repository_delivery",
+      projectId, projectWorkspaceId, executionWorkspaceId, deliveryRequirement: "repository_delivery",
       executionPolicy: {
         mode: "normal", commentRequired: true,
         stages: [{ id: stageId, type: "review", participants: [participant] }],
@@ -284,6 +309,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
 
   it("accepts a headSha-only proof and replays identical evidence without a second record", async () => {
     const { issueId } = await seedStuckCard();
+    await reclassifyRecordOnly(issueId);
     const first = await attach(issueId, goodProof({ mergeCommitSha: undefined, headSha: HEAD_OF_MERGED }));
     expect(first.status, JSON.stringify(first.body)).toBe(201);
     const again = await attach(issueId, goodProof({ mergeCommitSha: undefined, headSha: HEAD_OF_MERGED }));
@@ -312,6 +338,41 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     expect(await workProducts(issueId)).toHaveLength(0);
     const close = await patch(issueId, { status: "done" });
     expect(close.status, JSON.stringify(close.body)).toBe(409);
+    expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+  });
+
+  it("refuses a transient compare failure as unverifiable, not as off-base, and records nothing", async () => {
+    const { issueId } = await seedStuckCard();
+    await reclassifyRecordOnly(issueId);
+    github.compareStatus = 502;
+    const refused = await attach(issueId, goodProof());
+    expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+    expect(refused.body.code).toBe("landing_proof_unverifiable");
+    expect(await proofRows(issueId)).toHaveLength(0);
+    expect(await workProducts(issueId)).toHaveLength(0);
+  });
+
+  it("refuses with landing_proof_cannot_close when the card owes no landing debt, and records nothing", async () => {
+    const { issueId } = await seedStuckCard();
+    const refused = await attach(issueId, goodProof());
+    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+    expect(refused.body.code).toBe("landing_proof_cannot_close");
+    expect(await proofRows(issueId)).toHaveLength(0);
+    expect(await workProducts(issueId)).toHaveLength(0);
+  });
+
+  it("refuses with landing_proof_cannot_close when the execution branch is ahead of base with no merged PR, and records nothing", async () => {
+    const { issueId } = await seedStuckCard({ executionBranchAhead: true });
+    await reclassifyRecordOnly(issueId);
+    const close = await patch(issueId, { status: "done" });
+    expect(close.status, JSON.stringify(close.body)).toBe(409);
+    expect(close.body.error).toContain("has no merged PR");
+    const refused = await attach(issueId, goodProof());
+    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+    expect(refused.body.code).toBe("landing_proof_cannot_close");
+    expect(refused.body.error).toContain("has no merged PR");
+    expect(await proofRows(issueId)).toHaveLength(0);
+    expect(await workProducts(issueId)).toHaveLength(0);
     expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
   });
 

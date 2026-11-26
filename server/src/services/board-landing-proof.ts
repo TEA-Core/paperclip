@@ -180,7 +180,7 @@ export async function verifyBoardLandingProof(
       break;
     }
     if (onBase.outcome !== "proven") {
-      return refuse("landing_proof_not_on_base", onBase.reason);
+      return refuse(onBase.notOnBase ? "landing_proof_not_on_base" : "landing_proof_unverifiable", onBase.reason);
     }
     return {
       ok: true,

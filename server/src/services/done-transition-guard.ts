@@ -5875,12 +5875,15 @@ async function evaluateDoneTransitionGuardCore(
   // ADR-103 M3.6: out-parameter the census the core already computed, so the
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
-  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext },
+  // `quiet` evaluates without writing audit rows (the SUP-25193 attach preflight).
+  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext; quiet?: boolean },
   // SUP-24429: the requirement stored before the close request; undefined when
   // the caller's request does not change it.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
   landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
+  const writeAudit: typeof writeAuditLog = observer?.quiet ? async () => {} : writeAuditLog;
+  const writeSkippedAudit: typeof writeGuardSkippedAuditLog = observer?.quiet ? async () => {} : writeGuardSkippedAuditLog;
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
     reason,
@@ -5921,7 +5924,7 @@ async function evaluateDoneTransitionGuardCore(
     if (recovered !== null) {
       reviewLadder = recovered;
       if (recovered.satisfied) {
-        void writeAuditLog(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
+        void writeAudit(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
           reason: "review_ladder_recovered_from_decisions",
           completedStageIds: recovered.completedStageIds,
           skippedStageIds: recovered.skippedStageIds,
@@ -6033,7 +6036,7 @@ async function evaluateDoneTransitionGuardCore(
   // gated at the children and the parent would close ungated. Fail closed
   // here, in the same pre-network zone as mechanism C.
   if (mechanismA !== null && mechanismA.count >= 2) {
-    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+    void writeAudit(db, issue, "issue.done_transition_null_policy_refused", {
       reason: "ungated_decomposed_parent",
       ladderedChildCount: mechanismA.count,
       ladderedChildIdentifiers: mechanismA.identifiers,
@@ -6069,7 +6072,7 @@ async function evaluateDoneTransitionGuardCore(
   // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
   // Runs in the same pre-network zone as mechanisms A and C.
   if (ladderShape !== null) {
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+    void writeAudit(db, issue, "issue.done_transition_ladder_shape_refused", {
       reason: "adr072_close_ladder_shape_incomplete",
       missingStageLabels: ladderShape.missingStageLabels,
       outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
@@ -6195,7 +6198,7 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
-    void writeAuditLog(db, issue, "issue.done_transition_override", {
+    void writeAudit(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
@@ -6290,7 +6293,7 @@ async function evaluateDoneTransitionGuardCore(
   );
   if (staleOpenUnverifiable.length > 0) {
     prSkipReason = appendSkipReason(prSkipReason, `stale_open_unverifiable:${staleOpenUnverifiable.length}`);
-    void writeAuditLog(db, issue, "issue.done_transition_guard_failed_open", {
+    void writeAudit(db, issue, "issue.done_transition_guard_failed_open", {
       reason: `stale_open_unverifiable:${staleOpenUnverifiable.length}`,
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
@@ -6344,7 +6347,7 @@ async function evaluateDoneTransitionGuardCore(
       if (refused.length > 0) {
         const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
         const refusedNames = refused.map((p) => p.displayName).join(", ");
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
           reason: refusalToken,
           skipReason: refusalToken,
           prs: refusedNames,
@@ -6371,7 +6374,7 @@ async function evaluateDoneTransitionGuardCore(
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)
       // closes must still land the PRs first.
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
@@ -6402,7 +6405,7 @@ async function evaluateDoneTransitionGuardCore(
         skipReason: prSkipReason,
       };
     }
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `open_linked_prs:${openPrs.length}`,
       skipReason: `open_linked_prs:${openPrs.length}`,
       prs: prNames,
@@ -6521,7 +6524,7 @@ async function evaluateDoneTransitionGuardCore(
         // ref (unresolvable/stale on the remote) or a transient API state, not
         // the deliverable branch. Never report this as branch-absent.
         if (decisionCarried) {
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `compare_404_base_ref_unresolvable_decision_carried:${branch}`,
             skipReason: prSkipReason,
             branch,
@@ -6599,7 +6602,7 @@ async function evaluateDoneTransitionGuardCore(
           // approval that arms the merge must not be blocked by the unpushed
           // branch it is approving (SUP-13207/13290 precedent); a plain close
           // still lands the deliverable first.
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `branch_absent_decision_carried:${branch}`,
             skipReason: `branch_absent_decision_carried:${branch}`,
             branch,
@@ -6627,7 +6630,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        await writeGuardSkippedAuditLog(db, issue, {
+        await writeSkippedAudit(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
@@ -6745,7 +6748,7 @@ async function evaluateDoneTransitionGuardCore(
       // Same deadlock shape as the open-linked-PR block above, firing when the
       // open PR is unlinked/unhydrated: the approval that arms the merge must
       // not be blocked by the unmerged branch it is approving (SUP-13207).
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
         skipReason: appendSkipReason(
           foreignToken,
@@ -6851,7 +6854,7 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: "foreign_workspace_branch",
       skipReason: foreignToken,
       branch,
@@ -6927,7 +6930,7 @@ async function evaluateDoneTransitionGuardCore(
     // Same deadlock shape as the open-linked-PR block above, firing when the
     // open PR is unlinked/unhydrated: the approval that arms the merge must
     // not be blocked by the unmerged branch it is approving (SUP-13207).
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       skipReason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       branch,
@@ -6962,6 +6965,27 @@ async function evaluateDoneTransitionGuardCore(
     skipped: false,
     skipReason: prSkipReason,
   };
+}
+
+/**
+ * SUP-25193: why a board-attached landing proof could not change this card's
+ * close outcome, or null when it could. The proof only answers outstanding
+ * landing debt; it never overrides a core guard refusal such as a measured
+ * ahead-of-base or foreign execution branch. Writes no audit rows.
+ */
+export async function boardLandingProofCloseBlocker(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
+  landingDebtOwed: boolean,
+): Promise<string | null> {
+  if (!landingDebtOwed) {
+    return "the card owes no repository landing debt, so a landing proof cannot change its close";
+  }
+  const core = await evaluateDoneTransitionGuardCore(db, issue, null, false, { quiet: true }, undefined, true);
+  if (!core.allowed) {
+    return `the done guard refuses this close for a reason a landing proof does not answer: ${core.reason}`;
+  }
+  return null;
 }
 
 /**

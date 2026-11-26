@@ -322,12 +322,22 @@ least one completed review stage names only users, and it records no
 `deliveryIdentity`. For such a card a board actor may call
 `POST /api/issues/:id/landing-proof` with one merged pull request in the card's
 project repository, its merge or head commit, and a reason. An agent key is
-refused with 403, including the assignee or the lease holder. The server verifies
+refused with 403, including the assignee or the lease holder. The proof is
+debt-only. It answers outstanding repository landing debt and never overrides
+another done-guard refusal, such as an execution-workspace branch ahead of base
+with no merged PR or a foreign branch. When the card owes no landing debt, or the
+done guard refuses the close for such another reason, the call is refused 409
+`landing_proof_cannot_close` and nothing is recorded. The server verifies
 the proof live against GitHub before it records anything. The PR must be merged,
 the supplied sha must match the PR, the repository must be the card's project
 repository, and the merge commit must be contained in the card's control-plane
-base branch. A failed check is a typed 4xx refusal. A success records an
+base branch. A failed check is a typed 4xx refusal. `landing_proof_not_on_base`
+means a readable compare showed the merge commit outside the base branch. A
+network error, a non-OK GitHub answer or an unresolvable base branch is
+`landing_proof_unverifiable`, which may succeed on retry. A success records an
 `issue.landing_proof_attached` activity row and a `pull_request` work product.
+The call is idempotent for retries: the same evidence again returns 200 with
+`replayed: true` and writes nothing.
 Attaching discharges no debt. Only a board close accepts the proof. That close
 re-verifies the latest attached proof on its door, and again under the issue-row
 lock with the same 15-second bound. The debt rows are discharged in the

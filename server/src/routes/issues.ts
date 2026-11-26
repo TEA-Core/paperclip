@@ -302,6 +302,7 @@ import {
 } from "../services/plan-review-context.js";
 import {
   countLadderedChildren,
+  boardLandingProofCloseBlocker,
   evaluateDoneTransitionGuard,
   prepareLandingDebtClose,
   evaluateDoneTierDeclaration,
@@ -14373,6 +14374,16 @@ export function issueRoutes(
       });
       return;
     }
+    const landingDebtOwed = (await prepareLandingDebtClose(db, existing)).owed;
+    const cannotClose = await boardLandingProofCloseBlocker(db, existing, landingDebtOwed);
+    if (cannotClose) {
+      res.status(409).json({
+        error: `Landing proof refused: ${cannotClose}`,
+        code: "landing_proof_cannot_close",
+        details: { ...refusalDetails, reason: cannotClose },
+      });
+      return;
+    }
     const verified = await verifyBoardLandingProof(db, existing, body);
     if (!verified.ok) {
       res.status(422).json({
@@ -14383,7 +14394,6 @@ export function issueRoutes(
       return;
     }
     const proof = verified.proof;
-    const landingDebtOwed = (await prepareLandingDebtClose(db, existing)).owed;
     const actor = getActorInfo(req);
     const outcome = await db.transaction(async (tx) => {
       const [locked] = await tx.select().from(issueRows)
