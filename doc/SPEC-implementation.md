@@ -340,9 +340,10 @@ delivery. A `pull_request` work product on the card that the attach did not
 create, or a linked external object, can link the PR. A delivery commit recorded
 on the card can also tie it, when the PR head or merge commit contains that
 commit. A head branch that names the card can also tie it. Otherwise the call is
-refused `landing_proof_not_card_delivery`. The close re-checks this tie too. A failed check is a typed 4xx refusal. `landing_proof_not_on_base`
-means a readable compare showed the merge commit outside the base branch. A
-network error, a non-OK GitHub answer or an unresolvable base branch is
+refused `landing_proof_not_card_delivery`. The close re-checks this tie too.
+A failed check is a typed 4xx refusal. `landing_proof_not_on_base` means a
+readable compare showed the merge commit outside the base branch. A network
+error, a non-OK GitHub answer or an unresolvable base branch is
 `landing_proof_unverifiable`, which may succeed on retry. A success records an
 `issue.landing_proof_attached` activity row and a `pull_request` work product.
 The call is idempotent for retries: the same evidence again returns 200 with
