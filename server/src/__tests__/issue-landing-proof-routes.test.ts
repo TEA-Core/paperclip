@@ -10,6 +10,8 @@ import {
   companyMemberships,
   createDb,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   heartbeatRuns,
   issueWorkProducts,
   issues,
@@ -62,6 +64,7 @@ const LINKED_MERGE = sha("a7");
 const RECORDED_PR_HEAD = sha("b8");
 const RECORDED_PR_MERGE = sha("c9");
 const RECORDED_DELIVERY = sha("d0");
+const MENTIONED_MERGE = sha("e8");
 const REPO_ID = 1001;
 
 interface FakePr {
@@ -137,7 +140,7 @@ function resetGitHub() {
   github.contains.clear();
   github.branches.set(BASE, MERGE_ON_BASE);
   github.onBase.add(MERGE_ON_BASE);
-  for (const onBase of [OTHER_CARD_MERGE, LINKED_MERGE, RECORDED_PR_MERGE]) github.onBase.add(onBase);
+  for (const onBase of [OTHER_CARD_MERGE, LINKED_MERGE, RECORDED_PR_MERGE, MENTIONED_MERGE]) github.onBase.add(onBase);
   const pr = (over: Partial<FakePr>): FakePr => ({
     state: "closed",
     merged: true,
@@ -165,6 +168,11 @@ function resetGitHub() {
   github.prs.set(507, pr({
     merge_commit_sha: RECORDED_PR_MERGE,
     head: { sha: RECORDED_PR_HEAD, ref: "another-unrelated-branch", repo: { full_name: `${OWNER}/${REPO}` } },
+  }));
+  // The card's own PR, tied only by an external-object mention on the card.
+  github.prs.set(508, pr({
+    merge_commit_sha: MENTIONED_MERGE,
+    head: { sha: sha("e9"), ref: "mention-only-branch", repo: { full_name: `${OWNER}/${REPO}` } },
   }));
 }
 
@@ -512,6 +520,27 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       expect(closed.status, JSON.stringify(closed.body)).toBe(200);
       expect((await debtDispositions(issueId))[0]).toMatchObject({
         landingDebtDisposition: "discharged", landingProof: { source: "board_merged_pr", pullRequestNumber: 506 },
+      });
+    });
+
+    it("accepts the card's own merged PR linked only by an external-object mention cached as closed", async () => {
+      const { companyId, issueId } = await seedStuckCard();
+      const [object] = await db.insert(externalObjects).values({
+        companyId, providerKey: "github", objectType: "pull_request", externalId: `${OWNER}/${REPO}#pull/508`,
+        data: { state: "closed", merged: true, merge_commit_sha: MENTIONED_MERGE },
+      }).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId, sourceIssueId: issueId, sourceKind: "comment", objectId: object!.id,
+        providerKey: "github", objectType: "pull_request",
+      });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof({ pullRequestNumber: 508, mergeCommitSha: MENTIONED_MERGE }));
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(attached.body.proof.possession).toMatchObject({ kind: "linked_external_object" });
+      const closed = await patch(issueId, { status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect((await debtDispositions(issueId))[0]).toMatchObject({
+        landingDebtDisposition: "discharged", landingProof: { source: "board_merged_pr", pullRequestNumber: 508 },
       });
     });
 

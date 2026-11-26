@@ -4,7 +4,7 @@ import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   fetchPullRequestHeadSha,
-  resolveLinkedPullRequests,
+  resolveLinkedPullRequestsWithState,
   parseRepoUrl,
   resolveCardDeliveryBaseRef,
   resolveIssueRepoContext,
@@ -361,7 +361,7 @@ async function resolveCardDeliveryPossession(
       if (/^[0-9a-f]{40}$/.test(value)) recordedShas.add(value);
     }
   }
-  const linkedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id, { includeDrafts: true });
+  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
   const linkedPr = linkedPrs.find((candidate) =>
     candidate.owner.toLowerCase() === pr.owner.toLowerCase() &&
     candidate.repo.toLowerCase() === pr.repo.toLowerCase() &&
