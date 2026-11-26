@@ -2019,6 +2019,13 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   function answerZeroDeltaGitHub() {
     mockGhFetch.mockImplementation(async (url: string) => {
       const text = String(url);
+      if (/\/git\/matching-refs\/$/.test(text)) {
+        const listed = git(currentOrigin, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads");
+        return Response.json(listed.length === 0 ? [] : listed.split("\n").map((line) => {
+          const space = line.indexOf(" ");
+          return { ref: line.slice(0, space), object: { type: "commit", sha: line.slice(space + 1) } };
+        }));
+      }
       if (/\/branches(?:\?|$)/.test(text)) {
         const listed = git(currentOrigin, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads");
         const body = listed.length === 0 ? [] : listed.split("\n").map((line) => {
@@ -2166,6 +2173,60 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId))).toEqual([]);
     expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
     expect(mockGhFetch.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === "POST")).toEqual([]);
+  });
+
+  it("rolls back a final-stage zero-delta approval when deletion shifts the forge's offset pages", async () => {
+    const fixture = await seedFinalZeroDeltaApproval();
+    const baseSha = git(fixture.worktree, "rev-parse", "HEAD");
+    git(currentOrigin, "branch", "a-ephemeral", baseSha);
+    const normalFetch = mockGhFetch.getMockImplementation()!;
+    let writePhase = false;
+    mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      const text = String(url);
+      if (writePhase && /\/branches(?:\?|$)/.test(text)) {
+        if (new URL(text).searchParams.has("page")) return Response.json([]);
+        const page = [
+          { name: "a-ephemeral", commit: { sha: baseSha } },
+          { name: "main", commit: { sha: baseSha } },
+        ];
+        git(currentOrigin, "update-ref", "-d", "refs/heads/a-ephemeral");
+        return Response.json(page, { headers: { link: `<https://api.github.com/repos/TEA-Core/paperclip/branches?per_page=2&page=2>; rel="next"` } });
+      }
+      if (/\/git\/matching-refs\/$/.test(text)) {
+        const listed = git(currentOrigin, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads");
+        return Response.json(listed.split("\n").map((line) => {
+          const space = line.indexOf(" ");
+          return { ref: line.slice(0, space), object: { type: "commit", sha: line.slice(space + 1) } };
+        }));
+      }
+      return normalFetch(url, init);
+    });
+    mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+      const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+      expect(result.allowed, result.reason).toBe(true);
+      if (!writePhase) {
+        const parked = git(currentOrigin, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+          "commit-tree", `${baseSha}^{tree}`, "-p", baseSha, "-m", "undelivered remote work");
+        git(currentOrigin, "update-ref", "refs/heads/parked-work", parked);
+        writePhase = true;
+      }
+      return result;
+    });
+
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({
+      status: "done",
+      comment: "Independent final approval.",
+      doneTier: zeroDeltaDoneTier(fixture.worktree),
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("merge_commit_unrecorded");
+    expect(git(currentOrigin, "rev-list", "--count", "main..parked-work")).toBe("1");
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(stored?.status).toBe("in_review");
+    expect(stored?.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issueId))).toEqual([]);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
   });
 
   it("refuses a zero-delta close that rebinds the execution workspace in the same request", async () => {

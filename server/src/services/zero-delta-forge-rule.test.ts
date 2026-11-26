@@ -26,6 +26,10 @@ let pulls: Array<{ state: string; merged_at?: string; head: { sha: string; repo:
 function answer(url: string): Response {
   const { pathname } = new URL(url);
   if (pathname.includes("/commits/")) return Response.json({ sha: pathname.endsWith("/main") ? base : ancestor });
+  if (pathname.endsWith("/git/matching-refs/")) return Response.json([
+    ...branches.map(({ name, commit }) => ({ ref: `refs/heads/${name}`, object: { type: "commit", sha: commit.sha } })),
+    ...tags.map(({ name, commit }) => ({ ref: `refs/tags/${name}`, object: { type: "commit", sha: commit.sha } })),
+  ]);
   if (pathname.endsWith("/branches")) return Response.json(branches);
   if (pathname.endsWith("/tags")) return Response.json(tags);
   if (pathname.endsWith("/pulls")) return Response.json(pulls);
@@ -82,25 +86,27 @@ describe("zero-delta forge evidence", () => {
     expect(fetch.mock.calls.every(([url]) => String(url).endsWith("/commits/main"))).toBe(true);
   });
 
-  it("follows a short non-final branch page and refuses hidden work on its successor", async () => {
+  it.each(["pagination", "partial status", "content range"])("refuses a reference response without complete evidence (%s)", async (partial) => {
     fetch.mockImplementation(async (url: string) => {
-      if (url === `${api}/branches?per_page=100`) return Response.json(branches, { headers: { link: `<${api}/branches?per_page=100&page=2>; rel="next"` } });
-      if (url.endsWith("/branches?per_page=100&page=2")) return Response.json([{ name: "later-work", commit: { sha: hidden } }]);
-      return answer(url);
-    });
-    expect(await decide()).toMatchObject({ ok: false, reason: "branch later-work is not on the base line and is not a pull-request head" });
-  });
-
-  it("reaches a valid final page beyond the old twenty-page cap", async () => {
-    fetch.mockImplementation(async (url: string) => {
-      const u = new URL(url);
-      if (u.pathname.endsWith("/branches")) {
-        const page = Number(u.searchParams.get("page") ?? "1");
-        return Response.json([{ name: `delivered-${page}`, commit: { sha: base } }], page < 21 ? { headers: { link: `<${api}/branches?per_page=100&page=${page + 1}>; rel="next"` } } : undefined);
+      if (url.endsWith("/git/matching-refs/")) {
+        const headers = new Headers();
+        if (partial === "pagination") headers.set("link", `<${api}/git/matching-refs/?page=2>; rel="next"`);
+        if (partial === "content range") headers.set("content-range", "items 0-0/2");
+        return Response.json([{ ref: "refs/heads/main", object: { type: "commit", sha: base } }], {
+          status: partial === "partial status" ? 206 : 200,
+          headers,
+        });
       }
       return answer(url);
     });
-    expect(await decide()).toMatchObject({ ok: true, proof: { classified: 21 } });
+    expect(await decide()).toMatchObject({ ok: false });
+  });
+
+  it("classifies every tip in a complete inventory larger than twenty former pages", async () => {
+    branches.push(...Array.from({ length: 2101 }, (_, i) => ({ name: `delivered-${i}`, commit: { sha: base } })));
+    expect(await decide()).toMatchObject({ ok: true });
+    branches[branches.length - 1]!.commit.sha = hidden;
+    expect(await decide()).toMatchObject({ ok: false, reason: "branch delivered-2100 is not on the base line and is not a pull-request head" });
   });
 
   it("refuses when the base moves while the snapshot is listed", async () => {
@@ -120,6 +126,73 @@ describe("zero-delta forge evidence", () => {
     });
   });
 
+  it.each(["branch", "tag"] as const)("refuses a close-write %s inventory whose offset pages shift after a deletion", async (kind) => {
+    const listed = kind === "branch" ? branches : tags;
+    listed.unshift({ name: "a-ephemeral", commit: { sha: base } });
+    if (kind === "tag") listed.push({ name: "delivered", commit: { sha: base } });
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    listed.push({ name: "parked-work", commit: { sha: hidden } });
+
+    fetch.mockImplementation(async (url: string) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith(kind === "branch" ? "/branches" : "/tags")) {
+        const page = Number(u.searchParams.get("page") ?? "1");
+        const rows = listed.slice((page - 1) * 2, page * 2);
+        if (page === 1) {
+          listed.shift();
+          return Response.json(rows, { headers: { link: `<${api}/${kind === "branch" ? "branches" : "tags"}?per_page=2&page=2>; rel="next"` } });
+        }
+        return Response.json(rows);
+      }
+      if (u.pathname.endsWith("/git/matching-refs/")) {
+        return Response.json([
+          ...branches.map(({ name, commit }) => ({ ref: `refs/heads/${name}`, object: { type: "commit", sha: commit.sha } })),
+          ...tags.map(({ name, commit }) => ({ ref: `refs/tags/${name}`, object: { type: "commit", sha: commit.sha } })),
+        ]);
+      }
+      return answer(url);
+    });
+
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({
+      ok: false,
+      retriable: true,
+    });
+  });
+
+  it.each([
+    [],
+    [{ ref: "refs/heads/main", object: { type: "commit", sha: hidden } }],
+    [{ ref: "refs/heads/main", object: { type: "commit", sha: base } }, { ref: "refs/heads/main", object: { type: "commit", sha: base } }],
+    [{ ref: "refs/heads/main", object: { type: "commit", sha: base } }, { ref: "refs/tags/broken", object: { type: "commit", sha: "not-a-sha" } }],
+  ])("refuses incomplete or ambiguous reference evidence %#", async (...rows) => {
+    fetch.mockImplementation(async (url: string) => url.endsWith("/git/matching-refs/") ? Response.json(rows) : answer(url));
+    expect(await decide()).toMatchObject({ ok: false });
+  });
+
+  it("peels annotated tags by captured immutable object rather than by tag name", async () => {
+    const tag = "d".repeat(40);
+    const nested = "e".repeat(40);
+    let taggedCommit = ancestor;
+    fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith("/git/matching-refs/")) return Response.json([
+        { ref: "refs/heads/main", object: { type: "commit", sha: base } },
+        { ref: "refs/tags/release", object: { type: "tag", sha: taggedCommit === ancestor ? tag : "f".repeat(40) } },
+      ]);
+      if (url.endsWith(`/git/tags/${tag}`)) return Response.json({ object: { type: "tag", sha: nested } });
+      if (url.includes("/git/tags/")) return Response.json({ object: { type: "commit", sha: taggedCommit } });
+      return answer(url);
+    });
+    const measured = await decide();
+    expect(measured.ok, JSON.stringify(measured)).toBe(true);
+    if (!measured.ok) throw new Error(measured.reason);
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: true });
+    taggedCommit = hidden;
+    expect(await decide()).toMatchObject({ ok: false, reason: "tag release is not on the base line and is not a pull-request head" });
+    expect(await recheckZeroDeltaForgeAtWrite(card, measured.proof, githubForgeReader("test-token"), budget)).toMatchObject({ ok: false });
+  });
+
   it("aborts an unanswered forge read and refuses rather than hanging", async () => {
     const signals: AbortSignal[] = [];
     // The server's TypeScript library target predates Promise.withResolvers.
@@ -137,9 +210,9 @@ describe("zero-delta forge evidence", () => {
     let now = 0;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     fetch.mockImplementation(async (url: string) => {
-      if (url.includes("/branches?")) {
+      if (url.includes("/pulls?")) {
         now = 5001;
-        return Response.json(branches, { headers: { link: `<${api}/branches?per_page=100&page=2>; rel="next"` } });
+        return Response.json(pulls, { headers: { link: `<${api}/pulls?state=all&per_page=100&page=2>; rel="next"` } });
       }
       return answer(url);
     });

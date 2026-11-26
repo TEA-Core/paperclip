@@ -45,9 +45,11 @@ export const ZERO_DELTA_MEASUREMENT_BUDGET: ForgeBudget = { perCallMs: 10_000, t
 export const ZERO_DELTA_WRITE_BUDGET: ForgeBudget = { perCallMs: 10_000, totalMs: 20_000, concurrency: 1 };
 
 const deliveredToBase = new Map<string, true>();
+const tagCommits = new Map<string, string>();
 
 export function resetZeroDeltaForgeCache(): void {
   deliveredToBase.clear();
+  tagCommits.clear();
 }
 
 export function forgeSnapshotDigest(baseSha: string, refs: readonly ForgeRef[], pullRequestHeads: ReadonlySet<string>): string {
@@ -72,14 +74,6 @@ function stringField(value: unknown, key: string): string | null {
   const row = asRecord(value);
   const field = row?.[key];
   return typeof field === "string" ? field : null;
-}
-
-function commitSha(entry: unknown): { name: string; sha: string } | null {
-  const row = asRecord(entry);
-  const name = row?.name;
-  const sha = stringField(row?.commit, "sha")?.toLowerCase() ?? "";
-  if (typeof name !== "string" || !/^[0-9a-f]{40}$/.test(sha)) return null;
-  return { name, sha };
 }
 
 function repoPath(repo: ForgeRepo): string {
@@ -148,6 +142,72 @@ async function readCommitSha(response: Response, label: string): Promise<string>
   return sha;
 }
 
+async function peelTag(token: string, api: string, sha: string, budget: ForgeBudget, startedAt: number): Promise<string> {
+  const visited = new Set<string>();
+  while (true) {
+    const url = `${api}/git/tags/${sha}`;
+    const cached = tagCommits.get(url);
+    if (cached) {
+      for (const tag of visited) tagCommits.set(tag, cached);
+      return cached;
+    }
+    if (visited.has(url)) throw new ForgeReadError("the forge tag objects formed a cycle", false);
+    visited.add(url);
+    const response = await forgeGet(token, url, budget, startedAt);
+    if (!response.ok) throw new ForgeReadError("the forge tag object could not be read", response.status >= 500);
+    const object = asRecord(asRecord(await response.json().catch(() => null))?.object);
+    const type = stringField(object, "type");
+    sha = stringField(object, "sha")?.toLowerCase() ?? "";
+    if (!/^[0-9a-f]{40}$/.test(sha) || (type !== "commit" && type !== "tag")) {
+      throw new ForgeReadError("the forge tag did not resolve to a commit", false);
+    }
+    if (type === "commit") {
+      // Tag objects are immutable. Cache only a fully resolved object, never a tag name.
+      for (const tag of visited) tagCommits.set(tag, sha);
+      return sha;
+    }
+  }
+}
+
+async function readRefs(token: string, api: string, baseBranch: string, baseSha: string, budget: ForgeBudget, startedAt: number): Promise<ForgeRef[]> {
+  // GitHub documents this unfiltered endpoint as one complete, unpaginated
+  // namespace read. Offset-paged /branches and /tags can silently skip work.
+  const response = await forgeGet(token, `${api}/git/matching-refs/`, budget, startedAt);
+  if (response.status !== 200) throw new ForgeReadError(`the forge reference snapshot failed (${response.status})`, response.status >= 500);
+  if (response.headers.has("link") || response.headers.has("content-range")) {
+    throw new ForgeReadError("the forge reference snapshot was partial or paginated", true);
+  }
+  const rows: unknown = await response.json().catch(() => null);
+  if (!Array.isArray(rows)) throw new ForgeReadError("the forge reference snapshot was not a list", false);
+  const refs: ForgeRef[] = [];
+  const annotated: ForgeRef[] = [];
+  const names = new Set<string>();
+  for (const row of rows) {
+    const name = stringField(row, "ref");
+    if (!name?.startsWith("refs/") || names.has(name)) throw new ForgeReadError("the forge reference snapshot had invalid or duplicate names", false);
+    names.add(name);
+    const kind = name.startsWith("refs/heads/") ? "branch" : name.startsWith("refs/tags/") ? "tag" : null;
+    if (!kind) continue;
+    const object = asRecord(asRecord(row)?.object);
+    const type = stringField(object, "type");
+    const sha = stringField(object, "sha")?.toLowerCase() ?? "";
+    const shortName = name.slice(kind === "branch" ? "refs/heads/".length : "refs/tags/".length);
+    if (!shortName || !/^[0-9a-f]{40}$/.test(sha) || (type !== "commit" && (kind !== "tag" || type !== "tag"))) {
+      throw new ForgeReadError("the forge reference snapshot omitted a commit", false);
+    }
+    const ref: ForgeRef = { kind, name: shortName, sha };
+    refs.push(ref);
+    if (type === "tag") annotated.push(ref);
+  }
+  if (!refs.some((ref) => ref.kind === "branch" && ref.name === baseBranch && ref.sha === baseSha)) {
+    throw new ForgeReadError("the forge reference snapshot omitted or changed the remote base", true);
+  }
+  await mapPool(annotated, budget.concurrency, async (ref) => {
+    ref.sha = await peelTag(token, api, ref.sha, budget, startedAt);
+  });
+  return refs;
+}
+
 export function githubForgeReader(token: string): ForgeReader {
   return {
     async snapshot(repo, baseBranch, budget) {
@@ -159,8 +219,7 @@ export function githubForgeReader(token: string): ForgeReader {
         throw new ForgeReadError(`the remote base ${baseBranch} could not be read`, before.status >= 500);
       }
       const baseSha = await readCommitSha(before, `the remote base ${baseBranch}`);
-      const branchRows = await listAll(token, `${api}${repoPath(repo)}/branches?per_page=100`, budget, startedAt);
-      const tagRows = await listAll(token, `${api}${repoPath(repo)}/tags?per_page=100`, budget, startedAt);
+      const refs = await readRefs(token, `${api}${repoPath(repo)}`, baseBranch, baseSha, budget, startedAt);
       const pullRows = await listAll(token, `${api}${repoPath(repo)}/pulls?state=all&per_page=100`, budget, startedAt);
       const pullRequestHeads = new Set<string>();
       const repositoryName = `${repo.owner}/${repo.repo}`.toLowerCase();
@@ -174,17 +233,6 @@ export function githubForgeReader(token: string): ForgeReader {
       if (!after.ok) throw new ForgeReadError(`the remote base ${baseBranch} could not be read`, after.status >= 500);
       if (await readCommitSha(after, `the remote base ${baseBranch}`) !== baseSha) {
         throw new ForgeReadError(`the remote base ${baseBranch} moved while it was listed`, true);
-      }
-      const refs: ForgeRef[] = [];
-      for (const row of branchRows) {
-        const parsed = commitSha(row);
-        if (!parsed) throw new ForgeReadError("the forge branch list omitted a commit", false);
-        refs.push({ kind: "branch", name: parsed.name, sha: parsed.sha });
-      }
-      for (const row of tagRows) {
-        const parsed = commitSha(row);
-        if (!parsed) throw new ForgeReadError("the forge tag list omitted a commit", false);
-        refs.push({ kind: "tag", name: parsed.name, sha: parsed.sha });
       }
       return { repo, baseBranch, baseSha, refs, pullRequestHeads, digest: forgeSnapshotDigest(baseSha, refs, pullRequestHeads) };
     },

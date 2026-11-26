@@ -163,21 +163,17 @@ function answerGitHub(url: string): Response {
       ? json({ ref: `refs/heads/${decodeURIComponent(ref[1]!)}` })
       : json({ message: "Not Found" }, 404);
   }
-  if (u.pathname === `${repoPath}/branches`) {
-    const listed = originGit("for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads");
-    const branches = listed.length === 0 ? [] : listed.split("\n").map((line) => {
-      const space = line.indexOf(" ");
-      return { name: line.slice(0, space), commit: { sha: line.slice(space + 1) } };
-    });
-    return json(branches);
+  if (u.pathname === `${repoPath}/git/matching-refs/`) {
+    const listed = originGit("for-each-ref", "--format=%(refname) %(objecttype) %(objectname)", "refs/heads", "refs/tags");
+    return json(listed.length === 0 ? [] : listed.split("\n").map((line) => {
+      const [ref, type, sha] = line.split(" ");
+      return { ref, object: { type, sha } };
+    }));
   }
-  if (u.pathname === `${repoPath}/tags`) {
-    const listed = originGit("for-each-ref", "--format=%(refname:short) %(objectname)", "refs/tags");
-    const tags = listed.length === 0 ? [] : listed.split("\n").map((line) => {
-      const space = line.indexOf(" ");
-      return { name: line.slice(0, space), commit: { sha: line.slice(space + 1) } };
-    });
-    return json(tags);
+  if (u.pathname.startsWith(`${repoPath}/git/tags/`)) {
+    const sha = u.pathname.slice(`${repoPath}/git/tags/`.length);
+    const object = originGit("cat-file", "-p", sha);
+    return json({ object: { sha: /^object ([0-9a-f]{40})$/m.exec(object)?.[1], type: /^type (\w+)$/m.exec(object)?.[1] } });
   }
   if (u.pathname === `${repoPath}/pulls`) {
     return json(pullRequestHeads.map((sha, index) => ({ number: index + 1, state: "open", head: { sha, repo: { full_name: "TEA-Core/paperclip" } } })));
