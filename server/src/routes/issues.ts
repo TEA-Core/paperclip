@@ -5812,7 +5812,14 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
-      { allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable" },
+      {
+        allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable",
+        recordOnlyReviewDecision:
+          issue.deliveryRequirement === "record_only" &&
+          decisionCarried &&
+          guardResult.skipped &&
+          guardResult.skipReason === "record_only_delivery_skipped",
+      },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
