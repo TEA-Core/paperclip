@@ -79,7 +79,12 @@ function resolvePhysicalPath(value: string): string {
     if (
       !(error instanceof Error) || !("code" in error) ||
       error.code !== "ENOENT" || parent === absolute
-    ) throw error;
+    ) {
+      throw new Error(
+        `Refusing worktree boot: cannot verify filesystem isolation for ${absolute}; check path permissions`,
+        { cause: error },
+      );
+    }
     return path.join(resolvePhysicalPath(parent), path.basename(absolute));
   }
 }
@@ -244,7 +249,10 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     [...mainHomes, path.join(homeDir, "instances"), path.join(fallback.homeDir, "instances")],
   );
   const explicitOwnDatabase = operatorOrLayout("DATABASE_URL") !== null || explicitEmbeddedDir !== null;
-  const exportedWorktreeHome = exportedHomeMatch && (homeDir === fallback.homeDir || explicitOwnDatabase);
+  // A configured worktrees home may also be a main home whose config lives
+  // elsewhere. Only the default layout can re-enter without an explicit DB.
+  const defaultLayoutHome = operatorOrLayout("PAPERCLIP_WORKTREES_DIR") === null && homeDir === fallback.homeDir;
+  const exportedWorktreeHome = exportedHomeMatch && (defaultLayoutHome || explicitOwnDatabase);
   if (explicitEmbeddedDir) claimed = { ...claimed, embeddedPostgresDataDir: explicitEmbeddedDir };
   const remedy = exportedHomeMatch && !exportedWorktreeHome
     ? "; set an explicit own database for the worktree with an operator DATABASE_URL or a " +
@@ -261,6 +269,11 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     const code = error instanceof Error && "code" in error ? error.code : null;
     if (code !== "EACCES" && code !== "EPERM") throw error;
     parentEntries = null;
+  }
+  if (parentEntries === null && explicitEmbeddedDir !== null) {
+    throw new Error(
+      "Cannot list the worktree parent to verify the explicit worktree database; restore directory read access before booting",
+    );
   }
   const suffix = createHash("sha256").update(plan.configPath).digest("hex").slice(0, 12);
   const isolatedId = `${fallback.instanceId}-${suffix}`;

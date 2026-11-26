@@ -836,7 +836,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     }
   });
 
-  it.each(["default", "configured"])("reenters the %s layout database through real worktree env exports (R-W1)", async (layout) => {
+  it.each(["default", "configured"])("handles %s layout reentry through real worktree env exports (R-W1)", async (layout) => {
     const fixture = await makeWorktreeFixture({});
     try {
       process.env.HOME = path.join(fixture.root, "home");
@@ -849,8 +849,16 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       expect(dataDir).toBe(path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"));
       const configContents = fs.readFileSync(fixture.configPath, "utf8");
       const exports = await realWorktreeEnvExports(fixture);
-      process.env = { ...operatorEnv, ...exports };
+      for (const key of Object.keys(process.env)) if (!(key in operatorEnv)) delete process.env[key];
+      Object.assign(process.env, operatorEnv, exports);
       resetBootEnvForTests();
+      if (layout === "configured") {
+        const envContents = fs.readFileSync(fixture.ownEnvPath, "utf8");
+        await expect(bootServerModules()).rejects.toThrow(/No isolated worktree identity.*explicit own database/);
+        expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(configContents);
+        expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(envContents);
+        return;
+      }
       const reentered = await bootServerModules();
       expect(reentered.loadConfig().databaseUrl).toBeUndefined();
       expect(reentered.loadConfig().embeddedPostgresDataDir).toBe(dataDir);
@@ -882,7 +890,8 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       process.chdir(fixture.worktreeRoot);
       let configContents: string | undefined;
       for (const exported of [true, false, true]) {
-        process.env = { ...operatorEnv, ...(exported ? exports : {}) };
+        for (const key of Object.keys(process.env)) if (!(key in operatorEnv)) delete process.env[key];
+        Object.assign(process.env, operatorEnv, exported ? exports : {});
         resetBootEnvForTests();
         const booted = await bootServerModules();
         expect(booted.loadConfig().embeddedPostgresDataDir, `exported=${exported}`).toBe(dataDir);
@@ -898,6 +907,165 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it.each(["own-file", "operator"])(
+    "refuses a configured worktrees home that is also the exported custom main home (N6, %s)",
+    async (source) => {
+      const fixture = await makeWorktreeFixture({});
+      try {
+        process.env.HOME = path.join(fixture.root, "home");
+        const mainHome = path.join(fixture.root, "custom-main");
+        const mainRoot = path.join(mainHome, "instances", "dev");
+        const mainConfigPath = path.join(mainHome, "main-config.json");
+        const mainConfig = JSON.stringify(buildLegacyConfig(mainRoot), null, 2) + "\n";
+        fs.mkdirSync(mainRoot, { recursive: true });
+        fs.writeFileSync(mainConfigPath, mainConfig);
+        fs.writeFileSync(fixture.configPath, mainConfig);
+        const contents = envFileContents({
+          PAPERCLIP_HOME: mainHome,
+          PAPERCLIP_INSTANCE_ID: "dev",
+          PAPERCLIP_CONFIG: fixture.configPath,
+          PAPERCLIP_IN_WORKTREE: "true",
+          PAPERCLIP_WORKTREE_NAME: fixture.worktreeName,
+          ...(source === "own-file" ? { PAPERCLIP_WORKTREES_DIR: mainHome } : {}),
+        });
+        fs.writeFileSync(fixture.ownEnvPath, contents);
+        if (source === "operator") process.env.PAPERCLIP_WORKTREES_DIR = mainHome;
+        Object.assign(process.env, await realWorktreeEnvExports(fixture));
+        process.chdir(fixture.worktreeRoot);
+        await expect(bootServerModules()).rejects.toThrow(/No isolated worktree identity.*explicit own database/);
+        expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+        expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(mainConfig);
+        expect(fs.readFileSync(mainConfigPath, "utf8")).toBe(mainConfig);
+        expect(fs.existsSync(path.join(mainRoot, "db"))).toBe(false);
+      } finally {
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("refuses a nested exported home rather than treating all worktrees descendants as layout homes (L-LAYOUT-REAL)", async () => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      process.env.HOME = path.join(fixture.root, "home");
+      const worktreesHome = path.join(process.env.HOME, ".paperclip-worktrees");
+      const contents = envFileContents({
+        PAPERCLIP_HOME: path.join(worktreesHome, "nested"),
+        PAPERCLIP_INSTANCE_ID: "dev",
+        PAPERCLIP_CONFIG: fixture.configPath,
+        PAPERCLIP_IN_WORKTREE: "true",
+      });
+      fs.writeFileSync(fixture.ownEnvPath, contents);
+      Object.assign(process.env, await realWorktreeEnvExports(fixture));
+      process.chdir(fixture.worktreeRoot);
+      await expect(bootServerModules()).rejects.toThrow(/No isolated worktree identity.*explicit own database/);
+      expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses an explicit database alias containing the checkout root (R-ROOTEQ)",
+    async () => {
+      const fixture = await makeWorktreeFixture({});
+      try {
+        process.env.HOME = path.join(fixture.root, "home");
+        const alias = path.join(fixture.stateDir, "checkout-alias");
+        fs.symlinkSync(fixture.worktreeRoot, alias, "dir");
+        const config = buildLegacyConfig(path.join(fixture.root, "shared-main"));
+        config.database.embeddedPostgresDataDir = alias;
+        fs.writeFileSync(fixture.configPath, JSON.stringify(config));
+        const contents = envFileContents({
+          PAPERCLIP_HOME: path.join(fixture.root, "custom-home"),
+          PAPERCLIP_INSTANCE_ID: "dev",
+          PAPERCLIP_CONFIG: fixture.configPath,
+          PAPERCLIP_IN_WORKTREE: "true",
+        });
+        fs.writeFileSync(fixture.ownEnvPath, contents);
+        operatorWorktreeLayout(fixture);
+        Object.assign(process.env, await realWorktreeEnvExports(fixture));
+        process.chdir(fixture.worktreeRoot);
+        const booted = await bootServerModules();
+        expect(bootEnvReport().refusals.map((refusal) => refusal.kind)).toContain("identity");
+        expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+          path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
+        );
+        expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+      } finally {
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")(
+    "names an inaccessible identity path instead of failing open or leaking a raw errno (WG-EACCES, P-FAILOPEN)",
+    async () => {
+      const fixture = await makeWorktreeFixture({});
+      const locked = path.join(fixture.root, "locked");
+      fs.mkdirSync(locked);
+      try {
+        process.env.HOME = path.join(fixture.root, "home");
+        const contents = envFileContents({
+          PAPERCLIP_HOME: path.join(locked, "home"),
+          PAPERCLIP_INSTANCE_ID: "dev",
+          PAPERCLIP_IN_WORKTREE: "true",
+        });
+        fs.writeFileSync(fixture.ownEnvPath, contents);
+        const config = fs.readFileSync(fixture.configPath, "utf8");
+        operatorWorktreeLayout(fixture);
+        process.chdir(fixture.worktreeRoot);
+        fs.chmodSync(locked, 0o000);
+        await expect(bootServerModules()).rejects.toThrow(/Refusing worktree boot: cannot verify filesystem isolation/);
+        expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+        expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(config);
+      } finally {
+        fs.chmodSync(locked, 0o700);
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")(
+    "refuses to abandon an accepted database when the worktree parent becomes unlistable (WG-UNL2)",
+    async () => {
+      const fixture = await makeWorktreeFixture({});
+      try {
+        process.env.HOME = path.join(fixture.root, "home");
+        operatorWorktreeLayout(fixture);
+        const operatorEnv = { ...process.env };
+        const ownRoot = path.join(fixture.stateDir, "own-database");
+        fs.writeFileSync(fixture.configPath, JSON.stringify(buildLegacyConfig(ownRoot)));
+        process.chdir(fixture.worktreeRoot);
+        const first = await bootServerModules();
+        expect(first.loadConfig().embeddedPostgresDataDir).toBe(path.join(ownRoot, "db"));
+        const config = fs.readFileSync(fixture.configPath, "utf8");
+        const contents = fs.readFileSync(fixture.ownEnvPath, "utf8");
+        fs.chmodSync(fixture.repoRoot, 0o311);
+        for (const key of Object.keys(process.env)) if (!(key in operatorEnv)) delete process.env[key];
+        Object.assign(process.env, operatorEnv);
+        resetBootEnvForTests();
+        await expect(bootServerModules()).rejects.toThrow(/Cannot list the worktree parent.*explicit.*database/);
+        expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(config);
+        expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+        fs.chmodSync(fixture.repoRoot, 0o700);
+        for (const key of Object.keys(process.env)) if (!(key in operatorEnv)) delete process.env[key];
+        Object.assign(process.env, operatorEnv);
+        resetBootEnvForTests();
+        const restored = await bootServerModules();
+        expect(restored.loadConfig().embeddedPostgresDataDir).toBe(path.join(ownRoot, "db"));
+        expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(config);
+      } finally {
+        fs.chmodSync(fixture.repoRoot, 0o700);
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each(["default", "dev"])("refuses a keyless main database config (%s, N-DEFDIR)", async (instanceId) => {
     const fixture = await makeWorktreeFixture({});

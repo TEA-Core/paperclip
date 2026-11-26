@@ -1050,21 +1050,30 @@ config-path-derived suffix; if no safe identity exists, boot refuses.
 Explicit operator instance IDs take precedence over own-file IDs, subject to
 the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
 identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
-the main home, for a non-`default` instance when it matches the layout worktrees
-home. This preserves the documented `eval "$(paperclipai worktree env)"` re-entry.
-Other exported homes require an explicit own database: an operator `DATABASE_URL`,
-or a worktree config `database.embeddedPostgresDataDir` inside the worktree
-checkout. An accepted in-checkout directory is kept and used on every boot,
-with or without the shell exports. That directory may not be the checkout root
+the main home, for a non-`default` instance when it matches the default
+`~/.paperclip-worktrees` home and the operator did not set
+`PAPERCLIP_WORKTREES_DIR`. This preserves the default-layout
+`eval "$(paperclipai worktree env)"` re-entry. A configured worktrees home can
+also be a main home, even when its main config lives elsewhere. Exports with
+`PAPERCLIP_WORKTREES_DIR` set, and other exported homes, therefore require an
+explicit own database: an operator `DATABASE_URL`, or a worktree config
+`database.embeddedPostgresDataDir` inside the worktree checkout. An accepted
+in-checkout directory is kept and used on every permitted boot, with or without
+the shell exports. That directory may not be the checkout root
 itself, inside the claimed home's or worktree home's `instances` tree, inside
 `~/.paperclip`, or a database directory another known instance config uses.
 Home and database containment checks resolve symlink aliases through existing
 ancestors, including when the database directory has not yet been created.
+A worktrees home that resolves into `~/.paperclip` is refused, including a
+symlink such as `~/.paperclip-worktrees -> ~/.paperclip/worktrees`. Move that
+home outside the main home. If a containment path cannot be resolved because
+of permissions or another filesystem error, boot refuses with a named
+filesystem-isolation error; it does not use lexical containment instead.
 A data directory outside the checkout does not count as an explicit own
 database, because a copied or legacy config may still name another instance's
-database. For an exported home other than the layout worktrees home, its embedded
-default may belong to a main instance whose config lives elsewhere, so boot
-refuses without an explicit own database and names that remedy.
+database. For any exported home outside the unconfigured default layout, its
+embedded default may belong to a main instance whose config lives elsewhere,
+so boot refuses without an explicit own database and names that remedy.
 A `DATABASE_URL` read only from the worktree's own `.env` does not count, but
 `worktree env` exports every own-file entry, so after `eval` it is an operator
 value. This guard covers the database only: when the exemption is granted, the
@@ -1078,7 +1087,10 @@ A different transient runtime home does not replace persisted worktree paths.
 If the parent can be searched but not listed, reusable identity claims are
 refused and the config-path-derived identity is used; registered sibling
 collisions and main-home checks still apply. An own file that makes no
-identity claim is not refused there and keeps its allowlisted secrets.
+identity claim is not refused there and keeps its allowlisted secrets. When a
+config names an explicit in-checkout database, an unlistable parent instead
+stops boot before repair. Restore parent-directory read access to resume with
+the same database; repair never changes that binding to a new database.
 
 An unchanged repair also cleans temporary env files belonging to dead writers,
 without rewriting the env file. Live writers' temporary files are retained.
