@@ -4822,7 +4822,7 @@ async function fetchPullRequestHeadShaOnce(
  * HeadShaResult. A deterministic result (success, 4xx, malformed body) returns
  * after the first attempt — byte-for-byte unchanged from the single-attempt read.
  */
-async function fetchPullRequestHeadSha(
+export async function fetchPullRequestHeadSha(
   token: string,
   owner: string,
   repo: string,

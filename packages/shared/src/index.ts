@@ -2015,6 +2015,8 @@ export {
   issueExecutionStateSchema,
   gitCommitShaSchema,
   GIT_COMMIT_SHA_WIRE_PATTERN,
+  attachIssueLandingProofSchema,
+  type AttachIssueLandingProof,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
   issueReviewRequestSchema,

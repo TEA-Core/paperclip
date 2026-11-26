@@ -48,6 +48,11 @@ import {
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
 import {
+  BOARD_LANDING_PROOF_SOURCE,
+  loadAttachedBoardLandingProof,
+  verifyBoardLandingProof,
+} from "./board-landing-proof.js";
+import {
   fetchOpenPullRequests,
   GITHUB_GRAPHQL_URL,
   isAnchoredCardPullRequest,
@@ -247,10 +252,19 @@ export function renderDoneTierDeclaration(
  */
 export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
 
-interface LandingHeadProof {
-  head: string;
-  source: "remote" | "worktree";
-}
+type LandingHeadProof =
+  | { head: string; source: "remote" | "worktree" }
+  // SUP-25193: a board-attached merged-PR proof. `head` is the PR merge commit;
+  // no execution-workspace branch is involved, so it is re-verified at the close
+  // boundary against GitHub instead of re-measuring a branch head.
+  | {
+    head: string;
+    source: typeof BOARD_LANDING_PROOF_SOURCE;
+    proofActivityId: string;
+    pullRequestNumber: number;
+    repoUrl: string;
+    baseRef: string;
+  };
 
 export interface DoneTransitionGuardResult {
   allowed: boolean;
@@ -330,6 +344,15 @@ export function unpaidLandingDebt() {
 type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
   "executionWorkspaceId" | "projectWorkspaceId" | "projectId" | "statusVersion"> & { deliveryRequirement: string };
 
+/** Bound close-boundary I/O. A timeout rejects, and the caller treats that as unverified. */
+function withLandingDeadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("landing proof re-verification timed out")), GITHUB_BASE_COMPARE_TIMEOUT_MS);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
 /** Prepare outside the close transaction; finalize only while holding the issue row lock. */
 export async function prepareLandingDebtClose(
   db: Db,
@@ -360,13 +383,48 @@ export async function prepareLandingDebtClose(
         code: "done_transition_missing_delivery", issueId: issue.id,
       });
       if (outstanding.length === 0) return;
+      const proof = result.landingProof;
+      if (proof?.source === BOARD_LANDING_PROOF_SOURCE) {
+        // SUP-25193: re-verify the board-attached merged-PR proof at this close
+        // boundary, on the locked repo binding. The attach call alone never
+        // discharges debt; only this accepted close does.
+        if (closeStatusVersion === undefined) {
+          throw conflict("Landing proof could not be bound to this close; retry the close.", {
+            code: "done_transition_missing_delivery", issueId: issue.id,
+          });
+        }
+        let verifiedHead: string | null = null;
+        try {
+          const attached = await withLandingDeadline(loadAttachedBoardLandingProof(tx, issue));
+          if (attached?.activityId === proof.proofActivityId) {
+            const verified = await withLandingDeadline(verifyBoardLandingProof(tx, {
+              id: issue.id, companyId: issue.companyId, projectId: locked.projectId,
+              projectWorkspaceId: locked.projectWorkspaceId, executionWorkspaceId: locked.executionWorkspaceId,
+            }, attached.evidence));
+            if (verified.ok && verified.proof.repoUrl === proof.repoUrl && verified.proof.baseRef === proof.baseRef) {
+              verifiedHead = verified.proof.mergeCommitSha;
+            }
+          }
+        } catch { verifiedHead = null; /* Failed and timed-out rechecks cannot discharge debt. */ }
+        if (verifiedHead !== proof.head) throw conflict("Board landing proof changed or could not be re-verified; retry the close.", {
+          code: "done_transition_missing_delivery", issueId: issue.id,
+        });
+        await tx.update(activityLog).set({
+          details: sql`${activityLog.details} || jsonb_build_object(
+            'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+            'closeStatusVersion', ${closeStatusVersion}::int,
+            'landingProof', jsonb_build_object('head', ${proof.head}::text, 'source', ${proof.source}::text,
+              'repoUrl', ${proof.repoUrl}::text, 'baseRef', ${proof.baseRef}::text,
+              'pullRequestNumber', ${proof.pullRequestNumber}::int, 'proofActivityId', ${proof.proofActivityId}::text))`,
+        }).where(debtWhere);
+        return;
+      }
       // Positive probes require an execution branch. Lock that binding through
       // commit so an in-place repo/base/branch update cannot invalidate the proof.
       const [workspace] = locked.executionWorkspaceId ? await tx.select().from(executionWorkspaces)
         .where(and(eq(executionWorkspaces.id, locked.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
         .for("share") : [];
       const binding = result.landingContext;
-      const proof = result.landingProof;
       if (!workspace || !binding || !proof || closeStatusVersion === undefined ||
         workspace.repoUrl !== binding.repoUrl || workspace.baseRef !== binding.defaultRef ||
         workspace.branchName !== binding.branch ||
@@ -6925,6 +6983,10 @@ export async function evaluateDoneTransitionGuard(
   // is record_only too; omitted means the request did not change the requirement.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
   landingDebtOwed = false,
+  // SUP-25193: only a board close may present a board-attached merged-PR landing
+  // proof. Every other door (agent closes, the landing backstop) leaves it off, so
+  // no agent close path accepts more evidence than it did before.
+  options: { acceptBoardLandingProof?: boolean } = {},
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext } = {};
   const result = await evaluateDoneTransitionGuardCore(
@@ -6937,10 +6999,37 @@ export async function evaluateDoneTransitionGuard(
     landingDebtOwed,
   );
   if (landingDebtOwed && result.landingVerified) result.landingContext = observer.landingContext;
+  let boardProofRefusal: string | null = null;
+  if (landingDebtOwed && result.allowed && !result.landingVerified && options.acceptBoardLandingProof) {
+    const attached = await loadAttachedBoardLandingProof(db, issue);
+    if (attached) {
+      const fields = await loadTier1RepoFields(db, issue);
+      const verified = await verifyBoardLandingProof(db, { id: issue.id, companyId: issue.companyId, ...fields }, attached.evidence);
+      if (verified.ok) {
+        return {
+          ...result,
+          landingVerified: true,
+          landingContext: observer.landingContext,
+          landingProof: {
+            head: verified.proof.mergeCommitSha,
+            source: BOARD_LANDING_PROOF_SOURCE,
+            proofActivityId: attached.activityId,
+            pullRequestNumber: verified.proof.pullRequestNumber,
+            repoUrl: verified.proof.repoUrl,
+            baseRef: verified.proof.baseRef,
+          },
+          reason: `${result.reason}; landing verified by the board-attached merged PR ` +
+            `${verified.proof.owner}/${verified.proof.repo}#${verified.proof.pullRequestNumber}`,
+        };
+      }
+      boardProofRefusal = `The board-attached landing proof failed re-verification (${verified.code}: ${verified.reason}).`;
+    }
+  }
   if (landingDebtOwed && result.allowed && !result.landingVerified) {
     return {
       ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",
-      reason: "Repository landing debt remains: no successful repository landing proof was obtained.",
+      reason: "Repository landing debt remains: no successful repository landing proof was obtained." +
+        (boardProofRefusal ? ` ${boardProofRefusal}` : ""),
       remedy:
         "Verify landing via a probe-able repository and branch or a merged PR, then retry the close; reclassification and board tier-form bypass do not waive landing debt. If landing cannot be verified, cancel the issue instead.",
     };

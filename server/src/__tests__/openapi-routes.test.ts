@@ -265,6 +265,24 @@ describe("openapi routes", () => {
     expect(Object.keys(remove.responses)).toEqual(expect.arrayContaining(["200", "400", "401", "403", "404", "409"]));
   });
 
+  it("documents the board-only SUP-25193 landing-proof route with its typed refusals", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/landing-proof"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      required: expect.arrayContaining(["owner", "repo", "pullRequestNumber", "reason"]),
+      additionalProperties: false,
+    });
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["200", "201", "403", "409", "422"]));
+    for (const code of [
+      "landing_proof_not_applicable", "landing_proof_wrong_repo", "landing_proof_pr_not_found",
+      "landing_proof_pr_not_merged", "landing_proof_pr_closed_unmerged", "landing_proof_sha_mismatch",
+      "landing_proof_not_on_base", "landing_proof_unverifiable",
+    ]) {
+      expect(operation.description).toContain(code);
+    }
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
