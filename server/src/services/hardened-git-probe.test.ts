@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1579,16 +1579,28 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
     return fixture;
   }
 
+  /** Nine `git stash push -m <120 KB>` entries from `dir`: about 1.08 MB of reflog, over the old 1 MiB read bound. */
+  const longMessagePushes = (f: StashFixture, dir: string, count = 9) => {
+    for (let index = 0; index < count; index += 1) f.stash(dir, "-m", `${index}`.padEnd(120_000, "x"));
+  };
+
   const REFLOG_LINE = (id: string, subject: string) =>
     `${"0".repeat(40)} ${id} t <t@example.com> 1700000000 +0000\t${subject}\n`;
 
-  /** `git stash list` as git sees it; a stack git cannot read is compared by its error. */
+  /**
+   * The stash stack as git sees it (entry ids, newest first); a stack git cannot
+   * read is compared by its error. One `git log -g` process and no helper: a
+   * `git stash list` timeout kills only `git stash`, which leaves its `git log`
+   * child blocked on a FIFO reflog after the test.
+   */
   function stashList(m: string): string {
     try {
-      return execFileSync("git", ["-C", m, "stash", "list", "--format=%H %gs"], {
+      return execFileSync("git", ["-C", m, "log", "-g", "--format=%H", "refs/stash", "--"], {
         env: fixtureEnv,
         stdio: "pipe",
         timeout: 3_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * MIB,
       }).toString();
     } catch (error) {
       return `unreadable: ${(error as { status?: number }).status ?? "timeout"}`;
@@ -1694,6 +1706,18 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       f.stash(f.x);
       appendFileSync(f.stashLog, REFLOG_LINE("e".repeat(40), "WIP on main: 1234567 x"));
     }],
+    ["ST-23 this card's entry below nine 120 KB-message stashes (reflog over 1 MiB)", OWN, (f) => {
+      f.stash(f.x);
+      git(f.x, "checkout", "-q", "--detach");
+      longMessagePushes(f, f.x);
+      git(f.x, "checkout", "-q", OWN);
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
+    ["ST-24 this card's entry below a registered sibling's 1 MiB of long-message stashes", OWN, (f) => {
+      f.stash(f.x);
+      longMessagePushes(f, f.y());
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
     ["ST-22 work stashed while a sibling stood on this card's branch", OWN, (f) => {
       const y = f.y();
       git(y, "switch", "-q", "--ignore-other-worktrees", OWN);
@@ -1766,6 +1790,10 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       truncateSync(object, 20);
     }],
     ["ST-50a a reflog that is a directory", (f) => mkdirSync(f.stashLog, { recursive: true })],
+    ["ST-51 only a registered sibling's stashes in a reflog over 1 MiB", (f) => {
+      longMessagePushes(f, f.y());
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
     ["ST-50b a reflog that is a FIFO", (f) => {
       f.stash(f.y());
       rmSync(f.stashLog);
@@ -1801,6 +1829,17 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
     expect(await probeKeepingStash(fixture)).toMatchObject({ ok: true, branch: OWN });
   });
 
+  it("ST-52 refuses a regular stash reflog over the 16 MiB bound as unverified, even with no stash of this card", async () => {
+    const fixture = stashFixture();
+    fixture.stash(fixture.y());
+    const padding = REFLOG_LINE("0".repeat(40), "x".repeat(4_000)).repeat(Math.ceil((16 * MIB) / 4_000) + 16);
+    appendFileSync(fixture.stashLog, padding);
+    expect(statSync(fixture.stashLog).size).toBeGreaterThan(16 * MIB);
+    const result = await probeNoRepositoryWorktree(fixture.input());
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+  });
+
   describe("at the close write", () => {
     async function measuredWithSibling() {
       const fixture = stashFixture();
@@ -1820,6 +1859,10 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
 
     it.each([
       ["W-01 this card stashes after measurement", (f: StashFixture) => f.stash(f.x)],
+      ["W-05 this card stashes after measurement on its recorded branch that is also registered to another card", (f: StashFixture) => {
+        f.registered.add(OWN);
+        f.stash(f.x);
+      }],
       ["W-04 this card's stash relabelled as the registered sibling's", (f: StashFixture) => {
         f.y();
         f.store(f.x, `On ${SIBLING}: draft`, f.create(f.x));
@@ -1832,6 +1875,39 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       expect(stashList(fixture.m)).toBe(before);
       expect(result.ok).toBe(false);
       expect((result as { reason: string }).reason).toContain(`stashed on this card's branch ${OWN} `);
+    });
+
+    it("W-06 refuses as timed out when the write budget runs out while the stash entries are read one by one", async () => {
+      const fixture = stashFixture();
+      fixture.registered.add(SIBLING);
+      const measured = await probeNoRepositoryWorktree(fixture.input());
+      if (!measured.ok) throw new Error(measured.reason);
+      // 2,000 reflog entries that name no object, then this card's stash, then
+      // a sibling's stash on top whose commit object is corrupt. The corrupt
+      // object fails the batched subject read, so every entry is read on its
+      // own; the budget runs out before this card's entry is reached.
+      mkdirSync(path.dirname(fixture.stashLog), { recursive: true });
+      const missing = Array.from({ length: 2_000 }, (_, index) =>
+        REFLOG_LINE(index.toString(16).padStart(40, "d"), "WIP on main: 1234567 x"));
+      writeFileSync(fixture.stashLog, missing.join(""));
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      const commit = git(fixture.m, "rev-parse", "refs/stash");
+      const object = path.join(fixture.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+      const budgetMs = 1_500;
+      expect(await recheckRecordedWorktree({
+        worktreePath: measured.worktreePath,
+        commonDir: measured.commonDir,
+        branch: measured.branch,
+        headSha: measured.headSha,
+        stashScope: fixture.input(),
+        budgetMs,
+      })).toEqual({
+        ok: false,
+        reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
+      });
     });
 
     it.each([

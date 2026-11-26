@@ -2185,6 +2185,23 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     const siblingBranch = (fixture: SeededIssue) => `${fixture.identifier.replace(/-\d+$/, "")}-2-sibling`;
 
+    /** Nine `git stash push -m <120 KB>` entries: about 1.08 MB of stash reflog. */
+    function longMessagePushes(dir: string) {
+      for (let index = 0; index < 9; index += 1) {
+        writeFileSync(path.join(dir, "README.md"), `long ${index}\n`);
+        git(dir, "stash", "push", "-q", "-m", `${index}`.padEnd(120_000, "x"));
+      }
+    }
+
+    /** Stash entry ids, newest first; the messages here outgrow `git stash list`'s default output buffer. */
+    function stashIds(repoRoot: string) {
+      try {
+        return git(repoRoot, "log", "-g", "--format=%H", "refs/stash", "--");
+      } catch {
+        return "no stash";
+      }
+    }
+
     it.each([
       ["R-02 this card's worktree stashes", async (fixture: SeededIssue) => {
         writeFileSync(path.join(fixture.worktree, "README.md"), "this card's work\n");
@@ -2195,6 +2212,13 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         await siblingWorktree(fixture, sibling);
         git(fixture.worktree, "stash", "store", "-m", `On ${sibling}: draft`, stashCreate(fixture.worktree, "this card's work\n"));
       }],
+      ["R-08 this card's stash below nine 120 KB-message stashes (reflog over 1 MiB)", async (fixture: SeededIssue) => {
+        writeFileSync(path.join(fixture.worktree, "README.md"), "this card's work\n");
+        git(fixture.worktree, "stash", "push", "-q");
+        git(fixture.worktree, "checkout", "-q", "--detach");
+        longMessagePushes(fixture.worktree);
+        git(fixture.worktree, "checkout", "-q", fixture.branch);
+      }],
       ["R-07 this card's stash behind a packed ref", async (fixture: SeededIssue) => {
         writeFileSync(path.join(fixture.worktree, "README.md"), "this card's work\n");
         git(fixture.worktree, "stash", "push", "-q");
@@ -2204,14 +2228,14 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       const fixture = await seed();
       await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
       await arrange(fixture);
-      const stashes = git(fixture.repoRoot, "stash", "list");
+      const stashes = stashIds(fixture.repoRoot);
 
       const res = await close(fixture.identifier);
 
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.error).toContain(`stashed on this card's branch ${fixture.branch} `);
       expect(await statusOf(fixture.issueId)).toBe("in_progress");
-      expect(git(fixture.repoRoot, "stash", "list")).toBe(stashes);
+      expect(stashIds(fixture.repoRoot)).toBe(stashes);
     });
 
     it.each([
@@ -2223,6 +2247,9 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         const other = await siblingWorktree(fixture, siblingBranch(fixture));
         git(other, "stash", "store", "-m", `On ${fixture.branch}: forged`, stashCreate(other, "sibling's work\n"));
       }],
+      ["R-09 only a registered sibling's 1 MiB of long-message stashes", async (fixture: SeededIssue) => {
+        longMessagePushes(await siblingWorktree(fixture, siblingBranch(fixture)));
+      }],
       ["R-06 a registered sibling branch that mentions this card", async (fixture: SeededIssue) => {
         const prefix = fixture.identifier.replace(/-\d+$/, "");
         const other = await siblingWorktree(fixture, `${prefix}-2-follow-up-for-${fixture.identifier}`);
@@ -2233,13 +2260,13 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       const fixture = await seed();
       await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
       await arrange(fixture);
-      const stashes = git(fixture.repoRoot, "stash", "list");
+      const stashes = stashIds(fixture.repoRoot);
 
       const res = await close(fixture.identifier);
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(fixture.issueId)).toBe("done");
-      expect(git(fixture.repoRoot, "stash", "list")).toBe(stashes);
+      expect(stashIds(fixture.repoRoot)).toBe(stashes);
     });
   });
 

@@ -810,6 +810,11 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * The entries are the union of the `refs/stash` tip as git resolves it (loose or
  * packed) and the new-id column of every line of the stash reflog file, so an
  * entry below the tip, a tip with no reflog line, and a packed tip all count.
+ * The reflog file is read up to the same 16 MiB bound as git's own output. A
+ * regular reflog file that is larger, or that cannot be read whole, refuses as
+ * unverified: `git stash push -m` with long messages can grow it, so dropping
+ * it would hide this card's entries below the tip. A missing reflog, a
+ * directory or a FIFO in its place contributes no entries.
  * The reflog subject, which `git stash store -m` sets freely, is never read, so
  * relabelling a stash changes no decision in either direction. Parents are
  * never read: a record_only card's own stash shares its first parent with every
@@ -822,6 +827,24 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * another subject, all record a branch that is not this card's, so they do not
  * refuse. A detached-HEAD stash of this card cannot be told from a sibling's.
  */
+const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
+
+/**
+ * The stash reflog's text; null when there is none or it is not a regular file
+ * (a directory or FIFO in its place is unreadable evidence, nobody's).
+ * `UNVERIFIED_STASH_REFLOG` when it is a regular file that is over the bound or
+ * cannot be read whole.
+ */
+async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
+  const regular = () => lstat(file).then((info) => info.isFile(), () => false);
+  if (!(await regular())) return null;
+  try {
+    return await readOptionalRegularFile(file, MAX_BUFFER);
+  } catch {
+    return (await regular()) ? UNVERIFIED_STASH_REFLOG : null;
+  }
+}
+
 async function cardStashRefusal(
   repoRoot: string,
   commonDir: string,
@@ -834,8 +857,10 @@ async function cardStashRefusal(
     await runHardenedGit(["-C", repoRoot, "for-each-ref", "--format=%(objectname)", "refs/stash"], options).catch(() => "")
   ).trim();
   if (SHA_RE.test(tip)) ids.add(tip);
-  const log = await readOptionalRegularFile(path.join(commonDir, "logs", "refs", "stash"), MAX_EXCLUDE_FILE_BYTES)
-    .catch(() => null);
+  const log = await readStashReflog(path.join(commonDir, "logs", "refs", "stash"));
+  if (log === UNVERIFIED_STASH_REFLOG) {
+    return `holds a stash reflog that could not be verified (a regular file larger than ${MAX_BUFFER} bytes or unreadable)`;
+  }
   for (const line of log?.split("\n") ?? []) {
     const id = line.split(" ", 2)[1] ?? "";
     if (SHA_RE.test(id)) ids.add(id);
