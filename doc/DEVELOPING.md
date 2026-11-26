@@ -1055,9 +1055,9 @@ an operator `DATABASE_URL`, or a worktree config
 `database.embeddedPostgresDataDir` inside the worktree checkout, which is then
 kept and used. That directory may not be the checkout root itself, inside the
 claimed home's or the worktree home's `instances` tree, inside `~/.paperclip`, or
-a database directory another known instance config already uses. A data directory outside the checkout does not
-count, because a copied or legacy config may still name another instance's
-database. Without an explicit own database, the worktree's database would be
+a database directory another known instance config already uses. A data
+directory outside the checkout does not count, because a copied or legacy config
+may still name another instance's database. Without an explicit own database, the worktree's database would be
 the embedded default under that home, which may belong to a main instance whose
 config lives elsewhere, so boot refuses and names the remedy: set an explicit
 own database for the worktree. This is a compatibility change: re-entering a
@@ -1068,8 +1068,7 @@ own database, or unset `PAPERCLIP_HOME` to use layout-derived isolation. A
 value. This guard covers the database only: when the exemption is granted, the
 worktree's logs, local storage and backups still live under that home's
 `instances/<id>` root, which a main instance with the same home and ID also
-uses. An instance whose own
-`instances/<id>/config.json` resolves its database inside that instance root is
+uses. An instance whose own `instances/<id>/config.json` resolves its database inside that instance root is
 a main instance, whatever its ID, so exporting its identity never permits a
 worktree to reuse its database.
 A different transient runtime home does not replace persisted worktree paths.
