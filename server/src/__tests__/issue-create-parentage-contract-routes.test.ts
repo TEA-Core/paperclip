@@ -1,13 +1,23 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { promisify } from "node:util";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createPaperclipMcpServer } from "../../../packages/mcp-server/src/index.js";
 import express from "express";
 import request from "supertest";
 import { eq, and } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentApiKeys,
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -57,8 +67,11 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentApiKeys);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -100,6 +113,84 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     return parent;
   }
 
+  async function seedMonitorOwner(companyId: string) {
+    const agentId = randomUUID();
+    const token = `monitor-test-${randomUUID()}`;
+    const responsibleUserId = randomUUID();
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: responsibleUserId,
+      name: "Monitor operator",
+      email: `${responsibleUserId}@example.com`,
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: responsibleUserId,
+      membershipRole: "operator",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Monitor owner",
+      role: "ceo",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    await db.insert(agentApiKeys).values({
+      agentId,
+      companyId,
+      name: "Monitor test key",
+      responsibleUserId,
+      keyHash: createHash("sha256").update(token).digest("hex"),
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId,
+      contextSnapshot: {},
+    });
+    return { agentId, token, runId };
+  }
+
+  async function withMcpClient(
+    companyId: string,
+    owner: { agentId: string; token: string; runId: string },
+    run: (client: Client) => Promise<void>,
+  ) {
+    const http = createServer(createApp());
+    const listening = once(http, "listening");
+    http.listen(0, "127.0.0.1");
+    await listening;
+    const { server } = createPaperclipMcpServer({
+      apiUrl: `http://127.0.0.1:${(http.address() as AddressInfo).port}/api`,
+      apiKey: owner.token,
+      companyId,
+      agentId: owner.agentId,
+      runId: owner.runId,
+    });
+    const client = new Client({ name: "monitor-contract-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      await run(client);
+    } finally {
+      await client.close();
+      await server.close();
+      await promisify(http.close.bind(http))();
+    }
+  }
+
   it("honours a supplied parentId at create and the re-GET shows that parent", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);
@@ -125,36 +216,31 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     expect(rows[0].id).toBe(created.body.id);
   });
 
-  it("persists a complete scheduled monitor and returns its saved schedule on create and GET", async () => {
+  it.each(["board", "agent"] as const)("persists the %s actor's monitor ownership and redacts external references on create and GET", async (actor) => {
     const companyId = await seedCompany();
-    const agentId = randomUUID();
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "Monitor owner",
-      role: "engineer",
-      status: "active",
-      adapterType: "process",
-      adapterConfig: {},
-      runtimeConfig: {},
-    });
+    const { agentId, token } = await seedMonitorOwner(companyId);
     const monitor = {
       nextCheckAt: "2099-12-01T12:00:00.000Z",
       notes: "Check deployment health",
-      scheduledBy: "board",
+      scheduledBy: actor === "board" ? "assignee" : "board",
       kind: "external_service",
       serviceName: "deployment-health",
-      externalRef: null,
+      externalRef: `fake-ref-${randomUUID()}`,
       timeoutAt: "2099-12-02T12:00:00.000Z",
       maxAttempts: 3,
       recoveryPolicy: "escalate_to_board",
     };
+    const savedMonitor = {
+      ...monitor,
+      scheduledBy: actor === "board" ? "board" : "assignee",
+      externalRef: "[redacted]",
+    };
     const app = createApp();
-    const created = await request(app)
-      .post(`/api/companies/${companyId}/issues`)
-      .send({
+    const create = request(app).post(`/api/companies/${companyId}/issues`);
+    if (actor === "agent") create.set("Authorization", `Bearer ${token}`);
+    const created = await create.send({
         title: "Monitor deployment",
-        status: "in_review",
+        status: actor === "board" ? "in_review" : "blocked",
         assigneeAgentId: agentId,
         executionPolicy: { monitor },
       })
@@ -162,11 +248,25 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     const fresh = await request(app).get(`/api/issues/${created.body.id}`).expect(200);
     for (const response of [created.body, fresh.body]) {
       expect(response.monitorNextCheckAt).toBe(monitor.nextCheckAt);
-      expect(response.executionPolicy.monitor).toEqual(monitor);
+      expect(response.executionPolicy.monitor).toEqual(savedMonitor);
+      expect(response.executionState.monitor).toMatchObject({ ...savedMonitor, status: "scheduled" });
+      expect(response.monitorScheduledBy).toBe(savedMonitor.scheduledBy);
+      expect(response.monitorNotes).toBe(savedMonitor.notes);
+      expect(JSON.stringify(response)).not.toContain(monitor.externalRef);
     }
     const [stored] = await db.select().from(issues).where(eq(issues.id, created.body.id));
     expect(stored.monitorNextCheckAt?.toISOString()).toBe(monitor.nextCheckAt);
-    expect(stored.executionPolicy?.monitor).toEqual(monitor);
+    expect(stored.executionPolicy?.monitor).toEqual(savedMonitor);
+    expect(stored.executionState?.monitor).toMatchObject({ ...savedMonitor, status: "scheduled" });
+    expect(stored.monitorScheduledBy).toBe(savedMonitor.scheduledBy);
+    expect(stored.monitorNotes).toBe(savedMonitor.notes);
+    expect(JSON.stringify(stored)).not.toContain(monitor.externalRef);
+    for (const rows of [
+      await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
+      await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+    ]) {
+      expect(JSON.stringify(rows)).not.toContain(monitor.externalRef);
+    }
   });
 
   it.each([false, true])("refuses top-level monitor fields without a partial create (nested monitor: %s)", async (includeNestedMonitor) => {
@@ -191,6 +291,108 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
       expect(response.body.error).toContain(field);
     }
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual([]);
+  });
+
+  it("names every permitted status when refusing an unschedulable monitor", async () => {
+    const companyId = await seedCompany();
+    const { agentId } = await seedMonitorOwner(companyId);
+    const response = await request(createApp())
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Invalid monitor status",
+        status: "todo",
+        assigneeAgentId: agentId,
+        executionPolicy: { monitor: { nextCheckAt: "2099-12-01T12:00:00.000Z" } },
+      })
+      .expect(422);
+    expect(response.body.error).toBe("Monitor can only be scheduled on issues assigned to an agent in in_progress, in_review, or blocked");
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual([]);
+  });
+
+  it.each([
+    ["create", false], ["create", true], ["update", false], ["update", true],
+  ] as const)("MCP %s refuses top-level monitor fields without saving (nested monitor: %s)", async (operation, includeNestedMonitor) => {
+    const companyId = await seedCompany();
+    const owner = await seedMonitorOwner(companyId);
+    const monitor = {
+      nextCheckAt: "2099-12-01T12:00:00.000Z",
+      serviceName: "deployment-health",
+      maxAttempts: 3,
+      recoveryPolicy: "escalate_to_board",
+    };
+    await withMcpClient(companyId, owner, async (client) => {
+      const { tools } = await client.listTools();
+      for (const name of ["paperclipCreateIssue", "paperclipUpdateIssue"]) {
+        expect(tools.find((tool) => tool.name === name)?.inputSchema.additionalProperties).toBe(false);
+      }
+      // A valid nested create must still reach the real route and database.
+      const created = await client.callTool({
+        name: "paperclipCreateIssue",
+        arguments: {
+          title: "MCP monitor",
+          status: "in_review",
+          assigneeAgentId: owner.agentId,
+          executionPolicy: { monitor },
+        },
+      });
+      expect(created.isError).not.toBe(true);
+      const [baseline] = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(baseline, JSON.stringify(created.content)).toBeDefined();
+      expect(baseline.executionPolicy?.monitor).toMatchObject(monitor);
+      await db.update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId: baseline.id } })
+        .where(eq(heartbeatRuns.id, owner.runId));
+      const originalRows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      const fields = {
+        monitorNextCheckAt: monitor.nextCheckAt,
+        monitorRecoveryPolicy: monitor.recoveryPolicy,
+        monitorServiceName: monitor.serviceName,
+        monitorMaxAttempts: monitor.maxAttempts,
+        monitorNotes: "Check health",
+        monitorScheduledBy: "board",
+        monitorKind: "external_service",
+        monitorExternalRef: "fake-ref",
+        monitorTimeoutAt: "2099-12-02T12:00:00.000Z",
+        nextCheckAt: monitor.nextCheckAt,
+        recoveryPolicy: monitor.recoveryPolicy,
+        maxAttempts: monitor.maxAttempts,
+        serviceName: monitor.serviceName,
+        monitorPolicy: monitor,
+        ...(operation === "create" ? { monitor } : {}),
+      };
+      for (const [field, value] of Object.entries(fields)) {
+        const result = await client.callTool({
+          name: operation === "create" ? "paperclipCreateIssue" : "paperclipUpdateIssue",
+          arguments: {
+            ...(operation === "create"
+              ? { title: `Invalid ${field}`, status: "in_progress", assigneeAgentId: owner.agentId }
+              : { issueId: baseline.id, title: `Invalid ${field}` }),
+            [field]: value,
+            ...(includeNestedMonitor ? { executionPolicy: { monitor } } : {}),
+          },
+        });
+        expect(result.isError, field).toBe(true);
+        expect(JSON.stringify(result.content)).toContain(field);
+        expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual(originalRows);
+      }
+      // The documented update-only monitor alias remains supported.
+      if (operation === "update") {
+        const conflict = await client.callTool({
+          name: "paperclipUpdateIssue",
+          arguments: { issueId: baseline.id, monitor, executionPolicy: { monitor } },
+        });
+        expect(conflict.isError).toBe(true);
+        expect(JSON.stringify(conflict.content)).toContain("monitor");
+        expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual(originalRows);
+        const updated = await client.callTool({
+          name: "paperclipUpdateIssue",
+          arguments: { issueId: baseline.id, monitor: { ...monitor, serviceName: "updated-health" } },
+        });
+        expect(updated.isError).not.toBe(true);
+        const [stored] = await db.select().from(issues).where(eq(issues.id, baseline.id));
+        expect(stored.executionPolicy?.monitor, JSON.stringify(updated.content)).toMatchObject({ serviceName: "updated-health" });
+      }
+    });
   });
 
   it("rejects the sibling parentIssueId spelling with a 400 naming the field", async () => {

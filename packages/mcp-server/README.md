@@ -85,6 +85,11 @@ Write tools:
 - `paperclipApprovalDecision`
 - `paperclipAddApprovalComment`
 
+Issue monitors use `executionPolicy.monitor` on create. The update tool also
+accepts the documented top-level `monitor` alias. Other top-level monitor fields,
+such as `monitorNextCheckAt`, are not aliases. The tools refuse them with
+`isError: true` and name the field before sending an HTTP request.
+
 Escape hatch:
 
 - `paperclipApiRequest`
