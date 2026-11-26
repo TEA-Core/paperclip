@@ -1052,17 +1052,23 @@ the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=tr
 identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
 the main home, only for a non-`default` instance with an explicit own database:
 an operator `DATABASE_URL`, or a worktree config
-`database.embeddedPostgresDataDir` inside the worktree checkout and outside every
-`instances` tree and `~/.paperclip`, which is then kept and used. A data
-directory elsewhere does not count, because a copied or legacy config may still
-name another instance's database. Without one, the worktree's database would be the embedded
-default under that home, which may belong to a main instance whose config lives
-elsewhere, so boot refuses and names the remedy: set an explicit own database
-for the worktree. An explicit data directory that another known instance config
-already uses is refused. This is a compatibility change: re-entering a worktree
-after `eval "$(paperclipai worktree env)"` now also needs an explicit own
-database, or unset `PAPERCLIP_HOME` to use layout-derived isolation. A file's
-`DATABASE_URL` does not count. An instance whose own
+`database.embeddedPostgresDataDir` inside the worktree checkout, which is then
+kept and used. That directory may not be the checkout root itself, inside any
+`instances` tree or `~/.paperclip`, or a database directory another known
+instance config already uses. A data directory outside the checkout does not
+count, because a copied or legacy config may still name another instance's
+database. Without an explicit own database, the worktree's database would be
+the embedded default under that home, which may belong to a main instance whose
+config lives elsewhere, so boot refuses and names the remedy: set an explicit
+own database for the worktree. This is a compatibility change: re-entering a
+worktree after `eval "$(paperclipai worktree env)"` now also needs an explicit
+own database, or unset `PAPERCLIP_HOME` to use layout-derived isolation. A
+`DATABASE_URL` read only from the worktree's own `.env` does not count, but
+`worktree env` exports every own-file entry, so after `eval` it is an operator
+value. This guard covers the database only: when the exemption is granted, the
+worktree's logs, local storage and backups still live under that home's
+`instances/<id>` root, which a main instance with the same home and ID also
+uses. An instance whose own
 `instances/<id>/config.json` resolves its database inside that instance root is
 a main instance, whatever its ID, so exporting its identity never permits a
 worktree to reuse its database.
