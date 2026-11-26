@@ -442,14 +442,17 @@ artifact and reviewer rows in one fixed order. Database triggers make any insert
 (or path re-point) of a workspace, project workspace, runtime service, operation
 or queued/running run on the same issue, workspace or overlapping path take
 conflicting keys, so such a phantom waits for the commit. Descendant writers
-share path-prefix keys; ancestor writers share a separate exact-path key for
-their cwd while admission holds exact keys for its ancestors. These exact keys
-can serialize concurrent admissions, not ordinary writes at unrelated paths.
+share path-prefix keys. Ancestor writers take a separate exact-path key for
+their cwd exclusively, while admission holds its own exact keys exclusively and
+shares the exact keys of its ancestors below the managed projects root.
+Concurrent admissions on disjoint worktrees therefore do not exclude each
+other; concurrent writer inserts at one exact cwd briefly serialize.
 No table lock is taken; lock contention and unsupported paths fail closed.
 
 The linked-worktree admin directory must also have a bounded, regular `gitdir`
 back-pointer resolving to this tree's own `.git` file; borrowing a sibling's
-Git directory cannot establish ownership.
+Git directory cannot establish ownership. A relative back-pointer resolves
+against the admin directory, as Git does.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;

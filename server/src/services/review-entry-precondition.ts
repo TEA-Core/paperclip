@@ -199,26 +199,32 @@ function claimedPaths(prepared: PreparedReviewEntry) {
     .map((candidate) => `/${candidate.split("/").filter(Boolean).join("/")}`))].sort();
 }
 
-/** Taken before the issue row lock. Prefix keys fence descendants; the separate
- * exact-path namespace fences writers at ancestors without blocking ordinary
- * writes in unrelated directories.
+/** Taken before the issue row lock. Prefix keys fence descendants. Exact-path
+ * keys are exclusive for claimed paths and shared for their ancestors below the
+ * managed projects root, so admissions do not exclude each other while the
+ * fence trigger's exclusive exact-path key still excludes ancestor writers.
  */
 export async function lockReviewEntryAuthority(tx: Db, issueId: string, prepared: PreparedReviewEntry) {
   await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
   const paths = claimedPaths(prepared);
+  const textualRoot = path.resolve(resolvePaperclipInstanceRoot(), "projects");
+  const roots = [...new Set([textualRoot, await realpath(textualRoot).catch(() => textualRoot)])];
   const ancestors = new Set<string>();
   for (const candidate of paths) {
-    for (let ancestor = candidate; ; ancestor = path.dirname(ancestor)) {
-      ancestors.add(ancestor);
-      if (ancestor === path.dirname(ancestor)) break;
+    for (let ancestor = path.dirname(candidate); roots.some((root) => ancestor !== root && containsPath(root, ancestor));
+      ancestor = path.dirname(ancestor)) {
+      if (!paths.includes(ancestor)) ancestors.add(ancestor);
     }
   }
-  const keys = [
+  const exclusive = [
     `issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`,
     ...paths.map((candidate) => `path:${candidate}`),
-    ...[...ancestors].sort().map((ancestor) => `path-exact:${ancestor}`),
+    ...paths.map((candidate) => `path-exact:${candidate}`),
   ];
-  for (const key of keys) await tx.execute(sql`SELECT pg_advisory_xact_lock(review_entry_lock_key(${key}))`);
+  for (const key of exclusive) await tx.execute(sql`SELECT pg_advisory_xact_lock(review_entry_lock_key(${key}))`);
+  for (const ancestor of [...ancestors].sort()) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock_shared(review_entry_lock_key(${`path-exact:${ancestor}`}))`);
+  }
 }
 
 async function physicalPath(candidate: string): Promise<PhysicalWorkspace> {

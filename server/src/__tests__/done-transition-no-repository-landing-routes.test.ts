@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -393,51 +393,57 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       /** The issue-title slug after the identifier in the worktree's branch (the default template). */
       branchSlug?: string | ((identifier: string) => string);
       projectWorkspace?: Partial<typeof projectWorkspaces.$inferInsert>;
+      /** Seed another card in this fixture's company, project and managed checkout. */
+      sameProjectAs?: SeededIssue;
     } = {},
   ): Promise<SeededIssue> {
     seedSequence += 1;
     const prefix = `NRL${seedSequence}`;
-    const companyId = await insertCompany(prefix);
-    const closerAgentId = await insertAgent(companyId, "Closer");
-    const rulerAgentId = await insertAgent(companyId, "Ruler");
-    const projectId = randomUUID();
-    const projectWorkspaceId = randomUUID();
+    const shared = options.sameProjectAs;
+    const companyId = shared?.companyId ?? await insertCompany(prefix);
+    const closerAgentId = shared?.closerAgentId ?? await insertAgent(companyId, "Closer");
+    const rulerAgentId = shared?.rulerAgentId ?? await insertAgent(companyId, "Ruler");
+    const projectId = shared?.projectId ?? randomUUID();
+    const projectWorkspaceId = shared?.projectWorkspaceId ?? randomUUID();
     const executionWorkspaceId = randomUUID();
     const issueId = randomUUID();
-    const identifier = `${prefix}-1`;
+    const identifier = shared ? `${shared.identifier.split("-")[0]}-${seedSequence}` : `${prefix}-1`;
     const branchSlug = typeof options.branchSlug === "function" ? options.branchSlug(identifier) : options.branchSlug;
     const branch = `${identifier}-${branchSlug ?? "entry-ruling"}`;
 
     const repoRoot = resolveManagedProjectWorkspaceDir({ companyId, projectId, repoName: "paperclip" });
-    const origin = path.join(home, "origins", `${prefix}.git`);
-    mkdirSync(path.dirname(origin), { recursive: true });
-    git(home, "init", "-q", "--bare", "-b", "main", origin);
-    const seedRepo = path.join(home, "seeds", prefix);
-    mkdirSync(seedRepo, { recursive: true });
-    git(seedRepo, "init", "-q", "-b", "main");
-    writeFileSync(path.join(seedRepo, "README.md"), "seed\n");
-    git(seedRepo, "add", "README.md");
-    git(seedRepo, "commit", "-qm", "seed");
-    git(seedRepo, "push", "-q", origin, "main");
-    mkdirSync(path.dirname(repoRoot), { recursive: true });
-    git(home, "clone", "-q", origin, repoRoot);
-    currentOrigin = origin;
     const worktree = path.join(repoRoot, ".paperclip", "worktrees", branch);
-    git(repoRoot, "worktree", "add", "-q", "-b", branch, worktree, "origin/main");
+    if (shared) git(repoRoot, "worktree", "add", "-q", "-b", branch, worktree, "origin/main");
+    else {
+      const origin = path.join(home, "origins", `${prefix}.git`);
+      mkdirSync(path.dirname(origin), { recursive: true });
+      git(home, "init", "-q", "--bare", "-b", "main", origin);
+      const seedRepo = path.join(home, "seeds", prefix);
+      mkdirSync(seedRepo, { recursive: true });
+      git(seedRepo, "init", "-q", "-b", "main");
+      writeFileSync(path.join(seedRepo, "README.md"), "seed\n");
+      git(seedRepo, "add", "README.md");
+      git(seedRepo, "commit", "-qm", "seed");
+      git(seedRepo, "push", "-q", origin, "main");
+      mkdirSync(path.dirname(repoRoot), { recursive: true });
+      git(home, "clone", "-q", origin, repoRoot);
+      currentOrigin = origin;
+      git(repoRoot, "worktree", "add", "-q", "-b", branch, worktree, "origin/main");
 
-    await db.insert(projects).values({ id: projectId, companyId, name: "Records", status: "active" });
-    await db.insert(projectWorkspaces).values({
-      id: projectWorkspaceId,
-      companyId,
-      projectId,
-      name: "Primary",
-      cwd: repoRoot,
-      repoUrl: "https://github.com/TEA-Core/records",
-      repoRef: "main",
-      defaultRef: "main",
-      isPrimary: true,
-      ...options.projectWorkspace,
-    });
+      await db.insert(projects).values({ id: projectId, companyId, name: "Records", status: "active" });
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary",
+        cwd: repoRoot,
+        repoUrl: "https://github.com/TEA-Core/records",
+        repoRef: "main",
+        defaultRef: "main",
+        isPrimary: true,
+        ...options.projectWorkspace,
+      });
+    }
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
@@ -524,8 +530,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch";
 
   describe("conditional first review entry", () => {
-    async function reviewFixture() {
-      const fixture = await seed();
+    async function reviewFixture(options: Parameters<typeof seed>[0] = {}) {
+      const fixture = await seed(options);
       const policy = {
         mode: "normal", commentRequired: true, stages: [{
           id: randomUUID(), type: "review", participants: [{
@@ -700,6 +706,78 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         await noAcceptedEntry(fixture.issueId);
       },
     );
+
+    it("admits first entries on other worktrees and projects while another admission holds its recheck", async () => {
+      const held = await reviewFixture();
+      const heldOrigin = currentOrigin;
+      const sameProject = await reviewFixture({ sameProjectAs: held });
+      const otherProject = await reviewFixture();
+      const otherOrigin = currentOrigin;
+      currentOrigin = heldOrigin;
+      let release!: () => void;
+      let locked!: () => void;
+      const lockedReached = new Promise<void>((resolve) => { locked = resolve; });
+      const canCommit = new Promise<void>((resolve) => { release = resolve; });
+      mockRecheckReviewEntry.mockImplementationOnce(async (captured: Extract<ReviewEntryWorktreeSnapshot, { ok: true }>) => {
+        const result = await realRecheckReviewEntry.current!(captured);
+        locked();
+        await canCommit;
+        return result;
+      });
+      const submit = (fixture: typeof held) => request(app).patch(`/api/issues/${fixture.identifier}`)
+        .set("x-test-actor", JSON.stringify(fixture.actor)).send(fixture.body).then((response) => response);
+      const entry = submit(held);
+      try {
+        await Promise.race([lockedReached, entry.then((response) => {
+          throw new Error(`Entry ended before the commit barrier: ${response.status} ${JSON.stringify(response.body)}`);
+        })]);
+        const sibling = await submit(sameProject);
+        expect(sibling.status, JSON.stringify(sibling.body)).toBe(200);
+        currentOrigin = otherOrigin;
+        const foreign = await submit(otherProject);
+        expect(foreign.status, JSON.stringify(foreign.body)).toBe(200);
+      } finally {
+        release();
+      }
+      const response = await entry;
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      for (const fixture of [held, sameProject, otherProject]) {
+        expect(await statusOf(fixture.issueId)).toBe("in_review");
+        expect(await db.select().from(issueReviewEntryReceipts)
+          .where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).toHaveLength(1);
+      }
+    }, 60_000);
+
+    it.each([
+      ["resolves to this tree", (adminDir: string, worktree: string) => path.relative(adminDir, path.join(worktree, ".git")), 200],
+      ["resolves to a sibling", (adminDir: string, worktree: string) =>
+        path.relative(adminDir, path.join(`${worktree}-elsewhere`, ".git")), 409],
+    ] as const)("judges a relative gitdir back-pointer that %s", async (_label, pointer, status) => {
+      const fixture = await reviewFixture();
+      const adminDir = git(fixture.worktree, "rev-parse", "--absolute-git-dir");
+      mkdirSync(`${fixture.worktree}-elsewhere`);
+      writeFileSync(path.join(`${fixture.worktree}-elsewhere`, ".git"), `gitdir: ${adminDir}\n`);
+      writeFileSync(path.join(adminDir, "gitdir"), `${pointer(adminDir, fixture.worktree)}\n`);
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(status);
+      if (status === 409) {
+        expect(response.body.code).toBe("review_entry_git_refused");
+        await noAcceptedEntry(fixture.issueId);
+      }
+    });
+
+    const gitVersion = execFileSync("git", ["--version"]).toString().match(/(\d+)\.(\d+)/);
+    const supportsRelativePaths = !!gitVersion && (Number(gitVersion[1]) > 2 || (Number(gitVersion[1]) === 2 && Number(gitVersion[2]) >= 48));
+    // `git worktree add --relative-paths` first shipped in Git 2.48.
+    it.skipIf(!supportsRelativePaths)("admits a worktree added with git worktree add --relative-paths", async () => {
+      const fixture = await reviewFixture();
+      git(fixture.repoRoot, "worktree", "remove", "--force", fixture.worktree);
+      git(fixture.repoRoot, "worktree", "add", "-q", "--relative-paths", fixture.worktree, fixture.branch);
+      expect(path.isAbsolute(readFileSync(path.join(git(fixture.worktree, "rev-parse", "--absolute-git-dir"), "gitdir"), "utf8").trim()))
+        .toBe(false);
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    });
 
     it("refuses a sibling worktree Git directory borrowed by the submitting tree", async () => {
       const fixture = await reviewFixture();

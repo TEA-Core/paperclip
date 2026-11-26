@@ -798,8 +798,8 @@ async function verifyCleanLinkedWorktree(
   try {
     const backlink = await readOptionalRegularFile(path.join(identity.gitDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
     const target = backlink?.endsWith("\n") ? backlink.slice(0, -1) : backlink;
-    if (!target || !path.isAbsolute(target) || /[\0\r\n]/.test(target) ||
-        await realpath(target) !== path.join(worktreePath, ".git")) {
+    if (!target || /[\0\r\n]/.test(target) ||
+        await realpath(path.resolve(identity.gitDir, target)) !== path.join(worktreePath, ".git")) {
       return { ok: false, reason: "has a linked-worktree Git directory registered to a different path" };
     }
   } catch {
