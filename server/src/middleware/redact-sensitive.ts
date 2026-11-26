@@ -1,3 +1,5 @@
+import { redactSecretTokens } from "../log-redaction.js";
+
 // Redaction for HTTP log payloads.
 //
 // `customProps` in logger.ts copies `req.body` / `req.params` / `req.query`
@@ -138,6 +140,11 @@ export function stripSecretBearingUrlParts(value: string): string {
 
 export function redactSensitive(value: unknown, depth = 0): unknown {
   if (depth > MAX_DEPTH) return undefined;
+  // SUP-25336 (RA F2): free-text fields such as a close comment or a done-tier
+  // `probeEvidence` are not sensitive keys, but a caller can paste a bearer
+  // token or API key into them. Mask credential-shaped tokens in every string
+  // leaf so a 4xx/5xx log line never keeps one.
+  if (typeof value === "string") return redactSecretTokens(value);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (depth + 1 > MAX_DEPTH) return undefined;
@@ -150,7 +157,7 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
       continue;
     }
     if (typeof entry === "string" && isUrlishKey(key)) {
-      out[key] = stripSecretBearingUrlParts(entry);
+      out[key] = redactSecretTokens(stripSecretBearingUrlParts(entry));
       continue;
     }
     out[key] = redactSensitive(entry, depth + 1);

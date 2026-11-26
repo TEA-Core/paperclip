@@ -14515,10 +14515,10 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const finalDeliveryPrefetch =
-        sourceIssueStatus === "done" && existing.status !== "done" && existing.deliveryRequirement !== "record_only"
-          ? await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing)
-          : null;
+      // SUP-25336 (RA F1): the authenticated final-delivery prefetch runs only
+      // after the done-tier source resolver below, so a dual-source conflict
+      // refuses with its 422 before this door spends any GitHub read.
+      let finalDeliveryPrefetch: Awaited<ReturnType<typeof prefetchFinalDelivery>> | null = null;
       // SUP-21910 (parent SUP-21901 audit F1): this door can land a card on
       // `done` — an owner restore after a manual landing (owner_completed) or an
       // agent's final-stage approval restore (SUP-17163), which then runs the
@@ -14569,6 +14569,9 @@ export function issueRoutes(
             runId: actor.runId ?? null,
           });
           structuredDoneTierRendered = true;
+        }
+        if (existing.deliveryRequirement !== "record_only") {
+          finalDeliveryPrefetch = await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing);
         }
         const recoveryDonePolicy = normalizeIssueExecutionPolicy(
           existing.executionPolicy ?? null,

@@ -773,3 +773,71 @@ describe("HTTP logger redaction", () => {
     },
   );
 });
+
+// SUP-25336 (RA F2): a refused close carries caller free text — the close
+// comment, the structured doneTier probeEvidence, a recovery resolution note —
+// that is not a sensitive key. A pasted credential in any of those fields must
+// never reach the 4xx log line, while the surrounding prose stays diagnosable.
+describe("HTTP logger redaction of credential-shaped free text (SUP-25336)", () => {
+  const BEARER = "Bearer abcdef1234567890ABCDEFtoken";
+  const GITHUB = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+  const OPENAI = "sk-live-9f8e7d6c5b4a39281706aBcDeF";
+  const planted = (label: string) =>
+    `${label}: ran curl -H 'Authorization: ${BEARER}' with ${GITHUB} and ${OPENAI}`;
+
+  function captureApp(handler: express.RequestHandler) {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.patch("/api/issues/:id", handler);
+    app.post("/api/issues/:id/comments", handler);
+    app.post("/api/issues/:id/recovery-actions/resolve", handler);
+    app.use(errorHandler);
+    return { app, chunks };
+  }
+
+  function expectNoCredential(log: string) {
+    expect(log).not.toContain("abcdef1234567890ABCDEFtoken");
+    expect(log).not.toContain(GITHUB);
+    expect(log).not.toContain(OPENAI);
+  }
+
+  it.each([
+    ["PATCH", "/api/issues/SUP-1", { status: "done", comment: planted("comment"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+    ["POST", "/api/issues/SUP-1/comments", { body: planted("body"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+    ["POST", "/api/issues/SUP-1/recovery-actions/resolve", { outcome: "restored", sourceIssueStatus: "done", resolutionNote: planted("resolutionNote"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+  ])("masks credentials in the request body and refusal reason of a %s %s 422", async (method, path, body) => {
+    const { app, chunks } = captureApp((req, _res, next) => {
+      // A refusal reason that quotes the offending caller line, as the
+      // done-tier evaluator's "Offending line" remedy does.
+      next(new HttpError(422, `Offending line: "${String(req.body.comment ?? req.body.body ?? req.body.resolutionNote)}"`, {
+        code: "done_transition_missing_tier_declaration",
+      }));
+    });
+    const agent = request(app);
+    const res = await (method === "PATCH" ? agent.patch(path) : agent.post(path)).send(body);
+    expect(res.status).toBe(422);
+    const log = chunks.join("");
+    expect(log).toContain("probeEvidence: ran curl");
+    expectNoCredential(log);
+  });
+
+  it("masks credentials in a 4xx body logged without an error context", async () => {
+    const { app, chunks } = captureApp((_req, res) => {
+      res.status(422).json({ error: "refused", code: "done_tier_dual_source_conflict" });
+    });
+    await request(app)
+      .patch("/api/issues/SUP-1")
+      .send({ status: "done", comment: planted("comment"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } });
+    const log = chunks.join("");
+    expect(log).toContain("comment: ran curl");
+    expectNoCredential(log);
+  });
+});

@@ -11,6 +11,7 @@ import {
   redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
+import { redactSecretTokens } from "../log-redaction.js";
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -164,7 +165,9 @@ export function createHttpLogger(baseLogger: Logger) {
         err?.message ||
         (res as any).err?.message ||
         "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
+      // SUP-25336 (RA F2): a refusal reason can quote caller free text, such
+      // as an offending close-comment line; mask credential-shaped tokens.
+      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${redactSecretTokens(String(errMsg))}`;
     },
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.

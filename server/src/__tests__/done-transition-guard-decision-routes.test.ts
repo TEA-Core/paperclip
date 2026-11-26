@@ -2666,6 +2666,37 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ]);
     });
 
+    it("recovery-action close: a repository-delivery dual-source conflict refuses before any GitHub read (SUP-25336 RA F1)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D25336T");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockMergedBranch();
+      // Drive the real final-delivery preflight: it resolves the GitHub token
+      // and reads the provider, so a door that prefetched before resolving the
+      // done-tier sources would show those calls here.
+      certifiedDelivery.useRealPreflight = true;
+      mockGhFetch.mockClear();
+      mockResolveSecretValue.mockClear();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          resolutionNote: `Delivered.\n\nClosed at Tier 2 (live): ${closeBody.doneTier.probeEvidence}`,
+          doneTier: { tier: "tier2", probeEvidence: "GET /api/health returned 200 after the sibling PR landed." },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_tier_dual_source_conflict");
+      // The conflict refuses before the authenticated final-delivery prefetch:
+      // no GitHub request and no credential resolution on this door.
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(mockResolveSecretValue).not.toHaveBeenCalled();
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
     it("recovery-action close: an exactly equivalent dual source closes with the original note (SUP-25336)", async () => {
       const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D25336S", { deliveryRequirement: "record_only" });
       const runId = await seedRun(companyId, reviewerAgentId, issueId);
