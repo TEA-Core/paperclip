@@ -300,13 +300,13 @@ rebind-first does not work in the `project_primary` arm: the stamp is written
 onto the `project_primary` row the card already holds, with no rebind. With
 `enableIsolatedWorkspaces` on and a project policy that sets
 `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary`
-stamp that writes the branch onto the card's branchless row is refused with
-`422` `workspace_issue_override_disallowed` whether or not the request names an
-`executionWorkspaceId`: the route re-supplies the stored workspace id on that
-write, and the policy check counts it as an override. This applies to the board
-refresh and to the agent's entry-into-review write alike. With the flag off the
-id is dropped from the patch before that policy check and the stamp proceeds on
-the row the card already holds. When the
+stamp that writes the branch onto the card's branchless row is accepted: the
+route re-supplies the stored workspace id on that write, and the policy check
+does not count an `executionWorkspaceId` equal to the one the card already
+holds as an override. This applies to the board refresh and to the agent's
+entry-into-review write alike. With the flag off the id is dropped from the
+patch before that policy check and the stamp proceeds on the row the card
+already holds. When the
 rebind does bind, the record is validated against (and, for a `project_primary`
 stamp, written onto) the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but
 a rebind does not revalidate a stored record, so it can leave a record the
@@ -333,8 +333,8 @@ sourced by an ancestor card, so a rebind onto it is refused and the only route
 is to record while the card still holds the carrier row; a `shared_workspace`
 carrier passes this check. (3) The project policy: with
 `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on),
-any explicit `executionWorkspaceId` is refused with `422`
-`workspace_issue_override_disallowed`. When all three pass, the rebind binds
+any explicit `executionWorkspaceId` other than the one the card already holds
+is refused with `422` `workspace_issue_override_disallowed`. When all three pass, the rebind binds
 and an identity `PATCH` sent after it returns `200`. Rebinding away from the
 carrier row after the record is written returns `200` and leaves the record in
 place, but the approval-time resolver then refuses it. So write the record while

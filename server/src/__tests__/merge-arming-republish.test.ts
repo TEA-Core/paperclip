@@ -6191,6 +6191,152 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
   });
 
+  describe("a project_primary stamp with enableIsolatedWorkspaces on and a project override policy (SUP-24798)", () => {
+    async function setProjectPolicy(issueId: string, policy: Record<string, unknown> | null) {
+      const [row] = await db.select({ projectId: issues.projectId }).from(issues).where(eq(issues.id, issueId));
+      await db.update(projects).set({ executionWorkspacePolicy: policy }).where(eq(projects.id, row!.projectId!));
+    }
+
+    function stampIdentity(branch: string) {
+      return { repo: { owner: OWNER, repo: REPO }, branch, headSha: HEAD_SHA };
+    }
+
+    beforeEach(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    });
+
+    afterEach(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    });
+
+    it("accepts the board stamp onto the card's own null-branch row when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14824-1-restored");
+    });
+
+    it("accepts the board stamp that names the card's stored executionWorkspaceId when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: boundWorkspaceId, deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+    });
+
+    it("accepts the agent's entry-into-review stamp onto the card's own null-branch row when allowIssueOverride is false", async () => {
+      const runId = randomUUID();
+      const { companyId, issueId, agentId } = await seedIssue({
+        executionRunId: runId,
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = agentActor(companyId, agentId, runId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", deliveryIdentity: stampIdentity("SUP-14824-project-primary") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-project-primary");
+      const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("in_review");
+    });
+
+    it("still refuses a different executionWorkspaceId with 422 workspace_issue_override_disallowed when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      const otherWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: otherWorkspaceId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details?.code).toBe("workspace_issue_override_disallowed");
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+    });
+
+    it("still refuses an executionWorkspacePreference that rides with the stored executionWorkspaceId when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: boundWorkspaceId, executionWorkspacePreference: "reuse_existing" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details?.code).toBe("workspace_issue_override_disallowed");
+    });
+
+    for (const [label, policy] of [
+      ["allowIssueOverride true", { enabled: true, allowIssueOverride: true }],
+      ["allowIssueOverride unset", { enabled: true }],
+    ] as const) {
+      it(`keeps the board stamp and a different-row rebind accepted when ${label}`, async () => {
+        const { companyId, issueId } = await seedIssue({
+          status: "in_review",
+          strategyType: "project_primary",
+          deliveryBranch: null,
+        });
+        await setProjectPolicy(issueId, { ...policy });
+        currentActor = boardActor(companyId);
+
+        const stamp = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+        expect(stamp.status, JSON.stringify(stamp.body)).toBe(200);
+        expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+
+        const otherWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
+        const rebind = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ executionWorkspaceId: otherWorkspaceId });
+        expect(rebind.status, JSON.stringify(rebind.body)).toBe(200);
+        expect(await boundWorkspaceOf(issueId)).toBe(otherWorkspaceId);
+      });
+    }
+  });
+
   it("refuses a board terminal-carrier record that also rebinds the card, then accepts the record alone", async () => {
     const { companyId, issueId } = await seedIssue({
       status: "in_review",
