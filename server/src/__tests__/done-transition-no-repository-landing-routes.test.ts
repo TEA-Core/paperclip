@@ -926,6 +926,28 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       }
     });
 
+    it.each([
+      ["a dangling symlink into the worktree", (link: string) => link, (worktree: string) => path.join(worktree, "sub")],
+      ["a path under a dangling symlink", (link: string) => path.join(link, "more"), (worktree: string) => path.join(worktree, "sub")],
+      ["a dangling symlink elsewhere", (link: string) => link, (worktree: string) => path.join(`${worktree}-nowhere`, "sub")],
+    ] as const)("refuses a foreign run path through %s as unverified", async (_label, runPath, target) => {
+      const fixture = await reviewFixture();
+      const link = `${fixture.worktree}-dangling`;
+      symlinkSync(target(fixture.worktree), link);
+      const otherCompany = await insertCompany(`DANG${seedSequence}`);
+      await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Dangling writer"),
+        status: "queued", contextSnapshot: { cwd: runPath(link) } });
+      try {
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toBe("review_entry_workspace_unverified");
+        await noAcceptedEntry(fixture.issueId);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.companyId, otherCompany));
+      }
+    });
+
     it.each(["deleted foreign project path", "archived project", "cloud sandbox workspace", "remote environment run"])(
       "does not count %s as a local writer", async (kind) => {
         const fixture = await reviewFixture();

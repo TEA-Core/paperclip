@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
@@ -244,6 +244,7 @@ async function assertExclusive(
         return inside(path.join(await realpath(ancestor), ...missing));
       } catch (error) {
         if (!absent(error) || ancestor === path.dirname(ancestor)) return unresolved();
+        if (await lstat(ancestor).then(() => true, (missingEntry) => !absent(missingEntry))) return unresolved();
         missing.unshift(path.basename(ancestor));
       }
     }
