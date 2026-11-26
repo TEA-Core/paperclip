@@ -19,6 +19,10 @@ import {
 } from "@paperclipai/shared";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
 import {
+  resolveDefaultEmbeddedPostgresDir,
+  resolvePaperclipConfigPathForInstance,
+} from "@paperclipai/shared/home-paths";
+import {
   readWorktreePortRegistry,
   withWorktreePortRegistryLockSync,
   writeWorktreePortRegistry,
@@ -223,7 +227,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     const registered = readWorktreePortRegistry(fallback.homeDir);
     for (const entry of readWorktreePortRegistry(candidate.homeDir)) registered.add(entry);
     const siblings = collectSiblingWorktreePorts(candidate, registered).configPaths;
-    const instanceConfigPath = path.join(candidate.instanceRoot, "config.json");
+    const mainInstance = { homeDir: candidate.homeDir, instanceId: candidate.instanceId };
+    const instanceConfigPath = resolvePaperclipConfigPathForInstance(mainInstance);
     siblings.add(instanceConfigPath);
     // Conventional sibling worktrees need not have booted into the registry yet.
     // Without a listing, refuse reusable claims and require path-derived identity.
@@ -236,7 +241,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
       try {
         const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as PaperclipConfig;
         const dataDir = config.database?.embeddedPostgresDataDir ??
-          (configPath === instanceConfigPath ? candidate.embeddedPostgresDataDir : undefined);
+          (configPath === instanceConfigPath ? resolveDefaultEmbeddedPostgresDir(mainInstance) : undefined);
         if (dataDir && isPathInside(resolveHomeAwarePath(dataDir), candidate.instanceRoot)) return true;
       } catch {
         // Missing or malformed sibling configs do not claim an instance.
