@@ -946,7 +946,8 @@ Monitors are not recurring intervals. When a monitor fires, Paperclip clears the
 
 Closing an issue still clears a future-dated monitor, but the issue update that
 closes it (PATCH, a review-approval comment, a stage decision, or any other
-service caller) writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
+service caller), or the routine retirement that cancels a superseded routine
+execution sibling, writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
 `recoveryPolicy` (nullable), the existing actor/run attribution, and
 `reason: cleared_by_close_future_check`. This is a searchable cancellation record,
 not a transfer or a later wake. Past-due watchdogs retain their ordinary clear
