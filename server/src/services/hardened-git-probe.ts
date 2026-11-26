@@ -1162,7 +1162,7 @@ export async function captureReviewEntryWorktree(
           const roots = [...probe.comparedTips, ...(baseIsLocal ? [input.publishedBaseSha] : [])];
           const uncovered = (await runHardenedGit(
             ["--git-dir", snapshot, "rev-list", "--count", "--stdin"],
-            { ...options, input: `${[...tagTargets, "--not", ...roots].join("\n")}\n` },
+            { ...options, input: `${[...tagTargets, ...roots.map((root) => `^${root}`)].join("\n")}\n` },
           )).trim();
           if (uncovered !== "0") return null;
         }

@@ -555,7 +555,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       ["a tag on an unpublished commit", 409],
       ["a tag on a tree", 409],
       ["a release tag in proven HEAD ancestry after the provider base moved past the local clone", 200],
-      ["a few hundred release tags on the published base", 200],
+      ["two hundred distinct release tags on the published base", 200],
     ] as const)("judges %s by published-base ancestry", async (kind, status) => {
       const fixture = await reviewFixture();
       const head = git(fixture.worktree, "rev-parse", "HEAD");
@@ -567,10 +567,20 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         const upstream = git(currentOrigin, "commit-tree", "main^{tree}", "-p", "main", "-m", "merged elsewhere");
         git(currentOrigin, "update-ref", "refs/heads/main", upstream);
         expect(() => git(fixture.worktree, "cat-file", "-e", upstream)).toThrow();
-      } else if (kind.startsWith("a few hundred")) {
+      } else if (kind.startsWith("two hundred")) {
+        const tree = git(fixture.worktree, "rev-parse", "HEAD^{tree}");
+        const releases: string[] = [];
+        let parent = head;
+        for (let index = 0; index < 200; index += 1) {
+          parent = git(fixture.worktree, "commit-tree", tree, "-p", parent, "-m", `release ${index}`);
+          releases.push(parent);
+        }
+        git(fixture.worktree, "merge", "--ff-only", "-q", parent);
+        git(fixture.worktree, "push", "-q", currentOrigin, `HEAD:refs/heads/main`);
         execFileSync("git", ["-C", fixture.worktree, "update-ref", "--stdin"], {
-          input: Array.from({ length: 300 }, (_, index) => `create refs/tags/v0.${index}.0 ${head}\n`).join(""), stdio: ["pipe", "pipe", "pipe"],
+          input: releases.map((sha, index) => `create refs/tags/v0.${index}.0 ${sha}\n`).join(""), stdio: ["pipe", "pipe", "pipe"],
         });
+        expect(new Set(git(fixture.worktree, "for-each-ref", "--format=%(objectname)", "refs/tags/").split("\n")).size).toBe(200);
       } else {
         const tree = git(fixture.worktree, "rev-parse", "HEAD^{tree}");
         git(fixture.worktree, "tag", "owed-work", git(fixture.worktree, "commit-tree", tree, "-p", head, "-m", "unpublished"));
