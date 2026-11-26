@@ -59,6 +59,9 @@ Remote SSH and sandbox restores use the same rule: the run directory closes
 before the transport writes any bytes, then the permission walk removes remote
 group/world write bits before the run directory opens again. Restore-created
 directories have the staged directory mode, never a published `02775`.
+Warm remote checkpoints download into an owner-only `0700` scratch directory
+inside the run directory, and the permission walk removes every group and world
+bit from the downloaded entries before validation and save.
 The permission walk refuses links and special files with the named
 `422` refusal, so a link restored from a remote or sandbox run is not retried.
 It rejects changed inode identities, opens entries without following symlinks,

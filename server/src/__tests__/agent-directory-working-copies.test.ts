@@ -1284,24 +1284,7 @@ describe("persistent agent directories", () => {
     const remoteCwd = path.join(home, "remote-task");
     await fs.mkdir(remoteCwd, { recursive: true });
     await execFile("git", ["init", remoteCwd]);
-    const runner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = {
-      execute: async input => {
-        const startedAt = new Date().toISOString();
-        const env = { ...process.env, ...input.env };
-        const args = [...(input.args ?? [])];
-        if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
-          env.PAPERCLIP_TEST_STDIN = input.stdin;
-          args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
-        }
-        try {
-          const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
-          return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
-        } catch (error) {
-          const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };
-          return { exitCode: typeof e.code === "number" ? e.code : 1, signal: e.signal ?? null, timedOut: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "", pid: null, startedAt };
-        }
-      },
-    };
+    const runner = localSandboxRunner();
     const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), remoteCwd, runner };
     const prepare = async () => {
       const runId = randomUUID();
@@ -1331,6 +1314,70 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(path.join(second.executionRoot, "task-only.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await copies.collectStopped({ companyId, runId: second.runId, target: executionTarget });
     await copies.release(companyId, second.runId);
+  });
+
+  function localSandboxRunner(): import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner {
+    return {
+      execute: async input => {
+        const startedAt = new Date().toISOString();
+        const env = { ...process.env, ...input.env };
+        const args = [...(input.args ?? [])];
+        if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
+          env.PAPERCLIP_TEST_STDIN = input.stdin;
+          args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
+        }
+        try {
+          const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+          return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
+        } catch (error) {
+          const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };
+          return { exitCode: typeof e.code === "number" ? e.code : 1, signal: e.signal ?? null, timedOut: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "", pid: null, startedAt };
+        }
+      },
+    };
+  }
+
+  it("keeps a warm sandbox checkpoint owner-only before its files are applied", async () => {
+    const remoteCwd = path.join(home, "warm-checkpoint-modes");
+    await fs.mkdir(remoteCwd, { recursive: true });
+    const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), remoteCwd, runner: localSandboxRunner() };
+    const previousUmask = process.umask();
+    const rename = fs.rename.bind(fs);
+    let live: string | undefined;
+    let observed: Array<[string, number]> | undefined;
+    const applying = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (live && !observed && String(destination).startsWith(`${root}${path.sep}`)) {
+        observed = [];
+        const runDir = path.dirname(live);
+        const walk = async (filename: string, relative: string) => {
+          const stat = await fs.lstat(filename);
+          observed!.push([relative, stat.mode & 0o7777]);
+          if (stat.isDirectory()) for (const entry of await fs.readdir(filename)) await walk(path.join(filename, entry), `${relative}/${entry}`);
+        };
+        for (const name of await fs.readdir(runDir)) if (name.startsWith("checkpoint-")) await walk(path.join(runDir, name), "checkpoint");
+      }
+      return rename(source, destination);
+    });
+    try {
+      process.umask(0o002);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const copy = (await withAgentsGid(process.getegid!(), () =>
+        copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, warm: true })))!;
+      expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o750);
+      live = copy.localRoot;
+      await fs.mkdir(path.join(copy.executionRoot, "shared"), { mode: 0o777 });
+      await fs.writeFile(path.join(copy.executionRoot, "shared/notes.md"), "remote writable");
+      await fs.chmod(path.join(copy.executionRoot, "shared"), 0o777);
+      await fs.chmod(path.join(copy.executionRoot, "shared/notes.md"), 0o666);
+      const saved = (await copies.checkpointWarm({ companyId, runId, target: executionTarget }))!;
+      expect(saved, JSON.stringify({ code: saved.errorCode, message: saved.errorMessage })).toMatchObject({ state: "warm_saved", errorCode: null });
+      expect(await fs.readFile(path.join(root, "shared/notes.md"), "utf8")).toBe("remote writable");
+      expect(observed?.length).toBeGreaterThan(1);
+      expect(observed!.find(([name]) => name === "checkpoint")?.[1]).toBe(0o700);
+      expect(observed!.filter(([, mode]) => mode & 0o077)).toEqual([]);
+      await copies.collectStopped({ companyId, runId, target: executionTarget });
+    } finally { applying.mockRestore(); process.umask(previousUmask); }
   });
 
   it("checkpoints and reuses the remote directory through the real transport without copying unchanged bytes", async () => {
