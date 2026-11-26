@@ -1029,7 +1029,7 @@ is skipped, while policy normalization writes `null`.
 
 The Wiki handoff guard is also skipped for a field-less write. In a field-less
 write, every present key is `undefined` or request attribution: `actorAgentId`,
-`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`actorAgentApiKeyId`, `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
 `expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
 write when the route adds no field to it and the request carries no
 `reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard

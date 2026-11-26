@@ -334,7 +334,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
     const { issue } = await seed();
     const policy = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt, recoveryPolicy: "wake_owner" } });
     await db.update(issues).set({
-      executionPolicy: policy as Record<string, unknown>,
+      executionPolicy: policy ? { ...policy } : null,
       monitorNextCheckAt: new Date(nextCheckAt),
     }).where(eq(issues.id, issue.id));
     const current = await stored(issue.id);

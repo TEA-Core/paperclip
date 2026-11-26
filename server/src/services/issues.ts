@@ -220,6 +220,7 @@ export async function logLostFutureMonitorCheck(
   await logActivityInTransaction(tx, {
     companyId: after.companyId,
     ...attribution,
+    boardApiKeyId: attribution.boardApiKeyId,
     action: "issue.monitor_cleared",
     entityType: "issue",
     entityId: after.id,
