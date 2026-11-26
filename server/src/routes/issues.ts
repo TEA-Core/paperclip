@@ -1,6 +1,7 @@
 import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
+import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
 import { createIssueReadTiming } from "../services/issue-read-timing.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -304,7 +305,8 @@ import {
   TIER2_FORM,
   TIER2_RECORD_ONLY_FORM,
   findMissingAdr072CloseLadderStages,
-  renderDoneTierDeclaration,
+  resolveDoneTierDeclarationSources,
+  DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
   measureNoRepositoryLandingForClose,
   noRepositoryLandingAuditDetails,
   noRepositoryStructuredFormSuffix,
@@ -5586,6 +5588,41 @@ export function issueRoutes(
         closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
       }
     | { ok: false; status: number; body: Record<string, unknown> };
+
+  // SUP-25336: every door that accepts a structured doneTier resolves the comment
+  // and structured sources here, BEFORE any rendering, status write or comment
+  // write. A dual-source conflict leaves one refusal row and throws a typed 422
+  // whose details carry only source status, differing fields and sanitized
+  // excerpts. Returns the comment body to evaluate and persist.
+  async function resolveDoneTierSourcesOrRefuse(input: {
+    issue: { id: string; companyId: string; identifier: string | null };
+    commentBody: string | null | undefined;
+    doneTier: DoneTierDeclaration | null | undefined;
+    door: "patch" | "comment_auto_approval" | "recovery_action_resolution";
+    runId: string | null;
+  }): Promise<string | null> {
+    const resolution = resolveDoneTierDeclarationSources(input.commentBody, input.doneTier);
+    if (resolution.ok) return resolution.commentBody;
+    const { conflict } = resolution;
+    await writeDoneTransitionRefusedAuditLog(db, input.issue, {
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      httpStatus: 422,
+      reason: conflict.message,
+      runId: input.runId,
+      door: input.door,
+      conflicts: conflict.conflicts,
+      differingFields: conflict.differingFields,
+    });
+    throw unprocessable(conflict.message, {
+      code: conflict.code,
+      issueId: input.issue.id,
+      identifier: input.issue.identifier ?? null,
+      conflicts: conflict.conflicts,
+      sources: conflict.sources,
+      differingFields: conflict.differingFields,
+      remedy: conflict.remedy,
+    });
+  }
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
   // land an issue on `done`: the status PATCH and the comment auto-approval path.
@@ -14524,10 +14561,13 @@ export function issueRoutes(
           );
         }
         if (doneTier !== undefined && doneTier !== null) {
-          doneTierResolutionNote = renderDoneTierDeclaration(
-            doneTierResolutionNote,
+          doneTierResolutionNote = await resolveDoneTierSourcesOrRefuse({
+            issue: existing,
+            commentBody: doneTierResolutionNote,
             doneTier,
-          );
+            door: "recovery_action_resolution",
+            runId: actor.runId ?? null,
+          });
           structuredDoneTierRendered = true;
         }
         const recoveryDonePolicy = normalizeIssueExecutionPolicy(
@@ -20001,6 +20041,23 @@ export function issueRoutes(
       !(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "comment"))
     ) return;
 
+    // SUP-25336: a close that carries a structured doneTier resolves its comment
+    // and structured declaration sources after this request's authorization
+    // checks and before its first side effect (the board interrupt below). A
+    // dual-source conflict refuses here with a typed 422. The resolved body is
+    // rendered into the transition and the persisted comment below, only once
+    // the requested/effective status is known to be `done`.
+    const resolvedDoneTierCommentBody =
+      doneTier !== undefined && updateFields.status === "done"
+        ? await resolveDoneTierSourcesOrRefuse({
+          issue: existing,
+          commentBody,
+          doneTier,
+          door: "patch",
+          runId: actor.runId ?? null,
+        })
+        : undefined;
+
     if (interruptRequested) {
       if (!commentBody) {
         res.status(400).json({ error: "Interrupt is only supported when posting a comment" });
@@ -20391,7 +20448,13 @@ export function issueRoutes(
     const originalCommentBody = commentBody;
     const transitionCommentBody =
       doneTier !== undefined && requestedTransitionStatus === "done"
-        ? renderDoneTierDeclaration(originalCommentBody, doneTier)
+        ? resolvedDoneTierCommentBody ?? await resolveDoneTierSourcesOrRefuse({
+          issue: existing,
+          commentBody: originalCommentBody,
+          doneTier,
+          door: "patch",
+          runId: actor.runId ?? null,
+        })
         : originalCommentBody;
     // A summary-generation issue must always bounce back to the Summarizer
     // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). The
@@ -21244,7 +21307,13 @@ export function issueRoutes(
     const effectiveStatus =
       typeof transition.patch.status === "string" ? transition.patch.status : requestedStatus;
     if (doneTier !== undefined && effectiveStatus === "done") {
-      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+      commentBody = resolvedDoneTierCommentBody ?? await resolveDoneTierSourcesOrRefuse({
+        issue: existing,
+        commentBody,
+        doneTier,
+        door: "patch",
+        runId: actor.runId ?? null,
+      });
     }
     if (commentAttachmentIds !== undefined && !commentBody) {
       res.status(400).json({ error: "Attachment ids require a comment" });
@@ -27319,7 +27388,13 @@ export function issueRoutes(
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
       if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
-        commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+        commentBody = await resolveDoneTierSourcesOrRefuse({
+          issue: currentIssue,
+          commentBody,
+          doneTier,
+          door: "comment_auto_approval",
+          runId: actor.runId ?? null,
+        });
         if (transition.decision) transition.decision.body = commentBody;
       }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
