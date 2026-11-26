@@ -22697,6 +22697,7 @@ export function issueRoutes(
             reviewEntryReceiptId = receipt!.id;
             await logActivityInTransaction(tx as unknown as Db, {
               companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId,
+              boardApiKeyId: actor.boardApiKeyId,
               agentId: actor.agentId, runId: actor.runId,
               action: "issue.review_entry_accepted", entityType: "issue", entityId: updated.id, issueId: updated.id,
               details: { receiptId: reviewEntryReceiptId, stageId: entryProof.evidence.stageId },
