@@ -435,8 +435,13 @@ describe("openapi routes", () => {
     const schema = response.body.paths["/api/companies/{companyId}/issues"].post
       .requestBody.content["application/json"].schema;
     const monitor = schema.properties.executionPolicy.properties.monitor.properties;
-    const ajv = new Ajv({ strict: false });
-    addFormats(ajv);
+    // ajv and ajv-formats are CJS modules; under this ESM test build the default import holds the module namespace.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const AjvCtor = (Ajv as any).default ?? Ajv;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const applyFormats = (addFormats as any).default ?? addFormats;
+    const ajv = new AjvCtor({ strict: false });
+    applyFormats(ajv);
     const served = (fragment: unknown, value: unknown) => ajv.validate(fragment as object, value);
     const bodyRule = { anyOf: schema.anyOf };
     const monitorBody = (fields: Record<string, unknown>) => ({
