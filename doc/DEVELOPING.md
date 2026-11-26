@@ -1050,27 +1050,30 @@ config-path-derived suffix; if no safe identity exists, boot refuses.
 Explicit operator instance IDs take precedence over own-file IDs, subject to
 the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
 identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
-the main home, only for a non-`default` instance with an explicit own database:
-an operator `DATABASE_URL`, or a worktree config
-`database.embeddedPostgresDataDir` inside the worktree checkout, which is then
-kept and used. That directory may not be the checkout root itself, inside the
-claimed home's or the worktree home's `instances` tree, inside `~/.paperclip`, or
-a database directory another known instance config already uses. A data
-directory outside the checkout does not count, because a copied or legacy config
-may still name another instance's database. Without an explicit own database, the worktree's database would be
-the embedded default under that home, which may belong to a main instance whose
-config lives elsewhere, so boot refuses and names the remedy: set an explicit
-own database for the worktree. This is a compatibility change: re-entering a
-worktree after `eval "$(paperclipai worktree env)"` now also needs an explicit
-own database, or unset `PAPERCLIP_HOME` to use layout-derived isolation. A
-`DATABASE_URL` read only from the worktree's own `.env` does not count, but
+the main home, for a non-`default` instance when it matches the layout worktrees
+home. This preserves the documented `eval "$(paperclipai worktree env)"` re-entry.
+Other exported homes require an explicit own database: an operator `DATABASE_URL`,
+or a worktree config `database.embeddedPostgresDataDir` inside the worktree
+checkout. An accepted in-checkout directory is kept and used on every boot,
+with or without the shell exports. That directory may not be the checkout root
+itself, inside the claimed home's or worktree home's `instances` tree, inside
+`~/.paperclip`, or a database directory another known instance config uses.
+Home and database containment checks resolve symlink aliases through existing
+ancestors, including when the database directory has not yet been created.
+A data directory outside the checkout does not count as an explicit own
+database, because a copied or legacy config may still name another instance's
+database. For an exported home other than the layout worktrees home, its embedded
+default may belong to a main instance whose config lives elsewhere, so boot
+refuses without an explicit own database and names that remedy.
+A `DATABASE_URL` read only from the worktree's own `.env` does not count, but
 `worktree env` exports every own-file entry, so after `eval` it is an operator
 value. This guard covers the database only: when the exemption is granted, the
 worktree's logs, local storage and backups still live under that home's
 `instances/<id>` root, which a main instance with the same home and ID also
-uses. An instance whose own `instances/<id>/config.json` resolves its database inside that instance root is
-a main instance, whatever its ID, so exporting its identity never permits a
-worktree to reuse its database.
+uses. An instance whose own `instances/<id>/config.json` resolves its database
+inside that instance root is a main instance, whatever its ID. A config without
+an explicit data-directory key resolves to that instance's default `db`
+directory, so exporting its identity never permits a worktree to reuse it.
 A different transient runtime home does not replace persisted worktree paths.
 If the parent can be searched but not listed, reusable identity claims are
 refused and the config-path-derived identity is used; registered sibling

@@ -68,9 +68,25 @@ function emptyWorktreeEnvFileContents(): string {
   ].join("\n");
 }
 
+// A database directory need not exist yet. Resolve its existing ancestors so
+// aliases cannot bypass home or database isolation before the first boot.
+function resolvePhysicalPath(value: string): string {
+  const absolute = path.resolve(value);
+  try {
+    return fs.realpathSync(absolute);
+  } catch (error) {
+    const parent = path.dirname(absolute);
+    if (
+      !(error instanceof Error) || !("code" in error) ||
+      error.code !== "ENOENT" || parent === absolute
+    ) throw error;
+    return path.join(resolvePhysicalPath(parent), path.basename(absolute));
+  }
+}
+
 function isPathInside(candidatePath: string, rootPath: string): boolean {
-  const candidate = path.resolve(candidatePath);
-  const root = path.resolve(rootPath);
+  const candidate = resolvePhysicalPath(candidatePath);
+  const root = resolvePhysicalPath(rootPath);
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
@@ -187,7 +203,7 @@ function explicitOwnEmbeddedDataDir(configPath: string, ownRoot: string, exclude
     const configured = nonEmpty(config.database.embeddedPostgresDataDir);
     if (!configured) return null;
     const dataDir = resolveHomeAwarePath(configured);
-    if (!isPathInside(dataDir, ownRoot) || dataDir === path.resolve(ownRoot)) return null;
+    if (!isPathInside(dataDir, ownRoot) || isPathInside(ownRoot, dataDir)) return null;
     return excludedRoots.some((root) => isPathInside(dataDir, root) || isPathInside(root, dataDir)) ? null : dataDir;
   } catch {
     return null;
@@ -228,9 +244,9 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     [...mainHomes, path.join(homeDir, "instances"), path.join(fallback.homeDir, "instances")],
   );
   const explicitOwnDatabase = operatorOrLayout("DATABASE_URL") !== null || explicitEmbeddedDir !== null;
-  const exportedWorktreeHome = exportedHomeMatch && explicitOwnDatabase;
-  if (exportedWorktreeHome && explicitEmbeddedDir) claimed = { ...claimed, embeddedPostgresDataDir: explicitEmbeddedDir };
-  const remedy = exportedHomeMatch && !explicitOwnDatabase
+  const exportedWorktreeHome = exportedHomeMatch && (homeDir === fallback.homeDir || explicitOwnDatabase);
+  if (explicitEmbeddedDir) claimed = { ...claimed, embeddedPostgresDataDir: explicitEmbeddedDir };
+  const remedy = exportedHomeMatch && !exportedWorktreeHome
     ? "; set an explicit own database for the worktree with an operator DATABASE_URL or a " +
       "database.embeddedPostgresDataDir inside the worktree checkout (not the checkout root, " +
       "the claimed home's or worktree home's instances tree, ~/.paperclip or a database " +
