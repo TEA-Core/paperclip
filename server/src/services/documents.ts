@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
+import { documentRevisions, documents, issueDocuments, issueReviewEntryReceipts, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, reviewEntryReceiptRetained, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
@@ -788,9 +788,17 @@ export function documentService(db: Db) {
           .from(issueDocuments)
           .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
           .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)))
+          .for("update")
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
+        const [entryReceipt] = await tx.select({ id: issueReviewEntryReceipts.id }).from(issueReviewEntryReceipts)
+          .innerJoin(documentRevisions, or(
+            eq(documentRevisions.id, issueReviewEntryReceipts.rulingRevisionId),
+            eq(documentRevisions.id, issueReviewEntryReceipts.artifactRevisionId),
+          ))
+          .where(eq(documentRevisions.documentId, existing.id)).limit(1);
+        if (entryReceipt) throw reviewEntryReceiptRetained("Document", entryReceipt.id);
         if (existing.lockedAt) {
           throw conflict("Document is locked", {
             key: existing.key,

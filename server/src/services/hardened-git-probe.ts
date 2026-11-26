@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
-import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -401,16 +402,21 @@ async function copyRegularFile(
   signal?: AbortSignal,
 ): Promise<number> {
   return withRegularFile(source, maxBytes, async (handle, size) => {
+    const before = await handle.stat();
     if (size === 0) {
       await writeFile(destination, "");
-      return 0;
+    } else {
+      await pipeline(
+        handle.createReadStream({ start: 0, end: size - 1, autoClose: false }),
+        createWriteStream(destination),
+        { signal },
+      );
     }
-    await pipeline(
-      handle.createReadStream({ start: 0, end: size - 1, autoClose: false }),
-      createWriteStream(destination),
-      { signal },
-    );
-    if ((await handle.stat()).size !== size) throw new HardenedGitError("failed", "file changed while it was copied");
+    const after = await handle.stat();
+    if (after.size !== size || after.mtimeMs !== before.mtimeMs) {
+      throw new HardenedGitError("failed", "file changed while it was copied");
+    }
+    await utimes(destination, before.atime, before.mtime);
     return size;
   });
 }
@@ -501,20 +507,19 @@ async function listIndexEntries(
   return entries;
 }
 
-async function snapshotStatusIsDirty(
+async function snapshotStatus(
   snapshotGitDir: string,
   workTree: string,
   ignoreSubmodules: "all" | "dirty",
   options: HardenedGitOptions,
-): Promise<boolean> {
-  const raw = await runHardenedGit(
+): Promise<string> {
+  return runHardenedGit(
     [
       "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
       "status", "--porcelain=v1", "-z", "--untracked-files=all", `--ignore-submodules=${ignoreSubmodules}`,
     ],
     options,
   );
-  return raw.split("\0").some((record) => record.length > 0);
 }
 
 /**
@@ -575,7 +580,7 @@ async function firstDisallowedIgnoredEntry(
   workTree: string,
   trackedPaths: ReadonlySet<string>,
   options: HardenedGitOptions,
-): Promise<{ entry: string; listed: boolean } | null> {
+): Promise<{ disallowed: { entry: string; listed: boolean } | null; entries: string[] }> {
   const gitArgs = ["-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`];
   const entries = (await runHardenedGit(
     [...gitArgs, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory"],
@@ -583,10 +588,10 @@ async function firstDisallowedIgnoredEntry(
   )).split("\0").filter((record) => record.length > 0);
   const listed: string[] = [];
   for (const entry of entries) {
-    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return { entry, listed: false };
+    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return { disallowed: { entry, listed: false }, entries };
     listed.push(entry);
   }
-  if (listed.length === 0) return null;
+  if (listed.length === 0) return { disallowed: null, entries };
   // Which rule ignores each listed directory itself (named without the trailing
   // slash, so a `.gitignore` inside it does not count): `source NUL line NUL
   // pattern NUL path NUL`, with an empty source for a path no rule ignores.
@@ -603,7 +608,7 @@ async function firstDisallowedIgnoredEntry(
     if (committedSource && !pattern.startsWith("!")) committed.add(`${directory}/`);
   }
   const uncommitted = listed.find((entry) => !committed.has(entry));
-  return uncommitted === undefined ? null : { entry: uncommitted, listed: true };
+  return { disallowed: uncommitted === undefined ? null : { entry: uncommitted, listed: true }, entries };
 }
 
 function escapeRegExp(text: string): string {
@@ -745,7 +750,7 @@ function refuse(reason: string): NoRepositoryWorktreeProbeResult {
 }
 
 type CleanWorktreeVerdict =
-  | { ok: true; branch: string; headSha: string }
+  | { ok: true; branch: string; headSha: string; indexDigest: string; statusManifestDigest: string }
   | { ok: false; reason: string };
 
 /**
@@ -810,10 +815,18 @@ async function verifyCleanLinkedWorktree(
   if (exclude !== null && !excludeHasOnlyServerWrittenRules(exclude)) {
     return { ok: false, reason: "has info/exclude ignore rules the server did not write" };
   }
+  let digests: { indexDigest: string; statusManifestDigest: string } | undefined;
   try {
     const dirtyReason = await withSnapshotGitDir(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: worktreeOptions.deadline },
       async (snapshot) => {
+        const index = createHash("sha256");
+        for (const name of (await readdir(snapshot)).filter((file) => file === "index" || file.startsWith("sharedindex.")).sort()) {
+          index.update(`${name}\0`);
+          await withRegularFile(path.join(snapshot, name), MAX_INDEX_FILE_BYTES, async (handle) => {
+            for await (const chunk of handle.createReadStream({ autoClose: false })) index.update(chunk);
+          });
+        }
         const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
           if (entry.stage !== "0") return "has unmerged index entries";
@@ -822,11 +835,18 @@ async function verifyCleanLinkedWorktree(
           if (entry.mode === "160000") return "has submodules";
           trackedPaths.add(entry.path);
         }
-        if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
+        const status = await snapshotStatus(snapshot, worktreePath, "all", worktreeOptions);
+        if (status.split("\0").some((record) => record.length > 0)) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
-        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
-        if (ignored === null) return null;
+        const { disallowed: ignored, entries } = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
+        if (ignored === null) {
+          digests = {
+            indexDigest: index.digest("hex"),
+            statusManifestDigest: createHash("sha256").update(JSON.stringify({ status, ignored: entries })).digest("hex"),
+          };
+          return null;
+        }
         const entry = JSON.stringify(ignored.entry.slice(0, 200));
         return ignored.listed
           ? `has a regenerated-artefact directory that no committed ignore rule ignores (${entry})`
@@ -837,7 +857,8 @@ async function verifyCleanLinkedWorktree(
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha };
+  if (!digests) return { ok: false, reason: "status could not be verified" };
+  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, ...digests };
 }
 
 /** Why `sha` may not stand as "level with the default branch"; null when it does. */
@@ -1066,6 +1087,38 @@ export type ReviewEntryWorktreeSnapshot =
     }
   | { ok: false; reason: string };
 
+type ReviewEntryFingerprint = Pick<
+  Extract<ReviewEntryWorktreeSnapshot, { ok: true }>,
+  "branch" | "headSha" | "indexDigest" | "refsDigest" | "statusManifestDigest"
+>;
+
+const REVIEW_ENTRY_BUDGET_MS = 15_000;
+
+async function readRefs(worktreePath: string, options: HardenedGitOptions): Promise<string> {
+  return runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options);
+}
+
+/** HEAD, index bytes, porcelain status (tracked, untracked and ignored) and refs of one worktree. */
+async function reviewEntryFingerprint(
+  worktreePath: string,
+  commonDir: string,
+  options: HardenedGitOptions,
+): Promise<{ ok: true; fingerprint: ReviewEntryFingerprint } | { ok: false; reason: string }> {
+  const beforeRefs = await readRefs(worktreePath, options);
+  const verdict = await verifyCleanLinkedWorktree(worktreePath, commonDir, { ...options, cwd: path.dirname(commonDir) });
+  if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
+  const afterRefs = await readRefs(worktreePath, options);
+  if (beforeRefs !== afterRefs) return { ok: false, reason: "Git refs changed during first-entry capture" };
+  return {
+    ok: true,
+    fingerprint: {
+      branch: verdict.branch, headSha: verdict.headSha, indexDigest: verdict.indexDigest,
+      statusManifestDigest: verdict.statusManifestDigest,
+      refsDigest: createHash("sha256").update(afterRefs).digest("hex"),
+    },
+  };
+}
+
 /** Entry uses the established clean/attribution predicate, plus object integrity
  * and content-addressed metadata. No tree-equivalence or local-base shortcut.
  * Repository drivers never run: fsck, index and tree reads use private metadata.
@@ -1073,43 +1126,54 @@ export type ReviewEntryWorktreeSnapshot =
 export async function captureReviewEntryWorktree(
   input: NoRepositoryWorktreeProbeInput,
 ): Promise<ReviewEntryWorktreeSnapshot> {
-  const deadline: ProbeDeadline = { at: performance.now() + 15_000, expired: false };
+  const deadline: ProbeDeadline = { at: performance.now() + REVIEW_ENTRY_BUDGET_MS, expired: false };
   const options: HardenedGitOptions = { cwd: "/", deadline };
   try {
-    const beforeRefs = await runHardenedGit(
-      ["-C", input.recordedWorktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options,
-    );
+    const beforeRefs = await readRefs(input.recordedWorktreePath, options);
     if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes)\//.test(ref))) {
       return { ok: false, reason: "Unattributed private or tag refs prevent strict first-entry proof" };
     }
     const probe = await probeNoRepositoryWorktree({ ...input, deadline });
     if (!probe.ok) return probe;
     const identity = await readWorktreeIdentity(probe.worktreePath, options);
-    return await withSnapshotGitDir(
+    const treeSha = await withSnapshotGitDir(
       { identity, headSha: probe.headSha, config: snapshotConfig(identity.objectFormat), exclude: null, deadline },
       async (snapshot) => {
         await runHardenedGit(
           ["--git-dir", snapshot, "fsck", "--strict", "--no-reflogs", "--no-dangling", ...probe.comparedTips], options,
         );
-        const treeSha = (await runHardenedGit(
-          ["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options,
-        )).trim();
-        const hash = createHash("sha256");
-        await withRegularFile(path.join(snapshot, "index"), MAX_INDEX_FILE_BYTES, async (handle) => {
-          for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
-        });
-        const afterRefs = await runHardenedGit(
-          ["-C", probe.worktreePath, "for-each-ref", "--format=%(objectname) %(refname)"], options,
-        );
-        if (beforeRefs !== afterRefs) return { ok: false as const, reason: "Git refs changed during first-entry capture" };
-        return {
-          ...probe, treeSha, indexDigest: hash.digest("hex"),
-          refsDigest: createHash("sha256").update(afterRefs).digest("hex"),
-          statusManifestDigest: createHash("sha256").update("clean;index-checked;ignored-artifact-allowlist-v1").digest("hex"),
-        };
+        return (await runHardenedGit(["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options)).trim();
       },
     );
+    const measured = await reviewEntryFingerprint(probe.worktreePath, probe.commonDir, options);
+    if (!measured.ok) return measured;
+    if (measured.fingerprint.refsDigest !== createHash("sha256").update(beforeRefs).digest("hex") ||
+        measured.fingerprint.branch !== probe.branch || measured.fingerprint.headSha !== probe.headSha) {
+      return { ok: false, reason: "Git refs changed during first-entry capture" };
+    }
+    return { ...probe, treeSha, ...measured.fingerprint };
   } catch {
     return { ok: false, reason: deadline.expired ? "First-entry Git proof timed out" : "First-entry Git integrity could not be verified" };
+  }
+}
+
+/** The locked section's cheap recheck: no fsck, no provider call. The isolated
+ * worktree must still carry exactly the captured HEAD, index, status and refs.
+ */
+export async function recheckReviewEntryWorktree(
+  captured: Extract<ReviewEntryWorktreeSnapshot, { ok: true }>,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
+  const deadline: ProbeDeadline = { at: performance.now() + REVIEW_ENTRY_BUDGET_MS, expired: false };
+  try {
+    const measured = await reviewEntryFingerprint(captured.worktreePath, captured.commonDir, { cwd: "/", deadline });
+    if (!measured.ok) return measured;
+    const { branch, headSha, indexDigest, refsDigest, statusManifestDigest } = captured;
+    if (!isDeepStrictEqual(measured.fingerprint, { branch, headSha, indexDigest, refsDigest, statusManifestDigest })) {
+      return { ok: false, reason: "The worktree, index, status, HEAD or refs changed after capture." };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: deadline.expired ? "First-entry Git recheck timed out" : "First-entry Git state could not be rechecked" };
   }
 }

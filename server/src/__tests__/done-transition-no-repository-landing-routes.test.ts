@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -62,7 +62,12 @@ import {
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
-import type { NoRepositoryWorktreeProbeInput, ReviewEntryWorktreeSnapshot, recheckRecordedWorktree } from "../services/hardened-git-probe.js";
+import type {
+  NoRepositoryWorktreeProbeInput, ReviewEntryWorktreeSnapshot, recheckRecordedWorktree, recheckReviewEntryWorktree,
+} from "../services/hardened-git-probe.js";
+import { companyService } from "../services/companies.js";
+import { documentService } from "../services/documents.js";
+import { issueService } from "../services/issues.js";
 import type { StorageService } from "../storage/types.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
@@ -89,6 +94,8 @@ const mockCaptureReviewEntry = vi.hoisted(() => vi.fn());
 const realCaptureReviewEntry = vi.hoisted(() => ({
   current: null as ((input: NoRepositoryWorktreeProbeInput) => Promise<ReviewEntryWorktreeSnapshot>) | null,
 }));
+const mockRecheckReviewEntry = vi.hoisted(() => vi.fn());
+const realRecheckReviewEntry = vi.hoisted(() => ({ current: null as typeof recheckReviewEntryWorktree | null }));
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
     getByName: mockGetByName,
@@ -106,9 +113,14 @@ vi.mock("../services/hardened-git-probe.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/hardened-git-probe.js")>();
   realCaptureReviewEntry.current = actual.captureReviewEntryWorktree;
   mockCaptureReviewEntry.mockImplementation(actual.captureReviewEntryWorktree);
+  realRecheckReviewEntry.current = actual.recheckReviewEntryWorktree;
+  mockRecheckReviewEntry.mockImplementation(actual.recheckReviewEntryWorktree);
   realRecheckRecordedWorktreeRef.current = actual.recheckRecordedWorktree;
   mockRecheckRecordedWorktree.mockImplementation(actual.recheckRecordedWorktree);
-  return { ...actual, recheckRecordedWorktree: mockRecheckRecordedWorktree, captureReviewEntryWorktree: mockCaptureReviewEntry };
+  return {
+    ...actual, recheckRecordedWorktree: mockRecheckRecordedWorktree, captureReviewEntryWorktree: mockCaptureReviewEntry,
+    recheckReviewEntryWorktree: mockRecheckReviewEntry,
+  };
 });
 
 vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
@@ -258,6 +270,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockRecheckRecordedWorktree.mockImplementation(realRecheckRecordedWorktreeRef.current!);
     mockCaptureReviewEntry.mockReset();
     mockCaptureReviewEntry.mockImplementation(realCaptureReviewEntry.current!);
+    mockRecheckReviewEntry.mockReset();
+    mockRecheckReviewEntry.mockImplementation(realRecheckReviewEntry.current!);
   });
 
   async function insertCompany(prefix: string) {
@@ -565,6 +579,16 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await expect(db.update(documentRevisions).set({ body: "Changed after entry" })
         .where(eq(documentRevisions.id, fixture.artifact.id))).rejects.toThrow();
       await expect(db.delete(documentRevisions).where(eq(documentRevisions.id, fixture.ruling.id))).rejects.toThrow();
+      await db.update(documentRevisions).set({ createdByAgentId: null, createdByRunId: null })
+        .where(eq(documentRevisions.id, fixture.artifact.id));
+      const retained = { status: 409, details: { code: "review_entry_receipt_retained", receiptId: response.body.reviewEntryReceiptId } };
+      await expect(documentService(db).deleteIssueDocument(fixture.issueId, "summary")).rejects.toMatchObject(retained);
+      await expect(documentService(db).deleteIssueDocument(fixture.issueId, "entry-ruling")).rejects.toMatchObject(retained);
+      await expect(issueService(db).remove(fixture.issueId)).rejects.toMatchObject(retained);
+      await expect(companyService(db).remove(fixture.companyId)).rejects.toMatchObject(retained);
+      expect(await db.select({ id: documentRevisions.id }).from(documentRevisions)
+        .where(eq(documentRevisions.documentId, fixture.artifact.documentId))).toHaveLength(1);
+      expect(await statusOf(fixture.issueId)).toBe("in_review");
       const foreignCompany = await insertCompany(`READ${seedSequence}`);
       const foreignAgent = await insertAgent(foreignCompany, "Foreign reader");
       const denied = await request(app).get(`/api/issues/${fixture.identifier}/review-entry-receipts`).set("x-test-actor",
@@ -573,7 +597,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(denied.body).not.toHaveProperty("evidence");
     });
 
-    it.each(["project_primary", "alias", "symlink alias", "foreign alias", "project path", "another card", "another run", "run path", "run hint", "runtime service", "workspace operation"])(
+    it.each(["project_primary", "alias", "nested alias", "foreign alias", "project path", "another card", "another run", "run path", "run hint", "runtime service", "workspace operation"])(
       "refuses a shared workspace: %s", async (kind) => {
         const fixture = await reviewFixture();
         if (kind === "project_primary") {
@@ -590,11 +614,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
             phase: "sync", cwd: fixture.worktree, status: "running" });
         } else if (kind.includes("alias")) {
           const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
-          let aliasPath = fixture.worktree;
-          if (kind === "symlink alias") {
-            aliasPath = `${fixture.worktree}-alias`;
-            symlinkSync(fixture.worktree, aliasPath);
-          }
+          const aliasPath = kind === "nested alias" ? `${fixture.worktree}//sub/` : fixture.worktree;
           const aliasCompanyId = kind === "foreign alias" ? await insertCompany(`ALIAS${seedSequence}`) : fixture.companyId;
           await db.insert(executionWorkspaces).values({ ...workspace!, id: randomUUID(), companyId: aliasCompanyId, cwd: aliasPath, providerRef: aliasPath });
         } else if (kind === "another card") {
@@ -665,7 +685,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       },
     );
 
-    it.each(["tracked", "staged", "untracked", "ignored", "hidden index", "detached", "unknown branch", "private ref", "shallow", "bare", "unresolvable", "unpublished same-tree merge", "poisoned local default", "unavailable provider"])(
+    it.each(["tracked", "staged", "untracked", "ignored", "hidden index", "detached", "unknown branch", "private ref", "shallow", "bare", "unresolvable", "unpublished same-tree merge", "poisoned local default", "published unlanded", "unavailable provider"])(
       "refuses uncertain Git proof: %s", async (kind) => {
         const fixture = await reviewFixture();
         if (["tracked", "staged", "hidden index"].includes(kind)) {
@@ -693,9 +713,19 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         } else if (kind === "poisoned local default") {
           git(fixture.worktree, "commit", "--allow-empty", "-qm", "not published");
           git(fixture.worktree, "update-ref", "refs/remotes/origin/main", git(fixture.worktree, "rev-parse", "HEAD"));
+        } else if (kind === "published unlanded") {
+          git(fixture.worktree, "commit", "--allow-empty", "-qm", "published but not landed");
+          git(currentOrigin, "fetch", "-q", fixture.worktree, `HEAD:refs/heads/${fixture.branch}`);
         } else repositoryAnswer.status = 503;
         const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
         expect(response.status, JSON.stringify(response.body)).toBe(409);
+        const typedCode: Record<string, string> = {
+          "published unlanded": "review_entry_repository_work_owed",
+          "poisoned local default": "review_entry_published_base_unavailable",
+          "unpublished same-tree merge": "review_entry_published_base_unavailable",
+          "unavailable provider": "review_entry_published_base_unavailable",
+        };
+        if (typedCode[kind]) expect(response.body.code).toBe(typedCode[kind]);
         await noAcceptedEntry(fixture.issueId);
       },
     );
@@ -730,32 +760,72 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       },
     );
 
-    it("excludes a competing physical-path claim through the commit barrier", async () => {
+    it("excludes same-path phantom writers through the commit barrier without freezing unrelated writes", async () => {
       const fixture = await reviewFixture();
       // The project's ES2022 type library has no Promise.withResolvers.
       let release!: () => void;
-      let captured!: () => void;
-      const captureReached = new Promise<void>((resolve) => { captured = resolve; });
+      let locked!: () => void;
+      const lockedReached = new Promise<void>((resolve) => { locked = resolve; });
       const canCommit = new Promise<void>((resolve) => { release = resolve; });
-      mockCaptureReviewEntry.mockImplementationOnce(realCaptureReviewEntry.current!)
-        .mockImplementationOnce(async (input: NoRepositoryWorktreeProbeInput) => {
-          const snapshot = await realCaptureReviewEntry.current!(input);
-          captured();
-          await canCommit;
-          return snapshot;
-        });
+      mockRecheckReviewEntry.mockImplementationOnce(async (captured: Extract<ReviewEntryWorktreeSnapshot, { ok: true }>) => {
+        const result = await realRecheckReviewEntry.current!(captured);
+        locked();
+        await canCommit;
+        return result;
+      });
       const entry = request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body).then((response) => response);
-      await captureReached;
+      await lockedReached;
+      const otherCompany = await insertCompany(`PHANTOM${seedSequence}`);
+      const otherAgent = await insertAgent(otherCompany, "Phantom writer");
+      const phantoms: Record<string, (tx: Db) => Promise<unknown>> = {
+        "workspace on the path": (tx) => tx.insert(executionWorkspaces).values({
+          companyId: fixture.companyId, projectId: fixture.projectId, name: "Competing path claim",
+          mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
+          cwd: fixture.worktree, providerRef: fixture.worktree,
+        }),
+        "project workspace inside the path": (tx) => tx.insert(projectWorkspaces).values({
+          companyId: fixture.companyId, projectId: fixture.projectId, name: "Nested source", cwd: path.join(fixture.worktree, "docs"),
+        }),
+        "foreign run on the path": (tx) => tx.insert(heartbeatRuns).values({
+          companyId: otherCompany, agentId: otherAgent, status: "running", contextSnapshot: { cwd: fixture.worktree },
+        }),
+        "run hint inside the path": (tx) => tx.insert(heartbeatRuns).values({
+          companyId: otherCompany, agentId: otherAgent, status: "queued",
+          contextSnapshot: { paperclipWorkspaces: [{ worktreePath: path.join(fixture.worktree, "src") }] },
+        }),
+        "run on the workspace": (tx) => tx.insert(heartbeatRuns).values({
+          companyId: fixture.companyId, agentId: fixture.rulerAgentId, status: "queued",
+          contextSnapshot: { executionWorkspaceId: fixture.executionWorkspaceId },
+        }),
+        "run on the issue": (tx) => tx.insert(heartbeatRuns).values({
+          companyId: fixture.companyId, agentId: fixture.rulerAgentId, status: "queued", contextSnapshot: { issueId: fixture.issueId },
+        }),
+        "runtime service on the workspace": (tx) => tx.insert(workspaceRuntimeServices).values({ id: randomUUID(),
+          companyId: fixture.companyId, executionWorkspaceId: fixture.executionWorkspaceId, scopeType: "execution_workspace",
+          serviceName: "writer", status: "running", lifecycle: "persistent", provider: "local" }),
+        "operation on the path": (tx) => tx.insert(workspaceOperations).values({
+          companyId: otherCompany, phase: "sync", cwd: fixture.worktree, status: "running" }),
+      };
+      const outcomes: Record<string, string> = {};
       try {
-        await expect(db.transaction(async (tx) => {
-          await tx.execute(sql`SET LOCAL lock_timeout = '100ms'`);
+        for (const [label, write] of Object.entries(phantoms)) {
+          outcomes[label] = await db.transaction(async (tx) => {
+            await tx.execute(sql`SET LOCAL lock_timeout = '200ms'`);
+            await write(tx as unknown as Db);
+          }).then(() => "written", () => "excluded");
+        }
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`SET LOCAL lock_timeout = '200ms'`);
           await tx.insert(executionWorkspaces).values({
-            companyId: fixture.companyId, projectId: fixture.projectId, name: "Competing path claim",
+            companyId: fixture.companyId, projectId: fixture.projectId, name: "Unrelated path",
             mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
-            cwd: fixture.worktree, providerRef: fixture.worktree,
+            cwd: `${fixture.worktree}-sibling`, providerRef: `${fixture.worktree}-sibling`,
           });
-        })).rejects.toThrow();
+          await tx.insert(activityLog).values({ companyId: otherCompany, actorType: "system", actorId: "unrelated",
+            entityType: "company", entityId: otherCompany, action: "company.unrelated_write" });
+        });
       } finally { release(); }
+      expect(outcomes).toEqual(Object.fromEntries(Object.keys(phantoms).map((label) => [label, "excluded"])));
       const response = await entry;
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.cwd, fixture.worktree))).toHaveLength(1);

@@ -411,8 +411,10 @@ The current `entry-ruling` revision must be substantive and independently author
 The current reviewed document revision must be separate from that ruling.
 
 Only the card's own active, managed isolated Git worktree is supported.
-The server resolves physical paths (including aliases) across workspace and live
-run records and refuses another card, workspace or run sharing that directory.
+The server looks up workspace, project, runtime-service, operation and live-run
+records (across companies) whose stored path is this worktree's canonical or
+recorded path, or a path inside it, and refuses another card, workspace or run
+sharing that directory.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
 Provision summary-routine cards with their own isolated-worktree workspace after
@@ -421,18 +423,26 @@ deployment; this change does not edit or migrate live routines.
 The owner yields its isolated directory while its conditional PATCH runs.
 This is a sole-owner local-worktree contract, not a privileged host freeze or a
 claim that database locks fence arbitrary host filesystem writers. Do not use it
-for shared folders or out-of-band writers. Authority-table writer locks exclude
-managed run/workspace aliases and evidence insertion through the commit. These
-conservative locks can briefly delay unrelated authority writes; lock contention
+for shared folders or out-of-band writers. The transaction takes advisory locks
+keyed by the issue, its execution workspace and the worktree's paths before it
+locks the issue row, then row-locks the workspace binding, ruling, owning run,
+artifact and reviewer rows in one fixed order. Database triggers make any insert
+(or path re-point) of a workspace, project workspace, runtime service, operation
+or queued/running run on the same issue, workspace or path take the same keys,
+so such a phantom waits for the commit. No table lock is taken; lock contention
 and unsupported paths fail closed.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
 local default refs, equal trees and synthetic merge histories are not authority.
 The issue-locked transaction rechecks classification, debt, policy/state, owning
-run, repository binding, pinned revisions and physical exclusivity, recomputes
-the ordinary stage transition, and repeats the hardened clean/index/ignored-file,
-branch-attribution and Git-integrity proof under one 15-second Git budget.
+run, repository binding, pinned revisions and physical exclusivity and recomputes
+the ordinary stage transition. The full hardened clean/index/ignored-file,
+branch-attribution and `git fsck --strict` proof runs before the transaction;
+inside it a cheap recheck requires the same HEAD, branch, index digest, refs digest
+and status-manifest digest (porcelain status plus the allowed ignored entries),
+under one 15-second Git budget. A provider refusal keeps its typed code
+(`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`).
 Private or tag refs outside the initial attributed-branch contract also refuse;
 this first implementation does not infer their ownership from equal content.
 
@@ -444,7 +454,10 @@ read. It retains the immutable ruling and artifact revisions, actor/run, before
 and after versions, selected reviewer, repository/base identities and bounded Git
 snapshot digests. `capturedAt` and `recordedAt` are capture and transaction-write
 times, not an external clock's assertion of the exact commit instant.
-Receipt and pinned revision updates/deletes are refused by the database.
+Receipt and pinned revision content updates/deletes are refused by the database;
+foreign-key `SET NULL` of a revision's run/agent provenance still applies.
+Deleting a company, issue or document whose evidence a receipt retains returns
+409 `review_entry_receipt_retained` with the receipt ID before any delete work.
 As with the release-assurance ledger, a serving role cannot truncate it;
 privileged database administration remains outside the append-only guarantee.
 
