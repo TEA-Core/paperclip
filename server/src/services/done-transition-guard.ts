@@ -206,37 +206,267 @@ export function noRepositoryStructuredFormSuffix(issue: { deliveryRequirement?: 
     : "";
 }
 
-export function renderDoneTierDeclaration(
-  body: string | null | undefined,
-  declaration: DoneTierDeclaration,
-): string {
-  const current = body ?? "";
-  const lines = current.split(/\r?\n/);
-  const isCanonicalTierDeclaration = (line: string): boolean => {
-    const trimmed = line.trim();
-    return trimmed.startsWith(TIER_2_PREFIX) ||
-      trimmed.startsWith(TIER_1_PREFIX) ||
-      trimmed.startsWith("Closed at Tier 0 (decision-only):");
-  };
-
-  const rendered = declaration.tier === "tier2"
+/** The one canonical comment line a structured `doneTier` declaration renders to. */
+export function renderDoneTierDeclarationLine(declaration: DoneTierDeclaration): string {
+  return declaration.tier === "tier2"
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
       : declaration.landing.mode === "landingDelegated"
         ? `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`
         : "no-repository-landing"} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
-  if (lines.some((line) => line.trim() === rendered)) {
-    return current;
+}
+
+// SUP-25336: refusal code for a close that carries both a comment declaration
+// and a structured `doneTier`, when the two are not exactly the same canonical
+// line, either one is malformed, or the comment holds more than one declaration.
+export const DONE_TIER_DUAL_SOURCE_CONFLICT_CODE = "done_tier_dual_source_conflict";
+
+const DONE_TIER_CANONICAL_PREFIXES = [TIER_2_PREFIX, TIER_1_PREFIX, TIER_0_PREFIX] as const;
+const DONE_TIER_CONFLICT_EXCERPT_LIMIT = 160;
+const TIER1_RENDERED_REST_RE =
+  /^(?:landed-at-tip ([0-9a-f]{7,40})|landing-delegated PR #([1-9][0-9]*) via (\S+)|(no-repository-landing)) — (.*)\. Liveness unverified\.$/i;
+
+type DoneTierSourceTier = "tier0" | "tier1" | "tier2";
+
+export type DoneTierDualSourceConflictReason =
+  | "comment_declaration_ambiguous"
+  | "comment_declaration_malformed"
+  | "structured_declaration_malformed"
+  | "sources_not_equivalent";
+
+export interface DoneTierDualSourceConflict {
+  code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+  message: string;
+  conflicts: DoneTierDualSourceConflictReason[];
+  sources: {
+    comment: {
+      status: "valid" | "malformed" | "ambiguous";
+      declarationCount: number;
+      declarations: Array<{ tier: DoneTierSourceTier; excerpt: string }>;
+    };
+    structured: {
+      status: "valid" | "malformed";
+      tier: "tier1" | "tier2";
+      excerpt: string;
+    };
+  };
+  differingFields: string[];
+  remedy: string;
+}
+
+export type DoneTierSourceResolution =
+  | { ok: true; source: "none" | "comment" | "structured" | "equivalent"; commentBody: string | null }
+  | { ok: false; conflict: DoneTierDualSourceConflict };
+
+function canonicalDeclarationTier(trimmedLine: string): DoneTierSourceTier | null {
+  if (trimmedLine.startsWith(TIER_2_PREFIX)) return "tier2";
+  if (trimmedLine.startsWith(TIER_1_PREFIX)) return "tier1";
+  if (trimmedLine.startsWith(TIER_0_PREFIX)) return "tier0";
+  return null;
+}
+
+const DONE_TIER_COMMAND_REDACTED = "`<command redacted>`";
+
+function redactedDoneTierField(name: string, value: string): string {
+  return `<${name} redacted, ${value.length} chars>`;
+}
+
+// A conflict response never echoes caller free text: a parsed declaration is
+// rebuilt from its structural, enumerated and validated fields only, and every
+// free-text field (and anything unparsed) becomes a length marker.
+function doneTierConflictExcerpt(tier: DoneTierSourceTier, trimmedLine: string): string {
+  const prefix = tier === "tier2" ? TIER_2_PREFIX : tier === "tier1" ? TIER_1_PREFIX : TIER_0_PREFIX;
+  const fields = tier === "tier0" ? null : declarationLineFields(tier, trimmedLine);
+  if (!fields) {
+    const length = trimmedLine.slice(prefix.length).trim().length;
+    return `${prefix} <unparsed evidence redacted, ${length} chars>`;
+  }
+  const rest =
+    fields.form === "record-only"
+      ? `record-only probe ${DONE_TIER_COMMAND_REDACTED} target ${redactedDoneTierField("target", fields.target)} ` +
+        `observed ${fields.observedStart}${fields.observedEnd ? `-${fields.observedEnd}` : ""} ` +
+        `result: ${fields.result} ${redactedDoneTierField("predicate", fields.predicate)}`
+      : fields.form === "merge-head"
+        ? `probe ${DONE_TIER_COMMAND_REDACTED} head ${fields.head} post-merge: ${redactedDoneTierField("postMerge", fields.postMerge)}`
+        : `${fields["landing.mode"] === "landedAtTip"
+          ? `landed-at-tip ${fields["landing.mergeCommit"]}`
+          : fields["landing.mode"] === "landingDelegated"
+            ? `landing-delegated PR #${fields["landing.prNumber"]} via ${redactedDoneTierField("carrier", fields["landing.carrier"])}`
+            : "no-repository-landing"} — ${redactedDoneTierField("reason", fields.reason)}. ${TIER_1_SUFFIX}`;
+  const excerpt = `${prefix} ${rest}`;
+  return excerpt.length > DONE_TIER_CONFLICT_EXCERPT_LIMIT
+    ? `${excerpt.slice(0, DONE_TIER_CONFLICT_EXCERPT_LIMIT - 1)}…`
+    : excerpt;
+}
+
+function containsCanonicalPrefix(text: string): boolean {
+  return DONE_TIER_CANONICAL_PREFIXES.some((prefix) => text.includes(prefix));
+}
+
+// Syntactic only: the evaluator still owns every contextual proof
+// (classification, closing run, calendar, repository).
+function tier2EvidenceFields(evidence: string): Record<string, string> | null {
+  const trimmed = evidence.trim();
+  const recordOnly = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(trimmed);
+  if (recordOnly) {
+    return {
+      form: "record-only",
+      command: recordOnly[1],
+      target: recordOnly[2],
+      observedStart: recordOnly[3],
+      observedEnd: recordOnly[4] ?? "",
+      result: recordOnly[5].toLowerCase(),
+      predicate: recordOnly[6],
+    };
+  }
+  const mergeHead = TIER2_PROBE_SHAPE_RE.exec(trimmed);
+  if (mergeHead) {
+    return {
+      form: "merge-head",
+      command: mergeHead[1],
+      head: mergeHead[2].toLowerCase(),
+      postMerge: mergeHead[3],
+    };
+  }
+  return null;
+}
+
+function declarationLineFields(tier: DoneTierSourceTier, trimmedLine: string): Record<string, string> | null {
+  if (tier === "tier2") {
+    return tier2EvidenceFields(trimmedLine.slice(TIER_2_PREFIX.length));
+  }
+  if (tier === "tier1") {
+    const rest = TIER1_RENDERED_REST_RE.exec(trimmedLine.slice(TIER_1_PREFIX.length).trim());
+    if (!rest) return null;
+    const landing = rest[1]
+      ? { mode: "landedAtTip", mergeCommit: rest[1].toLowerCase() }
+      : rest[2]
+        ? { mode: "landingDelegated", prNumber: rest[2], carrier: rest[3] }
+        : { mode: "noRepositoryLanding" };
+    return { ...Object.fromEntries(Object.entries(landing).map(([k, v]) => [`landing.${k}`, v])), reason: rest[5] };
+  }
+  return null;
+}
+
+function differingDeclarationFields(
+  commentTier: DoneTierSourceTier,
+  commentLine: string,
+  structuredTier: "tier1" | "tier2",
+  renderedLine: string,
+): string[] {
+  if (commentTier !== structuredTier) return ["tier"];
+  const commentFields = declarationLineFields(commentTier, commentLine);
+  const structuredFields = declarationLineFields(structuredTier, renderedLine);
+  if (!commentFields || !structuredFields) return ["declaration"];
+  const keys = new Set([...Object.keys(commentFields), ...Object.keys(structuredFields)]);
+  const differing = [...keys].filter((key) => commentFields[key] !== structuredFields[key]);
+  return differing.length > 0 ? differing : ["declaration"];
+}
+
+/**
+ * SUP-25336: resolve the done-tier declaration sources of one close request
+ * BEFORE anything is rendered or written. The comment and the structured
+ * `doneTier` are parsed independently:
+ * - no structured declaration: the comment is used as-is (comment-only parsing
+ *   stays the evaluator's job, unchanged);
+ * - structured only (the comment holds no line-start canonical declaration):
+ *   the canonical line is appended to the caller's comment;
+ * - both: accepted only when the comment holds exactly one line-start
+ *   canonical declaration, that line is exactly the canonical line rendered
+ *   from the structured object, and the structured object is well formed. The
+ *   original comment is then kept unchanged, so one declaration persists.
+ * Every other dual-source request is a typed conflict. A caller declaration is
+ * never removed to obtain acceptance, and a canonical prefix inside the
+ * structured evidence is never stripped.
+ */
+export function resolveDoneTierDeclarationSources(
+  body: string | null | undefined,
+  declaration: DoneTierDeclaration | null | undefined,
+): DoneTierSourceResolution {
+  const commentBody = body ?? null;
+  if (!declaration) {
+    return { ok: true, source: commentBody && commentBody.trim().length > 0 ? "comment" : "none", commentBody };
+  }
+  const renderedLine = renderDoneTierDeclarationLine(declaration);
+  const commentDeclarations = (commentBody ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .flatMap((line) => {
+      const tier = canonicalDeclarationTier(line);
+      return tier ? [{ tier, line }] : [];
+    });
+  if (commentDeclarations.length === 0) {
+    const current = (commentBody ?? "").trim();
+    return {
+      ok: true,
+      source: "structured",
+      commentBody: current.length > 0 ? `${current}\n\n${renderedLine}` : renderedLine,
+    };
   }
 
-  const withoutCanonicalTierDeclaration = lines
-    .filter((line) => !isCanonicalTierDeclaration(line))
-    .join("\n")
-    .trim();
-  return withoutCanonicalTierDeclaration.length > 0
-    ? `${withoutCanonicalTierDeclaration}\n\n${rendered}`
-    : rendered;
+  const structuredText = declaration.tier === "tier2" ? declaration.probeEvidence : declaration.reason;
+  const structuredMalformed =
+    containsCanonicalPrefix(structuredText) ||
+    (declaration.tier === "tier2" && tier2EvidenceFields(declaration.probeEvidence) === null);
+  const commentMalformed = commentDeclarations.some(
+    ({ tier, line }) => tier !== "tier0" && declarationLineFields(tier, line) === null,
+  );
+  const ambiguous = commentDeclarations.length > 1;
+  // Exact equality with the rendered line also rules out a Tier 0 comment
+  // declaration: structured input never renders Tier 0.
+  const equivalent = !ambiguous && commentDeclarations[0].line === renderedLine;
+  if (equivalent && !structuredMalformed && !commentMalformed) {
+    return { ok: true, source: "equivalent", commentBody };
+  }
+
+  const conflicts: DoneTierDualSourceConflictReason[] = [];
+  if (ambiguous) conflicts.push("comment_declaration_ambiguous");
+  if (commentMalformed) conflicts.push("comment_declaration_malformed");
+  if (structuredMalformed) conflicts.push("structured_declaration_malformed");
+  if (!equivalent) conflicts.push("sources_not_equivalent");
+  const differingFields = ambiguous
+    ? ["declarationCount"]
+    : equivalent
+      ? []
+      : differingDeclarationFields(
+        commentDeclarations[0].tier,
+        commentDeclarations[0].line,
+        declaration.tier,
+        renderedLine,
+      );
+  return {
+    ok: false,
+    conflict: {
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      message:
+        "This close carries a done-tier declaration in the comment and the structured doneTier field, " +
+        `and the two sources do not resolve to one canonical declaration (${conflicts.join(", ")}). ` +
+        "The guard does not choose between two attestations, and nothing was written.",
+      conflicts,
+      sources: {
+        comment: {
+          status: ambiguous ? "ambiguous" : commentMalformed ? "malformed" : "valid",
+          declarationCount: commentDeclarations.length,
+          declarations: commentDeclarations.slice(0, 3).map(({ tier, line }) => ({
+            tier,
+            excerpt: doneTierConflictExcerpt(tier, line),
+          })),
+        },
+        structured: {
+          status: structuredMalformed ? "malformed" : "valid",
+          tier: declaration.tier,
+          excerpt: doneTierConflictExcerpt(declaration.tier, renderedLine),
+        },
+      },
+      differingFields,
+      remedy:
+        "Send exactly one done-tier source: either the canonical declaration line in the comment with no doneTier " +
+        "field, or the structured doneTier field with no canonical declaration line in the comment. A dual-source " +
+        "close is accepted only when the comment holds exactly one declaration line and it equals the line the " +
+        "structured field renders to. probeEvidence excludes the \"Closed at Tier 2 (live): \" prefix.",
+    },
+  };
 }
 
 /**
@@ -908,6 +1138,17 @@ export async function writeDoneTransitionRefusedAuditLog(
         decisionCarried: boolean;
         runId: string | null;
         stage?: string;
+      }
+    | {
+        // SUP-25336: a dual-source done-tier conflict, refused before any
+        // rendering or write. Only the sanitized conflict summary is stored.
+        code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+        httpStatus: 422;
+        reason: string;
+        runId: string | null;
+        door: "patch" | "comment_auto_approval" | "recovery_action_resolution";
+        conflicts: DoneTierDualSourceConflictReason[];
+        differingFields: string[];
       }
     | {
         code: "done_transition_record_only_flip_refused";
@@ -4744,10 +4985,11 @@ export async function resolveCitedCommits(
  *
  * Tier handling mirrors the wrapper's two branches exactly, without
  * duplicating predicates:
- * - a sweep that holds landing evidence supplies `structuredDoneTier`; it is
- *   rendered into the close comment (persisted the same way PATCH renders the
- *   structured field into the persisted close comment) and evaluated by the
- *   shared `evaluateDoneTierDeclaration`.
+ * - a sweep that holds landing evidence supplies `structuredDoneTier`; the
+ *   shared `resolveDoneTierDeclarationSources` resolves it against the close
+ *   comment first (a dual-source conflict refuses before any probe), then the
+ *   resolved comment is persisted the same way PATCH persists it and evaluated
+ *   by the shared `evaluateDoneTierDeclaration`.
  * - a declaration-incapable system janitor passes none and gets the SUP-13939
  *   board-bypass shape: the runner RETURNS the `doneTierSkipAudit` activity
  *   input (same shape the guard's own audit rows use) instead of writing it —
@@ -4796,8 +5038,25 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         | NonNullable<DoneTierDeclarationResult["code"]>;
       reason: string;
     }
+  | {
+      allowed: false;
+      code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+      reason: string;
+      conflict: DoneTierDualSourceConflict;
+    }
 > {
   const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
+  // SUP-25336: the same pure source resolver the route doors run, before any
+  // guard probe or rendering.
+  const tierSources = resolveDoneTierDeclarationSources(closeComment, structuredDoneTier);
+  if (!tierSources.ok) {
+    return {
+      allowed: false,
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      reason: tierSources.conflict.message,
+      conflict: tierSources.conflict,
+    };
+  }
   const debt = await prepareLandingDebtClose(db, issue);
   const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false, undefined, debt.owed);
   if (!guardResult.allowed) {
@@ -4810,7 +5069,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   const finalizeLandingDebt = (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion = locked.statusVersion) =>
     debt.finalize(tx, locked, guardResult, closeStatusVersion);
   if (structuredDoneTier) {
-    const renderedComment = renderDoneTierDeclaration(closeComment, structuredDoneTier);
+    const renderedComment = tierSources.commentBody;
     const tierResult = await evaluateDoneTierDeclaration(
       db,
       issue,
