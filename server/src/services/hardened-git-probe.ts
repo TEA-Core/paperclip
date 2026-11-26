@@ -533,8 +533,8 @@ async function snapshotStatusIsDirty(
 // The outcome keeps the callers' fail-open contract for a git that ran and
 // could not answer (null), but a probe that could not run safely or to
 // completion is unverified, and the callers fail closed on it: the timeout
-// fired, no root-owned git is installed, the worktree holds more submodules
-// than the probe measures (each initialized submodule is measured by the same
+// fired, no root-owned git is installed, the worktree holds more initialized
+// submodules than the probe measures (each initialized submodule is measured by the same
 // hardened probe, never by Git recursing into it), or the server process
 // inherits `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY`.
 
@@ -656,15 +656,15 @@ async function legacyTreeIsDirty(
   }
   if (measured.dirty) return true;
   for (const gitlink of measured.gitlinks) {
+    const submodulePath = path.join(identity.topLevel, gitlink);
+    if (!(await isInitializedSubmodule(submodulePath))) continue;
     submodules.remaining -= 1;
     if (submodules.remaining < 0) {
       throw new HardenedGitError(
         "refused",
-        `the worktree has more than ${LEGACY_SUBMODULE_LIMIT} submodules, the probe's bound`,
+        `the worktree has more than ${LEGACY_SUBMODULE_LIMIT} initialized submodules, the probe's bound`,
       );
     }
-    const submodulePath = path.join(identity.topLevel, gitlink);
-    if (!(await isInitializedSubmodule(submodulePath))) continue;
     if (await legacyTreeIsDirty(submodulePath, submodulePath, options, submodules)) return true;
   }
   return false;

@@ -378,6 +378,17 @@ describe("legacy status probe keeps the git status --porcelain answer for ordina
       expect(await worktreeHasUncommittedContent(clone)).toBe(false);
     });
 
+    it("measures a clean worktree whose index records more than 64 uninitialized submodules clean, not unverified", async () => {
+      const repo = plainRepo("repo");
+      const sha = git(repo, "rev-parse", "HEAD");
+      const info = Array.from({ length: 70 }, (_, i) => `160000,${sha},vendor/lib${i}`);
+      for (const entry of info) git(repo, "update-index", "--add", "--cacheinfo", entry);
+      for (let i = 0; i < 70; i += 1) mkdirSync(path.join(repo, "vendor", `lib${i}`), { recursive: true });
+      git(repo, "commit", "-qm", "record submodules");
+      expect(porcelainIsDirty(repo)).toBe(false);
+      expect(await worktreeHasUncommittedContent(repo)).toBe(false);
+    });
+
     it("ignores GIT_DIR and GIT_WORK_TREE inherited by the server, so a clean repository cannot mask dirt inside a submodule", async () => {
       const { repo, sub } = repoWithSubmodule();
       writeFileSync(path.join(sub, "a.txt"), "undelivered\n");

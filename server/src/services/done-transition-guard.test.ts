@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -4537,7 +4537,7 @@ describe("evaluateDoneTransitionGuard", () => {
       mockExecFile.mockImplementation(
         (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
           if (args.includes("ls-files")) {
-            cb(null, Array.from({ length: 65 }, (_, i) => `H 160000 ${"b".repeat(40)} 0\tvendor/lib${i}\0`).join(""));
+            cb(null, `H 160000 ${"b".repeat(40)} 0\tvendor-link\0`);
             return;
           }
           if (answerSnapshotStatusCall(args, cb)) return;
@@ -4549,11 +4549,22 @@ describe("evaluateDoneTransitionGuard", () => {
         },
       );
       ghFetchMock.mockImplementation(foreignCompareFetch);
-      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      const submoduleTarget = mkdtempSync(path.join(os.tmpdir(), "paperclip-guard-submodule-"));
+      mkdirSync(path.join(submoduleTarget, "sub"));
+      writeFileSync(path.join(submoduleTarget, "sub", ".git"), "gitdir: elsewhere\n");
+      const link = path.join(snapshotProbeGitDir, "vendor-link");
+      symlinkSync(path.join(submoduleTarget, "sub"), link);
+      let result: Awaited<ReturnType<typeof evaluateDoneTransitionGuard>>;
+      try {
+        result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      } finally {
+        rmSync(link, { force: true });
+        rmSync(submoduleTarget, { recursive: true, force: true });
+      }
       expect(result.allowed).toBe(false);
       expect(result.skipped).toBe(false);
       expect(result.reason).toContain("worktree status probe");
-      expect(result.reason).toContain("more than 64 submodules");
+      expect(result.reason).toContain("reached through a symlink");
       expect(result.reason).not.toContain("Retry");
       expect(result.skipReason).toContain("legacy_worktree_probe_unverified:status");
       expect(logActivity).toHaveBeenCalledWith(
