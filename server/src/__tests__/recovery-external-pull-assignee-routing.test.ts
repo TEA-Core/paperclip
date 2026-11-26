@@ -157,6 +157,18 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     return db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.agentId, agentIds));
   }
 
+  async function setAgentStatus(agentId: string, status: "paused" | "terminated") {
+    await db.update(agents).set({ status }).where(eq(agents.id, agentId));
+  }
+
+  async function expectNotReassigned(fleet: Fleet, issueId: string) {
+    const issue = await issueRow(issueId);
+    expect(issue?.assigneeAgentId).toBe(fleet.externalAgentId);
+    expect(issue?.checkoutRunId ?? null).toBeNull();
+    expect(await recoveryChildren(issueId)).toHaveLength(0);
+    expect(await wakeRowsFor([fleet.ctoId, fleet.ceoId, fleet.coderId])).toHaveLength(0);
+  }
+
   async function expectLeftWithOwner(fleet: Fleet, issueId: string, expected: { status: string }) {
     const issue = await issueRow(issueId);
     expect(issue?.status).toBe(expected.status);
@@ -196,6 +208,29 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ctoId);
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ceoId);
   });
+
+  it.each(["paused", "terminated"] as const)(
+    "stillborn backlog: surfaces a %s external-pull assignee's card to the board without re-homing it",
+    async (status) => {
+      const fleet = await seedFleet();
+      await setAgentStatus(fleet.externalAgentId, status);
+      const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+      const { svc, enqueueWakeup } = makeSweep();
+
+      const result = await svc.reconcileStillbornAssignedBacklog();
+
+      expect(result.reported).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+      expect((await issueRow(issueId))?.status).toBe("blocked");
+      await expectNotReassigned(fleet, issueId);
+      const actions = await recoveryActionRows(issueId);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].cause).toBe("stillborn_assigned_backlog");
+      expect(actions[0].ownerType).toBe("board");
+      expect(actions[0].ownerAgentId).toBeNull();
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
 
   it("stillborn backlog: still escalates a parked card of an ordinary invoked agent", async () => {
     const fleet = await seedFleet();
@@ -286,6 +321,30 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ctoId);
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ceoId);
   });
+
+  it.each(["paused", "terminated"] as const)(
+    "stranded assigned issue: surfaces a %s external-pull assignee's card to the board without re-homing it",
+    async (status) => {
+      const fleet = await seedFleet();
+      await setAgentStatus(fleet.externalAgentId, status);
+      const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
+      await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, issueId));
+      const { svc, enqueueWakeup } = makeSweep();
+
+      const result = await svc.reconcileStrandedAssignedIssues();
+
+      expect(result.noLivePathOwnerUnavailable).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+      expect((await issueRow(issueId))?.status).toBe("in_progress");
+      await expectNotReassigned(fleet, issueId);
+      const actions = await recoveryActionRows(issueId);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
+      expect(actions[0].ownerType).toBe("board");
+      expect(actions[0].ownerAgentId).toBeNull();
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
 
   it("stranded assigned issue: still escalates a card of an ordinary invoked agent", async () => {
     const fleet = await seedFleet();
@@ -389,6 +448,27 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ctoId);
     expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ceoId);
   });
+
+  it.each(["paused", "terminated"] as const)(
+    "stranded issue recovery: leaves a %s external-pull assignee's card on its board action without re-homing it",
+    async (status) => {
+      const fleet = await seedFleet();
+      await setAgentStatus(fleet.externalAgentId, status);
+      const issueId = await seedExhaustedBlockedCard(fleet.companyId, fleet.externalAgentId);
+      const { svc, enqueueWakeup } = makeSweep();
+
+      const result = await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
+
+      expect(result.recoveryIssueMinted).toBe(0);
+      expect((await issueRow(issueId))?.status).toBe("blocked");
+      await expectNotReassigned(fleet, issueId);
+      const [action] = await recoveryActionRows(issueId);
+      expect(action.ownerType).toBe("board");
+      expect(action.status).toBe("escalated");
+      expect(action.recoveryIssueId).toBeNull();
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
 
   it("stranded issue recovery: still mints a recovery card for an ordinary invoked agent", async () => {
     const fleet = await seedFleet();
