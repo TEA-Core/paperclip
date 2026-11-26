@@ -1053,9 +1053,9 @@ identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
 the main home, only for a non-`default` instance with an explicit own database:
 an operator `DATABASE_URL`, or a worktree config
 `database.embeddedPostgresDataDir` inside the worktree checkout, which is then
-kept and used. That directory may not be the checkout root itself, inside any
-`instances` tree or `~/.paperclip`, or a database directory another known
-instance config already uses. A data directory outside the checkout does not
+kept and used. That directory may not be the checkout root itself, inside the
+claimed home's or the worktree home's `instances` tree, inside `~/.paperclip`, or
+a database directory another known instance config already uses. A data directory outside the checkout does not
 count, because a copied or legacy config may still name another instance's
 database. Without an explicit own database, the worktree's database would be
 the embedded default under that home, which may belong to a main instance whose

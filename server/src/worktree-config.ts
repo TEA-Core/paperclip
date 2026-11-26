@@ -233,7 +233,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   const remedy = exportedHomeMatch && !explicitOwnDatabase
     ? "; set an explicit own database for the worktree with an operator DATABASE_URL or a " +
       "database.embeddedPostgresDataDir inside the worktree checkout (not the checkout root, " +
-      "any instances tree, ~/.paperclip or a database directory another instance uses)"
+      "the claimed home's or worktree home's instances tree, ~/.paperclip or a database " +
+      "directory another known instance config uses)"
     : "";
   if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
   const parent = path.dirname(path.dirname(stateRoot));
