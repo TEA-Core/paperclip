@@ -5,6 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -40,8 +41,11 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("issue create parentage contract routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let previousSchedulingSuppression: string | undefined;
 
   beforeAll(async () => {
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-create-parentage-routes-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -49,6 +53,7 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(issueCreateIdempotencyKeys);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -58,6 +63,11 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
   });
 
   function createApp() {
@@ -113,6 +123,74 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     const rows = await db.select().from(issues).where(eq(issues.parentId, parent.id));
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(created.body.id);
+  });
+
+  it("persists a complete scheduled monitor and returns its saved schedule on create and GET", async () => {
+    const companyId = await seedCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Monitor owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    const monitor = {
+      nextCheckAt: "2099-12-01T12:00:00.000Z",
+      notes: "Check deployment health",
+      scheduledBy: "board",
+      kind: "external_service",
+      serviceName: "deployment-health",
+      externalRef: null,
+      timeoutAt: "2099-12-02T12:00:00.000Z",
+      maxAttempts: 3,
+      recoveryPolicy: "escalate_to_board",
+    };
+    const app = createApp();
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Monitor deployment",
+        status: "in_review",
+        assigneeAgentId: agentId,
+        executionPolicy: { monitor },
+      })
+      .expect(201);
+    const fresh = await request(app).get(`/api/issues/${created.body.id}`).expect(200);
+    for (const response of [created.body, fresh.body]) {
+      expect(response.monitorNextCheckAt).toBe(monitor.nextCheckAt);
+      expect(response.executionPolicy.monitor).toEqual(monitor);
+    }
+    const [stored] = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored.monitorNextCheckAt?.toISOString()).toBe(monitor.nextCheckAt);
+    expect(stored.executionPolicy?.monitor).toEqual(monitor);
+  });
+
+  it.each([false, true])("refuses top-level monitor fields without a partial create (nested monitor: %s)", async (includeNestedMonitor) => {
+    const companyId = await seedCompany();
+    const fields = {
+      monitorNextCheckAt: "2099-12-01T12:00:00.000Z",
+      monitorRecoveryPolicy: "escalate_to_board",
+      monitorServiceName: "deployment-health",
+      monitorMaxAttempts: 3,
+    };
+    const response = await request(createApp())
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Unsupported top-level monitor",
+        ...fields,
+        ...(includeNestedMonitor
+          ? { executionPolicy: { monitor: { nextCheckAt: fields.monitorNextCheckAt } } }
+          : {}),
+      })
+      .expect(400);
+    for (const field of Object.keys(fields)) {
+      expect(response.body.error).toContain(field);
+    }
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual([]);
   });
 
   it("rejects the sibling parentIssueId spelling with a 400 naming the field", async () => {

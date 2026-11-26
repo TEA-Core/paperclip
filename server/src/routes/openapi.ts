@@ -51,7 +51,7 @@ import {
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
   // Issue
-  createIssueSchema,
+  createIssueInputSchema,
   setIssueTitleSchema,
   updateIssueObjectSchema,
   approveIssueHeadSchema,
@@ -4341,7 +4341,9 @@ registry.registerPath({
   description: "Title is optional when description contains the task prompt. The server seeds a provisional title from the first 120 characters of the whitespace-normalized prompt and asks the assigned agent to refine it early. Explicit titles are preserved.",
   request: {
     params: z.object({ companyId: z.string() }),
-    body: jsonBody(createIssueSchema),
+    // The route's status-default preprocessor has an unconstrained input
+    // schema. Publish the same wire object as MCP, not that transform.
+    body: jsonBody(createIssueInputSchema),
   },
   responses: {
     200: r.ok(),

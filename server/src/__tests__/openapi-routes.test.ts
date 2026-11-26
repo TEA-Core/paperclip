@@ -6,6 +6,9 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { z } from "zod";
+import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
+import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -358,6 +361,69 @@ describe("openapi routes", () => {
     expect(schema.properties.items.items.properties.currentExecutionWorkspace.properties.deliveryState.enum)
       .toEqual(["merged_via_pr", "merged_by_ancestry", "unmerged", "unknown"]);
     expect(schema.properties.items.items.properties.workProducts.items.required).toContain("type");
+  });
+
+  it("advertises the same nested create monitor contract as the MCP adapter and refuses top-level spellings", async () => {
+    const response = await request(createApp()).get("/api/openapi.json").expect(200);
+    const schema = response.body.paths["/api/companies/{companyId}/issues"].post
+      .requestBody.content["application/json"].schema;
+    const tool = createToolDefinitions(new PaperclipApiClient({
+      apiUrl: "http://localhost:3100/api",
+      apiKey: "test-token",
+      companyId: "11111111-1111-4111-8111-111111111111",
+    })).find((candidate) => candidate.name === "paperclipCreateIssue")!;
+    const objectSchema = z.object({
+      properties: z.record(z.string(), z.unknown()),
+      required: z.array(z.string()).optional(),
+      additionalProperties: z.boolean().optional(),
+    });
+    const nullableSchema = z.object({ anyOf: z.array(z.unknown()) });
+    const objectVariant = (value: unknown) => objectSchema.parse(
+      nullableSchema.parse(value).anyOf.find((option) => objectSchema.safeParse(option).success),
+    );
+    const advertised = objectSchema.parse(z.toJSONSchema(tool.schema, { io: "input" }));
+    const monitor = schema.properties.executionPolicy.properties.monitor;
+    const mcpPolicy = objectVariant(advertised.properties.executionPolicy);
+    const mcpMonitor = objectVariant(mcpPolicy.properties.monitor);
+    const fields = [
+      "nextCheckAt", "notes", "scheduledBy", "kind", "serviceName",
+      "externalRef", "timeoutAt", "maxAttempts", "recoveryPolicy",
+    ];
+    expect(Object.keys(monitor.properties).sort()).toEqual([...fields].sort());
+    expect(Object.keys(mcpMonitor.properties).sort()).toEqual([...fields].sort());
+    expect(monitor.required).toEqual(["nextCheckAt"]);
+    expect(mcpMonitor.required).toEqual(["nextCheckAt"]);
+    expect(monitor.additionalProperties).toBe(false);
+    expect(mcpMonitor.additionalProperties).toBe(false);
+    expect(monitor.properties.maxAttempts).toMatchObject({
+      type: "integer", minimum: 0, exclusiveMinimum: true, maximum: 100,
+    });
+    expect(nullableSchema.parse(mcpMonitor.properties.maxAttempts).anyOf)
+      .toContainEqual(expect.objectContaining({ type: "integer", exclusiveMinimum: 0, maximum: 100 }));
+    expect(nullableSchema.parse(mcpMonitor.properties.recoveryPolicy).anyOf)
+      .toContainEqual(expect.objectContaining({ type: "string", enum: monitor.properties.recoveryPolicy.enum }));
+    const nestedMonitor = {
+      nextCheckAt: "2099-12-01T12:00:00.000Z",
+      serviceName: "deployment-health",
+      maxAttempts: 3,
+      recoveryPolicy: "escalate_to_board",
+    };
+    expect(tool.schema.parse({ title: "Monitor", executionPolicy: { monitor: nestedMonitor } }))
+      .toMatchObject({ executionPolicy: { monitor: nestedMonitor } });
+    expect(schema.additionalProperties).toBe(false);
+    expect(advertised.additionalProperties).toBe(false);
+    for (const [field, value] of Object.entries({
+      monitorNextCheckAt: nestedMonitor.nextCheckAt,
+      monitorRecoveryPolicy: nestedMonitor.recoveryPolicy,
+      monitorServiceName: nestedMonitor.serviceName,
+      monitorMaxAttempts: nestedMonitor.maxAttempts,
+    })) {
+      expect(schema.properties).not.toHaveProperty(field);
+      expect(advertised.properties).not.toHaveProperty(field);
+      const parsed = tool.schema.safeParse({ title: "Monitor", [field]: value });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) expect(parsed.error.message).toContain(field);
+    }
   });
 
   it("serves the generated OpenAPI document", async () => {
