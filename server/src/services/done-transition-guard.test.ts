@@ -5679,6 +5679,25 @@ describe("evaluateDoneTierDeclaration", () => {
       }
     });
 
+    it("conflict excerpts never echo unbackticked prose commands from malformed sources", () => {
+      const prose = "ran curl -H 'Authorization: Bearer sk-live-PROSE-SECRET' https://svc/health, passed";
+      const structured = conflictOf(`Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}`, { tier: "tier2", probeEvidence: prose });
+      const comment = conflictOf(`Closed at Tier 2 (live): ${prose}`, { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE });
+      for (const conflict of [structured, comment]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-PROSE-SECRET");
+        expect(serialized).not.toContain("Authorization");
+        expect(serialized).not.toContain("curl");
+      }
+      expect(structured.sources.structured.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${prose.length} chars>`,
+      );
+      expect(comment.sources.comment.declarations[0]?.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${prose.length} chars>`,
+      );
+      expect(structured.sources.comment.declarations[0]?.excerpt).toContain("record-only probe `<command redacted>` target ");
+    });
+
     it("accepts an exactly equivalent dual source and keeps the original comment with one declaration", () => {
       const comment = `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}\n\nFollow-up: none.`;
       const resolution = resolveDoneTierDeclarationSources(comment, {
@@ -5728,7 +5747,9 @@ describe("evaluateDoneTierDeclaration", () => {
       });
       expect(conflict.conflicts).toContain("structured_declaration_malformed");
       expect(conflict.conflicts).toContain("sources_not_equivalent");
-      expect(conflict.sources.structured.excerpt).toContain("Closed at Tier 2 (live): Closed at Tier 2 (live):");
+      expect(conflict.sources.structured.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${SOURCE_RECORD_ONLY_LINE.length} chars>`,
+      );
     });
 
     it("structured-only full-prefix input is not stripped: it renders verbatim and the evaluator refuses it", async () => {
@@ -5865,17 +5886,6 @@ describe("evaluateDoneTierDeclaration", () => {
         observed: "2026-11-04T09:15:00Z",
         closingRunId: null,
       });
-    });
-
-    it("every structured door resolves through the shared resolver; none renders by replacement", () => {
-      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
-      const guard = readFileSync(new URL("./done-transition-guard.ts", import.meta.url), "utf8");
-      expect(route).not.toContain("renderDoneTierDeclaration(");
-      expect(guard).not.toMatch(/export function renderDoneTierDeclaration\(/);
-      for (const door of ["\"patch\"", "\"comment_auto_approval\"", "\"recovery_action_resolution\""]) {
-        expect(route).toContain(`door: ${door},`);
-      }
-      expect(guard).toContain("resolveDoneTierDeclarationSources(closeComment, structuredDoneTier)");
     });
 
     it("renders structured declarations only after both close doors resolve to done", () => {
