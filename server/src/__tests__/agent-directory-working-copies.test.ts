@@ -1415,6 +1415,63 @@ describe("persistent agent directories", () => {
     } finally { applying.mockRestore(); process.umask(previousUmask); }
   });
 
+  it.skipIf(process.getuid?.() !== 0)("denies a non-owner agents-group write to a warm sandbox checkpoint before apply (needs root)", async () => {
+    const remoteCwd = path.join(home, "warm-checkpoint-peer");
+    await fs.mkdir(remoteCwd, { recursive: true });
+    const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), remoteCwd, runner: localSandboxRunner() };
+    const gid = process.getegid!();
+    const previousUmask = process.umask();
+    const rename = fs.rename.bind(fs);
+    let live: string | undefined;
+    let attempts: Array<{ target: string; owner: boolean; write: string | null }> | undefined;
+    const applying = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (live && !attempts && String(destination).startsWith(`${root}${path.sep}`)) {
+        const runDir = path.dirname(live);
+        // Only the disposable fixture is opened for agents-group traversal.
+        for (let dir = path.dirname(runDir); dir !== path.dirname(dir) && (dir === home || dir.startsWith(`${home}${path.sep}`)); dir = path.dirname(dir)) {
+          await fs.chmod(dir, 0o750);
+          await fs.chown(dir, 0, gid);
+        }
+        const targets: string[] = [];
+        const find = async (directory: string): Promise<void> => {
+          for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+            const filename = path.join(directory, entry.name);
+            if (entry.isDirectory()) await find(filename);
+            else if (entry.name === "notes.md") targets.push(filename);
+          }
+        };
+        for (const name of await fs.readdir(runDir)) if (name.startsWith("checkpoint-")) await find(path.join(runDir, name));
+        expect(targets).toHaveLength(1);
+        const { stdout } = await execFile(process.execPath, ["-e", `
+          const fs = require("node:fs");
+          const target = process.argv[1];
+          let write = null;
+          try { fs.writeFileSync(target, "injected"); } catch (error) { write = error.code; }
+          console.log(JSON.stringify([{ target, owner: process.getuid() === 0, write }]));
+        `, targets[0]!], { uid: 65534, gid });
+        attempts = JSON.parse(stdout);
+      }
+      return rename(source, destination);
+    });
+    try {
+      process.umask(0o002);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const copy = (await withAgentsGid(gid, () =>
+        copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, warm: true })))!;
+      live = copy.localRoot;
+      await fs.mkdir(path.join(copy.executionRoot, "shared"), { mode: 0o777 });
+      await fs.writeFile(path.join(copy.executionRoot, "shared/notes.md"), "remote writable");
+      await fs.chmod(path.join(copy.executionRoot, "shared"), 0o777);
+      await fs.chmod(path.join(copy.executionRoot, "shared/notes.md"), 0o666);
+      const saved = (await copies.checkpointWarm({ companyId, runId, target: executionTarget }))!;
+      expect(saved, JSON.stringify({ code: saved.errorCode, message: saved.errorMessage })).toMatchObject({ state: "warm_saved", errorCode: null });
+      expect(attempts).toEqual([{ target: expect.stringContaining(`${path.sep}checkpoint-`), owner: false, write: "EACCES" }]);
+      expect(await fs.readFile(path.join(root, "shared/notes.md"), "utf8")).toBe("remote writable");
+      await copies.collectStopped({ companyId, runId, target: executionTarget });
+    } finally { applying.mockRestore(); process.umask(previousUmask); }
+  });
+
   it("checkpoints and reuses the remote directory through the real transport without copying unchanged bytes", async () => {
     const remoteCwd = path.join(home, "warm-remote-task");
     await fs.mkdir(remoteCwd, { recursive: true });
