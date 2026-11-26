@@ -4537,10 +4537,14 @@ describe("evaluateDoneTransitionGuard", () => {
       mockExecFile.mockImplementation(
         (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
           if (args.includes("ls-files")) {
-            cb(null, `H 160000 ${"b".repeat(40)} 0\tvendor/lib\0`);
+            cb(null, Array.from({ length: 65 }, (_, i) => `H 160000 ${"b".repeat(40)} 0\tvendor/lib${i}\0`).join(""));
             return;
           }
           if (answerSnapshotStatusCall(args, cb)) return;
+          if (args.includes("status")) {
+            cb(null, "");
+            return;
+          }
           cb(null, args.includes("--grep") ? "0" : "5");
         },
       );
@@ -4549,7 +4553,8 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(false);
       expect(result.skipped).toBe(false);
       expect(result.reason).toContain("worktree status probe");
-      expect(result.reason).toContain("submodules");
+      expect(result.reason).toContain("more than 64 submodules");
+      expect(result.reason).not.toContain("Retry");
       expect(result.skipReason).toContain("legacy_worktree_probe_unverified:status");
       expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),

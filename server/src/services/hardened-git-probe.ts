@@ -533,11 +533,13 @@ async function snapshotStatusIsDirty(
 // The outcome keeps the callers' fail-open contract for a git that ran and
 // could not answer (null), but a probe that could not run safely or to
 // completion is unverified, and the callers fail closed on it: the timeout
-// fired, no root-owned git is installed, the worktree holds submodules (their
-// status runs each submodule's own configuration), or the server process
+// fired, no root-owned git is installed, the worktree holds more submodules
+// than the probe measures (each initialized submodule is measured by the same
+// hardened probe, never by Git recursing into it), or the server process
 // inherits `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY`.
 
 const LEGACY_PROBE_BUDGET_MS = DEFAULT_TIMEOUT_MS;
+const LEGACY_SUBMODULE_LIMIT = 64;
 const LEGACY_REFUSED_INHERITED_VARIABLES = ["GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] as const;
 const PROTECTED_CONFIG_SCOPES: ReadonlySet<string> = new Set(["system", "global", "command"]);
 
@@ -610,11 +612,25 @@ export async function runLegacyWorktreeProbe<T>(
  * Whether the worktree holding `worktreePath` has modified, staged or
  * untracked (not ignored) content: the answer `git status --porcelain` gives,
  * read through a snapshot git dir. The repository's `info/exclude` still
- * applies; its configuration does not. Throws `refused` when the index holds a
- * submodule.
+ * applies; its configuration does not. A submodule whose recorded commit
+ * differs is dirty; each initialized submodule (at most
+ * `LEGACY_SUBMODULE_LIMIT` in all, nested ones included) is measured by the
+ * same probe, and an uninitialized one is clean, as in Git.
  */
 export async function legacyWorktreeIsDirty(worktreePath: string, options: HardenedGitOptions): Promise<boolean> {
+  return legacyTreeIsDirty(worktreePath, null, options, { remaining: LEGACY_SUBMODULE_LIMIT });
+}
+
+async function legacyTreeIsDirty(
+  worktreePath: string,
+  expectedTopLevel: string | null,
+  options: HardenedGitOptions,
+  submodules: { remaining: number },
+): Promise<boolean> {
   const identity = await readWorktreeIdentity(worktreePath, options);
+  if (expectedTopLevel !== null && identity.topLevel !== expectedTopLevel) {
+    throw new HardenedGitError("refused", `the submodule at ${expectedTopLevel} names another work tree`);
+  }
   const headSha = await readHeadCommit(worktreePath, options);
   let exclude: string | null;
   try {
@@ -623,25 +639,51 @@ export async function legacyWorktreeIsDirty(worktreePath: string, options: Harde
     throw refusedSnapshotInput("the repository's info/exclude", error);
   }
   let snapshotReady = false;
+  let measured: { dirty: boolean; gitlinks: string[] };
   try {
-    return await withSnapshotGitDir(
+    measured = await withSnapshotGitDir(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: options.deadline },
       async (snapshot) => {
         snapshotReady = true;
         const entries = await listIndexEntries(snapshot, identity.topLevel, options);
-        if (entries.some((entry) => entry.mode === "160000")) {
-          throw new HardenedGitError(
-            "refused",
-            "the worktree has submodules, whose status Git reads through each submodule's own configuration",
-          );
-        }
-        return snapshotStatusIsDirty(snapshot, identity.topLevel, "all", options);
+        const gitlinks = [...new Set(entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path))];
+        return { dirty: await snapshotStatusIsDirty(snapshot, identity.topLevel, "dirty", options), gitlinks };
       },
     );
   } catch (error) {
     if (snapshotReady) throw error;
     throw refusedSnapshotInput("the snapshot git dir (the worktree's index and shared indexes)", error);
   }
+  if (measured.dirty) return true;
+  for (const gitlink of measured.gitlinks) {
+    submodules.remaining -= 1;
+    if (submodules.remaining < 0) {
+      throw new HardenedGitError(
+        "refused",
+        `the worktree has more than ${LEGACY_SUBMODULE_LIMIT} submodules, the probe's bound`,
+      );
+    }
+    const submodulePath = path.join(identity.topLevel, gitlink);
+    if (!(await isInitializedSubmodule(submodulePath))) continue;
+    if (await legacyTreeIsDirty(submodulePath, submodulePath, options, submodules)) return true;
+  }
+  return false;
+}
+
+async function isInitializedSubmodule(submodulePath: string): Promise<boolean> {
+  let resolved: string;
+  let marker;
+  try {
+    resolved = await realpath(submodulePath);
+    marker = await lstat(path.join(submodulePath, ".git"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+    throw new HardenedGitError("refused", `could not inspect the submodule at ${submodulePath}`);
+  }
+  if (resolved !== submodulePath || !(marker.isFile() || marker.isDirectory())) {
+    throw new HardenedGitError("refused", `the submodule at ${submodulePath} is reached through a symlink`);
+  }
+  return true;
 }
 
 function refusedSnapshotInput(what: string, error: unknown): HardenedGitError {

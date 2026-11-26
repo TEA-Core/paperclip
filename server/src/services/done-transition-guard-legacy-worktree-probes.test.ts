@@ -337,12 +337,71 @@ describe("legacy status probe keeps the git status --porcelain answer for ordina
     expect(await worktreeHasUncommittedContent(repo)).toBe(false);
   });
 
-  it("reports a worktree with a submodule unverified: its status would run the submodule's own configuration", async () => {
-    const sub = plainRepo("sub");
-    const repo = plainRepo("repo");
-    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "sub");
-    git(repo, "commit", "-qm", "add submodule");
-    expect(await worktreeHasUncommittedContent(repo)).toMatchObject({ unverified: true });
+  describe("a worktree with a submodule is measured, not refused", () => {
+    function repoWithSubmodule(): { repo: string; sub: string } {
+      const source = plainRepo("sub-source");
+      const repo = plainRepo("repo");
+      git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "sub");
+      git(repo, "commit", "-qm", "add submodule");
+      return { repo, sub: path.join(repo, "sub") };
+    }
+
+    it("reports a clean repository with a clean submodule clean", async () => {
+      const { repo } = repoWithSubmodule();
+      expect(porcelainIsDirty(repo)).toBe(false);
+      expect(await worktreeHasUncommittedContent(repo)).toBe(false);
+    });
+
+    it("reports a modified or untracked file inside the submodule dirty", async () => {
+      const { repo, sub } = repoWithSubmodule();
+      writeFileSync(path.join(sub, "a.txt"), "undelivered\n");
+      expect(await worktreeHasUncommittedContent(repo)).toBe(true);
+      git(sub, "checkout", "-q", "--", "a.txt");
+      writeFileSync(path.join(sub, "new.txt"), "undelivered\n");
+      expect(await worktreeHasUncommittedContent(repo)).toBe(true);
+    });
+
+    it("reports a changed submodule commit dirty", async () => {
+      const { repo, sub } = repoWithSubmodule();
+      writeFileSync(path.join(sub, "b.txt"), "x\n");
+      git(sub, "add", "b.txt");
+      git(sub, "commit", "-qm", "advance");
+      expect(porcelainIsDirty(repo)).toBe(true);
+      expect(await worktreeHasUncommittedContent(repo)).toBe(true);
+    });
+
+    it("reports an uninitialized submodule clean, as Git does", async () => {
+      const { repo } = repoWithSubmodule();
+      const clone = path.join(root, "clone");
+      execFileSync("git", ["clone", "-q", repo, clone], { env: fixtureEnv, stdio: "pipe" });
+      expect(porcelainIsDirty(clone)).toBe(false);
+      expect(await worktreeHasUncommittedContent(clone)).toBe(false);
+    });
+
+    it("ignores GIT_DIR and GIT_WORK_TREE inherited by the server, so a clean repository cannot mask dirt inside a submodule", async () => {
+      const { repo, sub } = repoWithSubmodule();
+      writeFileSync(path.join(sub, "a.txt"), "undelivered\n");
+      const clean = plainRepo("clean");
+      await withEnv({ GIT_DIR: path.join(clean, ".git"), GIT_WORK_TREE: clean }, async () => {
+        expect(await worktreeHasUncommittedContent(repo)).toBe(true);
+      });
+    });
+
+    it("does not run a filter driver the submodule's own configuration names", async () => {
+      const { repo, sub } = repoWithSubmodule();
+      const marker = path.join(root, "filter-ran");
+      writeFileSync(path.join(sub, ".gitattributes"), "*.txt filter=evil\n");
+      git(sub, "config", "filter.evil.clean", `sh -c 'touch ${marker}; cat'`);
+      git(sub, "config", "filter.evil.required", "true");
+      git(sub, "add", ".gitattributes");
+      git(sub, "commit", "-qm", "attributes");
+      git(repo, "add", "sub");
+      git(repo, "commit", "-qm", "bump submodule");
+      rmSync(marker, { force: true });
+      utimesSync(path.join(sub, "a.txt"), new Date(), new Date(Date.now() + 5_000));
+      expect(await worktreeHasUncommittedContent(repo)).toBe(false);
+      expect(existsSync(marker)).toBe(false);
+    });
   });
 });
 

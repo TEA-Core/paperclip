@@ -702,7 +702,7 @@ function legacyProbeUnverifiedRefusal(
     reason:
       `The ${probe} probe of the issue's worktree for branch ${at.branch} could not be verified ` +
       `(${unverified.reason}), so the transition is refused rather than allowed on an unverified signal. ` +
-      "Retry the close once the probe can run, or set doneTransitionOverride to a sanctioned " +
+      "Resolve the cause named above, or set doneTransitionOverride to a sanctioned " +
       "no-deliverable-head disposition.",
     aheadBy: at.aheadBy,
     branch: at.branch,
