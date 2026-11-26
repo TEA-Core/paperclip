@@ -440,7 +440,6 @@ Invariants:
 - `agent_id` uuid fk not null
 - `invocation_source` enum: `scheduler | manual | callback`
 - `status` enum: `queued | running | succeeded | failed | cancelled | timed_out`
-- `queued_at` timestamptz null; a database trigger stamps `clock_timestamp()` on each entry into `queued` (insert or transition from another status) and keeps it on queued→queued updates; a validated check requires it whenever `status = 'queued'`
 - `started_at` timestamptz null
 - `finished_at` timestamptz null
 - `error` text null
