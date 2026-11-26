@@ -4695,6 +4695,10 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   baseRef: string | null;
   /** The head repository (body.head.repo.full_name); a fork head differs from the base repo. */
   headRepoFullName?: string | null;
+  /** SUP-25193: the base repository's immutable identity (body.base.repo.id / node_id / full_name). */
+  baseRepoId?: number | null;
+  baseRepoNodeId?: string | null;
+  baseRepoFullName?: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4784,6 +4788,7 @@ async function fetchPullRequestHeadShaOnce(
     typeof headRepo?.full_name === "string" && headRepo.full_name.length > 0 ? headRepo.full_name : null;
   const base = body.base as Record<string, unknown> | undefined;
   const baseRef = typeof base?.ref === "string" && base.ref.length > 0 ? base.ref : null;
+  const baseRepo = base?.repo as Record<string, unknown> | undefined;
   const mergeCommitSha =
     typeof body.merge_commit_sha === "string" && body.merge_commit_sha.length > 0
       ? body.merge_commit_sha
@@ -4802,6 +4807,10 @@ async function fetchPullRequestHeadShaOnce(
       mergeCommitSha,
       baseRef,
       headRepoFullName,
+      baseRepoId: typeof baseRepo?.id === "number" ? baseRepo.id : null,
+      baseRepoNodeId: typeof baseRepo?.node_id === "string" && baseRepo.node_id.length > 0 ? baseRepo.node_id : null,
+      baseRepoFullName:
+        typeof baseRepo?.full_name === "string" && baseRepo.full_name.length > 0 ? baseRepo.full_name : null,
     };
   }
   return {

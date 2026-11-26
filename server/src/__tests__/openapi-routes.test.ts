@@ -277,7 +277,8 @@ describe("openapi routes", () => {
     for (const code of [
       "landing_proof_not_applicable", "landing_proof_wrong_repo", "landing_proof_pr_not_found",
       "landing_proof_pr_not_merged", "landing_proof_pr_closed_unmerged", "landing_proof_sha_mismatch",
-      "landing_proof_not_on_base", "landing_proof_unverifiable",
+      "landing_proof_not_on_base", "landing_proof_unverifiable", "landing_proof_repo_identity_mismatch",
+      "landing_proof_not_card_delivery",
     ]) {
       expect(operation.description).toContain(code);
     }

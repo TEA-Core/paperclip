@@ -48,6 +48,7 @@ import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   BOARD_LANDING_PROOF_ACTION,
+  BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
   boardLandingProofIneligibility,
   loadAttachedBoardLandingProof,
   verifyBoardLandingProof,
@@ -14445,6 +14446,9 @@ export function issueRoutes(
           headRepoFullName: proof.headRepoFullName,
           baseRef: proof.baseRef,
           repoUrl: proof.repoUrl,
+          repositoryId: proof.repositoryId,
+          repositoryNodeId: proof.repositoryNodeId,
+          possession: proof.possession,
           reason: body.reason,
           verifiedAt: new Date().toISOString(),
           landingDebtOwed,
@@ -14491,6 +14495,8 @@ export function issueRoutes(
             mergeCommitSha: proof.mergeCommitSha,
             headSha: proof.headSha,
             landingProofActivityId: activity.id,
+            // Never counts as prior evidence that this PR is the card's delivery.
+            source: BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
           },
         });
       }

@@ -1,8 +1,10 @@
 import { and, desc, eq } from "drizzle-orm";
-import { activityLog, type Db } from "@paperclipai/db";
+import { activityLog, issueWorkProducts, issues, type Db } from "@paperclipai/db";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
+import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   fetchPullRequestHeadSha,
+  resolveLinkedPullRequests,
   parseRepoUrl,
   resolveCardDeliveryBaseRef,
   resolveIssueRepoContext,
@@ -28,6 +30,8 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
  */
 export const BOARD_LANDING_PROOF_ACTION = "issue.landing_proof_attached";
 export const BOARD_LANDING_PROOF_SOURCE = "board_merged_pr";
+/** Marks a `pull_request` work product the attach route created, so it never counts as prior card evidence. */
+export const BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE = "board_landing_proof";
 
 export interface BoardLandingProofEvidence {
   owner: string;
@@ -35,7 +39,16 @@ export interface BoardLandingProofEvidence {
   pullRequestNumber: number;
   mergeCommitSha?: string | null;
   headSha?: string | null;
+  /** The immutable GitHub repository id recorded at attach; the close re-checks it. */
+  repositoryId?: number | null;
 }
+
+/** How the merged PR was tied to this card (it must be the card's own delivery). */
+export type BoardLandingProofPossession =
+  | { kind: "linked_work_product"; detail: string }
+  | { kind: "linked_external_object"; detail: string }
+  | { kind: "recorded_delivery_commit"; detail: string }
+  | { kind: "head_branch_names_card"; detail: string };
 
 export interface VerifiedBoardLandingProof {
   owner: string;
@@ -48,6 +61,9 @@ export interface VerifiedBoardLandingProof {
   headRepoFullName: string | null;
   baseRef: string;
   repoUrl: string;
+  repositoryId: number;
+  repositoryNodeId: string | null;
+  possession: BoardLandingProofPossession;
 }
 
 export type BoardLandingProofRefusalCode =
@@ -58,7 +74,9 @@ export type BoardLandingProofRefusalCode =
   | "landing_proof_pr_not_merged"
   | "landing_proof_pr_closed_unmerged"
   | "landing_proof_sha_mismatch"
-  | "landing_proof_not_on_base";
+  | "landing_proof_not_on_base"
+  | "landing_proof_repo_identity_mismatch"
+  | "landing_proof_not_card_delivery";
 
 export type BoardLandingProofVerification =
   | { ok: true; proof: VerifiedBoardLandingProof }
@@ -171,6 +189,51 @@ export async function verifyBoardLandingProof(
         `the supplied commit does not match pull request #${evidence.pullRequestNumber} (merge commit ${mergeCommitSha.slice(0, 12)}, head ${headSha.slice(0, 12)})`,
       );
     }
+    // The live repository identity must be the card's delivery repo. GitHub
+    // redirects a renamed or transferred repository, so the live full name is
+    // compared with the card's repo, and the PR's base repository must carry the
+    // same immutable id. A recorded id (from the attach) must still match.
+    const identity = await fetchGitHubRepositoryIdentity(token, owner, repo);
+    if (!identity.ok) {
+      if ((identity.status === 401 || identity.status === 403) && !last) continue;
+      lastFailure = `repository identity read failed: ${identity.status ? `HTTP ${identity.status}` : identity.message}`;
+      break;
+    }
+    const cardRepo = `${owner}/${repo}`.toLowerCase();
+    if (identity.fullName.toLowerCase() !== cardRepo) {
+      return refuse(
+        "landing_proof_repo_identity_mismatch",
+        `GitHub resolves ${owner}/${repo} to ${identity.fullName} (renamed or transferred); it is not this card's delivery repository`,
+      );
+    }
+    if (pr.baseRepoId == null || pr.baseRepoId !== identity.id ||
+      (pr.baseRepoFullName ?? "").toLowerCase() !== cardRepo) {
+      return refuse(
+        "landing_proof_repo_identity_mismatch",
+        `pull request #${evidence.pullRequestNumber} targets repository ${pr.baseRepoFullName ?? "(unreadable)"} (id ${pr.baseRepoId ?? "unknown"}), not this card's repository ${owner}/${repo} (id ${identity.id})`,
+      );
+    }
+    if (evidence.repositoryId != null && evidence.repositoryId !== identity.id) {
+      return refuse(
+        "landing_proof_repo_identity_mismatch",
+        `repository ${owner}/${repo} now has id ${identity.id}, not the id ${evidence.repositoryId} recorded with the proof`,
+      );
+    }
+    const possession = await resolveCardDeliveryPossession(db, issue, {
+      token, owner, repo, pullRequestNumber: evidence.pullRequestNumber,
+      headRef: pr.headRef, headSha, mergeCommitSha,
+    });
+    if (possession === "unverifiable") {
+      lastFailure = "the recorded delivery commit containment check could not be read";
+      break;
+    }
+    if (!possession) {
+      return refuse(
+        "landing_proof_not_card_delivery",
+        `pull request #${evidence.pullRequestNumber} is not this card's delivery: it is not linked to the card, ` +
+          "it contains none of the card's recorded delivery commits, and its head branch does not name the card",
+      );
+    }
     const onBase = await verifyMergedPullRequestOnBaseBranch(token, owner, repo, baseRef, mergeCommitSha, {
       requireVerifiedBranch: true,
     });
@@ -195,10 +258,158 @@ export async function verifyBoardLandingProof(
         headRepoFullName: pr.headRepoFullName ?? null,
         baseRef,
         repoUrl: ctx.repoUrl,
+        repositoryId: identity.id,
+        repositoryNodeId: identity.nodeId,
+        possession,
       },
     };
   }
   return refuse("landing_proof_unverifiable", lastFailure);
+}
+
+type RepositoryIdentityRead =
+  | { ok: true; id: number; nodeId: string | null; fullName: string }
+  | { ok: false; status: number; message: string };
+
+/** The live repository identity. fetch follows GitHub's rename/transfer redirect. */
+async function fetchGitHubRepositoryIdentity(token: string, owner: string, repo: string): Promise<RepositoryIdentityRead> {
+  let response: Response;
+  try {
+    response = await ghFetch(`${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${token}`,
+        "x-github-api-version": "2022-11-28",
+      },
+    });
+  } catch {
+    return { ok: false, status: 0, message: "network error" };
+  }
+  if (!response.ok) return { ok: false, status: response.status, message: `HTTP ${response.status}` };
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const id = body?.id;
+  const fullName = body?.full_name;
+  if (typeof id !== "number" || typeof fullName !== "string" || fullName.length === 0) {
+    return { ok: false, status: 0, message: "unreadable repository identity" };
+  }
+  return { ok: true, id, nodeId: typeof body?.node_id === "string" ? body.node_id : null, fullName };
+}
+
+const MAX_RECORDED_DELIVERY_COMMITS = 10;
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True when a branch name carries the card identifier as a delimited token (`SUP-1` or `sup1`). */
+export function headBranchNamesCard(headRef: string | null, identifier: string | null): boolean {
+  if (!headRef || !identifier) return false;
+  const forms = new Set([identifier, identifier.replace(/-/g, "")].map((form) => form.toLowerCase()).filter(Boolean));
+  const branch = headRef.toLowerCase();
+  return [...forms].some((form) => new RegExp(`(^|[/_.-])${escapeRegExp(form)}($|[/_.-])`).test(branch));
+}
+
+/**
+ * The merged PR must be THIS card's own delivery. Accepted ties, cheapest first:
+ *  - the head branch names the card;
+ *  - the PR is linked to the card on record: a `pull_request` work product the
+ *    attach route did not create, or a cached external-object link;
+ *  - the PR head or merge commit contains a delivery commit recorded on the card
+ *    (work-product head/merge commits, `executionState.deliveredHeadSha`),
+ *    checked live with the GitHub compare API.
+ * Returns null when nothing ties the PR to the card, or "unverifiable" when a
+ * needed live containment check could not be read.
+ */
+async function resolveCardDeliveryPossession(
+  db: Db,
+  issue: { id: string; companyId: string },
+  pr: {
+    token: string; owner: string; repo: string; pullRequestNumber: number;
+    headRef: string | null; headSha: string; mergeCommitSha: string;
+  },
+): Promise<BoardLandingProofPossession | null | "unverifiable"> {
+  const [card] = await db
+    .select({ identifier: issues.identifier, executionState: issues.executionState })
+    .from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
+  if (headBranchNamesCard(pr.headRef, card?.identifier ?? null)) {
+    return { kind: "head_branch_names_card", detail: `head branch ${pr.headRef} names ${card!.identifier}` };
+  }
+  const prKey = `${pr.owner}/${pr.repo}#${pr.pullRequestNumber}`.toLowerCase();
+  const products = await db
+    .select({ externalId: issueWorkProducts.externalId, url: issueWorkProducts.url, metadata: issueWorkProducts.metadata })
+    .from(issueWorkProducts)
+    .where(and(
+      eq(issueWorkProducts.companyId, issue.companyId),
+      eq(issueWorkProducts.issueId, issue.id),
+      eq(issueWorkProducts.type, "pull_request"),
+    ));
+  const recordedShas = new Set<string>();
+  const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pullRequestNumber}`.toLowerCase();
+  for (const product of products) {
+    const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+    if (metadata.source === BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE) continue;
+    const repository = typeof metadata.repository === "string" ? metadata.repository.toLowerCase() : null;
+    const sameRepo = repository === `${pr.owner}/${pr.repo}`.toLowerCase();
+    const linked =
+      product.externalId?.toLowerCase() === prKey ||
+      product.url?.toLowerCase().replace(/\/+$/, "") === prUrl ||
+      (sameRepo && metadata.prNumber === pr.pullRequestNumber);
+    if (linked) return { kind: "linked_work_product", detail: `work product ${product.externalId ?? product.url}` };
+    for (const key of ["headSha", "mergeCommitSha"] as const) {
+      const value = typeof metadata[key] === "string" ? (metadata[key] as string).trim().toLowerCase() : "";
+      if (/^[0-9a-f]{40}$/.test(value)) recordedShas.add(value);
+    }
+  }
+  const linkedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id, { includeDrafts: true });
+  const linkedPr = linkedPrs.find((candidate) =>
+    candidate.owner.toLowerCase() === pr.owner.toLowerCase() &&
+    candidate.repo.toLowerCase() === pr.repo.toLowerCase() &&
+    candidate.number === pr.pullRequestNumber);
+  if (linkedPr) return { kind: "linked_external_object", detail: `linked ${linkedPr.displayName}` };
+  const state = card?.executionState && typeof card.executionState === "object"
+    ? (card.executionState as Record<string, unknown>)
+    : null;
+  const delivered = typeof state?.deliveredHeadSha === "string" ? state.deliveredHeadSha.trim().toLowerCase() : "";
+  if (/^[0-9a-f]{40}$/.test(delivered)) recordedShas.add(delivered);
+  let unreadable = false;
+  for (const recorded of [...recordedShas].slice(0, MAX_RECORDED_DELIVERY_COMMITS)) {
+    if (recorded === pr.headSha || recorded === pr.mergeCommitSha) {
+      return { kind: "recorded_delivery_commit", detail: `recorded delivery commit ${recorded.slice(0, 12)} is the PR commit` };
+    }
+    for (const target of [pr.headSha, pr.mergeCommitSha]) {
+      const contained = await commitContains(pr.token, pr.owner, pr.repo, target, recorded);
+      if (contained === null) { unreadable = true; continue; }
+      if (contained) {
+        return {
+          kind: "recorded_delivery_commit",
+          detail: `PR commit ${target.slice(0, 12)} contains recorded delivery commit ${recorded.slice(0, 12)}`,
+        };
+      }
+    }
+  }
+  return unreadable ? "unverifiable" : null;
+}
+
+/** True when `container` contains `commit` (compare commit...container is ahead or identical). Null when unreadable. */
+async function commitContains(token: string, owner: string, repo: string, container: string, commit: string): Promise<boolean | null> {
+  let response: Response;
+  try {
+    response = await ghFetch(
+      `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(commit)}...${encodeURIComponent(container)}`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
+    );
+  } catch {
+    return null;
+  }
+  if (response.status === 404) return false;
+  if (!response.ok) return null;
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (typeof body?.behind_by === "number") return body.behind_by === 0;
+  const status = typeof body?.status === "string" ? body.status : null;
+  if (status === "ahead" || status === "identical") return true;
+  if (status === "behind" || status === "diverged") return false;
+  return null;
 }
 
 /**
@@ -266,7 +477,7 @@ export async function loadAttachedBoardLandingProof(
     .limit(1);
   const details = (row?.details ?? null) as Record<string, unknown> | null;
   if (!row || !details) return null;
-  const { owner, repo, pullRequestNumber, mergeCommitSha, headSha } = details;
+  const { owner, repo, pullRequestNumber, mergeCommitSha, headSha, repositoryId } = details;
   if (typeof owner !== "string" || typeof repo !== "string" || typeof pullRequestNumber !== "number") return null;
   return {
     activityId: row.id,
@@ -276,6 +487,7 @@ export async function loadAttachedBoardLandingProof(
       pullRequestNumber,
       mergeCommitSha: typeof mergeCommitSha === "string" ? mergeCommitSha : null,
       headSha: typeof headSha === "string" ? headSha : null,
+      repositoryId: typeof repositoryId === "number" ? repositoryId : null,
     },
   };
 }

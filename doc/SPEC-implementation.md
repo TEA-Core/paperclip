@@ -331,7 +331,16 @@ done guard refuses the close for such another reason, the call is refused 409
 the proof live against GitHub before it records anything. The PR must be merged,
 the supplied sha must match the PR, the repository must be the card's project
 repository, and the merge commit must be contained in the card's control-plane
-base branch. A failed check is a typed 4xx refusal. `landing_proof_not_on_base`
+base branch. The live repository identity must be the card's repository. GitHub
+must resolve the name to the same full name, so a renamed or transferred
+repository is refused. The PR's base repository must carry the same immutable
+repository id. The attach records that id, and the close re-checks it
+(`landing_proof_repo_identity_mismatch`). The PR must be this card's own
+delivery. A `pull_request` work product on the card that the attach did not
+create, or a linked external object, can link the PR. A delivery commit recorded
+on the card can also tie it, when the PR head or merge commit contains that
+commit. A head branch that names the card can also tie it. Otherwise the call is
+refused `landing_proof_not_card_delivery`. The close re-checks this tie too. A failed check is a typed 4xx refusal. `landing_proof_not_on_base`
 means a readable compare showed the merge commit outside the base branch. A
 network error, a non-OK GitHub answer or an unresolvable base branch is
 `landing_proof_unverifiable`, which may succeed on retry. A success records an
