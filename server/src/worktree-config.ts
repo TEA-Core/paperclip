@@ -201,9 +201,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   };
   const mainHomes = [path.join(os.homedir(), ".paperclip")];
   const operatorHome = operatorOrLayout("PAPERCLIP_HOME");
-  // Re-exporting a default identity does not make the main database a worktree.
   const exportedWorktreeHome = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
-    instanceId !== "default" && operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
+    operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
   if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
   const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
   const parent = path.dirname(path.dirname(stateRoot));
@@ -224,6 +223,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     const registered = readWorktreePortRegistry(fallback.homeDir);
     for (const entry of readWorktreePortRegistry(candidate.homeDir)) registered.add(entry);
     const siblings = collectSiblingWorktreePorts(candidate, registered).configPaths;
+    const instanceConfigPath = path.join(candidate.instanceRoot, "config.json");
+    siblings.add(instanceConfigPath);
     // Conventional sibling worktrees need not have booted into the registry yet.
     // Without a listing, refuse reusable claims and require path-derived identity.
     if (parentEntries === null && !pathBoundIdentity) return true;
@@ -234,7 +235,8 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
       if (path.resolve(configPath) === plan.configPath) continue;
       try {
         const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as PaperclipConfig;
-        const dataDir = config.database?.embeddedPostgresDataDir;
+        const dataDir = config.database?.embeddedPostgresDataDir ??
+          (configPath === instanceConfigPath ? candidate.embeddedPostgresDataDir : undefined);
         if (dataDir && isPathInside(resolveHomeAwarePath(dataDir), candidate.instanceRoot)) return true;
       } catch {
         // Missing or malformed sibling configs do not claim an instance.

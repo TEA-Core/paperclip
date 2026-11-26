@@ -816,12 +816,12 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     }
   });
 
-  it("refuses a custom main database after importing real worktree env exports (N2)", async () => {
+  it.each(["default", "dev"])("refuses a custom main %s database after importing real worktree env exports (N2)", async (mainId) => {
     const fixture = await makeWorktreeFixture({});
     try {
       process.env.HOME = path.join(fixture.root, "home");
       const mainHome = path.join(fixture.root, "custom-main-home");
-      const mainRoot = path.join(mainHome, "instances", "default");
+      const mainRoot = path.join(mainHome, "instances", mainId);
       const mainConfigPath = path.join(mainRoot, "config.json");
       const mainConfig = JSON.stringify(buildLegacyConfig(mainRoot), null, 2) + "\n";
       fs.mkdirSync(mainRoot, { recursive: true });
@@ -829,7 +829,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       fs.writeFileSync(fixture.configPath, mainConfig);
       const contents = envFileContents({
         PAPERCLIP_HOME: mainHome,
-        PAPERCLIP_INSTANCE_ID: "default",
+        PAPERCLIP_INSTANCE_ID: mainId,
         PAPERCLIP_CONFIG: fixture.configPath,
         PAPERCLIP_CONTEXT: path.join(mainHome, "context.json"),
         PAPERCLIP_IN_WORKTREE: "true",
