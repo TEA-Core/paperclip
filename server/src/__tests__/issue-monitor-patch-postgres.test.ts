@@ -175,6 +175,64 @@ describePostgres("monitor PATCH persisted authorization", () => {
     expect((await stored(issue.id)).monitorNextCheckAt).toEqual(new Date(monitor.nextCheckAt));
   });
 
+  it.each(["done", "cancelled"])("records a future verification lost when closing as %s", async (status) => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { ...monitor, recoveryPolicy: "wake_owner", notes: "Verify deployment tomorrow" } },
+      monitorNextCheckAt: new Date(monitor.nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status,
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      actorType: "agent", actorId: actor.agentId, agentId: actor.agentId, runId: actor.runId,
+      details: {
+        previousNextCheckAt: monitor.nextCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+        notes: "Verify deployment tomorrow",
+      },
+    });
+  });
+
+  it.each(["done", "cancelled"])("clears a past-due watchdog on %s without a disposition", async (status) => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    const nextCheckAt = "2020-01-01T00:00:00.000Z";
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { nextCheckAt, recoveryPolicy: "wake_owner" } },
+      monitorNextCheckAt: new Date(nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status,
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]!.details).toEqual({
+      identifier: issue.identifier,
+      previousNextCheckAt: nextCheckAt,
+      reason: status,
+      notes: null,
+    });
+  });
+
   it.each([
     { principal: "board", spelling: "alias", value: monitor },
     { principal: "board", spelling: "alias", value: null },

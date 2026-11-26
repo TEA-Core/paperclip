@@ -23264,6 +23264,10 @@ export function issueRoutes(
         },
       });
     } else if (!nextMonitor.nextCheckAt && previousMonitor.nextCheckAt) {
+      const lostFutureCheck =
+        existing.status !== issue.status &&
+        (issue.status === "done" || issue.status === "cancelled") &&
+        Date.parse(previousMonitor.nextCheckAt) > issue.updatedAt.getTime();
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -23278,7 +23282,8 @@ export function issueRoutes(
         details: {
           identifier: issue.identifier,
           previousNextCheckAt: previousMonitor.nextCheckAt,
-          reason: nextMonitor.clearReason ?? "manual",
+          reason: lostFutureCheck ? "cleared_by_close_future_check" : nextMonitor.clearReason ?? "manual",
+          ...(lostFutureCheck ? { recoveryPolicy: previousMonitor.recoveryPolicy } : {}),
           notes: previousMonitor.notes,
         },
       });
