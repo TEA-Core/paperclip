@@ -8,6 +8,7 @@ import type { Config } from "../config.js";
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
+const OWN_DATABASE_URL = "postgresql://worktree-own-database.invalid/paperclip";
 
 // Representative keys per class (advisor section 3.2): source selection,
 // database target, secret material, data location, code loading, plus one
@@ -789,7 +790,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
     expect(booted.loadConfig().databaseUrl).toBeUndefined();
     expect(fs.readFileSync(envPath, "utf8")).toBe("ZZ_PLAIN=declined\n");
   });
-  it("reenters a worktree with its documented shell exports", async () => {
+  it("reenters a worktree with its documented shell exports and an explicit own database", async () => {
     const fixture = await makeWorktreeFixture({});
     try {
       const exports = {
@@ -802,14 +803,69 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       };
       fs.writeFileSync(fixture.ownEnvPath, envFileContents(exports));
       Object.assign(process.env, exports);
+      process.env.DATABASE_URL = OWN_DATABASE_URL;
       operatorWorktreeLayout(fixture);
       process.chdir(fixture.worktreeRoot);
       const booted = await bootServerModules();
-      expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
+      const config = booted.loadConfig();
+      expect(config.databaseUrl).toBe(OWN_DATABASE_URL);
+      expect(config.embeddedPostgresDataDir).toBe(
         path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
       );
       expect(bootEnvReport().refusals).toEqual([]);
       expect(process.env.PAPERCLIP_HOME).toBe(fixture.isolatedHome);
+      expect(process.env.PAPERCLIP_INSTANCE_ID).toBe(fixture.worktreeName);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses exported-home reentry without an explicit own database and names the remedy", async () => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      const exports = {
+        PAPERCLIP_HOME: fixture.isolatedHome,
+        PAPERCLIP_INSTANCE_ID: fixture.worktreeName,
+        PAPERCLIP_CONFIG: fixture.configPath,
+        PAPERCLIP_CONTEXT: path.join(fixture.isolatedHome, "context.json"),
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_WORKTREE_NAME: fixture.worktreeName,
+      };
+      const contents = envFileContents(exports);
+      fs.writeFileSync(fixture.ownEnvPath, contents);
+      Object.assign(process.env, exports);
+      operatorWorktreeLayout(fixture);
+      process.chdir(fixture.worktreeRoot);
+      await expect(bootServerModules()).rejects.toThrow(/set an explicit own database for the worktree/);
+      expect(fs.readFileSync(fixture.ownEnvPath, "utf8")).toBe(contents);
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts exported-home exports onto a custom home when the operator sets an explicit own database", async () => {
+    const fixture = await makeWorktreeFixture({});
+    try {
+      process.env.HOME = path.join(fixture.root, "home");
+      const customHome = path.join(fixture.root, "custom-home");
+      const exports = {
+        PAPERCLIP_HOME: customHome,
+        PAPERCLIP_INSTANCE_ID: "dev",
+        PAPERCLIP_CONFIG: fixture.configPath,
+        PAPERCLIP_IN_WORKTREE: "true",
+      };
+      fs.writeFileSync(fixture.ownEnvPath, envFileContents(exports));
+      operatorWorktreeLayout(fixture);
+      Object.assign(process.env, exports);
+      process.env.DATABASE_URL = OWN_DATABASE_URL;
+      process.chdir(fixture.worktreeRoot);
+      const booted = await bootServerModules();
+      expect(bootEnvReport().refusals).toEqual([]);
+      expect(booted.loadConfig().databaseUrl).toBe(OWN_DATABASE_URL);
+      expect(process.env.PAPERCLIP_HOME).toBe(customHome);
+      expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("dev");
     } finally {
       process.chdir(ORIGINAL_CWD);
       fs.rmSync(fixture.root, { recursive: true, force: true });
@@ -817,10 +873,13 @@ describe("boot env source x key matrix (SUP-24365)", () => {
   });
 
   it.each([
-    { mainId: "default", configInRoot: true },
-    { mainId: "dev", configInRoot: true },
-    { mainId: "default", configInRoot: false },
-  ])("refuses a custom main $mainId database after importing real worktree env exports (N2, config in root: $configInRoot)", async ({ mainId, configInRoot }) => {
+    { mainId: "default", configInRoot: true, ownDatabase: false },
+    { mainId: "dev", configInRoot: true, ownDatabase: false },
+    { mainId: "default", configInRoot: false, ownDatabase: false },
+    { mainId: "dev", configInRoot: false, ownDatabase: false },
+    { mainId: "default", configInRoot: false, ownDatabase: true },
+    { mainId: "dev", configInRoot: true, ownDatabase: true },
+  ])("refuses a custom main $mainId database after importing real worktree env exports (N2, config in root: $configInRoot, own database: $ownDatabase)", async ({ mainId, configInRoot, ownDatabase }) => {
     const fixture = await makeWorktreeFixture({});
     try {
       process.env.HOME = path.join(fixture.root, "home");
@@ -854,9 +913,14 @@ describe("boot env source x key matrix (SUP-24365)", () => {
         timeout: 20_000,
       })) as Record<string, string>;
       Object.assign(process.env, exports);
+      if (ownDatabase) process.env.DATABASE_URL = OWN_DATABASE_URL;
       process.chdir(fixture.worktreeRoot);
       const booted = await bootServerModules();
-      expect(bootEnvReport().refusals.some((refusal) => refusal.kind === "identity")).toBe(true);
+      const identityRefusals = bootEnvReport().refusals.filter((refusal) => refusal.kind === "identity");
+      expect(identityRefusals).not.toEqual([]);
+      expect(identityRefusals.some((refusal) => refusal.message.includes("set an explicit own database"))).toBe(
+        mainId !== "default" && !ownDatabase,
+      );
       expect(booted.loadConfig().embeddedPostgresDataDir).toBe(
         path.join(fixture.isolatedHome, "instances", fixture.worktreeName, "db"),
       );
@@ -886,6 +950,7 @@ describe("boot env source x key matrix (SUP-24365)", () => {
       process.env.PAPERCLIP_HOME = mainHome;
       process.env.PAPERCLIP_INSTANCE_ID = fixture.worktreeName;
       process.env.PAPERCLIP_CONFIG = fixture.configPath;
+      process.env.DATABASE_URL = OWN_DATABASE_URL;
       if (exportedFlag) process.env.PAPERCLIP_IN_WORKTREE = "true";
       process.chdir(fixture.worktreeRoot);
       const booted = await bootServerModules();

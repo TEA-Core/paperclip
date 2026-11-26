@@ -205,8 +205,13 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
   };
   const mainHomes = [path.join(os.homedir(), ".paperclip")];
   const operatorHome = operatorOrLayout("PAPERCLIP_HOME");
-  const exportedWorktreeHome = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
+  const exportedHomeMatch = operatorEnvValue("PAPERCLIP_IN_WORKTREE") === "true" &&
     instanceId !== "default" && operatorHome !== null && resolveHomeAwarePath(operatorHome) === homeDir;
+  const explicitOwnDatabase = operatorOrLayout("DATABASE_URL") !== null;
+  const exportedWorktreeHome = exportedHomeMatch && explicitOwnDatabase;
+  const remedy = exportedHomeMatch && !explicitOwnDatabase
+    ? "; set an explicit own database for the worktree with an operator DATABASE_URL"
+    : "";
   if (operatorHome && !exportedWorktreeHome) mainHomes.push(resolveHomeAwarePath(operatorHome));
   const stateRoot = /^uid-\d+$/.test(path.basename(plan.stateDir)) ? path.dirname(plan.stateDir) : plan.stateDir;
   const parent = path.dirname(path.dirname(stateRoot));
@@ -254,7 +259,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_WORKTREE_NAME"].some((key) => staged(key) !== null);
   if (parentEntries !== null || ownIdentityClaim) refuseBootEnv({
     kind: "identity", path: fallback.envPath,
-    message: "PAPERCLIP_HOME, PAPERCLIP_INSTANCE_ID or PAPERCLIP_WORKTREE_NAME does not identify an isolated worktree",
+    message: `PAPERCLIP_HOME, PAPERCLIP_INSTANCE_ID or PAPERCLIP_WORKTREE_NAME does not identify an isolated worktree${remedy}`,
   });
   if (!unsafe(fallback)) return fallback;
   // A colliding operator/layout name also cannot adopt another worktree's data.
@@ -267,7 +272,7 @@ function resolveWorktreeRuntimeContext(): WorktreeRuntimeContext | null {
     storageDir: path.join(isolatedRoot, "data", "storage"),
     secretsKeyFilePath: path.join("/etc/paperclip/worktrees", isolatedId, "master.key"),
   };
-  if (unsafe(isolated)) throw new Error("No isolated worktree identity is available");
+  if (unsafe(isolated)) throw new Error(`No isolated worktree identity is available${remedy}`);
   return isolated;
 }
 

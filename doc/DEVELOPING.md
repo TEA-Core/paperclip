@@ -1050,7 +1050,14 @@ config-path-derived suffix; if no safe identity exists, boot refuses.
 Explicit operator instance IDs take precedence over own-file IDs, subject to
 the same isolation checks. Matching shell exports with `PAPERCLIP_IN_WORKTREE=true`
 identify the already-selected `PAPERCLIP_HOME` as the worktree home, rather than
-the main home, only for a non-`default` instance. An instance whose own
+the main home, only for a non-`default` instance whose operator environment also
+sets an explicit own database (`DATABASE_URL`). Without one, the worktree's
+database would be the embedded default under that home, which may belong to a
+main instance whose config lives elsewhere, so boot refuses and names the remedy:
+set an explicit own database for the worktree. This is a compatibility change:
+re-entering a worktree after `eval "$(paperclipai worktree env)"` now also needs
+`DATABASE_URL`, or unset `PAPERCLIP_HOME` to use layout-derived isolation. A
+file's `DATABASE_URL` does not count. An instance whose own
 `instances/<id>/config.json` resolves its database inside that instance root is
 a main instance, whatever its ID, so exporting its identity never permits a
 worktree to reuse its database.
