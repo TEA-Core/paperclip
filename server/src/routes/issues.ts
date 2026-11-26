@@ -216,7 +216,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
-import { redactIssueCommentBody } from "../services/issues.js";
+import { recordedLostFutureMonitorCheck, redactIssueCommentBody } from "../services/issues.js";
 import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
 import {
@@ -23267,12 +23267,7 @@ export function issueRoutes(
     } else if (
       !nextMonitor.nextCheckAt &&
       previousMonitor.nextCheckAt &&
-      !(
-        existing.status !== issue.status &&
-        (issue.status === "done" || issue.status === "cancelled") &&
-        existing.monitorNextCheckAt &&
-        existing.monitorNextCheckAt.getTime() > issue.updatedAt.getTime()
-      )
+      !recordedLostFutureMonitorCheck(issue)
     ) {
       await logActivity(db, {
         companyId: issue.companyId,

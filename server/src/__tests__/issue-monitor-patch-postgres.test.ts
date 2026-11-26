@@ -238,6 +238,37 @@ describePostgres("monitor PATCH persisted authorization", () => {
     });
   });
 
+  it("writes one clear row when a future check is armed between the close read and the row lock", async () => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    const pastDueCheckAt = "2020-01-01T00:00:00.000Z";
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { nextCheckAt: pastDueCheckAt, recoveryPolicy: "wake_owner" } },
+      monitorNextCheckAt: new Date(pastDueCheckAt),
+    }).where(eq(issues.id, issue.id));
+    interleave.afterRead = async () => {
+      await db.update(issues).set({
+        executionPolicy: { monitor: { ...monitor, recoveryPolicy: "wake_owner" } },
+        monitorNextCheckAt: new Date(monitor.nextCheckAt),
+      }).where(eq(issues.id, issue.id));
+    };
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status: "done",
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+    });
+    const clears = (await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id)))
+      .filter((row) => row.action === "issue.monitor_cleared");
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    expect(clears).toHaveLength(1);
+    expect(clears[0]!.details).toMatchObject({
+      previousNextCheckAt: monitor.nextCheckAt,
+      reason: "cleared_by_close_future_check",
+    });
+  });
+
   it("records a future verification lost when a review approval comment closes the issue", async () => {
     const { issue, approver } = await seed();
     const stageId = randomUUID();
