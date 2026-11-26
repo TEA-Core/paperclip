@@ -55,6 +55,15 @@ assignment is denied, the run falls back to a fresh copy behind a `0700` run
 directory and its receipt does not claim group staging. Without an assignable
 group the run also stays private. Both private paths keep only owner permission
 bits on all staged entries; no canonical group/world permission bits are copied.
+Remote SSH and sandbox restores use the same rule: the run directory closes
+before the transport writes any bytes, then the permission walk removes remote
+group/world write bits before the run directory opens again. Restore-created
+directories have the staged directory mode, never a published `02775`.
+The permission walk rejects hard links and changed inode identities. It opens
+entries without following symlinks, pins parent directories through the host's
+fd filesystem (`/proc/self/fd` on Linux, `/dev/fd` elsewhere), and changes modes
+and groups through file handles. If the fd filesystem cannot verify an entry,
+preparation or restoration fails closed; there is no path-based mutation fallback.
 Staging never changes canonical files: a file still at its staged mode is saved
 with its canonical mode; only a mode the run itself set is saved. Receipts record
 the staging formula version, so copies staged by the earlier group build (`0640`

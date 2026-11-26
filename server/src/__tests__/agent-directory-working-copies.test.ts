@@ -19,7 +19,7 @@ import { buildNativeRuntimeContext } from "../services/native-runtime/runtime-co
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
-import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { mergeDirectoryWithBaseline, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
 
 describe("persistent agent directories", () => {
@@ -115,6 +115,187 @@ describe("persistent agent directories", () => {
     }
   }
 
+  // Observe the permission boundary, whether mutation uses paths or handles.
+  function observeChmod(apply: (filename: string, mode: Parameters<typeof fs.chmod>[1], chmod: () => Promise<void>) => Promise<void>) {
+    const chmod = fs.chmod.bind(fs), open = fs.open.bind(fs);
+    const paths = vi.spyOn(fs, "chmod").mockImplementation((filename, mode) =>
+      apply(String(filename), mode, () => chmod(filename, mode)));
+    const handles = vi.spyOn(fs, "open").mockImplementation(async (filename, flags, mode) => {
+      const observed = String(filename).startsWith("/proc/self/fd/") || String(filename).startsWith("/dev/fd/")
+        ? await fs.realpath(filename) : String(filename);
+      const handle = await open(filename, flags, mode);
+      const chmod = handle.chmod.bind(handle);
+      vi.spyOn(handle, "chmod").mockImplementation(mode =>
+        apply(observed, mode, () => chmod(mode)));
+      return handle;
+    });
+    return { mockRestore() { paths.mockRestore(); handles.mockRestore(); } };
+  }
+
+  it("closes a published run before crash-recovery restaging copies writable canonical modes", async () => {
+    await fs.writeFile(path.join(root, "writable.md"), "canonical");
+    await fs.chmod(path.join(root, "writable.md"), 0o666);
+    const copy = await withAgentsGid(process.getegid!(), () => run());
+    expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o750);
+    await db.update(agentInstructionWorkingCopies).set({ state: "preparing" })
+      .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    const cp = fs.cp.bind(fs);
+    let restaged = false;
+    const copying = vi.spyOn(fs, "cp").mockImplementation(async (source, destination, options) => {
+      if (String(destination) === copy.localRoot) {
+        expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o700);
+        restaged = true;
+      }
+      return cp(source, destination, options);
+    });
+    try {
+      const recovered = await withAgentsGid(process.getegid!(), () =>
+        copies.prepare({ ...target(), runId: copy.runId, cwd: home }));
+      expect(restaged).toBe(true);
+      expect(recovered?.state).toBe("prepared");
+      expect((await fs.stat(path.join(copy.localRoot, "writable.md"))).mode & 0o7777).toBe(0o640);
+    } finally { copying.mockRestore(); }
+  });
+
+  it("removes partially applied parent sharing after a permission failure", async () => {
+    const sync = path.join(path.dirname(root), "file-sync");
+    await fs.mkdir(sync, { recursive: true });
+    await fs.chmod(sync, 0o775);
+    let denied = false;
+    const permissions = observeChmod(async (filename, mode, chmod) => {
+      await chmod();
+      if (filename === sync && mode === 0o750 && !denied) {
+        denied = true;
+        throw Object.assign(new Error("partial permission assignment"), { code: "EPERM" });
+      }
+    });
+    try {
+      const copy = await withAgentsGid(process.getegid!(), () => run());
+      expect(denied).toBe(true);
+      expect(copy.receipt?.stagedGid).toBeUndefined();
+      expect((await fs.stat(sync)).mode & 0o7777).toBe(0o700);
+      expect((await fs.stat(path.dirname(copy.localRoot))).mode & 0o7777).toBe(0o700);
+    } finally { permissions.mockRestore(); }
+  });
+
+  it("refuses a hard link planted after copying without changing its outside inode", async () => {
+    const outside = path.join(home, "hardlink-outside.md");
+    await fs.writeFile(outside, "outside");
+    await fs.chmod(outside, 0o664);
+    const before = await fs.stat(outside);
+    const cp = fs.cp.bind(fs);
+    const planting = vi.spyOn(fs, "cp").mockImplementation(async (source, destination, options) => {
+      await cp(source, destination, options);
+      if (path.basename(String(destination)) === "live") await fs.link(outside, path.join(String(destination), "planted.md"));
+    });
+    try {
+      await expect(withAgentsGid(process.getegid!(), () => run())).rejects.toThrow(/link/i);
+      const after = await fs.stat(outside);
+      expect(after.mode).toBe(before.mode);
+      expect(after.gid).toBe(before.gid);
+    } finally { planting.mockRestore(); }
+  });
+
+  it("refuses a directory swapped for an outside symlink between lookup and permission mutation", async () => {
+    await writeShared();
+    const outside = path.join(home, "swap-outside");
+    await fs.mkdir(outside, { mode: 0o700 });
+    await fs.writeFile(path.join(outside, "private.md"), "outside", { mode: 0o640 });
+    const before = await fs.stat(outside), childBefore = await fs.stat(path.join(outside, "private.md"));
+    const cp = fs.cp.bind(fs), lstat = fs.lstat.bind(fs);
+    let armed = false, swapped = false;
+    const copying = vi.spyOn(fs, "cp").mockImplementation(async (source, destination, options) => {
+      await cp(source, destination, options);
+      if (path.basename(String(destination)) === "live") armed = true;
+    });
+    const swapping = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+      const stat = await lstat(...args);
+      const filename = String(args[0]);
+      if (armed && !swapped && filename.endsWith(`${path.sep}doctrine`)) {
+        swapped = true;
+        await fs.rename(filename, path.join(home, "detached-doctrine"));
+        await fs.symlink(outside, filename);
+      }
+      return stat;
+    });
+    try {
+      await expect(withAgentsGid(process.getegid!(), () => run())).rejects.toThrow();
+      expect(swapped).toBe(true);
+      const after = await fs.stat(outside), childAfter = await fs.stat(path.join(outside, "private.md"));
+      expect([after.mode, after.gid, childAfter.mode, childAfter.gid])
+        .toEqual([before.mode, before.gid, childBefore.mode, childBefore.gid]);
+    } finally { copying.mockRestore(); swapping.mockRestore(); }
+  });
+
+  it.each([
+    { transport: "ssh", entries: "files" }, { transport: "ssh", entries: "directories" },
+    { transport: "sandbox", entries: "files" }, { transport: "sandbox", entries: "directories" },
+  ] as const)("hardens $transport restored $entries before saved bytes can be reached by the agents group", async ({ transport, entries }) => {
+    const previousUmask = process.umask();
+    const remoteCwd = path.join(home, `restore-${transport}-${entries}`);
+    await fs.mkdir(remoteCwd);
+    const executionTarget = transport === "ssh"
+      ? { kind: "remote" as const, transport, environmentId: randomUUID(), remoteCwd,
+        spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd, remoteWorkspacePath: remoteCwd, privateKey: null, knownHosts: null, strictHostKeyChecking: false } }
+      : { kind: "remote" as const, transport, environmentId: randomUUID(), remoteCwd };
+    const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand")
+      .mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() });
+    const stage = vi.spyOn(ssh, "syncDirectoryToSsh").mockImplementation(async input => {
+      await fs.mkdir(path.dirname(input.remoteDir), { recursive: true });
+      await fs.cp(input.localDir, input.remoteDir, { recursive: true });
+    });
+    const restore = vi.spyOn(ssh, "restoreWorkspaceFromSshExecution").mockImplementation(async input => {
+      expect((await fs.stat(path.dirname(input.localDir))).mode & 0o7777).toBe(0o700);
+      await mergeDirectoryWithBaseline({ baseline: input.baselineSnapshot!, sourceDir: input.remoteDir!, targetDir: input.localDir });
+    });
+    const runtime = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+      const remote = input.workspaceRemoteDir!;
+      await fs.mkdir(path.dirname(remote), { recursive: true });
+      await fs.cp(input.workspaceLocalDir, remote, { recursive: true });
+      return { target: executionTarget, workspaceRemoteDir: remote, runtimeRootDir: null,
+        assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+        restoreWorkspace: async () => {
+          expect((await fs.stat(path.dirname(input.workspaceLocalDir))).mode & 0o7777).toBe(0o700);
+          await mergeDirectoryWithBaseline({ baseline: input.workspaceBaseline!, sourceDir: remote, targetDir: input.workspaceLocalDir });
+        } };
+    });
+    const rename = fs.rename.bind(fs);
+    let observed: Record<string, number> | undefined;
+    let live: string | undefined;
+    const saving = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (live && String(destination).startsWith(`${root}${path.sep}`)) {
+        // The canonical save consumes this tree. Check it before the save, not
+        // after cleanup or after canonical mode mapping has hidden the defect.
+        const names = entries === "files" ? [entryFile, "created.md", "newdir/tool.sh"] : ["newdir"];
+        observed = {};
+        for (const relative of names) observed[relative] = (await fs.stat(path.join(live, relative))).mode & 0o7777;
+      }
+      return rename(source, destination);
+    });
+    try {
+      process.umask(0o002);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const copy = (await withAgentsGid(process.getegid!(), () =>
+        copies.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget })))!;
+      live = copy.localRoot;
+      await fs.writeFile(path.join(copy.executionRoot, entryFile), "remote edit");
+      await fs.chmod(path.join(copy.executionRoot, entryFile), 0o664);
+      await fs.writeFile(path.join(copy.executionRoot, "created.md"), "remote new", { mode: 0o664 });
+      await fs.mkdir(path.join(copy.executionRoot, "newdir"), { mode: 0o775 });
+      await fs.writeFile(path.join(copy.executionRoot, "newdir/tool.sh"), "#!/bin/sh\n", { mode: 0o775 });
+      const result = await copies.collectStopped({ companyId, runId, target: executionTarget });
+      expect(observed).toEqual(entries === "files"
+        ? { [entryFile]: 0o640, "created.md": 0o640, "newdir/tool.sh": 0o750 } : { newdir: 0o2750 });
+      expect(result?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe("remote edit");
+      expect(await fs.readFile(path.join(root, "newdir/tool.sh"), "utf8")).toBe("#!/bin/sh\n");
+    } finally {
+      saving.mockRestore(); runtime.mockRestore(); restore.mockRestore(); stage.mockRestore(); shell.mockRestore();
+      process.umask(previousUmask);
+    }
+  });
+
   it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
     const gid = process.getegid!();
     const previousUmask = process.umask();
@@ -165,10 +346,9 @@ describe("persistent agent directories", () => {
       "private.md": 0o600, "private.sh": 0o700, "world-read.md": 0o600, "writable.md": 0o640 };
     // Explicitly avoid depending on the host umask for the configured entry.
     await fs.chmod(path.join(root, entryFile), 0o644);
-    const chmod = fs.chmod.bind(fs);
     const previousUmask = process.umask();
     let published = false;
-    const publishing = vi.spyOn(fs, "chmod").mockImplementation(async (filename, mode) => {
+    const publishing = observeChmod(async (filename, mode, chmod) => {
       const name = String(filename);
       const runDir = name.split(`${path.sep}live`)[0]!;
       if (name.includes(`${path.sep}live`)) {
@@ -192,7 +372,7 @@ describe("persistent agent directories", () => {
         await check(path.join(name, "live"));
         published = true;
       }
-      return chmod(filename, mode);
+      return chmod();
     });
     try {
       process.umask(umask);
@@ -471,10 +651,9 @@ describe("persistent agent directories", () => {
     await writeShared();
     await fs.writeFile(path.join(root, "notes.md"), "before");
     await fs.chmod(path.join(root, "notes.md"), 0o644);
-    const chmod = fs.chmod.bind(fs);
-    const denied = vi.spyOn(fs, "chmod").mockImplementation(async (filename, mode) => {
+    const denied = observeChmod(async (filename, mode, chmod) => {
       if (String(filename).endsWith(`${path.sep}doctrine`) && mode === 0o2750) throw Object.assign(new Error("denied"), { code });
-      return chmod(filename, mode);
+      return chmod();
     });
     let copy;
     try { copy = await withAgentsGid(process.getegid!(), () => run()); } finally { denied.mockRestore(); }
@@ -489,7 +668,7 @@ describe("persistent agent directories", () => {
     expect((await fs.stat(path.join(root, "notes.md"))).mode & 0o7777).toBe(0o640);
   });
 
-  it("does not change external targets of symlinks encountered while staging permissions", async () => {
+  it("rejects symlinks encountered while staging permissions without changing their external targets", async () => {
     const outside = await fs.mkdtemp(path.join(os.tmpdir(), "agent-copy-outside-"));
     const filename = path.join(outside, "private.md");
     await fs.writeFile(filename, "outside", { mode: 0o600 });
@@ -503,9 +682,7 @@ describe("persistent agent directories", () => {
       await fs.symlink(filename, path.join(String(args[1]), "external-file"));
     });
     try {
-      const copy = await run();
-      expect((await fs.lstat(path.join(copy.localRoot, "external-directory"))).isSymbolicLink()).toBe(true);
-      expect((await fs.lstat(path.join(copy.localRoot, "external-file"))).isSymbolicLink()).toBe(true);
+      await expect(run()).rejects.toThrow(/link/i);
       const afterDirectory = await fs.stat(outside);
       const afterFile = await fs.stat(filename);
       expect(afterDirectory.mode).toBe(beforeDirectory.mode);

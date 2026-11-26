@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -50,20 +51,38 @@ const STAGED_MODE_VERSION = 3;
 const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
 const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
 
-async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
-  const stat = await fs.lstat(filename);
-  if (stat.isSymbolicLink()) return;
-  if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  if (gid !== null && stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
-  // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  const owner = stat.mode & 0o700;
-  const mode = gid === null ? owner : stat.isDirectory()
-    ? owner | ((owner >> 3) & 0o050) | (recursive ? 0o2000 : 0)
-    : stagedMode(stat.mode) & 0o7777;
-  if (gid !== null || mode !== (stat.mode & 0o7777)) await fs.chmod(filename, mode);
-  if (recursive && stat.isDirectory()) {
-    for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
-  }
+async function workingCopyPermissions(filename: string, gid: number | null, recursive = true, parentFd?: number): Promise<void> {
+  // Pin each parent while walking. O_NOFOLLOW alone protects only the leaf,
+  // not an ancestor replaced between lookup and open.
+  const fdRoot = process.platform === "linux" ? "/proc/self/fd" : "/dev/fd";
+  const entryPath = parentFd === undefined ? filename : path.join(fdRoot, String(parentFd), path.basename(filename));
+  const expected = await fs.lstat(entryPath);
+  if (!expected.isDirectory() && !expected.isFile()) throw new Error("Agent working copy contains a link or non-regular entry");
+  const handle = await fs.open(entryPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
+    (expected.isDirectory() ? constants.O_DIRECTORY : 0));
+  try {
+    const stat = await handle.stat();
+    if (stat.dev !== expected.dev || stat.ino !== expected.ino || stat.isFile() && stat.nlink !== 1) {
+      throw new Error("Agent working copy entry changed or contains a hard link");
+    }
+    // Fail closed when the fd filesystem is unavailable; never fall back to a
+    // path-based chown/chmod. Also reject a parent moved out of the live tree.
+    if (await fs.realpath(path.join(fdRoot, String(handle.fd))) !== await fs.realpath(filename)) {
+      throw new Error("Agent working copy entry moved during permission assignment");
+    }
+    if (gid !== null && stat.gid !== gid) await handle.chown(stat.uid, gid);
+    // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
+    const owner = stat.mode & 0o700;
+    const mode = gid === null ? owner : stat.isDirectory()
+      ? owner | ((owner >> 3) & 0o050) | (recursive ? 0o2000 : 0)
+      : stagedMode(stat.mode) & 0o7777;
+    if (gid !== null || mode !== (stat.mode & 0o7777)) await handle.chmod(mode);
+    if (recursive && stat.isDirectory()) {
+      for (const entry of await fs.readdir(path.join(fdRoot, String(handle.fd)))) {
+        await workingCopyPermissions(path.join(filename, entry), gid, true, handle.fd);
+      }
+    }
+  } finally { await handle.close(); }
 }
 
 const permissionDenied = (error: unknown) => ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "");
@@ -315,7 +334,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         runtime = await transport(row, target, true);
         transports.set(key(row), runtime);
       }
+      // The restore helper preserves remote modes and mkdir's umask. Fence the
+      // entire apply, including its temporary files, until the staging rule has
+      // removed non-owner write access from every restored entry.
+      const runDir = path.dirname(row.localRoot);
+      await fs.chmod(runDir, 0o700);
       await runtime.restoreWorkspace();
+      const gid = typeof row.receipt?.stagedGid === "number" ? row.receipt.stagedGid : null;
+      await workingCopyPermissions(row.localRoot, gid);
+      if (gid !== null) await workingCopyPermissions(runDir, gid, false);
     }
     return inspectAgentDirectory(row.localRoot);
   }
