@@ -317,7 +317,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
     const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
     expect(clears).toHaveLength(1);
     expect(clears[0]).toMatchObject({
-      actorType: "agent", actorId: approver.id, agentId: approver.id,
+      actorType: "agent", actorId: approver.id, agentId: approver.id, runId: approverRun!.id,
       details: {
         previousNextCheckAt: monitor.nextCheckAt,
         recoveryPolicy: "wake_owner",

@@ -25464,6 +25464,8 @@ export function issueRoutes(
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId ?? null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
         },
         // SUP-17552: a final-stage escalation approval closes the card (the
         // guard above already allowed it); a non-final stage still only advances
@@ -25943,6 +25945,9 @@ export function issueRoutes(
                       userId:
                         actor.actorType === "user" ? actor.actorId : null,
                       runId: actor.runId,
+                      agentApiKeyId: actor.agentApiKeyId ?? null,
+                      boardApiKeyId:
+                        actor.actorType === "user" ? actor.boardApiKeyId : null,
                     },
                     deferredPostCommit: rejectDeferredPostCommit,
                     skipStatusCompare: true,
@@ -27382,6 +27387,7 @@ export function issueRoutes(
           ? { workflowControlledAssignment: true }
           : {}),
         actorAgentId: actor.agentId ?? null,
+        actorRunId: actor.agentId ? actor.runId ?? null : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         actorAgentApiKeyId: actor.agentApiKeyId ?? null,
         boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
