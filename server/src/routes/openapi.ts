@@ -1726,6 +1726,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/recovery-carrier-park/candidate",
   "POST /api/issues/{id}/recovery-carrier-park",
   "POST /api/issues/{id}/recovery-carrier-park/{holdId}/release",
+  "POST /api/issues/{id}/recovery/external-pull-exemption/clear",
   "POST /api/issues/{id}/tree-control/preview",
   "POST /api/issues/{id}/tree-holds",
   "POST /api/issues/{id}/tree-holds/{holdId}/release",
@@ -8631,6 +8632,17 @@ registry.registerPath({
     body: jsonBody(releaseRecoveryCarrierParkSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery/external-pull-exemption/clear",
+  tags: ["issues"],
+  summary: "Clear the external-pull recovery exemption for one issue by board decision",
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: { 201: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

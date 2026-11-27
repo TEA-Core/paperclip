@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   companies,
@@ -15,6 +18,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.ts";
+import {
+  EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
+  EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS,
+} from "../services/recovery/external-pull-exemption.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -161,6 +168,44 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     await db.update(agents).set({ status }).where(eq(agents.id, agentId));
   }
 
+  // Moves the card's last activity past the exemption age bound.
+  async function ageCardPastExemption(issueId: string) {
+    await db
+      .update(issues)
+      .set({ updatedAt: new Date(Date.now() - EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS - 60 * 60_000) })
+      .where(eq(issues.id, issueId));
+  }
+
+  async function createRouteApp(actor: Record<string, unknown>) {
+    const { errorHandler } = await import("../middleware/index.js");
+    const { issueTreeControlRoutes } = await import("../routes/issue-tree-control.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: Record<string, unknown> }).actor = actor;
+      next();
+    });
+    app.use("/api", issueTreeControlRoutes(db));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function boardActor(companyId: string) {
+    return { type: "board", userId: "board-user", source: "session", isInstanceAdmin: false, companyIds: [companyId] };
+  }
+
+  async function clearExemptionAsBoard(companyId: string, issueId: string) {
+    const app = await createRouteApp(boardActor(companyId));
+    const res = await request(app).post(`/api/issues/${issueId}/recovery/external-pull-exemption/clear`).send({});
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+  }
+
+  async function expectBoardOnlyAction(actions: Array<typeof issueRecoveryActions.$inferSelect>) {
+    expect(actions).toHaveLength(1);
+    expect(actions[0].ownerType).toBe("board");
+    expect(actions[0].ownerAgentId).toBeNull();
+  }
+
   async function expectNotReassigned(fleet: Fleet, issueId: string) {
     const issue = await issueRow(issueId);
     expect(issue?.assigneeAgentId).toBe(fleet.externalAgentId);
@@ -231,6 +276,36 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
       expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
+
+  it("stillborn backlog: surfaces a live external-pull assignee's card to the board once it is older than the exemption bound", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+    await ageCardPastExemption(issueId);
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(1);
+    expect((await issueRow(issueId))?.status).toBe("blocked");
+    await expectNotReassigned(fleet, issueId);
+    await expectBoardOnlyAction(await recoveryActionRows(issueId));
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stillborn backlog: surfaces a live external-pull assignee's card to the board after a board override", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+    await clearExemptionAsBoard(fleet.companyId, issueId);
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(1);
+    expect((await issueRow(issueId))?.status).toBe("blocked");
+    await expectNotReassigned(fleet, issueId);
+    await expectBoardOnlyAction(await recoveryActionRows(issueId));
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
 
   it("stillborn backlog: still escalates a parked card of an ordinary invoked agent", async () => {
     const fleet = await seedFleet();
@@ -303,23 +378,79 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     return { issueId, runId };
   }
 
-  it("stranded assigned issue: does not block or re-home a card of an external-pull assignee", async () => {
+  it("stranded assigned issue: keeps normal recovery for an in_progress card of a live external-pull assignee", async () => {
+    // `in_progress` is not a parked status, so the exemption does not apply.
     const fleet = await seedFleet();
     const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
+    const { svc } = makeSweep();
+
+    const result = await svc.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect((await issueRow(issueId))?.status).toBe("blocked");
+    const actions = await recoveryActionRows(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].kind).toBe("stranded_assigned_issue");
+  });
+
+  async function seedParkedReviewCard(companyId: string, assigneeAgentId: string) {
+    const { issueId } = await seedStrandedCard(companyId, assigneeAgentId);
+    await db
+      .update(issues)
+      // Past the no-live-path grace window, well inside the exemption bound.
+      .set({ status: "in_review", checkoutRunId: null, updatedAt: new Date(Date.now() - 60 * 60_000) })
+      .where(eq(issues.id, issueId));
+    return issueId;
+  }
+
+  it("stranded assigned issue: skips a parked in_review card of a live external-pull assignee", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedParkedReviewCard(fleet.companyId, fleet.externalAgentId);
     const { svc, enqueueWakeup } = makeSweep();
 
     const result = await svc.reconcileStrandedAssignedIssues();
 
-    expect(result.escalated).toBe(0);
     expect(result.issueIds).not.toContain(issueId);
-    const issue = await issueRow(issueId);
-    expect(issue?.status).toBe("in_progress");
-    expect(issue?.assigneeAgentId).toBe(fleet.externalAgentId);
+    expect((await issueRow(issueId))?.status).toBe("in_review");
+    await expectNotReassigned(fleet, issueId);
     expect(await recoveryActionRows(issueId)).toHaveLength(0);
-    expect(await recoveryChildren(issueId)).toHaveLength(0);
-    expect(await wakeRowsFor([fleet.ctoId, fleet.ceoId])).toHaveLength(0);
-    expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ctoId);
-    expect(wokenAgentIds(enqueueWakeup)).not.toContain(fleet.ceoId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stranded assigned issue: surfaces a parked in_review card to the board once it is older than the exemption bound", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedParkedReviewCard(fleet.companyId, fleet.externalAgentId);
+    await ageCardPastExemption(issueId);
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect((await issueRow(issueId))?.status).toBe("in_review");
+    await expectNotReassigned(fleet, issueId);
+    const actions = await recoveryActionRows(issueId);
+    await expectBoardOnlyAction(actions);
+    expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stranded assigned issue: surfaces a parked in_review card to the board after a board override", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedParkedReviewCard(fleet.companyId, fleet.externalAgentId);
+    await clearExemptionAsBoard(fleet.companyId, issueId);
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
+    expect((await issueRow(issueId))?.status).toBe("in_review");
+    await expectNotReassigned(fleet, issueId);
+    const actions = await recoveryActionRows(issueId);
+    await expectBoardOnlyAction(actions);
+    expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each(["paused", "terminated"] as const)(
@@ -469,6 +600,61 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
       expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
+
+  it("stranded issue recovery: keeps normal recovery for an in_progress source of a live external-pull assignee", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedExhaustedBlockedCard(fleet.companyId, fleet.externalAgentId);
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    const { svc } = makeSweep();
+
+    const result = await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
+
+    expect(result.recoveryIssueMinted).toBe(1);
+    expect(await recoveryChildren(issueId)).toHaveLength(1);
+  });
+
+  it("stranded issue recovery: never mints a ladder card for a parked source even past the exemption bound", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedExhaustedBlockedCard(fleet.companyId, fleet.externalAgentId);
+    await ageCardPastExemption(issueId);
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
+
+    expect(result.recoveryIssueMinted).toBe(0);
+    await expectNotReassigned(fleet, issueId);
+    const [action] = await recoveryActionRows(issueId);
+    expect(action.ownerType).toBe("board");
+    expect(action.recoveryIssueId).toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // --- board override route -------------------------------------------------
+
+  it("board override: records the override for one card and refuses an agent actor", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+    const agentApp = await createRouteApp({
+      type: "agent",
+      agentId: fleet.externalAgentId,
+      companyId: fleet.companyId,
+      source: "agent_key",
+      runId: null,
+    });
+
+    const refused = await request(agentApp)
+      .post(`/api/issues/${issueId}/recovery/external-pull-exemption/clear`)
+      .send({});
+    expect(refused.status).toBe(403);
+
+    await clearExemptionAsBoard(fleet.companyId, issueId);
+    const rows = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].actorType).toBe("user");
+  });
 
   it("stranded issue recovery: still mints a recovery card for an ordinary invoked agent", async () => {
     const fleet = await seedFleet();

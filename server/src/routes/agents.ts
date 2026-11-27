@@ -96,6 +96,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { parseAgentWorkDelivery } from "../services/agent-work-delivery.js";
 import { resolveLiveExecutionLeases } from "../services/issue-execution-lease.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -2284,6 +2285,24 @@ export function agentRoutes(
     const nextRaw =
       asRecord(asRecord(nextRuntimeConfig)?.debug)?.providerTrace === "raw";
     if (previousRaw !== nextRaw) assertInstanceAdmin(req);
+  }
+
+  // Fork (two-fleet routing): an `external_pull` declaration exempts an agent's
+  // parked cards from recovery sweeps, so only the board may set or clear it.
+  // An agent write that changes the parsed mode is refused; other runtime
+  // settings stay writable.
+  function assertWorkDeliveryTransition(
+    req: Request,
+    nextRuntimeConfig: unknown,
+    previousRuntimeConfig?: unknown,
+  ): void {
+    if (req.actor.type !== "agent") return;
+    const next = parseAgentWorkDelivery({ runtimeConfig: asRecord(nextRuntimeConfig) ?? {} });
+    const previous = parseAgentWorkDelivery({ runtimeConfig: asRecord(previousRuntimeConfig) ?? {} });
+    if (next === previous) return;
+    throw forbidden("Only the board can change an agent's work delivery mode.", {
+      code: "agent_work_delivery_board_only",
+    });
   }
 
   async function assertAgentDefaultEnvironmentSelection(
@@ -4518,6 +4537,7 @@ export function agentRoutes(
       rollbackConfig.runtimeConfig,
       existing.runtimeConfig,
     );
+    assertWorkDeliveryTransition(req, rollbackConfig.runtimeConfig, existing.runtimeConfig);
     const rollbackAdapterType = assertKnownAdapterType(
       typeof rollbackConfig.adapterType === "string"
         ? rollbackConfig.adapterType
@@ -4688,6 +4708,7 @@ export function agentRoutes(
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
+    assertWorkDeliveryTransition(req, hireInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
       companyId,
       hireInput.adapterType,
@@ -5001,6 +5022,7 @@ export function agentRoutes(
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
+    assertWorkDeliveryTransition(req, createInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
       companyId,
       createInput.adapterType,
@@ -5705,6 +5727,7 @@ export function agentRoutes(
         runtimeConfig,
         existing.runtimeConfig,
       );
+      assertWorkDeliveryTransition(req, runtimeConfig, existing.runtimeConfig);
       requestedRuntimeConfig = runtimeConfig;
     }
     const touchesAdapterConfiguration =
