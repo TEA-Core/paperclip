@@ -3933,17 +3933,21 @@ export async function preflightFinalDelivery(
  * the final review stage arms leaves no open PR, so the decision-head resolver
  * and the SUP-22346 mention fallback both end in `no-pr`. The card's own
  * `pull_request` work products are then the delivery record, but every field
- * of it is agent-writable, so it only names the claim. When every one is MERGED
- * and the primary names a pull request and a full 40-hex
- * `metadata.mergeCommitSha`, that claim is verified live by the board landing
- * proof (verifyBoardLandingProof): the PR is merged in the card's delivery
- * repository, its merge commit is the recorded one and is on the card's base
- * branch, and board-written evidence ties it to the card. Only then is the
- * `no-pr` refusal returned with `mergedBeforeVerdict` set, and the
- * final-delivery preflight admits the verdict with no certified head. No work
- * product, or any work product that is not merged, returns the refusal
- * unchanged. Every other gap or landing-proof refusal keeps refusing, with a
- * remedy that names it.
+ * of it is agent-writable, so it only names the claim. Every distinct PR the
+ * work products name is read live, and each must be: in the card's delivery
+ * repository (base and head, so not a fork), MERGED into the card's base
+ * branch, merged before this verdict, and merged at any merge commit its work
+ * product records. The primary must also record a full 40-hex
+ * `metadata.mergeCommitSha` and the reviewed head as `metadata.headSha`; the
+ * board landing proof (verifyBoardLandingProof) then verifies that the PR
+ * merged at that head and that merge commit, that the merge commit is on the
+ * card's base branch, and that board-written evidence ties the PR to the card.
+ * Only then is the `no-pr` refusal returned with `mergedBeforeVerdict` set, and
+ * the final-delivery preflight admits the verdict with no certified head. No
+ * work product, or any work product not recorded as merged, returns the
+ * refusal unchanged. Every other gap, live mismatch or GitHub failure keeps
+ * refusing, with a named `landingProofRefusal` where a live check refused and
+ * a remedy that names the gap.
  */
 async function resolveMergedBeforeVerdictLanding(
   db: Db,
@@ -3951,6 +3955,8 @@ async function resolveMergedBeforeVerdictLanding(
   issueId: string,
   refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
 ): Promise<DecisionHeadResolution> {
+  // The verdict instant, taken before any read: every PR must have merged before it.
+  const verdictAt = Date.now();
   const products = await db
     .select({
       title: issueWorkProducts.title,
@@ -3968,38 +3974,120 @@ async function resolveMergedBeforeVerdictLanding(
       ),
     );
   if (products.length === 0 || products.some((product) => product.status !== "merged")) return refusal;
+  const gap = (remedy: string): DecisionHeadResolution => ({
+    ...refusal,
+    remedy: `every linked pull_request work product is MERGED, but ${remedy} Do not open a replacement PR.`,
+  });
   const primaries = products.filter((product) => product.isPrimary);
   const primary = primaries.length === 1 ? primaries[0]! : products.length === 1 ? products[0]! : null;
   if (!primary) {
-    return {
-      ...refusal,
-      remedy:
-        "every linked pull_request work product is MERGED, but no single primary work product names the delivery. " +
-        "Mark the delivering pull_request work product primary, record its merge commit as metadata.mergeCommitSha, " +
-        "then submit the final verdict again. Do not open a replacement PR.",
-    };
+    return gap(
+      "no single primary work product names the delivery. Mark the delivering pull_request work product primary, " +
+        "record its merge commit as metadata.mergeCommitSha and its reviewed head as metadata.headSha, then submit " +
+        "the final verdict again.",
+    );
   }
   const label = primary.externalId ?? primary.title;
-  const recorded = primary.metadata?.mergeCommitSha;
-  const mergeCommitSha = typeof recorded === "string" ? recorded.trim().toLowerCase() : "";
-  if (!/^[0-9a-f]{40}$/.test(mergeCommitSha)) {
-    return {
-      ...refusal,
-      remedy:
-        `every linked pull_request work product is MERGED, but the primary work product ${label} has no recorded ` +
-        "metadata.mergeCommitSha (a full 40-hex merge commit SHA). Record its merge commit as metadata.mergeCommitSha, " +
-        "then submit the final verdict again. Do not open a replacement PR.",
-    };
+  const mergeCommitSha = readFullSha(primary.metadata?.mergeCommitSha);
+  if (!mergeCommitSha) {
+    return gap(
+      `the primary work product ${label} has no recorded metadata.mergeCommitSha (a full 40-hex merge commit SHA). ` +
+        "Record its merge commit as metadata.mergeCommitSha, then submit the final verdict again.",
+    );
   }
-  const pr = parseWorkProductPullRequest(primary.externalId, primary.metadata);
-  if (!pr) {
-    return {
-      ...refusal,
-      remedy:
-        `every linked pull_request work product is MERGED, but the primary work product ${label} names no parseable ` +
-        "pull request (externalId owner/repo#N, or metadata.repository with metadata.prNumber). Record the delivering " +
-        "pull request on that work product, then submit the final verdict again. Do not open a replacement PR.",
-    };
+  const reviewedHeadSha = readFullSha(primary.metadata?.headSha);
+  if (!reviewedHeadSha) {
+    return gap(
+      `the primary work product ${label} has no recorded metadata.headSha (the full 40-hex head SHA the review ` +
+        "approved). Record the reviewed head as metadata.headSha, then submit the final verdict again.",
+    );
+  }
+  const claims = new Map<string, {
+    pr: { owner: string; repo: string; pullRequestNumber: number };
+    label: string;
+    recordedMergeShas: Set<string>;
+  }>();
+  for (const product of products) {
+    const productLabel = product.externalId ?? product.title;
+    const pr = parseWorkProductPullRequest(product.externalId, product.metadata);
+    if (!pr) {
+      return gap(
+        `the work product ${productLabel} names no parseable pull request (externalId owner/repo#N, or ` +
+          "metadata.repository with metadata.prNumber). Record the delivering pull request on that work product, " +
+          "then submit the final verdict again.",
+      );
+    }
+    const key = `${pr.owner}/${pr.repo}#${pr.pullRequestNumber}`.toLowerCase();
+    const claim = claims.get(key) ?? { pr, label: productLabel, recordedMergeShas: new Set<string>() };
+    const recorded = product.metadata?.mergeCommitSha;
+    if (recorded !== undefined && recorded !== null) {
+      claim.recordedMergeShas.add(readFullSha(recorded) ?? String(recorded));
+    }
+    claims.set(key, claim);
+  }
+  const primaryPr = parseWorkProductPullRequest(primary.externalId, primary.metadata)!;
+  const primaryKey = `${primaryPr.owner}/${primaryPr.repo}#${primaryPr.pullRequestNumber}`.toLowerCase();
+  const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  const baseRef = await resolveCardDeliveryBaseRef(db, companyId, issueId);
+  if (!identity.repo || !baseRef) {
+    return gap(
+      "this card records no delivery repository or base branch to verify the merges against. Bind the card to its " +
+        "project repository and base branch, then submit the final verdict again.",
+    );
+  }
+  const cardRepo = `${identity.repo.owner}/${identity.repo.repo}`;
+  const liveRefusal = (claimLabel: string, pr: { owner: string; repo: string; pullRequestNumber: number }, code: string, reason: string): DecisionHeadResolution => ({
+    ...refusal,
+    landingProofRefusal: { code, reason },
+    remedy:
+      `every linked pull_request work product is MERGED, but the live GitHub check of ${claimLabel} ` +
+      `(${pr.owner}/${pr.repo}#${pr.pullRequestNumber}) refused with ${code}: ${reason}. Every linked pull request ` +
+      `must be MERGED from ${cardRepo} into the card's base branch ${baseRef} before the final verdict, at any merge ` +
+      "commit its work product records, and the primary must be merged at the reviewed head recorded as " +
+      "metadata.headSha. Fix the record, then submit the final verdict again. Do not open a replacement PR.",
+  });
+  for (const [key, claim] of claims) {
+    const { pr } = claim;
+    if (`${pr.owner}/${pr.repo}`.toLowerCase() !== cardRepo.toLowerCase()) {
+      return liveRefusal(claim.label, pr, "merged_first_wrong_repository",
+        `the work product names ${pr.owner}/${pr.repo}, not this card's delivery repository ${cardRepo}`);
+    }
+    const read = await readWorkProductPullRequest(db, companyId, identity.repo.owner, identity.repo.repo, pr.pullRequestNumber);
+    if (!read.ok) return liveRefusal(claim.label, pr, "merged_first_pr_unreadable", read.reason);
+    const live = read.live;
+    if (live.merged !== true) {
+      return liveRefusal(claim.label, pr, "merged_first_pr_not_merged",
+        live.state === "closed" ? "the pull request was closed without merging" : "the pull request is still open");
+    }
+    if ((live.baseRepoFullName ?? "").toLowerCase() !== cardRepo.toLowerCase()) {
+      return liveRefusal(claim.label, pr, "merged_first_wrong_repository",
+        `the pull request targets ${live.baseRepoFullName ?? "an unreadable repository"}, not ${cardRepo}`);
+    }
+    if ((live.headRepoFullName ?? "").toLowerCase() !== cardRepo.toLowerCase()) {
+      return liveRefusal(claim.label, pr, "merged_first_fork_head",
+        `the pull request head is in ${live.headRepoFullName ?? "an unreadable repository"}, not ${cardRepo}`);
+    }
+    if (live.baseRef !== baseRef) {
+      return liveRefusal(claim.label, pr, "merged_first_wrong_base",
+        `the pull request merged into ${live.baseRef ?? "an unreadable base branch"}, not the card's base branch ${baseRef}`);
+    }
+    const mergedAt = live.mergedAt ? Date.parse(live.mergedAt) : Number.NaN;
+    if (Number.isNaN(mergedAt)) {
+      return liveRefusal(claim.label, pr, "merged_first_pr_unreadable", "GitHub reported no readable merged_at time");
+    }
+    if (mergedAt >= verdictAt) {
+      return liveRefusal(claim.label, pr, "merged_first_merged_after_verdict",
+        `the pull request merged at ${live.mergedAt}, not before this verdict at ${new Date(verdictAt).toISOString()}`);
+    }
+    const liveMergeSha = readFullSha(live.mergeCommitSha);
+    if (claim.recordedMergeShas.size > 1 || [...claim.recordedMergeShas].some((sha) => sha !== liveMergeSha)) {
+      return liveRefusal(claim.label, pr, "merged_first_stale_record",
+        `the recorded metadata.mergeCommitSha (${[...claim.recordedMergeShas].join(", ")}) is not the pull request's merge commit ${liveMergeSha ?? "(unreadable)"}`);
+    }
+    if (key === primaryKey && readFullSha(live.headSha) !== reviewedHeadSha) {
+      return liveRefusal(claim.label, pr, "merged_first_head_not_reviewed",
+        `the pull request merged at head ${live.headSha}, not the reviewed head ${reviewedHeadSha} recorded as metadata.headSha`);
+    }
   }
   const [issue] = await db
     .select({
@@ -4012,25 +4100,65 @@ async function resolveMergedBeforeVerdictLanding(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
   if (!issue) return refusal;
+  // Dynamic: board-landing-proof.ts statically imports this module, so a static import would be circular.
   const { verifyBoardLandingProof } = await import("./board-landing-proof.js");
-  const verified = await verifyBoardLandingProof(db, issue, { ...pr, mergeCommitSha });
+  const verified = await verifyBoardLandingProof(db, issue, { ...primaryPr, mergeCommitSha, headSha: reviewedHeadSha });
   if (!verified.ok) {
     return {
       ...refusal,
       landingProofRefusal: { code: verified.code, reason: verified.reason },
       remedy:
         `every linked pull_request work product is MERGED, but the live GitHub landing proof for ${label} ` +
-        `(${pr.owner}/${pr.repo}#${pr.pullRequestNumber}, recorded metadata.mergeCommitSha ${mergeCommitSha}) refused ` +
-        `with ${verified.code}: ${verified.reason}. The pull request must be MERGED in the card's delivery repository ` +
-        "with that merge commit on the card's base branch, and a board user must tie it to the card by writing a " +
-        "pull_request work product for it. Fix the record, then submit the final verdict again. " +
-        "Do not open a replacement PR.",
+        `(${primaryPr.owner}/${primaryPr.repo}#${primaryPr.pullRequestNumber}, recorded metadata.mergeCommitSha ` +
+        `${mergeCommitSha}, reviewed head ${reviewedHeadSha}) refused with ${verified.code}: ${verified.reason}. ` +
+        "The pull request must be MERGED in the card's delivery repository at that head and with that merge commit " +
+        "on the card's base branch, and a board user must tie it to the card by writing a pull_request work product " +
+        "for it. Fix the record, then submit the final verdict again. Do not open a replacement PR.",
     };
   }
   return {
     ...refusal,
     mergedBeforeVerdict: { mergeCommitSha: verified.proof.mergeCommitSha, workProduct: label, baseRef: verified.proof.baseRef },
   };
+}
+
+/** A full 40-hex SHA, lower-cased, or null. */
+function readFullSha(value: unknown): string | null {
+  const sha = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+/**
+ * SUP-25478: one work-product PR read live across the repository's token
+ * candidates (401/403 advances to the next candidate). Any other failure is a
+ * named refusal reason: the caller never accepts a PR it could not read.
+ */
+async function readWorkProductPullRequest(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<{ ok: true; live: HeadShaSuccess } | { ok: false; reason: string }> {
+  let candidates: GitHubTokenResolution[];
+  try {
+    candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  } catch (err) {
+    return { ok: false, reason: `GitHub credential resolution failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (candidates.length === 0) return { ok: false, reason: `no GitHub credential resolves ${owner}/${repo}` };
+  for (let i = 0; i < candidates.length; i++) {
+    const live = await fetchPullRequestHeadSha(candidates[i]!.token, owner, repo, number);
+    if (live.ok) return { ok: true, live };
+    if ((live.status === 401 || live.status === 403) && i < candidates.length - 1) continue;
+    if (live.status === 0) return { ok: false, reason: "the GitHub read failed with a network error or timeout" };
+    if (live.status === 404) return { ok: false, reason: "GitHub returned HTTP 404: the pull request was not found" };
+    if (live.status === 429 || /rate limit/i.test(live.message ?? "")) {
+      return { ok: false, reason: `GitHub returned HTTP ${live.status}: rate limited` };
+    }
+    return { ok: false, reason: `GitHub returned HTTP ${live.status}${live.message ? `: ${live.message}` : ""}` };
+  }
+  return { ok: false, reason: "no GitHub credential could read the pull request" };
 }
 
 /** The pull request a `pull_request` work product names: externalId `owner/repo#N`, else metadata repository + prNumber. */
@@ -4845,6 +4973,8 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   baseRepoId?: number | null;
   baseRepoNodeId?: string | null;
   baseRepoFullName?: string | null;
+  /** SUP-25478: when the PR merged (body.merged_at), else null. */
+  mergedAt?: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4957,6 +5087,7 @@ async function fetchPullRequestHeadShaOnce(
       baseRepoNodeId: typeof baseRepo?.node_id === "string" && baseRepo.node_id.length > 0 ? baseRepo.node_id : null,
       baseRepoFullName:
         typeof baseRepo?.full_name === "string" && baseRepo.full_name.length > 0 ? baseRepo.full_name : null,
+      mergedAt: typeof body.merged_at === "string" && body.merged_at.length > 0 ? body.merged_at : null,
     };
   }
   return {

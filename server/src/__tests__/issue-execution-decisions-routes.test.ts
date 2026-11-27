@@ -871,12 +871,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const MERGE_SHA = "5248066639ab65daa2883012ae82d181a0b6430b";
     const OTHER_MERGE_SHA = "e".repeat(40);
     const HEAD_SHA = "d".repeat(40);
-    type Product = { number: number; status: string; isPrimary: boolean; metadata: Record<string, unknown> };
+    type Product = { number: number; status: string; isPrimary: boolean; metadata: Record<string, unknown>; externalId?: string };
     const REPO_ID = 4242;
-    // GitHub's live view of the delivery PRs: each one merged into TEA-Core/paperclip
-    // main with the merge commit its work product records.
+    const MERGED_AT = "2026-11-27T16:16:00Z";
+    // GitHub's live view of the delivery PRs: each one merged from TEA-Core/paperclip
+    // into its main branch, before the verdict, with the merge commit its work product records.
     const livePull = (number: number, mergeCommit: string) => ({
-      number, state: "closed", draft: false, merged: true, merge_commit_sha: mergeCommit,
+      number, state: "closed", draft: false, merged: true, merge_commit_sha: mergeCommit, merged_at: MERGED_AT,
       head: { ref: `delivery-${number}`, sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
       base: { ref: "main", repo: { id: REPO_ID, node_id: "R_paperclip", full_name: "TEA-Core/paperclip" } },
     });
@@ -887,8 +888,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       fixture: Awaited<ReturnType<typeof pendingDelivery>>,
       products: Product[],
       { pulls = {}, boardWritten = true }: {
-        /** Live GitHub answers per PR number; a PR absent here reads as merged with its recorded merge commit. */
-        pulls?: Record<number, Response | Record<string, unknown>>;
+        /**
+         * Live GitHub answers per PR number; a PR absent here reads as merged with its recorded
+         * merge commit. An Error is thrown by the fetch (a network failure or timeout).
+         */
+        pulls?: Record<number, Response | Error | Record<string, unknown>>;
         /** Record each work product as written by the board user (the landing proof's tie to the card). */
         boardWritten?: boolean;
       } = {},
@@ -911,7 +915,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       for (const product of products) {
         const [row] = await db.insert(issueWorkProducts).values({
           companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
-          externalId: `TEA-Core/paperclip#${product.number}`, title: `PR #${product.number} TEA-Core/paperclip`,
+          externalId: product.externalId ?? `TEA-Core/paperclip#${product.number}`, title: `PR #${product.number} TEA-Core/paperclip`,
           url: `https://github.com/TEA-Core/paperclip/pull/${product.number}`, status: product.status,
           reviewState: "none", isPrimary: product.isPrimary, healthStatus: "unknown", metadata: product.metadata,
         }).returning();
@@ -936,26 +940,208 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         if (pull && product) {
           const live = pulls[product.number]
             ?? livePull(product.number, String(product.metadata.mergeCommitSha ?? OTHER_MERGE_SHA));
+          if (live instanceof Error) throw live;
           return live instanceof Response ? live.clone() : Response.json(live);
         }
         return served(input, init);
       });
+      const body = (mergeCommit: string) => ({
+        status: "done",
+        comment: "Final review approved: every delivery PR is merged and CI is green at tip.",
+        doneTier: {
+          tier: "tier1",
+          reason: "Delivery merged before this review stage armed; landing verified at the base tip.",
+          landing: { mode: "landedAtTip", mergeCommit },
+        },
+      });
       const app = createApp(db, agentActor(fixture.company, reviewer, run!.id));
       return {
-        approve: (mergeCommit: string) => request(app).patch(`/api/issues/${fixture.issue.id}`).send({
-          status: "done",
-          comment: "Final review approved: every delivery PR is merged and CI is green at tip.",
-          doneTier: {
-            tier: "tier1",
-            reason: "Delivery merged before this review stage armed; landing verified at the base tip.",
-            landing: { mode: "landedAtTip", mergeCommit },
-          },
-        }),
+        approve: (mergeCommit: string) => request(app).patch(`/api/issues/${fixture.issue.id}`).send(body(mergeCommit)),
+        /** The same final verdict from an agent that is not the stage participant. */
+        approveAsOutsider: async (mergeCommit: string) => {
+          const outsider = await seedAgent(db, fixture.company.id);
+          const [outsiderRun] = await db.insert(heartbeatRuns).values({
+            companyId: fixture.company.id, agentId: outsider.id, status: "running",
+            contextSnapshot: { issueId: fixture.issue.id },
+          }).returning();
+          return request(createApp(db, agentActor(fixture.company, outsider, outsiderRun!.id)))
+            .patch(`/api/issues/${fixture.issue.id}`).send(body(mergeCommit));
+        },
       };
     }
 
     const merged = (number: number, isPrimary: boolean, metadata: Record<string, unknown>): Product =>
-      ({ number, status: "merged", isPrimary, metadata: { mergedAt: "2026-11-27T16:16:00Z", ...metadata } });
+      ({ number, status: "merged", isPrimary, metadata: { mergedAt: MERGED_AT, headSha: HEAD_SHA, ...metadata } });
+
+    // A refused merged-first verdict leaves the stage pending: no decision, no completion, no stamp.
+    async function expectRefused(
+      fixture: Awaited<ReturnType<typeof pendingDelivery>>,
+      response: request.Response,
+      details: Record<string, unknown>,
+    ) {
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        reason: expect.stringContaining("no-pr"),
+        ...details,
+      });
+      expect(response.body.details.remedy).not.toContain("provide one OPEN");
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    }
+
+    it("refuses when a secondary work product recorded as merged is still open on GitHub", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: { ...livePull(4413, OTHER_MERGE_SHA), state: "open", merged: false, merged_at: null } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_pr_not_merged", reason: expect.stringContaining("still open") },
+      });
+    });
+
+    it("refuses when a secondary work product recorded as merged was closed without merging", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, {}),
+      ], { pulls: { 4413: { ...livePull(4413, OTHER_MERGE_SHA), merged: false, merged_at: null } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_pr_not_merged", reason: expect.stringContaining("closed without merging") },
+      });
+    });
+
+    it("refuses when a secondary work product names another repository", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        { ...merged(4413, false, {}), externalId: "TEA-Core/paperclip-evil#4413" },
+      ]);
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_wrong_repository" },
+      });
+    });
+
+    it("live-checks a secondary named with the card repository in another letter case", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        { ...merged(4413, false, {}), externalId: "tea-core/PAPERCLIP#4413" },
+      ], { pulls: { 4413: { ...livePull(4413, OTHER_MERGE_SHA), state: "open", merged: false, merged_at: null } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_pr_not_merged" },
+      });
+    });
+
+    it("refuses when a secondary pull request was merged from a fork", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const live = livePull(4413, OTHER_MERGE_SHA);
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: { ...live, head: { ...live.head, repo: { full_name: "Someone/paperclip" } } } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_fork_head" },
+      });
+    });
+
+    it("refuses a stale secondary record whose mergeCommitSha is not the live merge commit", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: livePull(4413, "f".repeat(40)) } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_stale_record" },
+      });
+    });
+
+    it("refuses when a pull request merged into another base branch than the card's", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const live = livePull(4413, OTHER_MERGE_SHA);
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: { ...live, base: { ...live.base, ref: "release" } } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_wrong_base", reason: expect.stringContaining("release") },
+      });
+    });
+
+    it("refuses when a pull request merged at or after the verdict", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: { ...livePull(4413, OTHER_MERGE_SHA), merged_at: new Date(Date.now() + 3_600_000).toISOString() } } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_merged_after_verdict" },
+      });
+    });
+
+    it("refuses when the primary merged at a head other than the reviewed head", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const live = livePull(4412, MERGE_SHA);
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        pulls: { 4412: { ...live, head: { ...live.head, sha: "b".repeat(40) } } },
+      });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_head_not_reviewed", reason: expect.stringContaining(HEAD_SHA) },
+      });
+    });
+
+    it("refuses when the primary records no reviewed head", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA, headSha: undefined })]);
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        remedy: expect.stringContaining("has no recorded metadata.headSha"),
+      });
+    });
+
+    it.each([
+      ["HTTP 404", () => Response.json({ message: "Not Found" }, { status: 404 }), "HTTP 404"],
+      ["a rate limit (HTTP 429)", () => Response.json({ message: "slow down" }, { status: 429 }), "rate limited"],
+      ["a rate limit (HTTP 403)", () => Response.json({ message: "API rate limit exceeded for installation" }, { status: 403 }), "rate limited"],
+      ["a timeout", () => new DOMException("The operation was aborted due to timeout", "TimeoutError"), "network error or timeout"],
+    ])("refuses when the secondary pull request read fails with %s", async (_label, answer, reason) => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { pulls: { 4413: answer() } });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_pr_unreadable", reason: expect.stringContaining(reason) },
+      });
+    });
+
+    it("records nothing when an agent that is not the stage participant submits the merged-first verdict", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })]);
+      const before = await fixture.read();
+
+      const response = await review.approveAsOutsider(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBeGreaterThanOrEqual(400);
+      expect(response.status).toBeLessThan(500);
+      const stored = await fixture.read();
+      expect(stored.status).toBe(before.status);
+      expect(stored.executionState).toEqual(before.executionState);
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
 
     it("records the final verdict and skips the arm when every PR work product merged first", async () => {
       const fixture = await pendingDelivery({ missing: true });
@@ -993,21 +1179,10 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         pulls: { 4412: livePull(4412, OTHER_MERGE_SHA) },
       });
 
-      const response = await review.approve(MERGE_SHA);
-
-      expect(response.status, JSON.stringify(response.body)).toBe(409);
-      expect(response.body.details).toMatchObject({
-        code: "approval_final_delivery_preflight",
-        reason: expect.stringContaining("no-pr"),
-        landingProofRefusal: { code: "landing_proof_sha_mismatch" },
-        remedy: expect.stringContaining("landing_proof_sha_mismatch"),
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_stale_record" },
+        remedy: expect.stringContaining("merged_first_stale_record"),
       });
-      // The remedy names only the board action that unlocks this path: a board comment does not.
-      expect(response.body.details.remedy).toContain("writing a pull_request work product");
-      expect(response.body.details.remedy).not.toContain("board comment");
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-      expect(fixture.writes).toEqual([]);
     });
 
     it("refuses a merged PR that targets another repository than the card's delivery repository", async () => {
@@ -1017,15 +1192,9 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         pulls: { 4412: { ...live, base: { ref: "main", repo: { id: 9999, full_name: "Someone/fork" } } } },
       });
 
-      const response = await review.approve(MERGE_SHA);
-
-      expect(response.status, JSON.stringify(response.body)).toBe(409);
-      expect(response.body.details).toMatchObject({
-        code: "approval_final_delivery_preflight",
-        landingProofRefusal: { code: "landing_proof_repo_identity_mismatch" },
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_wrong_repository" },
       });
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     });
 
     it("refuses when GitHub cannot serve the live pull request", async () => {
@@ -1034,15 +1203,9 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         pulls: { 4412: Response.json({ message: "Validation Failed" }, { status: 422 }) },
       });
 
-      const response = await review.approve(MERGE_SHA);
-
-      expect(response.status, JSON.stringify(response.body)).toBe(409);
-      expect(response.body.details).toMatchObject({
-        code: "approval_final_delivery_preflight",
-        landingProofRefusal: { code: "landing_proof_unverifiable", reason: expect.stringContaining("HTTP 422") },
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_pr_unreadable", reason: expect.stringContaining("HTTP 422") },
       });
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     });
 
     it("refuses when only agent-written records tie the merged PR to the card", async () => {
@@ -1053,13 +1216,12 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
       const response = await review.approve(MERGE_SHA);
 
-      expect(response.status, JSON.stringify(response.body)).toBe(409);
-      expect(response.body.details).toMatchObject({
-        code: "approval_final_delivery_preflight",
+      await expectRefused(fixture, response, {
         landingProofRefusal: { code: "landing_proof_not_card_delivery" },
       });
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      // The remedy names only the board action that unlocks this path: a board comment does not.
+      expect(response.body.details.remedy).toContain("writing a pull_request work product");
+      expect(response.body.details.remedy).not.toContain("board comment");
     });
 
     it("still refuses when the merged primary carries no recorded mergeCommitSha", async () => {
