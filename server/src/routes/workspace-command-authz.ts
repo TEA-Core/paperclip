@@ -92,7 +92,7 @@ export function assertNoAgentProjectWorkspaceSourceMutation(req: Request, paths:
 }
 
 export function collectExecutionWorkspaceIdentityPaths(workspacePatch: unknown, prefix = ""): string[] {
-  const paths = collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName"], prefix);
+  const paths = collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName", "baseRef"], prefix);
   if (isRecord(workspacePatch)) {
     paths.push(...collectOwnKeyPaths(workspacePatch.metadata, [PROVISIONED_GIT_ADMIN_IDENTITY_KEY], prefixPath(prefix, "metadata")));
   }

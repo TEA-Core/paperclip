@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import {
@@ -35,12 +36,21 @@ import {
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
+  probeZeroDeltaWorktree,
+  localRefOutsideRemoteBaseRefusal,
   recheckRecordedWorktree,
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { detectEvidence } from "./card-evidence.js";
 import { scanCardEvidence } from "./card-evidence-census.js";
+import {
+  decideZeroDeltaFromForge,
+  githubForgeReader,
+  recheckZeroDeltaForgeAtWrite,
+  ZERO_DELTA_MEASUREMENT_BUDGET,
+  ZERO_DELTA_WRITE_BUDGET,
+} from "./zero-delta-forge-rule.js";
 import {
   resolveGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
@@ -728,6 +738,8 @@ interface DoneTier2CloseAuditDetails {
   closingRunId?: string | null;
   /** SUP-23490: the closing run's resolved start (`startedAt ?? createdAt`), when resolvable. */
   closingRunStartedAt?: string | null;
+  /** SUP-24402: set when the close was accepted as a zero-delta repository_delivery close. */
+  zeroDelta?: ZeroDeltaCloseMeasurement;
 }
 
 export interface DoneTierDeclarationResult {
@@ -743,6 +755,10 @@ export interface DoneTierDeclarationResult {
   // and re-checks that inside the write (verifyNoRepositoryLandingAtTransition).
   landing?: "noRepositoryLanding";
   noRepositoryMeasurement?: NoRepositoryLandingMeasurement;
+  // SUP-24402: set when the accepted declaration is a zero-delta
+  // repository_delivery close, with what it measured. The accepting door
+  // re-checks that inside its status write (verifyZeroDeltaCloseAtTransition).
+  zeroDeltaMeasurement?: ZeroDeltaCloseMeasurement;
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
@@ -754,6 +770,8 @@ export interface DoneTierDeclarationResult {
 
 interface DoneTierDeclarationOptions {
   allowTier0DecisionOnly?: boolean;
+  // Only the PATCH door rechecks a zero-delta measurement inside its status write.
+  zeroDeltaRecheckedAtWrite?: boolean;
   // SUP-23347: a record_only card's participant review decision carried the close
   // and the delivery guard skipped for record_only_delivery_skipped. A close
   // comment with no tier declaration text at all is then an audited skip
@@ -830,6 +848,7 @@ async function githubBranchExists(
   repo: string,
   branch: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<BranchProbeOutcome> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
@@ -842,7 +861,7 @@ async function githubBranchExists(
     authorization: `Bearer ${token}`,
   };
   try {
-    const response = await ghFetch(url, { headers });
+    const response = await ghFetch(url, { headers, signal });
     if (response.status === 401 || response.status === 403) {
       return { outcome: "auth_failed", status: response.status };
     }
@@ -2852,11 +2871,504 @@ async function attributeTier2EvidenceToClosingRun(
   return { ...result, tier2Audit: audit };
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// SUP-24402: the zero-delta repository_delivery close. A routine cycle card
+// whose own branch carries no change has no pull request and no recorded merge
+// commit, so the merge-head origin predicate above refused every truthful Tier
+// 2 declaration it could write (merge_commit_unrecorded). Such a card closes at
+// Tier 2 only when the SERVER proves, at close time, every one of:
+//   (1) no pull request: no linked pull request in any state (drafts
+//       included) and no pull_request work product in any status;
+//   (2) no recorded merge commit: none on any work product, in any form;
+//   (3) zero commits ahead of the base ref: `rev-list --count base..HEAD`
+//       prints exactly 0 in the card's worktree, and GitHub's compare of the
+//       base branch with that HEAD, and with the card's branch when it exists
+//       on the remote, is ahead by 0;
+//   (4) HEAD is an ancestor of the base ref: `merge-base --is-ancestor`;
+//   (5) a clean worktree: `status --porcelain=v1 --untracked-files=all`
+//       prints nothing (no tracked change, no untracked file).
+// The declaration is not the evidence. Its probe head must name the HEAD the
+// server measured, so a declaration that claims zero delta while the worktree
+// is ahead refuses on the measurement, not on the text.
+//
+// The proof is bound to the card itself, never to a workspace the closer
+// chooses: the execution workspace must be the one this issue owns
+// (`sourceIssueId`), in this company, an isolated git worktree; the worktree
+// path and branch are that row's `providerRef ?? cwd` and `branchName`, which
+// an agent cannot set (PATCH /api/execution-workspaces refuses them for agent
+// keys); and the base is the workspace's own `baseRef` (the base the delivery
+// guard compares the branch with), accepted only when it names one of the
+// project's branches: the project workspace's default or reference branch
+// (board-only) or the repository's default branch on GitHub. The remote
+// compare is the authority over refs the worktree can write: a worktree whose
+// local origin ref was moved onto its own commits still refuses. Every failure
+// to read, resolve or measure refuses, with the merge_commit_unrecorded reason
+// kept as the refusal's prefix.
+// ───────────────────────────────────────────────────────────────────────
+
+const ZERO_DELTA_CLOSE_CONDITIONS =
+  "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only through " +
+  "PATCH /api/issues/{id}, and only when the server proves from the board-recorded forge repository that every " +
+  "branch and tag tip is on the base line or is a pull-request head, that a ref naming this card is on the base " +
+  "line, and that the declared head is on the base line. A name is never a reason to skip a tip. The close write " +
+  "re-reads that snapshot and refuses if it changed. Local checks can only refuse.";
+
+/** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
+export interface ZeroDeltaCloseMeasurement {
+  executionWorkspaceId: string;
+  workspaceProjectWorkspaceId: string;
+  /** The issue row's project workspace at measurement. The close write requires it unchanged. */
+  issueProjectWorkspaceId: string | null;
+  repository: string;
+  /** The workspace row's recorded path, verbatim; the close write compares its re-read against this. */
+  recordedWorktreePath: string;
+  worktreePath: string;
+  commonDir: string;
+  branch: string;
+  baseBranch: string;
+  baseRef: string;
+  baseSha: string;
+  headSha: string;
+  /** sha256 of the forge base, every non-pull ref, and repository-owned PR head set. */
+  forgeSnapshotDigest: string;
+  /** The project workspace's `defaultRef` and `repoRef` as read; the close write requires both unchanged. */
+  projectDefaultRef: string | null;
+  projectRepoRef: string | null;
+  /** The card the sibling scan attributed branches and worktrees to; the close write repeats that scan. */
+  issueIdentifier: string;
+  /** Digest of the branches the sibling scan read; the close write requires them unchanged. */
+  refsDigest: string;
+}
+
+type ZeroDeltaCloseProof =
+  | { ok: true; measurement: ZeroDeltaCloseMeasurement; token: string }
+  | { ok: false; reason: string };
+
+async function proveZeroDeltaRepositoryClose(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
+  executionWorkspaceId: string | null,
+  deliveryRepository: { hostname: string; owner: string; repo: string },
+): Promise<ZeroDeltaCloseProof> {
+  const refuse = (reason: string): ZeroDeltaCloseProof => ({ ok: false, reason });
+
+  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+  if (linkedPrs.length > 0) {
+    return refuse(`the card links pull requests (${linkedPrs.map((pr) => `${pr.displayName} ${pr.cachedState ?? "unknown"}`).join(", ")})`);
+  }
+  const workProducts = await db
+    .select({ type: issueWorkProducts.type, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+    .from(issueWorkProducts)
+    .where(and(eq(issueWorkProducts.companyId, issue.companyId), eq(issueWorkProducts.issueId, issue.id)));
+  const pullRequestProduct = workProducts.find((product) => product.type === "pull_request");
+  if (pullRequestProduct) {
+    return refuse(`the card records a pull_request work product (status ${pullRequestProduct.status})`);
+  }
+  if (
+    workProducts.some((product) => {
+      const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+      return (metadata.mergeCommitSha ?? metadata.merge_commit_sha ?? null) !== null;
+    })
+  ) {
+    return refuse("the card records a merge commit on a work product");
+  }
+
+  if (!executionWorkspaceId) return refuse("the card has no execution workspace");
+  const workspace = await db
+    .select({
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      projectId: executionWorkspaces.projectId,
+      projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+      mode: executionWorkspaces.mode,
+      strategyType: executionWorkspaces.strategyType,
+      providerType: executionWorkspaces.providerType,
+      providerRef: executionWorkspaces.providerRef,
+      cwd: executionWorkspaces.cwd,
+      branchName: executionWorkspaces.branchName,
+      baseRef: executionWorkspaces.baseRef,
+    })
+    .from(executionWorkspaces)
+    .where(and(eq(executionWorkspaces.id, executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!workspace || workspace.sourceIssueId !== issue.id) {
+    return refuse("the card's execution workspace is not one this card owns in this company");
+  }
+  if (
+    workspace.mode !== "isolated_workspace" ||
+    workspace.strategyType !== "git_worktree" ||
+    workspace.providerType !== "git_worktree"
+  ) {
+    return refuse(
+      `the card's execution workspace is ${workspace.mode}/${workspace.strategyType}/${workspace.providerType}, not its own isolated git worktree`,
+    );
+  }
+  const worktreePath = workspace.providerRef ?? workspace.cwd;
+  if (!worktreePath) return refuse("the card's execution workspace records no worktree path");
+  if (!workspace.branchName) return refuse("the card's execution workspace records no branch");
+  const baseBranch = normalizeBaseBranch(workspace.baseRef);
+  if (!baseBranch) return refuse("the card's execution workspace records no base ref");
+  // The GitHub compare strips one leading `origin/` from its base, so a branch
+  // literally named `origin/…` would be measured locally and remotely against
+  // two different branches.
+  if (baseBranch.startsWith("origin/")) {
+    return refuse(`the base branch ${baseBranch} starts with origin/, which the remote compare cannot name unambiguously`);
+  }
+  if (!workspace.projectWorkspaceId) return refuse("the card's execution workspace names no project workspace");
+  const projectWorkspace = await db
+    .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
+    .from(projectWorkspaces)
+    .where(
+      and(
+        eq(projectWorkspaces.id, workspace.projectWorkspaceId),
+        eq(projectWorkspaces.companyId, issue.companyId),
+        eq(projectWorkspaces.projectId, workspace.projectId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  const projectRepository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+  if (
+    !projectRepository ||
+    `${projectRepository.hostname}/${projectRepository.owner}/${projectRepository.repo}`.toLowerCase() !==
+      `${deliveryRepository.hostname}/${deliveryRepository.owner}/${deliveryRepository.repo}`.toLowerCase()
+  ) {
+    return refuse("the card's delivery repository is not its project workspace's repository");
+  }
+  const { hostname, owner, repo } = projectRepository;
+
+  const { token } = await resolveGitHubToken(db, issue.companyId);
+  if (!token) return refuse("no GitHub credential is configured to compare with the base on the remote");
+  const projectBranches = new Set<string>();
+  for (const ref of [projectWorkspace?.defaultRef, projectWorkspace?.repoRef]) {
+    const branch = normalizeBaseBranch(ref ?? null);
+    if (branch) projectBranches.add(branch);
+  }
+  const githubDefaultBranch = await readGitHubDefaultBranch(hostname, owner, repo, token);
+  if (githubDefaultBranch) projectBranches.add(githubDefaultBranch);
+  if (!projectBranches.has(baseBranch)) {
+    return refuse(`the base ref ${workspace.baseRef} is not one of the project's branches`);
+  }
+  if (!issue.identifier) return refuse("the card has no identifier to tie its worktree's branches to it");
+  // Branches registered to ANOTHER issue's execution workspace in this company
+  // and project belong to that card (branchName is board-only for agents);
+  // the probe refuses every other branch that is neither this card's nor one
+  // of the project's own branches.
+  const attributedBranches = await db
+    .select({ branchName: executionWorkspaces.branchName })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.projectId, workspace.projectId),
+        isNotNull(executionWorkspaces.sourceIssueId),
+        ne(executionWorkspaces.sourceIssueId, issue.id),
+        isNotNull(executionWorkspaces.branchName),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.branchName!).sort());
+  const probe = await probeZeroDeltaWorktree({
+    recordedWorktreePath: worktreePath,
+    managedProjectRoot: path.dirname(
+      resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: workspace.projectId }),
+    ),
+    branch: workspace.branchName,
+    baseBranch,
+    issueIdentifier: issue.identifier,
+    projectBranches,
+    attributedBranches: new Set(attributedBranches),
+    existingOtherCardIdentifiers: async (candidates) =>
+      new Set(
+        await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              ne(issues.id, issue.id),
+              inArray(issues.identifier, [...candidates]),
+            ),
+          )
+          .then((rows) => rows.flatMap((row) => (row.identifier ? [row.identifier] : []))),
+      ),
+    countCommitsAheadOfBase: async (sha) => {
+      const ahead = await githubCompareAheadBy(
+        hostname,
+        owner,
+        repo,
+        baseBranch,
+        sha,
+        token,
+        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead === null) throw new Error("GitHub compare returned no ahead_by");
+      return ahead;
+    },
+  });
+  if (!probe.ok) return refuse(probe.reason);
+  const forge = githubForgeReader(token);
+  const forgeCard = { repo: { hostname, owner, repo }, baseBranch, declaredHead: probe.headSha, cardBranch: workspace.branchName, cardIdentifier: issue.identifier, otherCardBranches: new Set(attributedBranches) };
+  const decided = await decideZeroDeltaFromForge(forgeCard, forge, ZERO_DELTA_MEASUREMENT_BUDGET);
+  if (!decided.ok) return refuse(decided.reason);
+  if (decided.proof.baseSha !== probe.baseSha.toLowerCase()) {
+    return refuse(`the local base ref ${probe.baseRef} is not the remote base ${baseBranch}`);
+  }
+  try {
+    const outside = await localRefOutsideRemoteBaseRefusal(
+      path.dirname(probe.commonDir),
+      decided.proof.baseSha,
+      issue.identifier,
+      performance.now() + ZERO_DELTA_MEASUREMENT_BUDGET.totalMs,
+    );
+    if (outside) return refuse(outside);
+  } catch (err) {
+    return refuse(`the local refs could not be compared with the remote base (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  return {
+    ok: true,
+    token,
+    measurement: {
+      executionWorkspaceId,
+      workspaceProjectWorkspaceId: workspace.projectWorkspaceId,
+      issueProjectWorkspaceId: issue.projectWorkspaceId ?? null,
+      repository: `${hostname}/${owner}/${repo}`,
+      recordedWorktreePath: worktreePath,
+      worktreePath: probe.worktreePath,
+      commonDir: probe.commonDir,
+      branch: probe.branch,
+      baseBranch,
+      baseRef: probe.baseRef,
+      baseSha: decided.proof.baseSha,
+      headSha: probe.headSha,
+      forgeSnapshotDigest: decided.proof.snapshotDigest,
+      projectDefaultRef: projectWorkspace?.defaultRef ?? null,
+      projectRepoRef: projectWorkspace?.repoRef ?? null,
+      issueIdentifier: issue.identifier,
+      refsDigest: probe.refsDigest,
+    },
+  };
+}
+
+async function proveZeroDeltaTier2Live(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
+  executionWorkspaceId: string | null,
+  deliveryRepository: { hostname: string; owner: string; repo: string },
+  evidence: string,
+  shape: RegExpExecArray,
+  sameRun: boolean,
+  unrecorded: string,
+  tier2Forms: string,
+): Promise<DoneTierDeclarationResult> {
+  let proof: ZeroDeltaCloseProof;
+  try {
+    proof = await proveZeroDeltaRepositoryClose(db, issue, executionWorkspaceId, deliveryRepository);
+  } catch (err) {
+    proof = { ok: false, reason: `the proof could not be completed (${err instanceof Error ? err.message : "unknown"})` };
+  }
+  if (!proof.ok) {
+    return refuseTier2(
+      `${unrecorded}A zero-delta close was not proven: ${proof.reason}. ${ZERO_DELTA_CLOSE_CONDITIONS} ` +
+        `Accepted form: ${tier2Forms}`,
+    );
+  }
+  const { measurement } = proof;
+  const probeHead = shape[2]!.toLowerCase();
+  let probeHeadResolved: string | null;
+  try {
+    probeHeadResolved = await resolveGitHubRefHeadSha(
+      deliveryRepository.hostname,
+      deliveryRepository.owner,
+      deliveryRepository.repo,
+      probeHead,
+      proof.token,
+      AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+    );
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
+  }
+  if (probeHeadResolved !== measurement.headSha) {
+    return refuseTier2(
+      `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved ?? "nothing on the remote"}) is not HEAD ` +
+        `${measurement.headSha} of this card's own worktree, which the server measured zero-delta against ` +
+        `${measurement.baseRef}; a zero-delta close names the HEAD the server measured. ` +
+        `Accepted form: ${tier2Forms}`,
+    );
+  }
+  const probeCommand = shape[1]!.trim();
+  return {
+    ...acceptTier2(evidence.trim(), sameRun, {
+      probeCommand,
+      probeTarget: /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null,
+      observed: null,
+      observedRangeEnd: null,
+      tierForm: "live",
+      probeHead,
+      mergeCommit: null,
+      zeroDelta: measurement,
+    }),
+    zeroDeltaMeasurement: measurement,
+  };
+}
+
+export type ZeroDeltaCloseVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * SUP-24402 compare-and-set, inside the status write that lands a zero-delta
+ * close and against the row it holds `FOR UPDATE`. It makes no network call:
+ * it re-reads the database half of the proof and requires it to match what
+ * was measured (including the project settings that approved the base), then
+ * requires the recorded path to still resolve to the measured worktree and
+ * re-checks that worktree (index, status, ignored entries and stash on the
+ * measured branch and commit), the branches the sibling scan read, and every
+ * other worktree on a branch naming the card, under one shared 15 s budget,
+ * so work written after the measurement refuses.
+ */
+export async function verifyZeroDeltaCloseAtTransition(
+  tx: Db,
+  lockedIssue: {
+    id: string;
+    companyId: string;
+    status?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
+    executionWorkspaceId?: string | null;
+    projectWorkspaceId?: string | null;
+  },
+  measurement: ZeroDeltaCloseMeasurement,
+): Promise<ZeroDeltaCloseVerdict> {
+  const refuse = (reason: string): ZeroDeltaCloseVerdict => ({ ok: false, reason });
+  if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+    return refuse("the issue's status changed after the close was measured");
+  }
+  if (lockedIssue.deliveryRequirement !== "repository_delivery") {
+    return refuse("is accepted only on an issue already stored as repository_delivery at the close write");
+  }
+  if ((lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId) {
+    return refuse("the issue's execution workspace changed after the close was measured");
+  }
+  if ((lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId) {
+    return refuse("the issue's project workspace changed after the close was measured");
+  }
+  try {
+    const linkedPrs = await resolveLinkedPullRequestsWithState(tx, lockedIssue.companyId, lockedIssue.id, { includeDrafts: true });
+    if (linkedPrs.length > 0) {
+      return refuse(`the card links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}) at the close write`);
+    }
+    const workProducts = await tx
+      .select({ type: issueWorkProducts.type, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.companyId, lockedIssue.companyId), eq(issueWorkProducts.issueId, lockedIssue.id)));
+    if (workProducts.some((product) => product.type === "pull_request")) {
+      return refuse("the card records a pull_request work product at the close write");
+    }
+    if (
+      workProducts.some((product) => {
+        const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+        return (metadata.mergeCommitSha ?? metadata.merge_commit_sha ?? null) !== null;
+      })
+    ) {
+      return refuse("the card records a merge commit on a work product at the close write");
+    }
+    const workspace = await tx
+      .select({
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+        providerRef: executionWorkspaces.providerRef,
+        cwd: executionWorkspaces.cwd,
+        branchName: executionWorkspaces.branchName,
+        baseRef: executionWorkspaces.baseRef,
+      })
+      .from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.id, measurement.executionWorkspaceId), eq(executionWorkspaces.companyId, lockedIssue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!workspace || workspace.sourceIssueId !== lockedIssue.id) {
+      return refuse("the card's execution workspace is not one this card owns in this company at the close write");
+    }
+    if (workspace.projectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
+      return refuse("the execution workspace's project workspace changed after the close was measured");
+    }
+    if ((workspace.providerRef ?? workspace.cwd) !== measurement.recordedWorktreePath) {
+      return refuse("the recorded worktree path changed after the close was measured");
+    }
+    if (workspace.branchName !== measurement.branch) {
+      return refuse("the recorded branch changed after the close was measured");
+    }
+    if (normalizeBaseBranch(workspace.baseRef) !== measurement.baseBranch) {
+      return refuse("the recorded base ref changed after the close was measured");
+    }
+    const projectWorkspace = await tx
+      .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.id, measurement.workspaceProjectWorkspaceId),
+          eq(projectWorkspaces.companyId, lockedIssue.companyId),
+          eq(projectWorkspaces.projectId, workspace.projectId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    const projectRepository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+    if (
+      !projectRepository ||
+      `${projectRepository.hostname}/${projectRepository.owner}/${projectRepository.repo}`.toLowerCase() !==
+        measurement.repository.toLowerCase()
+    ) {
+      return refuse("the project's repository changed after the close was measured");
+    }
+    if (
+      (projectWorkspace?.defaultRef ?? null) !== measurement.projectDefaultRef ||
+      (projectWorkspace?.repoRef ?? null) !== measurement.projectRepoRef
+    ) {
+      return refuse("the project's base branch settings changed after the close was measured");
+    }
+  } catch (err) {
+    return refuse(`could not be verified at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const resolvedWorktreePath = await realpath(measurement.recordedWorktreePath).catch(() => null);
+  if (resolvedWorktreePath !== measurement.worktreePath) {
+    return refuse("the recorded worktree path no longer resolves to the measured worktree");
+  }
+  const recheck = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
+  });
+  if (!recheck.ok) return refuse(`refused at the close write: ${recheck.reason}`);
+  try {
+    const { token } = await resolveGitHubToken(tx, lockedIssue.companyId);
+    if (!token) return refuse("the remote could not be re-read at the close write");
+    const [hostname, owner, repo] = measurement.repository.split("/");
+    if (!hostname || !owner || !repo) return refuse("the measured repository could not be re-read at the close write");
+    const again = await recheckZeroDeltaForgeAtWrite(
+      { repo: { hostname, owner, repo }, baseBranch: measurement.baseBranch },
+      { snapshotDigest: measurement.forgeSnapshotDigest, baseSha: measurement.baseSha },
+      githubForgeReader(token),
+      ZERO_DELTA_WRITE_BUDGET,
+    );
+    if (!again.ok) return refuse(again.reason);
+  } catch (err) {
+    return refuse(`the remote could not be re-read at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const afterRemote = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
+  });
+  if (!afterRemote.ok) return refuse(`refused at the close write: ${afterRemote.reason}`);
+  return { ok: true };
+}
+
 async function proveTier2Live(
   db: Db,
   issue: {
     id: string;
     companyId: string;
+    identifier?: string | null;
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
@@ -2864,6 +3376,7 @@ async function proveTier2Live(
   evidence: string,
   sameRun: boolean,
   deliveryRequirement: IssueDeliveryRequirement | null | undefined,
+  zeroDeltaRecheckedAtWrite: boolean,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: classification-aware routing. The record-only grammar is
   // accepted only on record_only cards; a repository_delivery card submitting
@@ -2896,8 +3409,10 @@ async function proveTier2Live(
   }
   const probeHead = shape[2]!.toLowerCase();
   let ctx: IssueRepoContext | null;
+  let executionWorkspaceId: string | null;
   try {
     const fields = await loadTier1RepoFields(db, issue);
+    executionWorkspaceId = fields.executionWorkspaceId;
     ctx = await resolveIssueRepoContext(db, {
       companyId: issue.companyId,
       projectId: fields.projectId,
@@ -2928,13 +3443,26 @@ async function proveTier2Live(
     return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (recordedMergeCommit === null) {
-    return refuseTier2(
+    const unrecorded =
       "Tier 2 declaration could not be verified: no recorded delivery merge commit is available " +
-        "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
-        "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
-        "fallback to the live branch tip. " +
-        `Accepted form: ${tier2Forms}`,
-    );
+      "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
+      "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
+      "fallback to the live branch tip. ";
+    // SUP-24402: only a card stored as repository_delivery may prove a
+    // zero-delta close instead; every other classification, and an absent one,
+    // keeps this refusal byte for byte.
+    if (deliveryRequirement !== "repository_delivery") {
+      return refuseTier2(`${unrecorded}Accepted form: ${tier2Forms}`);
+    }
+    // Only a door that re-checks the measurement inside its status write
+    // (verifyZeroDeltaCloseAtTransition) may accept the zero-delta form.
+    if (!zeroDeltaRecheckedAtWrite) {
+      return refuseTier2(
+        `${unrecorded}A zero-delta close is accepted only on PATCH /api/issues/{id}, whose status write re-checks ` +
+          `the measured worktree; this close path does not. Accepted form: ${tier2Forms}`,
+      );
+    }
+    return proveZeroDeltaTier2Live(db, { ...issue, identifier: issue.identifier ?? null }, executionWorkspaceId, parsed, evidence, shape, sameRun, unrecorded, tier2Forms);
   }
   let token: string | null;
   try {
@@ -4221,6 +4749,7 @@ export async function verifyNoRepositoryLandingAtTransition(
     commonDir: measurement.probe.commonDir,
     branch: measurement.probe.branch,
     headSha: measurement.probe.headSha,
+    stashScope: { issueIdentifier: read.record.identifier, attributedBranches: new Set(read.record.attributedBranches) },
   });
   if (!recheck.ok) {
     return noRepositoryRefusal(`refused at the close write: ${recheck.reason}.`);
@@ -4533,7 +5062,7 @@ export async function evaluateDoneTierDeclaration(
       return attributeTier2EvidenceToClosingRun(
         db,
         issue,
-        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
+        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement, options.zeroDeltaRecheckedAtWrite === true),
         runId,
         closingAgentId,
       );
@@ -4651,7 +5180,7 @@ export async function evaluateDoneTierDeclaration(
     return attributeTier2EvidenceToClosingRun(
       db,
       issue,
-      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
+      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement, options.zeroDeltaRecheckedAtWrite === true),
       runId,
       closingAgentId,
     );
