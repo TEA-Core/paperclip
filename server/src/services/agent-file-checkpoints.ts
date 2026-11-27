@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { captureAgentFiles, checkpointPath, type AgentFileManifest, type AgentFileCheckpointStats } from "./scripts/agent-file-checkpoint.mjs";
+import { workingCopyPermissions } from "./agent-file-permissions.js";
 import { inspectAgentFile, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES, MAX_AGENT_FILE_BYTES } from "./agent-file-store.js";
 
 export type { AgentFileManifest, AgentFileCheckpointStats };
@@ -98,6 +99,8 @@ export async function captureAgentFileCheckpoint(input: {
     }
   };
   try {
+    await fs.mkdir(directory, { mode: 0o700 });
+    await fs.chmod(directory, 0o700);
     let stats: AgentFileCheckpointStats;
     if (!target) ({ stats } = await captureAgentFiles(input.localRoot, input.previous, directory));
     else {
@@ -118,6 +121,7 @@ export async function captureAgentFileCheckpoint(input: {
         workspaceRemoteDir: remoteDirectory!, syncWorkspace: true, workspaceInboundMode: "adopt_remote", workspaceBaseline: { exclude: [], entries: new Map() }, workspaceGitSnapshot: null, workspaceFileMode: "all" });
       await restore.restoreWorkspace();
     }
+    await workingCopyPermissions(directory, null);
     return { directory, manifest: await validateAgentFileCheckpoint(directory, input.previous), stats, cleanup };
   } catch (error) { await cleanup().catch(() => undefined); throw error; }
 }

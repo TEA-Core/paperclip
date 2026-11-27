@@ -11,6 +11,7 @@ import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructi
 import { instructionGitExcludeProgram, resolveAgentsGid } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
+import { stagedMode, workingCopyPermissions } from "./agent-file-permissions.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
@@ -24,36 +25,16 @@ const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
 
-// Group readability is opt-in via the canonical group-read bit, never inferred
-// from owner access alone. Strip write access for every non-owner.
-const stagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700) |
-  (mode & 0o400 && mode & 0o040 ? 0o040 | (mode & 0o100 ? 0o010 : 0) : 0);
 const STAGED_MODE_VERSION = 3;
 const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
 const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
-
-async function workingCopyPermissions(filename: string, gid: number | null, recursive = true): Promise<void> {
-  const stat = await fs.lstat(filename);
-  if (stat.isSymbolicLink()) return;
-  if (!stat.isDirectory() && !stat.isFile()) throw new Error("Agent working copy contains a non-regular entry");
-  if (gid !== null && stat.gid !== gid) await fs.chown(filename, stat.uid, gid);
-  // chmod must follow chown (which can clear setgid) and bypass mkdir's umask.
-  const owner = stat.mode & 0o700;
-  const mode = gid === null ? owner : stat.isDirectory()
-    ? owner | ((owner >> 3) & 0o050) | (recursive ? 0o2000 : 0)
-    : stagedMode(stat.mode) & 0o7777;
-  if (gid !== null || mode !== (stat.mode & 0o7777)) await fs.chmod(filename, mode);
-  if (recursive && stat.isDirectory()) {
-    for (const entry of await fs.readdir(filename)) await workingCopyPermissions(path.join(filename, entry), gid);
-  }
-}
 
 const permissionDenied = (error: unknown) => ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "");
 
 async function workingCopyParents(agentRoot: string): Promise<number | null> {
   // Share the live tree only with the agents group, and only when this process
   // may assign it. Otherwise keep the owner-only layout.
-  let gid = await resolveAgentsGid();
+  let gid = process.platform === "win32" ? null : await resolveAgentsGid();
   let parent = agentRoot;
   for (const segment of ["file-sync", "runs"]) {
     parent = path.join(parent, segment);
@@ -299,7 +280,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         runtime = await transport(row, target, true);
         transports.set(key(row), runtime);
       }
+      // The restore helper preserves remote modes and mkdir's umask. Fence the
+      // entire apply, including its temporary files, until the staging rule has
+      // removed non-owner write access from every restored entry.
+      const runDir = path.dirname(row.localRoot);
+      await fs.chmod(runDir, 0o700);
       await runtime.restoreWorkspace();
+      const gid = typeof row.receipt?.stagedGid === "number" ? row.receipt.stagedGid : null;
+      if (gid !== null || row.receipt?.stagedModeVersion === STAGED_MODE_VERSION) await workingCopyPermissions(row.localRoot, gid);
+      if (gid !== null) await workingCopyPermissions(runDir, gid, false);
     }
     return inspectAgentDirectory(row.localRoot);
   }
