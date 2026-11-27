@@ -16,14 +16,15 @@ import { createRunIssueLookup } from "../services/run-issue-lookup.js";
  * How each live event type relates to issue content. The record is exhaustive,
  * so a new event type does not compile until it is classified here.
  * - `none`: carries no issue content; every subscriber receives it.
- * - `activity`: an activity entry about an issue, or about another entity.
+ * - `activity`: an activity entry; only one about an issue is filtered.
  * - `run`: a heartbeat run event about the run's issue.
  * - `goal`: a runner goal projection about its `issueId`.
  *
  * A subscriber that cannot read the event's issue receives only its metadata
- * (see `issueEventMetadata`). An event whose issue cannot be resolved goes in
- * full only to a subscriber with company-wide read (`company_scope:read`, the
- * check run telemetry and activity routes apply), and as metadata otherwise.
+ * (see `issueEventMetadata`). A run or goal event whose issue cannot be
+ * resolved goes in full only to a subscriber with company-wide read
+ * (`company_scope:read`, the check run telemetry applies), and as metadata
+ * otherwise. Activity about other entities goes to every subscriber unchanged.
  */
 const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "run" | "goal"> = {
   "heartbeat.run.queued": "none",
@@ -143,10 +144,7 @@ export function createLiveEventIssueVisibility(db: Db) {
     async function visibleActivity(event: LiveEvent): Promise<LiveEvent> {
       const { entityType, entityId, details } = event.payload;
       if (!isRecord(details)) return event;
-      if (entityType !== "issue" || typeof entityId !== "string" || entityId.length === 0) {
-        if (await canReadCompany(event)) return event;
-        return { ...event, payload: { ...event.payload, details: issueEventMetadata(details, () => false) } };
-      }
+      if (entityType !== "issue" || typeof entityId !== "string" || entityId.length === 0) return event;
       // Without the issue row there is no reader to decide for, so the entry
       // keeps its identifiers and loses its details.
       if (!(await loadIssue(event, entityId))) return { ...event, payload: { ...event.payload, details: null } };

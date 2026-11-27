@@ -448,6 +448,38 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     expect(readerEvents.find(isActivityFor(restrictedIssue.id))?.payload.details).toEqual(details);
   });
 
+  it("sends activity about a non-issue entity unchanged to a subscriber without company-wide read", async () => {
+    const { company, userId } = await seedCompany(db);
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { scopedAgent, nonReaderToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const scopedEvents = await connect(port, company.id, nonReaderToken);
+
+    const details = {
+      name: "Renamed agent",
+      changes: { name: { from: "Old agent", to: "Renamed agent" } },
+      reason: "Free-text reason for the rename",
+    };
+    await logActivity(db, {
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: scopedAgent.id,
+      details,
+    });
+
+    const isAgentActivity = (event: LiveEvent) => event.payload.entityType === "agent";
+    await waitFor(() => scopedEvents.some(isAgentActivity));
+
+    expect(scopedEvents.find(isAgentActivity)?.payload.details).toEqual(details);
+  });
+
   it("sends run output that names no issue only as metadata to a subscriber without company-wide read", async () => {
     const { company, userId } = await seedCompany(db);
     const ownIssue = await seedIssue(db, company.id, {
