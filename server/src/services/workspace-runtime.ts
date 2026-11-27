@@ -6812,6 +6812,19 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     if (!validation.valid) {
+      if (input.preserveRecordedCheckoutBranch === true) {
+        // A managed start/restart/repair reports a checkout that already
+        // drifted from its recorded branch as the 409 drift refusal, with its
+        // evidence. It throws only on drift; any other reuse failure falls
+        // through to the error below.
+        await assertRecordedCheckoutBranchIdentity({
+          cwd: reuseWorktreePath,
+          expectedBranch: realized.branchName,
+          strategy: realized.strategy,
+          executionWorkspaceId: input.workspace.id ?? null,
+          recorder: input.recorder ?? null,
+        });
+      }
       throw new WorkspaceRuntimeValidationFailure(
         // `repoRoot` is the repository the registration was looked up in, and
         // `baseCwd` is what it was derived from. Without them a `not_registered`

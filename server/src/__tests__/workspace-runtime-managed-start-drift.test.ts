@@ -755,6 +755,70 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     await expectNoStartingRuntimeRows();
   }, 30_000);
 
+  it.each([
+    {
+      label: "a tag ref",
+      recordedRef: "v1-tag",
+      reasonCode: "recorded_ref_missing",
+      prepare: async (f: LinkedSource) => {
+        await git(["tag", "v1-tag", "branch-a"], f.owner);
+      },
+    },
+    {
+      label: "a branch whose checkout is detached off its tip",
+      recordedRef: "branch-a",
+      reasonCode: "detached_head_off_recorded_tip",
+      prepare: async (f: LinkedSource) => {
+        await git(["checkout", "-q", "--detach", "branch-b"], f.source);
+      },
+    },
+    {
+      label: "a branch whose checkout moved to another branch",
+      recordedRef: "branch-a",
+      reasonCode: "branch_mismatch",
+      prepare: async (f: LinkedSource) => {
+        await git(["switch", "-q", "--ignore-other-worktrees", "branch-b"], f.source);
+      },
+    },
+  ])("refuses a git_worktree start with 409 when the checkout already drifted from $label", async ({ recordedRef, reasonCode, prepare }) => {
+    const fixture = await makeLinkedSource();
+    await prepare(fixture);
+    const headRefBefore = await git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null);
+    const headBefore = await git(["rev-parse", "--verify", "--quiet", "HEAD"], fixture.source).catch(() => null);
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: recordedRef,
+      baseRef: "branch-a",
+      projectCwd: fixture.owner,
+      strategyType: "git_worktree",
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+
+    expectDriftRefusal(res, reasonCode);
+    await expect(fs.stat(started)).rejects.toThrow();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null))
+      .resolves.toBe(headRefBefore);
+    await expect(git(["rev-parse", "--verify", "--quiet", "HEAD"], fixture.source).catch(() => null))
+      .resolves.toBe(headBefore);
+    const row = await db.select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.workspaceId))
+      .then((rows) => rows[0]);
+    expect(row?.branchName).toBe(recordedRef);
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain("checkoutBranchDrift");
+    expect(evidence).toContain(reasonCode);
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
   it("returns the pre-spawn refusal while the start transaction holds the workspace row lock", async () => {
     const fixture = await makeLinkedSource();
     const scope = await seedCompany();
