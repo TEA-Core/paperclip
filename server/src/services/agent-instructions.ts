@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agentInstructionHeads, agents, type Db } from "@paperclipai/db";
-import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes, materializeInstructionBytes, createInstructionDirectory } from "./agent-instruction-files.js";
+import { instructionPath, assertInstructionPathSafe, instructionBytes, readInstructionBytes, materializeInstructionBytes, createInstructionDirectory, resolveAgentsGid } from "./agent-instruction-files.js";
 import { notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 
@@ -453,15 +453,16 @@ function buildPersistedBundleConfig(
 async function writeBundleFiles(
   rootPath: string,
   files: Record<string, string>,
-  options?: { overwriteExisting?: boolean },
+  options?: { overwriteExisting?: boolean; gid?: number | null },
 ) {
+  const gid = options?.gid === undefined ? await resolveAgentsGid() : options.gid;
   for (const [relativePath, content] of Object.entries(files)) {
     const normalizedPath = normalizeRelativeFilePath(relativePath);
     instructionBytes(content);
     const absolutePath = await assertInstructionPathSafe(rootPath, normalizedPath);
     const existingStat = await statIfExists(absolutePath);
     if (existingStat?.isFile() && !options?.overwriteExisting) continue;
-    await materializeInstructionBytes(rootPath, normalizedPath, Buffer.from(content, "utf8"));
+    await materializeInstructionBytes(rootPath, normalizedPath, Buffer.from(content, "utf8"), { gid });
   }
 }
 
@@ -561,7 +562,8 @@ export function agentInstructionsService(db?: Db) {
       entryFile,
       clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
     });
-    await createInstructionDirectory(managedRoot);
+    const gid = await resolveAgentsGid();
+    await createInstructionDirectory(managedRoot, { gid });
 
     const entryPath = await assertInstructionPathSafe(managedRoot, entryFile);
     const entryStat = await statIfExists(entryPath);
@@ -569,7 +571,7 @@ export function agentInstructionsService(db?: Db) {
       const legacyInstructions = await readLegacyInstructions(agent, current.config);
       if (legacyInstructions.trim().length > 0) {
         await assertUnversionedEntry(agent, entryFile);
-        await materializeInstructionBytes(managedRoot, entryFile, Buffer.from(legacyInstructions, "utf8"));
+        await materializeInstructionBytes(managedRoot, entryFile, Buffer.from(legacyInstructions, "utf8"), { gid });
       }
     }
 
@@ -608,7 +610,8 @@ export function agentInstructionsService(db?: Db) {
     }
 
     await assertInstructionPathSafe(nextRootPath, nextEntryFile);
-    await createInstructionDirectory(nextRootPath);
+    const gid = await resolveAgentsGid();
+    await createInstructionDirectory(nextRootPath, { gid });
 
     const existingFiles = await listFilesRecursive(nextRootPath);
     if (nextMode === "managed" && !existingFiles.includes(nextEntryFile)) {
@@ -616,12 +619,12 @@ export function agentInstructionsService(db?: Db) {
     }
     const exported = await exportFiles(agent);
     if (existingFiles.length === 0) {
-      await writeBundleFiles(nextRootPath, exported.files);
+      await writeBundleFiles(nextRootPath, exported.files, { gid });
     }
     const refreshedFiles = existingFiles.length === 0 ? await listFilesRecursive(nextRootPath) : existingFiles;
     if (!refreshedFiles.includes(nextEntryFile)) {
       const nextEntryContent = exported.files[nextEntryFile] ?? exported.files[exported.entryFile] ?? "";
-      await writeBundleFiles(nextRootPath, { [nextEntryFile]: nextEntryContent });
+      await writeBundleFiles(nextRootPath, { [nextEntryFile]: nextEntryContent }, { gid });
     }
 
     const nextConfig = applyBundleConfig(state.config, {
@@ -769,17 +772,18 @@ export function agentInstructionsService(db?: Db) {
     if (options?.replaceExisting) {
       await fs.rm(rootPath, { recursive: true, force: true });
     }
-    await createInstructionDirectory(rootPath);
+    const gid = await resolveAgentsGid();
+    await createInstructionDirectory(rootPath, { gid });
 
     const normalizedEntries = Object.entries(files).map(([relativePath, content]) => [
       normalizeRelativeFilePath(relativePath),
       content,
     ] as const);
     for (const [relativePath, content] of normalizedEntries) {
-      await materializeInstructionBytes(rootPath, relativePath, Buffer.from(content, "utf8"));
+      await materializeInstructionBytes(rootPath, relativePath, Buffer.from(content, "utf8"), { gid });
     }
     if (!normalizedEntries.some(([relativePath]) => relativePath === entryFile)) {
-      await materializeInstructionBytes(rootPath, entryFile, Buffer.alloc(0));
+      await materializeInstructionBytes(rootPath, entryFile, Buffer.alloc(0), { gid });
     }
 
     const adapterConfig = applyBundleConfig(asRecord(agent.adapterConfig), {

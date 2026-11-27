@@ -14,6 +14,9 @@ import { agents, companies, authUsers, companyMemberships, principalPermissionGr
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
 
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/agents-gid.js")).mockAgentsGroupLookup(await importOriginal()));
+
 // The agents group is never gid 0 or the server's primary group.
 const agentsGid = assignableAgentsGid();
 const sharing = agentsGid !== undefined;
@@ -265,7 +268,7 @@ describe("persistent agent directories", () => {
       await fs.writeFile(path.join(root, "permissive/public.md"), "public");
       await fs.writeFile(path.join(root, "private.md"), "private", { mode: 0o600 });
       await fs.writeFile(path.join(root, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
-      const copy = await withAgentsGid(shared ? agentsGid! : -1, () => run({ warm: true }));
+      const copy = await withAgentsGid(shared ? agentsGid! : null, () => run({ warm: true }));
       const check = async (directory: string) => {
         const stat = await fs.stat(directory);
         expect(stat.mode & 0o027).toBe(0);

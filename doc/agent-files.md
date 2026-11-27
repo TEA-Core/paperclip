@@ -37,11 +37,13 @@ workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
 
-The runtime's agents group is resolved by name (`agents`). `PAPERCLIP_AGENTS_GID`
-may give it numerically where the name does not resolve. The server refuses an
-override that is not numeric, is gid `0`, is the server's own primary group, or
-differs from the named `agents` group. The group is used only when the server
-process may assign it (it is root or a member). Otherwise no group is used.
+The runtime's agents group is resolved by name (`agents`) only. When the name
+does not resolve (no such group, no `getent`, or a lookup timeout), no group is
+used and the server logs a warning, whatever `PAPERCLIP_AGENTS_GID` says.
+`PAPERCLIP_AGENTS_GID` is accepted only when it equals the named group's gid;
+an override that differs, is gid `0`, or is the server's own primary group is
+refused and no group is used. The group is used only when the server process
+may assign it (it is root or a member).
 
 Editor saves, bundle initialization/import, and adoption of revision-backed files
 write instruction files as `0640` and directories as `0750`, both owned by the
@@ -51,10 +53,19 @@ writes stay owner-only (`0600` files, `0700` directories) and grant no group
 access. Each write replaces the file with a new inode in the final mode and
 group. It also sets every existing directory from the instruction root down to
 that file to the same layout, so a loose (for example `0777`) directory is
-tightened. Directories above the instruction root are not changed. If a loose
-directory cannot be tightened (for example, another user owns it), the write is
-refused with `INSTRUCTION_STORAGE_UNSAFE`. Files that are not written are not
-bulk-migrated. The adoption marker remains private (`0600`).
+tightened. Each of those directories must be owned by the server user.
+
+For canonical storage under `<instance>/companies/`, each existing directory
+from the instance root down to the instruction root (the agent directory
+included) must be owned by the server user and must not be world-writable. A
+server-owned directory there that is only group-writable loses group write in
+place. Nothing outside the instance root is checked or changed.
+
+A write is refused with `INSTRUCTION_STORAGE_UNSAFE` when a directory is owned
+by another user (`reason: "foreign-owner"`), when an ancestor is world-writable
+(`"world-writable-ancestor"`), or when a mode cannot be tightened
+(`"cannot-tighten"`). Files that are not written are not bulk-migrated. The
+adoption marker remains private (`0600`).
 
 Instruction files are readable by every member of the agents group. Do not put
 secrets (API keys, tokens, passwords, credentials) in instruction files or

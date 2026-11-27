@@ -9,6 +9,9 @@ import { agents, agentApiKeys, companies, authUsers, companyMemberships, princip
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
 
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/agents-gid.js")).mockAgentsGroupLookup(await importOriginal()));
+
 const agentsGid = assignableAgentsGid();
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
