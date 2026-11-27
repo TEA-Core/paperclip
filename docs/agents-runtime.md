@@ -102,11 +102,11 @@ The same declaration keeps the undispatchable-assignee sweep quiet. A `process` 
 
 The stillborn-backlog sweep (`stillborn_assigned_backlog`), the stranded-issue sweep (`stranded_assigned_issue`) and the exhausted-recovery drain apply a narrower rule to the cards a pull agent parks:
 
-- Only parked cards are exempt: `backlog`, `blocked` and `in_review`. A pull agent's `todo` or `in_progress` card keeps normal recovery.
+- Only parked cards are exempt: `backlog`, `blocked` and `in_review`. A pull agent's `todo` or `in_progress` card is still detected, but it is reported only to the board, the same way as a lapsed exemption below.
 - While the pull agent's status lets it work, the sweeps skip its parked cards, because the agent pulls them itself.
 - The exemption ends when the pull agent is paused, terminated or pending approval, when a parked card has had no activity for 72 hours (`EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS`), or when the board clears it for one card with `POST /api/issues/{issueId}/recovery/external-pull-exemption/clear`. The card is then reported, but only to the board: the stranded sweep holds it with a board-owned `no_live_path_owner_unavailable` action, and the stillborn sweep blocks it with a board escalation.
-- Exhausted recovery never opens a manager-owned `stranded_issue_recovery` card for a pull agent's parked issue.
-- In none of these cases does recovery reassign a pull agent's parked card to another agent, wake another agent on it, or let another agent check it out.
+- Exhausted recovery never opens a manager-owned `stranded_issue_recovery` card for a pull agent's issue, parked or not.
+- In none of these cases does recovery reassign a pull agent's card to another agent, wake another agent on it, or let another agent check it out.
 
 Notes:
 

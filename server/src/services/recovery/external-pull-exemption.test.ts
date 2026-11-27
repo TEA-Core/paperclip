@@ -24,8 +24,11 @@ describe("decideExternalPullRecoveryExemption", () => {
     expect(decideExternalPullRecoveryExemption(facts({ issueStatus }))).toEqual({ kind: "exempt" });
   });
 
-  it.each(["todo", "in_progress"])("keeps normal recovery for a %s card", (issueStatus) => {
-    expect(decideExternalPullRecoveryExemption(facts({ issueStatus }))).toEqual({ kind: "none" });
+  it.each(["todo", "in_progress"])("sends a live pull owner's %s card to the board", (issueStatus) => {
+    expect(decideExternalPullRecoveryExemption(facts({ issueStatus }))).toEqual({
+      kind: "board_only",
+      reason: "active_card",
+    });
   });
 
   it("keeps normal recovery for an owner that is not a pull agent", () => {

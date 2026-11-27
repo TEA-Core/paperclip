@@ -4,8 +4,8 @@
 // sweep and the exhausted-recovery drain use this one decision for such a card.
 //
 // The exemption is narrow on purpose:
-// - Only parked statuses are exempt. A card the pull agent holds in `todo` or
-//   `in_progress` keeps normal recovery.
+// - Only parked statuses are exempt from detection. A card the pull agent
+//   holds in `todo` or `in_progress` is still detected, but goes to the board.
 // - Only a live owner is exempt. A paused, terminated or pending-approval owner
 //   pulls nothing.
 // - The exemption expires. A parked card with no activity for
@@ -29,6 +29,7 @@ export const EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION =
 
 export type ExternalPullRecoveryBoardOnlyReason =
   | "owner_not_invokable"
+  | "active_card"
   | "exemption_expired"
   | "board_cleared";
 
@@ -60,8 +61,8 @@ export function decideExternalPullRecoveryExemption(
   facts: ExternalPullRecoveryExemptionFacts,
 ): ExternalPullRecoveryExemption {
   if (!facts.ownerIsExternalPull) return { kind: "none" };
-  if (!isExternalPullRecoveryExemptStatus(facts.issueStatus)) return { kind: "none" };
   if (!facts.ownerStatusInvokable) return { kind: "board_only", reason: "owner_not_invokable" };
+  if (!isExternalPullRecoveryExemptStatus(facts.issueStatus)) return { kind: "board_only", reason: "active_card" };
   if (facts.boardCleared) return { kind: "board_only", reason: "board_cleared" };
   if (facts.now.getTime() - facts.lastActivityAt.getTime() >= EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS) {
     return { kind: "board_only", reason: "exemption_expired" };

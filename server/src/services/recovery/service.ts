@@ -194,7 +194,6 @@ import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
   decideExternalPullRecoveryExemption,
   EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
-  isExternalPullRecoveryExemptStatus,
   type ExternalPullRecoveryExemption,
 } from "./external-pull-exemption.js";
 import {
@@ -1693,7 +1692,6 @@ export function recoveryService(
     now: Date = new Date(),
     runner: Db = db,
   ): Promise<ExternalPullRecoveryExemption> {
-    if (!isExternalPullRecoveryExemptStatus(issue.status)) return { kind: "none" };
     const owner = await getExternalPullAgent(issue.companyId, ownerAgentId, runner);
     if (!owner) return { kind: "none" };
     return decideExternalPullRecoveryExemption({
@@ -6936,9 +6934,9 @@ export function recoveryService(
       }
 
       // Fork (two-fleet routing): a parked card of a live `external_pull` owner
-      // is not stranded. When the exemption lapses (dead owner, age bound,
-      // board override) the card reaches only the board-owned hold below,
-      // never the manager ladder. A non-parked card keeps normal recovery.
+      // is not stranded. Any other card of such an owner (active card, dead
+      // owner, age bound, board override) reaches only the board-owned hold
+      // below, never the manager ladder.
       const externalPullExemption = await evaluateExternalPullRecoveryExemption(issue, agentId, now);
       if (externalPullExemption.kind === "exempt") {
         result.skipped += 1;
@@ -10442,13 +10440,10 @@ export function recoveryService(
     }
 
     // Fork (two-fleet routing): never mint a ladder-owned recovery card for a
-    // parked source owned by an `external_pull` agent, whatever its age, owner
+    // source owned by an `external_pull` agent, whatever its status, age, owner
     // status or board override; the board action stays the decision item and
-    // the card stays with its owner. A non-parked source keeps normal recovery.
-    if (
-      isExternalPullRecoveryExemptStatus(input.issue.status) &&
-      (await getExternalPullAgent(input.issue.companyId, input.issue.assigneeAgentId, db))
-    ) {
+    // the card stays with its owner.
+    if (await getExternalPullAgent(input.issue.companyId, input.issue.assigneeAgentId, db)) {
       return EXHAUSTED_RECOVERY_UNAVAILABLE;
     }
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);

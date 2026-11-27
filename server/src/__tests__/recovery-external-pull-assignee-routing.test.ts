@@ -378,20 +378,25 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     return { issueId, runId };
   }
 
-  it("stranded assigned issue: keeps normal recovery for an in_progress card of a live external-pull assignee", async () => {
-    // `in_progress` is not a parked status, so the exemption does not apply.
+  it("stranded assigned issue: surfaces an in_progress card of a live external-pull assignee to the board without re-homing it", async () => {
     const fleet = await seedFleet();
     const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
-    const { svc } = makeSweep();
+    await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, issueId));
+    const { svc, enqueueWakeup } = makeSweep();
 
     const result = await svc.reconcileStrandedAssignedIssues();
 
-    expect(result.escalated).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
-    expect((await issueRow(issueId))?.status).toBe("blocked");
+    expect((await issueRow(issueId))?.status).toBe("in_progress");
+    await expectNotReassigned(fleet, issueId);
     const actions = await recoveryActionRows(issueId);
     expect(actions).toHaveLength(1);
-    expect(actions[0].kind).toBe("stranded_assigned_issue");
+    expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
+    expect(actions[0].ownerType).toBe("board");
+    expect(actions[0].ownerAgentId).toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   async function seedParkedReviewCard(companyId: string, assigneeAgentId: string) {
@@ -601,16 +606,22 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     },
   );
 
-  it("stranded issue recovery: keeps normal recovery for an in_progress source of a live external-pull assignee", async () => {
+  it("stranded issue recovery: never mints a ladder card for an in_progress source of a live external-pull assignee", async () => {
     const fleet = await seedFleet();
     const issueId = await seedExhaustedBlockedCard(fleet.companyId, fleet.externalAgentId);
     await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
-    const { svc } = makeSweep();
+    const { svc, enqueueWakeup } = makeSweep();
 
     const result = await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
 
-    expect(result.recoveryIssueMinted).toBe(1);
-    expect(await recoveryChildren(issueId)).toHaveLength(1);
+    expect(result.recoveryIssueMinted).toBe(0);
+    expect(await recoveryChildren(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId))?.status).toBe("in_progress");
+    await expectNotReassigned(fleet, issueId);
+    const [action] = await recoveryActionRows(issueId);
+    expect(action.ownerType).toBe("board");
+    expect(action.recoveryIssueId).toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("stranded issue recovery: never mints a ladder card for a parked source even past the exemption bound", async () => {
