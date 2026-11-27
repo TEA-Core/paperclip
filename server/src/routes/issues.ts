@@ -24733,6 +24733,7 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          { enforceExecutionPolicySeatRules: true },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {

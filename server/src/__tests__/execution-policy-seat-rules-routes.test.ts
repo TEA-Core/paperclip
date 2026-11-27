@@ -807,4 +807,27 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
     const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
     expect(after.assigneeAgentId).toBeNull();
   });
+
+  it("checkout: the atomic write judges the row's current policy, not the route's earlier read", async () => {
+    const { companyId, executorId, reviewerId } = await seed();
+    // The route read the card before a concurrent PATCH seated the caller; the
+    // write must judge the policy the row holds when it is locked.
+    const issue = await insertIssue({
+      companyId,
+      createdByUserId: BOARD_USER,
+      executionPolicy: policy(agentStage("review", executorId, reviewerId)),
+    });
+    let error: unknown = null;
+    try {
+      await issueService(db).checkout(issue.id, reviewerId, ["todo"], null, { enforceExecutionPolicySeatRules: true });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", participantId: reviewerId, conflictingRole: "assignee" },
+    });
+    const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(after.assigneeAgentId).toBeNull();
+  });
 });

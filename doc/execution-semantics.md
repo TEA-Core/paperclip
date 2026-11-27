@@ -103,9 +103,12 @@ alias, and a whole-policy replace) and checkout. The server compares agent ids,
 never names: an agent participant against `createdByAgentId` and
 `assigneeAgentId`. User participants are not judged, matching the agent tools'
 rule. Routine create, update and revision restore apply the same rule to the
-routine's policy, its assignee and the agent that created it; a routine stored
-before the rule still dispatches, and the server logs a warning naming the
-routine. A violation is refused with `422` and the code
+routine's policy, its assignee and the agent that created it. A run requested
+through `POST /api/routines/{id}/run` is judged as the issue it would create
+(the stored policy, the effective assignee including a per-run override, and a
+manual runner as creator) and refused before anything is created; a scheduled
+or webhook dispatch of a routine stored before the rule still creates the issue,
+and the server logs a warning naming the routine. A violation is refused with `422` and the code
 `execution_policy_seat_conflict`; `details` names the seat (`reviewer` or
 `approver`), the stage, the participant id and the conflicting role (`creator`
 or `assignee`). The rule applies to agent and board callers alike, and the

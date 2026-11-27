@@ -321,7 +321,7 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
-import { assertExecutionPolicySeatsLawful } from "./execution-policy-seat-rules.js";
+import { activeExecutionStageId, assertExecutionPolicySeatsLawful } from "./execution-policy-seat-rules.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -13512,6 +13512,7 @@ export function issueService(
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      options: { enforceExecutionPolicySeatRules?: boolean } = {},
     ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId, status: issues.status })
@@ -13580,13 +13581,29 @@ export function issueService(
       await clearCheckoutRunIfTerminal(id);
 
       return db.transaction(async (tx) => {
-        const lockedIssue = await tx.select({ status: issues.status }).from(issues)
+        const lockedIssue = await tx.select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          createdByAgentId: issues.createdByAgentId,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        }).from(issues)
           .where(and(eq(issues.id, id), eq(issues.companyId, issueCompany.companyId)))
           .for("update").then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
         if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
           throw conflict("Issue cannot be checked out because it is already closed", {
             code: "checkout_refused_terminal_status", issueId: id, status: lockedIssue.status,
+          });
+        }
+        if (options.enforceExecutionPolicySeatRules === true && lockedIssue.assigneeAgentId !== agentId) {
+          assertExecutionPolicySeatsLawful({
+            executionPolicy: lockedIssue.executionPolicy ?? null,
+            creator: { agentId: lockedIssue.createdByAgentId },
+            assignee: { agentId },
+            judgeCreator: false,
+            judgeAssignee: true,
+            assigneeMayHoldStageId: activeExecutionStageId(lockedIssue),
           });
         }
         // Keep every acquisition read and fallback stamp on this connection.

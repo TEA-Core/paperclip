@@ -499,6 +499,21 @@ function assertRoutineExecutionPolicySeatsLawful(
   });
 }
 
+function routineDispatchSeatRuleInput(
+  routine: { executionPolicy: unknown },
+  source: "schedule" | "manual" | "api" | "webhook",
+  assigneeAgentId: string | null,
+  actor: Actor | undefined,
+) {
+  return {
+    executionPolicy: routine.executionPolicy ?? null,
+    creator: { agentId: source === "manual" ? actor?.agentId ?? null : null },
+    assignee: { agentId: assigneeAgentId },
+    judgeCreator: true,
+    judgeAssignee: true,
+  };
+}
+
 function normalizeDraftRoutineStatus(status: string, assigneeAgentId: string | null | undefined) {
   if (statusRequiresDefaultAgent(status) && !assigneeAgentId) {
     return "paused";
@@ -2192,6 +2207,7 @@ export function routineService(
       throw unprocessable("Default agent required");
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
+    const seatRuleInput = routineDispatchSeatRuleInput(input.routine, input.source, assigneeAgentId, input.actor);
     const automaticVariables: Record<string, string | number | boolean> = {};
     // SUP-21022: a routine-level preference only applies when the run supplies
     // no workspace selection of its own, so manual/API overrides still win.
@@ -2367,14 +2383,7 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        const createdByAgentId = input.source === "manual" ? input.actor?.agentId ?? null : null;
-        const seatConflicts = findExecutionPolicySeatConflicts({
-          executionPolicy: input.routine.executionPolicy ?? null,
-          creator: { agentId: createdByAgentId },
-          assignee: { agentId: assigneeAgentId },
-          judgeCreator: true,
-          judgeAssignee: true,
-        });
+        const seatConflicts = findExecutionPolicySeatConflicts(seatRuleInput);
         if (seatConflicts.length > 0) {
           logger.warn(
             { routineId: input.routine.id, runId: createdRun.id, conflicts: seatConflicts },
@@ -2392,7 +2401,7 @@ export function routineService(
             status: "todo",
             priority: input.routine.priority,
             assigneeAgentId,
-            createdByAgentId,
+            createdByAgentId: seatRuleInput.creator.agentId,
             createdByUserId: manualRunnerUserId,
             responsibleUserId,
             trustExplicitResponsibleUserId: true,
@@ -3440,6 +3449,9 @@ export function routineService(
       await assertProject(routine.companyId, input.projectId ?? null);
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
+      assertExecutionPolicySeatsLawful(
+        routineDispatchSeatRuleInput(routine, input.source, assigneeAgentId, actor),
+      );
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
       if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
       if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
