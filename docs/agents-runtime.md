@@ -100,6 +100,8 @@ Two supported shapes, in order of preference:
 
 The same declaration keeps the undispatchable-assignee sweep quiet. A `process` agent cannot be woken, so that sweep normally reports its `todo`/`in_progress` cards and opens a board-owned `undispatchable_assignee` recovery action. A declared pull agent is exempt while its status lets it work: `active`, `idle`, `running` or `error`. A pull agent in `error` status is still exempt, because `error` describes its last run, not whether it can pull work. A paused, terminated or pending-approval pull agent pulls nothing, so its cards are still reported. Declaring the mode does not close an `undispatchable_assignee` action that is already open: the board resolves it.
 
+The stillborn-backlog sweep (`stillborn_assigned_backlog`) and the stranded-issue sweep (`stranded_assigned_issue`) apply the same rule to the cards a pull agent parks. While its status lets it work, they skip its cards, because the agent pulls them itself. When it is paused, terminated or pending approval, its cards are still reported, but only to the board: the stranded sweep holds them with a board-owned `no_live_path_owner_unavailable` action, and the stillborn sweep blocks them with a board escalation. Exhausted recovery never opens a manager-owned `stranded_issue_recovery` card for a pull agent's issue. Recovery never reassigns a pull agent's card to another agent, wakes another agent on it, or lets another agent check it out.
+
 Notes:
 
 - The declaration is read from the agent record only. Paperclip never infers it from the adapter command, because a no-op command and a genuinely misconfigured `process` agent look identical — and the misconfigured one still needs its recovery path.
