@@ -5,6 +5,7 @@ import { isUuidLike, type LiveEvent, type LiveEventType } from "@paperclipai/sha
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
 import { issueAccessDecisionInput, type IssueAccessTarget } from "../services/issue-access-input.js";
 import {
+  isIssueDocumentEvent,
   isRecord,
   summarizedIssueIds,
   withoutUnreadableIssueContent,
@@ -16,18 +17,18 @@ import {
  * - `none`: carries no issue content; every subscriber receives it.
  * - `activity`: an activity entry; issue entries lose the content the
  *   subscriber cannot read and keep their identifiers and metadata.
- * - `run`: a heartbeat run event; it carries output of the run's issue and
- *   goes only to a subscriber that can read that issue.
- * - `issue`: names its issue in `payload.issueId`; it goes only to a
- *   subscriber that can read that issue.
+ * - `goal`: a runner goal projection; a subscriber that cannot read its issue
+ *   receives it without the goal's objective and last reason.
+ * - a field list: a heartbeat run event; a subscriber that cannot read the
+ *   run's issue receives it with these output fields set to `null`.
  */
-const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "run" | "issue"> = {
-  "heartbeat.run.queued": "run",
-  "heartbeat.run.status": "run",
-  "heartbeat.run.progress": "run",
-  "heartbeat.run.event": "run",
-  "heartbeat.run.log": "run",
-  "agent.session.goal.changed": "issue",
+const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "goal" | readonly string[]> = {
+  "heartbeat.run.queued": "none",
+  "heartbeat.run.status": ["error", "finalText"],
+  "heartbeat.run.progress": ["message", "lastAssistantSnippet"],
+  "heartbeat.run.event": ["message", "error", "lastAssistantSnippet", "payload"],
+  "heartbeat.run.log": ["chunk"],
+  "agent.session.goal.changed": "goal",
   "agent.status": "none",
   "activity.logged": "activity",
   "external_object.updated": "none",
@@ -43,6 +44,7 @@ const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "run" 
  */
 const READ_DECISION_TTL_MS = 1_000;
 const READ_DECISION_CACHE_LIMIT = 512;
+const RUN_ISSUE_CACHE_LIMIT = 1_024;
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -60,7 +62,8 @@ export function createLiveEventIssueVisibility(db: Db) {
   // The bus hands every subscriber the same event object, so one lookup per
   // event and issue serves all sockets of the company.
   const issueLoads = new WeakMap<LiveEvent, Map<string, Promise<IssueAccessTarget | null>>>();
-  const runIssueLoads = new WeakMap<LiveEvent, Promise<string | null>>();
+  // A run's issue does not change, so one lookup serves every event of the run.
+  const runIssueLoads = new Map<string, Promise<string | null>>();
 
   function loadIssue(event: LiveEvent, issueId: string) {
     let loads = issueLoads.get(event);
@@ -97,14 +100,17 @@ export function createLiveEventIssueVisibility(db: Db) {
     if (named) return Promise.resolve(named);
     const runId = nonEmptyString(event.payload.runId);
     if (!runId || !isUuidLike(runId)) return Promise.resolve(null);
-    let load = runIssueLoads.get(event);
+    const key = `${event.companyId}:${runId}`;
+    let load = runIssueLoads.get(key);
     if (!load) {
+      if (runIssueLoads.size >= RUN_ISSUE_CACHE_LIMIT) runIssueLoads.clear();
       load = db
         .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, event.companyId)))
         .then((rows) => nonEmptyString(rows[0]?.contextSnapshot?.issueId));
-      runIssueLoads.set(event, load);
+      runIssueLoads.set(key, load);
+      load.catch(() => runIssueLoads.delete(key));
     }
     return load;
   }
@@ -144,31 +150,38 @@ export function createLiveEventIssueVisibility(db: Db) {
         Promise.all(summarized.map((issueId) => canReadIssue(event, issueId))),
       ]);
       const readable = new Set(summarized.filter((_, index) => summarizedReadable[index]));
-      const visible = withoutUnreadableIssueContent(details, {
-        ownIssue,
-        summarizedIssue: (issueId) => typeof issueId === "string" && readable.has(issueId),
-      });
+      const visible = withoutUnreadableIssueContent(
+        details,
+        { ownIssue, summarizedIssue: (issueId) => typeof issueId === "string" && readable.has(issueId) },
+        isIssueDocumentEvent(event.payload.action),
+      );
       return visible === details ? event : { ...event, payload: { ...event.payload, details: visible } };
     }
 
-    /** The event as this subscriber may receive it, or `null` when it must be withheld. */
-    return async function visibleLiveEvent(event: LiveEvent): Promise<LiveEvent | null> {
-      switch (LIVE_EVENT_ISSUE_SCOPE[event.type]) {
-        case "none":
-          return event;
-        case "activity":
-          return visibleActivity(event);
-        case "run": {
-          const issueId = await loadRunIssueId(event);
-          return !issueId || (await canReadIssue(event, issueId)) ? event : null;
-        }
-        case "issue": {
-          const issueId = nonEmptyString(event.payload.issueId);
-          return !issueId || (await canReadIssue(event, issueId)) ? event : null;
-        }
-        default:
-          return null;
-      }
+    async function visibleRunEvent(event: LiveEvent, contentFields: readonly string[]): Promise<LiveEvent> {
+      const present = contentFields.filter((field) => event.payload[field] != null);
+      if (present.length === 0) return event;
+      const issueId = await loadRunIssueId(event);
+      if (!issueId || (await canReadIssue(event, issueId))) return event;
+      const payload = { ...event.payload };
+      for (const field of present) payload[field] = null;
+      return { ...event, payload };
+    }
+
+    async function visibleGoal(event: LiveEvent): Promise<LiveEvent> {
+      const { goal } = event.payload;
+      const issueId = nonEmptyString(event.payload.issueId);
+      if (!isRecord(goal) || !issueId || (await canReadIssue(event, issueId))) return event;
+      return { ...event, payload: { ...event.payload, goal: { ...goal, objective: null, lastReason: null } } };
+    }
+
+    /** The event as this subscriber may receive it, without the issue content it may not read. */
+    return async function visibleLiveEvent(event: LiveEvent): Promise<LiveEvent> {
+      const scope = LIVE_EVENT_ISSUE_SCOPE[event.type];
+      if (scope === "none") return event;
+      if (scope === "activity") return visibleActivity(event);
+      if (scope === "goal") return visibleGoal(event);
+      return visibleRunEvent(event, scope);
     };
   };
 }

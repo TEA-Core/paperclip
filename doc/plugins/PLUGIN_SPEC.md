@@ -939,7 +939,7 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
-An issue event payload can carry issue content: the `description` of `issue.created` and `issue.updated` (also under `_previous`), the comment `bodySnippet` of `issue.comment.created`, and the `title` of each issue summary in `addedReferencedIssues`, `removedReferencedIssues`, `currentReferencedIssues`, `blockedByIssues`, `addedBlockedByIssues` and `removedBlockedByIssues`. The host delivers that content only to a plugin that can read the issue, by the same check as `issues.get`, which requires the `issues.read` capability. A plugin that cannot read the issue receives the event without that content. The issue title and the identifiers stay in the event. A plugin that can read the issue receives the event unchanged.
+An issue event payload can carry issue content: the `description` of `issue.created` and `issue.updated` (also under `_previous`), the comment `bodySnippet` of `issue.comment.created`, the document `title` of `issue.document.*`, and the `title` of each issue summary in `addedReferencedIssues`, `removedReferencedIssues`, `currentReferencedIssues`, `blockedByIssues`, `addedBlockedByIssues` and `removedBlockedByIssues`. The host delivers that content only to a plugin that can read the issue, by the same check as `issues.get`, which requires the `issues.read` capability. A plugin that cannot read the issue receives the event without that content. The issue's own title and the identifiers stay in the event. A plugin that can read the issue receives the event unchanged.
 
 ### 16.1 Event Filtering
 

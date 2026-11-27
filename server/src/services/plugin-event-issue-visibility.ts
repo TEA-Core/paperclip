@@ -1,6 +1,6 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { isRecord, withoutUnreadableIssueContent } from "./issue-event-content.js";
+import { isIssueDocumentEvent, isRecord, withoutUnreadableIssueContent } from "./issue-event-content.js";
 import { pluginCapabilityValidator } from "./plugin-capability-validator.js";
 
 const capabilityValidator = pluginCapabilityValidator();
@@ -20,11 +20,15 @@ const UNREADABLE = { ownIssue: false, summarizedIssue: () => false };
 /**
  * The domain event as a plugin may receive it. An issue event can carry issue
  * content in its payload (the description of `issue.created`, the comment
- * snippet of `issue.comment.created`, the titles of referenced and blocking
- * issues); a plugin that cannot read the issue gets the event without that
- * content, keeping the identifiers it needs to react.
+ * snippet of `issue.comment.created`, the title of an `issue.document.*`
+ * document, the titles of referenced and blocking issues); a plugin that
+ * cannot read the issue gets the event without that content, keeping the
+ * identifiers it needs to react.
  */
 export function pluginEventForRecipient(event: PluginEvent, canReadIssue: boolean): PluginEvent {
   if (canReadIssue || event.entityType !== "issue" || !isRecord(event.payload)) return event;
-  return { ...event, payload: withoutUnreadableIssueContent(event.payload, UNREADABLE) };
+  return {
+    ...event,
+    payload: withoutUnreadableIssueContent(event.payload, UNREADABLE, isIssueDocumentEvent(event.eventType)),
+  };
 }

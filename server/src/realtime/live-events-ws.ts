@@ -312,14 +312,14 @@ export function setupLiveEventsWebSocketServer(
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       delivery = delivery.then(async () => {
         if (socket.readyState !== WebSocket.OPEN) return;
-        let visible: LiveEvent | null;
+        let visible: LiveEvent;
         try {
           visible = await visibleLiveEvent(event);
         } catch (err) {
           logger.warn({ err, companyId: context.companyId }, "live event authorization failed; event withheld");
           return;
         }
-        if (!visible || socket.readyState !== WebSocket.OPEN) return;
+        if (socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify(visible));
       });
     });

@@ -83,6 +83,19 @@ describe("plugin issue event visibility", () => {
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
+  it("strips the document title of an unreadable issue's document event", () => {
+    const original = event({
+      eventType: "issue.document.created",
+      payload: { key: "plan", documentId: "doc-1", title: "Restricted document title", revisionNumber: 1 },
+    });
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      key: "plan",
+      documentId: "doc-1",
+      revisionNumber: 1,
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
+  });
+
   it("leaves events about other entities unchanged", () => {
     const agentEvent = event({ eventType: "agent.updated", entityType: "agent", payload: { title: "Agent title" } });
     expect(pluginEventForRecipient(agentEvent, false)).toBe(agentEvent);

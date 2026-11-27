@@ -42,6 +42,7 @@ if (!embeddedPostgresSupport.supported) {
 
 const RESTRICTED_TITLE = "Restricted issue title";
 const RESTRICTED_DESCRIPTION = "Restricted issue description body";
+const RESTRICTED_DOCUMENT_TITLE = "Restricted document title";
 
 type Db = ReturnType<typeof createDb>;
 
@@ -343,7 +344,57 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     expect(readerEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual(details);
   });
 
-  it("withholds run and goal events about an issue from a subscriber that cannot read that issue", async () => {
+  it("withholds a restricted issue's document quote and document title from a subscriber that cannot read it", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    const quoteDetails = { key: "plan", documentKey: "plan", threadId: "thread-1", quote: RESTRICTED_DESCRIPTION };
+    const documentDetails = { key: "plan", documentId: "doc-1", title: RESTRICTED_DOCUMENT_TITLE, revisionNumber: 2 };
+    for (const [action, details] of [
+      ["issue.document_annotation_thread_created", quoteDetails],
+      ["issue.document_updated", documentDetails],
+    ] as const) {
+      await logActivity(db, {
+        companyId: company.id,
+        actorType: "system",
+        actorId: "system",
+        action,
+        entityType: "issue",
+        entityId: restrictedIssue.id,
+        details,
+      });
+    }
+    await logIssueCreated(db, company.id, ownIssue);
+
+    await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
+    await waitFor(() => readerEvents.some(isActivityFor(ownIssue.id)));
+
+    const restrictedDetails = (events: LiveEvent[]) =>
+      events.filter(isActivityFor(restrictedIssue.id)).map((event) => event.payload.details);
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DOCUMENT_TITLE);
+    expect(restrictedDetails(nonReaderEvents)).toEqual([
+      { key: "plan", documentKey: "plan", threadId: "thread-1" },
+      { key: "plan", documentId: "doc-1", revisionNumber: 2 },
+    ]);
+    expect(restrictedDetails(readerEvents)).toEqual([quoteDetails, documentDetails]);
+    // The issue's own title stays on non-document events.
+    expect(nonReaderEvents.find(isActivityFor(ownIssue.id))?.payload.details).toMatchObject({ title: ownIssue.title });
+  });
+
+  it("sends run and goal events about an unreadable issue without their issue content", async () => {
     const { company, userId } = await seedCompany(db);
     const restrictedIssue = await seedIssue(db, company.id, {
       title: RESTRICTED_TITLE,
@@ -364,28 +415,48 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     const nonReaderEvents = await connect(port, company.id, nonReaderToken);
     const readerEvents = await connect(port, company.id, readerToken);
 
-    publishLiveEvent({
-      companyId: company.id,
-      type: "heartbeat.run.progress",
-      payload: {
-        runId: run.id,
-        agentId: scopedAgent.id,
-        issueId: restrictedIssue.id,
-        message: RESTRICTED_DESCRIPTION,
-        lastAssistantSnippet: RESTRICTED_DESCRIPTION,
-      },
-    });
+    const progress = {
+      runId: run.id,
+      agentId: scopedAgent.id,
+      issueId: restrictedIssue.id,
+      phase: "working",
+      message: RESTRICTED_DESCRIPTION,
+      currentToolName: "Bash",
+      lastAssistantSnippet: RESTRICTED_DESCRIPTION,
+    };
     // A run event that does not name its issue still concerns the run's issue.
-    publishLiveEvent({
-      companyId: company.id,
-      type: "heartbeat.run.status",
-      payload: { runId: run.id, agentId: scopedAgent.id, issueId: null, status: "failed", error: RESTRICTED_DESCRIPTION },
-    });
-    publishLiveEvent({
-      companyId: company.id,
-      type: "agent.session.goal.changed",
-      payload: { issueId: restrictedIssue.id, goal: { objective: RESTRICTED_DESCRIPTION } },
-    });
+    const status = {
+      runId: run.id,
+      agentId: scopedAgent.id,
+      issueId: null,
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: RESTRICTED_DESCRIPTION,
+      finalText: RESTRICTED_DESCRIPTION,
+    };
+    const runEvent = {
+      runId: run.id,
+      agentId: scopedAgent.id,
+      issueId: restrictedIssue.id,
+      seq: 1,
+      eventType: "assistant",
+      message: RESTRICTED_DESCRIPTION,
+      error: null,
+      lastAssistantSnippet: null,
+      payload: { text: RESTRICTED_DESCRIPTION },
+    };
+    const log = { runId: run.id, agentId: scopedAgent.id, issueId: restrictedIssue.id, seq: 1, stream: "stdout", chunk: RESTRICTED_DESCRIPTION };
+    const goal = {
+      issueId: restrictedIssue.id,
+      agentId: scopedAgent.id,
+      revision: 3,
+      goal: { objective: RESTRICTED_DESCRIPTION, lastReason: RESTRICTED_DESCRIPTION, status: "active", iterations: 2 },
+    };
+    publishLiveEvent({ companyId: company.id, type: "heartbeat.run.progress", payload: progress });
+    publishLiveEvent({ companyId: company.id, type: "heartbeat.run.status", payload: status });
+    publishLiveEvent({ companyId: company.id, type: "heartbeat.run.event", payload: runEvent });
+    publishLiveEvent({ companyId: company.id, type: "heartbeat.run.log", payload: log });
+    publishLiveEvent({ companyId: company.id, type: "agent.session.goal.changed", payload: goal });
     // An event without issue content reaches every subscriber and marks the end of the batch.
     publishLiveEvent({
       companyId: company.id,
@@ -398,16 +469,23 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     await waitFor(() => readerEvents.some(isAgentStatus));
 
     expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
-    expect(nonReaderEvents.map((event) => event.type)).toEqual(["agent.status"]);
-    // A subscriber that can read the issue still receives every event in full.
-    expect(readerEvents.map((event) => event.type)).toEqual([
-      "heartbeat.run.progress",
-      "heartbeat.run.status",
-      "agent.session.goal.changed",
-      "agent.status",
+    expect(nonReaderEvents.map((event) => event.payload)).toEqual([
+      { ...progress, message: null, lastAssistantSnippet: null },
+      { ...status, error: null, finalText: null },
+      { ...runEvent, message: null, payload: null },
+      { ...log, chunk: null },
+      { ...goal, goal: { ...goal.goal, objective: null, lastReason: null } },
+      { agentId: scopedAgent.id, status: "idle" },
     ]);
-    expect(readerEvents[0]!.payload).toMatchObject({ message: RESTRICTED_DESCRIPTION });
-    expect(readerEvents[1]!.payload).toMatchObject({ error: RESTRICTED_DESCRIPTION });
+    // A subscriber that can read the issue still receives every event in full.
+    expect(readerEvents.map((event) => event.payload)).toEqual([
+      progress,
+      status,
+      runEvent,
+      log,
+      goal,
+      { agentId: scopedAgent.id, status: "idle" },
+    ]);
   });
 
   it("stops sending issue content to a session once its instance-admin role is removed", async () => {
