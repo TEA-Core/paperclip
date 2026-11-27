@@ -19,6 +19,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueDocuments,
+  issueMonitorRecoveryClaims,
   issues,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
@@ -1284,6 +1285,147 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         }
       },
     );
+
+    // The episode is keyed on the arm. A re-arm while an earlier exhaustion's completion
+    // is still failing starts a new episode: the next exhaustion gets its own recovery
+    // and never replays the effect recorded for the stuck one.
+    it.each([
+      ["board", "wake_owner"],
+      ["board", "create_recovery_issue"],
+      ["assignee", "wake_owner"],
+      ["assignee", "create_recovery_issue"],
+    ] as const)(
+      "%s re-arm during a stuck %s completion gets a new recovery, not a replay",
+      async (rearmedBy, recoveryPolicy) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        const queuedWakeups = async () =>
+          (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).filter(
+            (row) =>
+              row.status !== "skipped" &&
+              (recoveryPolicy === "wake_owner"
+                ? row.idempotencyKey?.startsWith("issue-monitor-recovery:")
+                : row.idempotencyKey?.startsWith("issue-monitor-recovery-issue:")),
+          ).length;
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected completion fault'; end $$;
+          create trigger sup23786_completion_fault before insert on activity_log for each row
+            when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          await heartbeat.drainActiveRunExecutions();
+          expect(await exhaustionRows(issueId)).toHaveLength(0);
+          expect(await queuedWakeups()).toBe(1);
+          await db.update(issues).set({ status: "done" }).where(eq(issues.originId, issueId));
+
+          if (rearmedBy === "board") {
+            await rearm(issueId, "board", { maxAttempts: 2, recoveryPolicy, nextCheckAt: "2026-04-11T13:30:00.000Z" });
+          } else {
+            await rearm(issueId, "assignee", { ...monitor, nextCheckAt: "2026-04-11T13:30:00.000Z" });
+          }
+        } finally {
+          await db.execute(
+            sql.raw(
+              "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+            ),
+          );
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        if (rearmedBy === "board") {
+          // The board's higher bound lets attempt 2 fire normally; the owner's exhausted
+          // re-arm then reaches the recovery.
+          expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+          await rearm(issueId, "assignee", { maxAttempts: 2, recoveryPolicy, nextCheckAt: "2026-04-11T14:00:00.000Z" });
+          await heartbeat.tickTimers(new Date("2026-04-11T14:01:00.000Z"));
+          await heartbeat.drainActiveRunExecutions();
+        }
+
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(await queuedWakeups()).toBe(2);
+        if (recoveryPolicy === "wake_owner") {
+          expect(rows[0]!.details).toMatchObject({ recoveryOutcome: "owner_wake_queued" });
+        } else {
+          expect((await recoveryEffects(issueId, agentId, companyId)).recoveryIssues).toBe(2);
+          expect(rows[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+        }
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    it("a plain retry of the same arm after a completion failure reuses its single claim", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'sup23786 injected completion fault'; end $$;
+        create trigger sup23786_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+          ),
+        );
+      }
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      await heartbeat.drainActiveRunExecutions();
+
+      const claims = await db
+        .select()
+        .from(issueMonitorRecoveryClaims)
+        .where(eq(issueMonitorRecoveryClaims.issueId, issueId));
+      expect(claims).toHaveLength(1);
+      expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
+    });
+
+    // A re-arm that commits while the recovery effect runs must survive: the completion
+    // clear is guarded on the claimed arm and rolls back instead of overwriting it.
+    it("a re-arm committed during the recovery effect is kept and the exhaustion is not recorded", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      const rearmedAt = "2026-04-11T15:00:00.000Z";
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_rearm_during_effect() returns trigger language plpgsql as $$
+        begin
+          update issues set monitor_next_check_at = '${rearmedAt}' where id = new.origin_id::uuid;
+          return new;
+        end $$;
+        create trigger sup23786_rearm_during_effect after insert on issues for each row
+          when (new.origin_id = '${issueId}') execute function sup23786_rearm_during_effect();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_rearm_during_effect on issues; drop function if exists sup23786_rearm_during_effect();",
+          ),
+        );
+      }
+
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
 
     it("timeout: an agent re-arm after timeoutAt still reaches the recovery", async () => {
       const monitor = {

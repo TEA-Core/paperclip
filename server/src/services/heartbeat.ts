@@ -12584,7 +12584,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
     monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
     monitorAttemptCount: issues.monitorAttemptCount,
-    monitorExhaustionCount: issues.monitorExhaustionCount,
+    monitorArmGeneration: issues.monitorArmGeneration,
     monitorNotes: issues.monitorNotes,
     monitorScheduledBy: issues.monitorScheduledBy,
   };
@@ -12607,7 +12607,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorWakeRequestedAt: Date | null;
     monitorLastTriggeredAt: Date | null;
     monitorAttemptCount: number | null;
-    monitorExhaustionCount: number | null;
+    monitorArmGeneration: number;
     monitorNotes: string | null;
     monitorScheduledBy: string | null;
   }
@@ -12791,11 +12791,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   type IssueMonitorRecoveryClaim = typeof issueMonitorRecoveryClaims.$inferSelect;
 
   // The claim for one exhaustion episode is inserted (insert-or-skip on the unique
-  // issue + episode key) in its own transaction before the recovery effect, so it
-  // survives a failed completion transaction and a deleted recovery issue.
+  // issue + arm generation key) in its own transaction before the recovery effect, so
+  // it survives a failed completion transaction and a deleted recovery issue.
   async function claimIssueMonitorRecoveryEpisode(input: {
     claimed: IssueMonitorDispatchRow;
-    episode: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
   }): Promise<IssueMonitorRecoveryClaim> {
@@ -12804,13 +12803,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .values({
         companyId: input.claimed.companyId,
         issueId: input.claimed.id,
-        exhaustionEpisode: input.episode,
+        armGeneration: input.claimed.monitorArmGeneration,
         clearReason: input.clearReason,
         scheduledAt: input.claimed.monitorNextCheckAt!,
         recoveryPolicy: input.recoveryPolicy,
       })
       .onConflictDoNothing({
-        target: [issueMonitorRecoveryClaims.issueId, issueMonitorRecoveryClaims.exhaustionEpisode],
+        target: [issueMonitorRecoveryClaims.issueId, issueMonitorRecoveryClaims.armGeneration],
       })
       .returning();
     if (inserted) return inserted;
@@ -12820,7 +12819,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           eq(issueMonitorRecoveryClaims.issueId, input.claimed.id),
-          eq(issueMonitorRecoveryClaims.exhaustionEpisode, input.episode),
+          eq(issueMonitorRecoveryClaims.armGeneration, input.claimed.monitorArmGeneration),
         ),
       )
       .limit(1);
@@ -12853,7 +12852,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
-    const episodeKey = `${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}:${input.claim.exhaustionEpisode}`;
+    const episodeKey = `${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}:${input.claim.armGeneration}`;
     const reviewPathLost =
       input.claimed.status === "in_review" &&
       (await issuesSvc
@@ -12879,7 +12878,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (input.recoveryPolicy === "create_recovery_issue") {
-      const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}:${input.claim.exhaustionEpisode}`;
+      const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}:${input.claim.armGeneration}`;
       let recoveryIssueId = input.claim.recoveryIssueId;
       let recoveryIssue: typeof issues.$inferSelect | null = null;
       let reusedRecoveryIssue: boolean;
@@ -13135,6 +13134,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { recoveryOutcome: "owner_wake_queued" as const };
   }
 
+  class IssueMonitorRearmedDuringRecovery extends Error {}
+
   async function clearIssueMonitorAndRecover(input: {
     claimed: IssueMonitorDispatchRow;
     policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
@@ -13161,9 +13162,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // A retry after a completion failure must not repeat an effect. Before the
     // effect, the run claims the exhaustion episode in its own transaction
-    // (`issue_monitor_recovery_claims`, unique per issue and episode). The
-    // episode is the issue's `monitorExhaustionCount` + 1; this transaction
-    // increments the count, so a later, separate exhaustion gets a new claim.
+    // (`issue_monitor_recovery_claims`, unique per issue and arm generation). Every
+    // arm or re-arm increments `monitorArmGeneration`, and one arm exhausts at most
+    // once, so a later, separate exhaustion gets a new claim even while an earlier
+    // completion is still failing. The clear commits only while the claimed arm is
+    // still in place; a re-arm during the effect rolls the completion back.
     // An effect that commits outside this transaction (the recovery issue, the
     // wakes) is recorded on the claim right after it commits, and a retry of the
     // same episode replays the recorded effect instead of running it again. The
@@ -13178,12 +13181,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`select pg_advisory_xact_lock(hashtextextended(${`issue-monitor-exhaustion:${input.claimed.id}`}, 0))`,
         );
         const [current] = await tx
-          .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorExhaustionCount: issues.monitorExhaustionCount })
+          .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorArmGeneration: issues.monitorArmGeneration })
           .from(issues)
           .where(eq(issues.id, input.claimed.id))
           .limit(1);
         if (
           !current ||
+          current.monitorArmGeneration !== input.claimed.monitorArmGeneration ||
           (current.monitorNextCheckAt?.getTime() ?? null) !==
             (input.claimed.monitorNextCheckAt?.getTime() ?? null)
         ) {
@@ -13192,7 +13196,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const claim = await claimIssueMonitorRecoveryEpisode({
           claimed: input.claimed,
-          episode: current.monitorExhaustionCount + 1,
           clearReason: input.clearReason,
           recoveryPolicy: input.recoveryPolicy,
         });
@@ -13214,7 +13217,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activitySource: input.activitySource,
         });
 
-        await tx
+        const cleared = await tx
           .update(issues)
           .set({
             ...buildIssueMonitorClearedPatch({
@@ -13226,10 +13229,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // stops the owner agent from re-arming; board-armed state is unchanged.
               exhaustionRecovered: input.monitor?.scheduledBy === "assignee",
             }),
-            monitorExhaustionCount: sql`${issues.monitorExhaustionCount} + 1`,
             updatedAt: input.now,
           })
-          .where(eq(issues.id, input.claimed.id));
+          .where(
+            and(
+              eq(issues.id, input.claimed.id),
+              eq(issues.monitorArmGeneration, input.claimed.monitorArmGeneration),
+              eq(issues.monitorNextCheckAt, input.claimed.monitorNextCheckAt!),
+            ),
+          )
+          .returning({ id: issues.id });
+        if (cleared.length === 0) throw new IssueMonitorRearmedDuringRecovery();
 
         await logActivityInTransaction(tx as unknown as Db, {
           companyId: input.claimed.companyId,
@@ -13260,6 +13270,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const publication of postCommitPublications) publishActivity(publication);
       return result;
     } catch (err) {
+      if (err instanceof IssueMonitorRearmedDuringRecovery) {
+        return { outcome: "skipped" as const, reason: "monitor_rearmed" };
+      }
       await db
         .update(issues)
         .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })

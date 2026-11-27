@@ -8,8 +8,9 @@ import { issues } from "./issues.js";
  * survives a failed completion transaction. It records the effect that ran, so a
  * retry of the same episode never repeats it. `recovery_issue_id` has no foreign
  * key: deleting the recovery issue never erases the claim. The episode is the
- * monitored issue's `monitor_exhaustion_count` + 1 at claim time, so a later,
- * separate exhaustion of the same monitor gets its own claim.
+ * monitored issue's `monitor_arm_generation`, which every arm or re-arm of the
+ * monitor increments; one arm exhausts at most once, so each later, separate
+ * exhaustion gets its own claim.
  */
 export const issueMonitorRecoveryClaims = pgTable(
   "issue_monitor_recovery_claims",
@@ -17,7 +18,7 @@ export const issueMonitorRecoveryClaims = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
-    exhaustionEpisode: integer("exhaustion_episode").notNull(),
+    armGeneration: integer("arm_generation").notNull(),
     clearReason: text("clear_reason").notNull(),
     scheduledAt: timestamp("scheduled_at", { withTimezone: true }).notNull(),
     recoveryPolicy: text("recovery_policy").notNull(),
@@ -27,9 +28,9 @@ export const issueMonitorRecoveryClaims = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    issueEpisodeUq: uniqueIndex("issue_monitor_recovery_claims_issue_episode_uq").on(
+    issueArmGenerationUq: uniqueIndex("issue_monitor_recovery_claims_issue_arm_generation_uq").on(
       table.issueId,
-      table.exhaustionEpisode,
+      table.armGeneration,
     ),
     companyIssueIdx: index("issue_monitor_recovery_claims_company_issue_idx").on(table.companyId, table.issueId),
   }),
