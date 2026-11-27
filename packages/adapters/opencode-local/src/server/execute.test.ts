@@ -1146,7 +1146,7 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(result.usageBasis).toBe("per_run");
   });
 
-  it("charges a resumed session that already had usage its own step sums", async () => {
+  it("charges a resumed session its own step sums", async () => {
     const { result, requests } = await runServe({}, { sessionId: "ses_known" });
 
     expect(requests.some((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toBe(true);

@@ -82,11 +82,9 @@ export function parseOpenCodeJsonl(stdout: string) {
     outputTokens: 0,
   };
   let costUsd = 0;
-  // Cumulative session usage from `session.usage.updated` events, plus the
-  // pre-run baseline the serve transport reads from `GET /api/session/{id}`.
-  // Both are OpenCodeSessionTotals, not step sums: see session-usage.ts.
+  // Cumulative session usage from `session.usage.updated` events, as
+  // OpenCodeSessionTotals, not step sums: see session-usage.ts.
   let sessionUsage: OpenCodeSessionTotals | null = null;
-  let sessionUsageBaseline: OpenCodeSessionTotals | null = null;
   // False once the last usage update was partial or unreadable; only a later
   // complete update (or the transport's final session reading) restores it.
   let sessionUsageComplete = true;
@@ -156,8 +154,7 @@ export function parseOpenCodeJsonl(stdout: string) {
 
     if (type === "session_usage") {
       // Cumulative for the whole session, merged field by field so a partial
-      // later update never loses a counter; the reconciliation step subtracts
-      // the pre-run baseline.
+      // later update never loses a counter.
       const part = parseObject(event.part);
       const totals = parseOpenCodeSessionUsagePart(part);
       if (totals) sessionUsage = mergeOpenCodeSessionTotals(sessionUsage, totals);
@@ -168,12 +165,6 @@ export function parseOpenCodeJsonl(stdout: string) {
     if (type === "session_usage_final") {
       const totals = parseOpenCodeSessionUsagePart(event.part);
       if (totals) sessionUsageFinal = mergeOpenCodeSessionTotals(sessionUsageFinal, totals);
-      continue;
-    }
-
-    if (type === "session_usage_baseline") {
-      const totals = parseOpenCodeSessionUsagePart(event.part);
-      if (totals) sessionUsageBaseline = totals;
       continue;
     }
 
@@ -211,7 +202,6 @@ export function parseOpenCodeJsonl(stdout: string) {
     sessionUsage,
     sessionUsageComplete: sessionUsage !== null && sessionUsageComplete,
     sessionUsageFinal,
-    sessionUsageBaseline,
     stepUsage,
     stepCostUsd,
     stepUsageIssues,

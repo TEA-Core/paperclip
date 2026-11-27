@@ -309,13 +309,13 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
 
   // Emit one session-usage reading as a synthetic stdout line (see
   // session-usage.ts). A payload without complete counters emits nothing.
-  const emitSessionUsage = async (type: "session_usage_baseline" | "session_usage_final", sessionId: string, text: string) => {
+  const emitSessionUsage = async (sessionId: string, text: string) => {
     const totals = parseOpenCodeSessionTotals(text);
     if (!totals) return;
     await emit(
       "stdout",
       `${redact(JSON.stringify({
-        type,
+        type: "session_usage_final",
         sessionID: sessionId,
         part: { type: "session-usage", usage: totals.usage, costUsd: totals.costUsd },
       }))}\n`,
@@ -331,7 +331,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     try {
       const reading = await Promise.race([request(`/api/session/${encodeURIComponent(sessionId)}`), limit.promise]);
       if (reading === "timeout" || reading.status !== 200) return;
-      await emitSessionUsage("session_usage_final", sessionId, reading.text);
+      await emitSessionUsage(sessionId, reading.text);
     } catch {
       // The run keeps the usage evidence it already has.
     } finally {
@@ -428,11 +428,6 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       const existing = await request(`/api/session/${encodeURIComponent(sessionId)}`);
       if (existing.status === 404) throw new ServeTransportError(`OpenCode session ${sessionId} not found (unknown session)`);
       if (existing.status !== 200) throw new ServeTransportError(`OpenCode could not load session ${sessionId}: HTTP ${existing.status}`);
-      // Snapshot the session's cumulative usage before the prompt. A resumed
-      // run is charged its own per-step stdout sums either way
-      // (session-usage.ts); the snapshot only records whether the session had
-      // readable counters. A payload without complete counters emits nothing.
-      await emitSessionUsage("session_usage_baseline", sessionId, existing.text);
       const switched = await request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: "POST",
         body: JSON.stringify({ model }),

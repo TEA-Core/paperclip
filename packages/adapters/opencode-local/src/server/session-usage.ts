@@ -301,7 +301,7 @@ export function parseOpenCodeSessionUsageEvent(data: unknown): OpenCodeSessionTo
 
 /**
  * Parse the normalized `session-usage` part the event mapper and the transport
- * baseline line carry (`{ usage: { inputTokens, ... }, costUsd }`).
+ * final-reading line carry (`{ usage: { inputTokens, ... }, costUsd }`).
  */
 export function parseOpenCodeSessionUsagePart(part: unknown): OpenCodeSessionTotals | null {
   const record = asRecord(part);
@@ -319,49 +319,21 @@ export function parseOpenCodeSessionUsagePart(part: unknown): OpenCodeSessionTot
 }
 
 /**
- * The session payload is cumulative. Subtract the pre-run snapshot to report
- * only this attempt, clamping at zero if the session was compacted or reset.
- */
-export function subtractOpenCodeSessionTotals(
-  after: OpenCodeSessionTotals,
-  before: OpenCodeSessionTotals | null,
-): OpenCodeSessionTotals {
-  if (!before) return after;
-  const delta = (next: number, previous: number) => Math.max(0, next - previous);
-  return {
-    usage: {
-      inputTokens: delta(after.usage.inputTokens, before.usage.inputTokens),
-      cachedInputTokens: delta(after.usage.cachedInputTokens, before.usage.cachedInputTokens),
-      outputTokens: delta(after.usage.outputTokens, before.usage.outputTokens),
-    },
-    costUsd:
-      after.costUsd === null
-        ? null
-        : before.costUsd === null
-          ? after.costUsd
-          : Math.max(0, after.costUsd - before.costUsd),
-  };
-}
-
-/**
  * Reconcile this run's usage from the serve transport's durable session state.
  *
  * For a run that started its session the cumulative session totals are
- * exactly what this run spent,
- * so the result is scoped `per_run` and the server's legacy session-delta
- * heuristic steps aside. The totals are `complete` only when a final record
- * backs them: the post-turn session reading, or a last `session.usage.updated`
+ * exactly what this run spent, so the result is scoped `per_run` and the
+ * server's legacy session-delta heuristic steps aside. The totals are
+ * `complete` only when a final record backs them: the post-turn session reading, or a last `session.usage.updated`
  * event that carried every counter. When the last update was partial and no
  * final reading arrived, the merged totals may still miss a counter's latest
- * value, so each counter takes the larger of the session delta and the
+ * value, so each counter takes the larger of the session total and the
  * validated step sums, and the result is flagged incomplete.
  *
- * Without a session reading — an older server that never emits usage events,
- * or a resume whose baseline payload lacked counters, where the cumulative
- * total would silently include prior runs — and for any run that resumed a
- * session, the validated per-step sums stand in: a sibling run on the same
- * session can move the cumulative total, so only the run's own steps are
- * attributable to it. They cover only this run's steps, but a dropped
+ * Without a session reading (an older server that never emits usage events),
+ * and for any run that resumed a session, the validated per-step sums stand
+ * in: a resumed session's cumulative total includes prior runs and can be
+ * moved by a sibling run, so only the run's own steps are attributable to it. They cover only this run's steps, but a dropped
  * `step_finish` can under-report them, so they are never marked complete.
  *
  * A zero cost with nonzero tokens means the model is unpriced, not free: the
@@ -373,7 +345,6 @@ export function reconcileOpenCodeRunUsage(input: {
   sessionUsageComplete?: boolean;
   /** The post-turn `GET /api/session/{id}` reading, when one was taken. */
   sessionUsageFinal?: OpenCodeSessionTotals | null;
-  sessionUsageBaseline: OpenCodeSessionTotals | null;
   resumedSession: boolean;
   stepUsage: OpenCodeSessionUsage;
   stepCostUsd: number;
@@ -382,15 +353,12 @@ export function reconcileOpenCodeRunUsage(input: {
 }): OpenCodeRunUsageReconciliation {
   const finalRecord = input.sessionUsageFinal ?? null;
   const cumulative = mergeOpenCodeSessionTotals(input.sessionUsage, finalRecord);
-  const baseline = input.sessionUsageBaseline;
-  const startedSession = !input.resumedSession;
   const stepIssues = input.stepUsageIssues ?? [];
-  if (cumulative && startedSession) {
-    const delta = subtractOpenCodeSessionTotals(cumulative, baseline);
+  if (cumulative && !input.resumedSession) {
     const complete = finalRecord !== null || (input.sessionUsage !== null && input.sessionUsageComplete !== false);
     const issues: string[] = [];
-    let usage = delta.usage;
-    let costUsd = delta.costUsd;
+    let usage = cumulative.usage;
+    let costUsd = cumulative.costUsd;
     if (!complete) {
       issues.push("last session usage update was partial and no final session record was read");
       issues.push(...stepIssues);
@@ -414,11 +382,9 @@ export function reconcileOpenCodeRunUsage(input: {
       issues,
     };
   }
-  const reason = !cumulative
-    ? "session reported no usage; step sums used"
-    : baseline === null
-      ? "resumed session has no pre-run usage baseline; step sums used"
-      : "resumed session; this run's own step sums used";
+  const reason = cumulative
+    ? "resumed session; this run's own step sums used"
+    : "session reported no usage; step sums used";
   const stepTokens =
     input.stepUsage.inputTokens + input.stepUsage.cachedInputTokens + input.stepUsage.outputTokens;
   return {

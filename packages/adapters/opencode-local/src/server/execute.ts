@@ -1624,7 +1624,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 sessionUsage: parsed.sessionUsage,
                 sessionUsageComplete: parsed.sessionUsageComplete,
                 sessionUsageFinal: parsed.sessionUsageFinal,
-                sessionUsageBaseline: parsed.sessionUsageBaseline,
                 resumedSession: Boolean(resumeSessionId),
                 // Validated step sums with cache writes counted as input; the
                 // legacy parsed.usage stays the V1 CLI contract.

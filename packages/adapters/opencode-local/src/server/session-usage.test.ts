@@ -8,7 +8,6 @@ import {
   readOpenCodeSessionCounters,
   readOpenCodeStepUsage,
   reconcileOpenCodeRunUsage,
-  subtractOpenCodeSessionTotals,
   type OpenCodeSessionTotals,
 } from "./session-usage.js";
 
@@ -79,23 +78,6 @@ describe("parseOpenCodeSessionUsagePart", () => {
   });
 });
 
-describe("subtractOpenCodeSessionTotals", () => {
-  it("subtracts the baseline and clamps at zero", () => {
-    expect(subtractOpenCodeSessionTotals(totals(105, 20, 9, 0.5), totals(100, 20, 7, 0.5))).toEqual(totals(5, 0, 2, 0));
-    // A compacted or reset session cannot go negative.
-    expect(subtractOpenCodeSessionTotals(totals(10, 0, 1, 0.2), totals(100, 20, 7, 0.5))).toEqual(totals(0, 0, 0, 0));
-  });
-
-  it("keeps the after cost when the baseline cost is unknown", () => {
-    expect(subtractOpenCodeSessionTotals(totals(10, 0, 1, 0.2), totals(5, 0, 0, null))).toEqual(totals(5, 0, 1, 0.2));
-    expect(subtractOpenCodeSessionTotals(totals(10, 0, 1, null), totals(5, 0, 0, 0.1)).costUsd).toBeNull();
-  });
-
-  it("returns the totals unchanged without a baseline", () => {
-    expect(subtractOpenCodeSessionTotals(totals(10, 0, 1, 0.2), null)).toEqual(totals(10, 0, 1, 0.2));
-  });
-});
-
 describe("reconcileOpenCodeRunUsage", () => {
   const steps = { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 };
 
@@ -103,7 +85,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(105, 20, 9, 0.5),
-        sessionUsageBaseline: null,
         resumedSession: false,
         stepUsage: steps,
         stepCostUsd: 0,
@@ -118,11 +99,10 @@ describe("reconcileOpenCodeRunUsage", () => {
     });
   });
 
-  it("charges a resumed session that already had usage its own step sums", () => {
+  it("charges a resumed session its own step sums", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(505, 41, 62, 0.06),
-        sessionUsageBaseline: totals(500, 40, 60, 0.05),
         resumedSession: true,
         stepUsage: steps,
         stepCostUsd: 0.01,
@@ -141,13 +121,12 @@ describe("reconcileOpenCodeRunUsage", () => {
     // Runs A and B both resume session S at 100/10/20. A spends 50/5/10 and B
     // 30/3/6, so S reads 180/18/36 when each finishes. Each run is charged its
     // own step sums, exactly what the step-sum reporting charged before: 80 in
-    // total, never the 110 that cumulative-minus-own-baseline would charge.
-    const baseline = totals(100, 10, 20, 0.1);
+    // total, never the 110 that charging each run the session's growth since it
+    // started would charge.
     const after = totals(180, 18, 36, 0.18);
     const runA = reconcileOpenCodeRunUsage({
       sessionUsage: after,
       sessionUsageFinal: after,
-      sessionUsageBaseline: baseline,
       resumedSession: true,
       stepUsage: { inputTokens: 50, cachedInputTokens: 5, outputTokens: 10 },
       stepCostUsd: 0.05,
@@ -155,7 +134,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     const runB = reconcileOpenCodeRunUsage({
       sessionUsage: after,
       sessionUsageFinal: after,
-      sessionUsageBaseline: baseline,
       resumedSession: true,
       stepUsage: { inputTokens: 30, cachedInputTokens: 3, outputTokens: 6 },
       stepCostUsd: 0.03,
@@ -170,7 +148,6 @@ describe("reconcileOpenCodeRunUsage", () => {
   it("names refused step counters on a resumed session's step sums", () => {
     const reconciled = reconcileOpenCodeRunUsage({
       sessionUsage: totals(505, 41, 62, 0.06),
-      sessionUsageBaseline: totals(500, 40, 60, 0.05),
       resumedSession: true,
       stepUsage: steps,
       stepCostUsd: 0.01,
@@ -188,7 +165,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     // reads 0. Runs A and B both resume S at 0/0/0; A spends 50 and B 30, so S
     // reads 80 when each finishes. Each is charged its own steps (80 in total),
     // never the whole session total (160 in total).
-    const baseline = totals(0, 0, 0, 0);
     const after = totals(80, 0, 0, 0.08);
     const charged = [
       { inputTokens: 50, cachedInputTokens: 0, outputTokens: 0 },
@@ -197,7 +173,6 @@ describe("reconcileOpenCodeRunUsage", () => {
       reconcileOpenCodeRunUsage({
         sessionUsage: after,
         sessionUsageFinal: after,
-        sessionUsageBaseline: baseline,
         resumedSession: true,
         stepUsage,
         stepCostUsd: stepUsage.inputTokens / 1000,
@@ -207,32 +182,10 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(charged.every((run) => run.source === "step_finish")).toBe(true);
   });
 
-  it("falls back to step sums when a resumed session has no baseline", () => {
-    // Without a baseline the cumulative total includes prior runs; reporting it
-    // as per_run would over-count, so the per-step sums stand in.
-    expect(
-      reconcileOpenCodeRunUsage({
-        sessionUsage: totals(505, 41, 62, 0.06),
-        sessionUsageBaseline: null,
-        resumedSession: true,
-        stepUsage: steps,
-        stepCostUsd: 0.01,
-      }),
-    ).toEqual({
-      usage: steps,
-      costUsd: 0.01,
-      usageBasis: "per_run",
-      source: "step_finish",
-      complete: false,
-      issues: ["resumed session has no pre-run usage baseline; step sums used"],
-    });
-  });
-
   it("falls back to step sums when the session reported no usage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: null,
-        sessionUsageBaseline: totals(500, 40, 60, 0.05),
         resumedSession: true,
         stepUsage: steps,
         stepCostUsd: 0.01,
@@ -250,7 +203,6 @@ describe("reconcileOpenCodeRunUsage", () => {
   it("marks a zero cost with tokens as unpriced, not free", () => {
     const reconciled = reconcileOpenCodeRunUsage({
       sessionUsage: totals(105, 20, 9, 0),
-      sessionUsageBaseline: null,
       resumedSession: false,
       stepUsage: steps,
       stepCostUsd: 0,
@@ -260,7 +212,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(0, 0, 0, 0),
-        sessionUsageBaseline: null,
         resumedSession: false,
         stepUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
         stepCostUsd: 0,
@@ -270,7 +221,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: null,
-        sessionUsageBaseline: null,
         resumedSession: false,
         stepUsage: steps,
         stepCostUsd: 0,
@@ -279,24 +229,11 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: null,
-        sessionUsageBaseline: null,
         resumedSession: false,
         stepUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
         stepCostUsd: 0,
       }).costUsd,
     ).toBe(0);
-  });
-
-  it("keeps the after cost when the baseline cost is unknown", () => {
-    expect(
-      reconcileOpenCodeRunUsage({
-        sessionUsage: totals(105, 20, 9, 0.5),
-        sessionUsageBaseline: totals(100, 20, 7, null),
-        resumedSession: false,
-        stepUsage: steps,
-        stepCostUsd: 0,
-      }).costUsd,
-    ).toBe(0.5);
   });
 
   it("does not mark a total complete when the last usage update was partial", () => {
@@ -306,7 +243,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     const reconciled = reconcileOpenCodeRunUsage({
       sessionUsage: totals(5, 1, 7, 0.001),
       sessionUsageComplete: false,
-      sessionUsageBaseline: null,
       resumedSession: false,
       stepUsage: { inputTokens: 9, cachedInputTokens: 1, outputTokens: 2 },
       stepCostUsd: 0.002,
@@ -322,7 +258,6 @@ describe("reconcileOpenCodeRunUsage", () => {
       sessionUsage: totals(5, 1, 7, 0.005),
       sessionUsageComplete: false,
       sessionUsageFinal: totals(9, 1, 7, 0.01),
-      sessionUsageBaseline: null,
       resumedSession: false,
       stepUsage: steps,
       stepCostUsd: 0,
@@ -337,7 +272,6 @@ describe("reconcileOpenCodeRunUsage", () => {
     const reconciled = reconcileOpenCodeRunUsage({
       sessionUsage: totals(20, 2, 8, 0.2),
       sessionUsageFinal: totals(10, 2, 8, 0.1),
-      sessionUsageBaseline: null,
       resumedSession: false,
       stepUsage: steps,
       stepCostUsd: 0,
@@ -349,7 +283,6 @@ describe("reconcileOpenCodeRunUsage", () => {
   it("names refused step counters when the step sums stand in", () => {
     const reconciled = reconcileOpenCodeRunUsage({
       sessionUsage: null,
-      sessionUsageBaseline: null,
       resumedSession: false,
       stepUsage: steps,
       stepCostUsd: 0,

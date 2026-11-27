@@ -419,9 +419,9 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(second.sessionId).toBe(first.sessionId);
     expect(mainRequests.length).toBeGreaterThanOrEqual(2);
     expect(mainRequests.at(-1)!.messageCount).toBeGreaterThan(mainRequests[0]!.messageCount);
-    // The resumed run reports only what it spent itself — the pre-run baseline
-    // is subtracted, so the second run's usage is again a positive per-run
-    // number rather than a double-subtracted zero.
+    // The resumed run reports only what it spent itself — its own step sums,
+    // not the session's cumulative total — so its usage is a positive per-run
+    // number.
     expect(second.usageBasis).toBe("per_run");
     expect(second.usage?.inputTokens ?? 0).toBeGreaterThan(0);
     expect(second.usage?.outputTokens ?? 0).toBeGreaterThan(0);

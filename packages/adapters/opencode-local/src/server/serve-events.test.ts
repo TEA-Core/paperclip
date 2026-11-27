@@ -100,8 +100,6 @@ describe("mapOpenCodeServeEvent (recorded 2.2.4 streams)", () => {
       usage: { inputTokens: 300, cachedInputTokens: 60, outputTokens: 21 },
       costUsd: 0,
     });
-    // No transport baseline was replayed alongside these recordings.
-    expect(replay("text").parsed.sessionUsageBaseline).toBeNull();
   });
 
   it("maps a session.usage.updated event onto a session_usage line", () => {
@@ -193,10 +191,8 @@ describe("mapOpenCodeServeEvent (recorded 2.2.4 streams)", () => {
       JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 2 }, costUsd: 0.01 } }),
       JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: "no" }, costUsd: 0 } }),
       JSON.stringify({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 30, cachedInputTokens: 4, outputTokens: 6 }, costUsd: 0.02 } }),
-      JSON.stringify({ type: "session_usage_baseline", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 1 }, costUsd: 0.01 } }),
     ].join("\n");
     const parsed = parseOpenCodeJsonl(stream);
     expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 30, cachedInputTokens: 4, outputTokens: 6 }, costUsd: 0.02 });
-    expect(parsed.sessionUsageBaseline).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 1 }, costUsd: 0.01 });
   });
 });
