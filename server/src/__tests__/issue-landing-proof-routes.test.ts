@@ -92,8 +92,11 @@ const github = {
   compareStatus: null as number | null,
   /** The live identity GET /repos/{owner}/{repo} returns (a rename or transfer changes full_name). */
   repo: { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` },
-  /** `${commit}...${container}` pairs where the container commit contains the commit. */
-  contains: new Set<string>(),
+  /** Each PR's own commits (GET /pulls/{n}/commits); a PR absent here lists only its head commit. */
+  prCommits: new Map<number, string[]>(),
+  prCommitsStatus: null as number | null,
+  /** Commit ancestry: container commit -> commits reachable from it (answered by compare). */
+  ancestors: new Map<string, Set<string>>(),
 };
 
 function json(body: unknown, status = 200) {
@@ -112,6 +115,14 @@ async function fakeGitHub(url: string): Promise<Response> {
     if (!pr) return json({ message: "Not Found" }, 404);
     return json({ number: Number(pull[1]), ...pr });
   }
+  const pullCommits = /^\/pulls\/(\d+)\/commits$/.exec(rest);
+  if (pullCommits) {
+    const number = Number(pullCommits[1]);
+    const pr = github.prs.get(number);
+    if (!pr) return json({ message: "Not Found" }, 404);
+    if (github.prCommitsStatus !== null) return json({ message: "Server Error" }, github.prCommitsStatus);
+    return json((github.prCommits.get(number) ?? [pr.head.sha]).map((commitSha) => ({ sha: commitSha })));
+  }
   const ref = /^\/git\/ref\/heads\/(.+)$/.exec(rest);
   if (ref) {
     const head = github.branches.get(ref[1]!);
@@ -124,7 +135,7 @@ async function fakeGitHub(url: string): Promise<Response> {
   }
   const compare = /^\/compare\/(.+)\.\.\.(.+)$/.exec(rest);
   if (compare) {
-    if (github.contains.has(`${compare[1]}...${compare[2]}`)) return json({ status: "ahead", ahead_by: 1, behind_by: 0 });
+    if (github.ancestors.get(compare[2]!)?.has(compare[1]!)) return json({ status: "ahead", ahead_by: 1, behind_by: 0 });
     if (!github.branches.has(compare[1]!)) return json({ message: "Not Found" }, 404);
     if (github.compareStatus !== null) return json({ message: "Server Error" }, github.compareStatus);
     return github.onBase.has(compare[2]!)
@@ -142,7 +153,9 @@ function resetGitHub() {
   github.onBase.clear();
   github.compareStatus = null;
   github.repo = { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` };
-  github.contains.clear();
+  github.prCommits.clear();
+  github.prCommitsStatus = null;
+  github.ancestors.clear();
   github.branches.set(BASE, MERGE_ON_BASE);
   github.onBase.add(MERGE_ON_BASE);
   for (const onBase of [OTHER_CARD_MERGE, LINKED_MERGE, RECORDED_PR_MERGE, MENTIONED_MERGE]) github.onBase.add(onBase);
@@ -174,7 +187,7 @@ function resetGitHub() {
     state: "open", merged: false, merge_commit_sha: null, draft: true,
     head: { sha: sha("e9"), ref: "draft-follow-up", repo: { full_name: `${OWNER}/${REPO}` } },
   }));
-  // The card's own PR, tied only by containing the card's recorded delivery commit.
+  // The card's own PR, tied only by listing the card's recorded delivery commit among its own commits.
   github.prs.set(507, pr({
     merge_commit_sha: RECORDED_PR_MERGE,
     head: { sha: RECORDED_PR_HEAD, ref: "another-unrelated-branch", repo: { full_name: `${OWNER}/${REPO}` } },
@@ -575,22 +588,49 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
-    it("accepts a merged PR whose head contains the card's recorded delivery commit", async () => {
+    it("accepts a merged PR that lists the card's recorded delivery commit among its own commits", async () => {
       const { issueId } = await seedStuckCard();
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
       await db.update(issues).set({
         executionState: { ...(row!.executionState as object), deliveredHeadSha: RECORDED_DELIVERY },
       }).where(eq(issues.id, issueId));
-      github.contains.add(`${RECORDED_DELIVERY}...${RECORDED_PR_HEAD}`);
+      github.prCommits.set(507, [RECORDED_DELIVERY, RECORDED_PR_HEAD]);
       await reclassifyRecordOnly(issueId);
       const withDebt = await attach(issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
       expect(withDebt.status, JSON.stringify(withDebt.body)).toBe(201);
       expect(withDebt.body.proof.possession).toMatchObject({ kind: "recorded_delivery_commit" });
-      github.contains.clear();
+      github.prCommits.delete(507);
       const refusedWithout = await seedStuckCard();
       await reclassifyRecordOnly(refusedWithout.issueId);
       const refused = await attach(refusedWithout.issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
       expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+    });
+
+    it("refuses an unrelated later merged PR whose merge commit only has the recorded delivery commit as an ancestor", async () => {
+      // The card's recorded delivery commit is already on base (it is the base head).
+      const { issueId } = await seedStuckCard({ deliveredHeadSha: MERGE_ON_BASE });
+      await reclassifyRecordOnly(issueId);
+      // PR #505 merged later: its merge commit descends from the recorded commit,
+      // but the recorded commit is not one of the PR's own commits.
+      github.ancestors.set(OTHER_CARD_MERGE, new Set([MERGE_ON_BASE]));
+      github.ancestors.set(sha("e6"), new Set([MERGE_ON_BASE]));
+      const refused = await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE }));
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+    });
+
+    it("refuses as unverifiable when the PR commit list cannot be read, and records nothing", async () => {
+      const { issueId } = await seedStuckCard({ deliveredHeadSha: RECORDED_DELIVERY });
+      await reclassifyRecordOnly(issueId);
+      github.prCommitsStatus = 502;
+      const refused = await attach(issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe("landing_proof_unverifiable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
     });
 
     it("does not count the work product the attach itself created as the card's link", async () => {

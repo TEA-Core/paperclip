@@ -223,14 +223,14 @@ export async function verifyBoardLandingProof(
       headSha, mergeCommitSha,
     });
     if (possession === "unverifiable") {
-      lastFailure = "the recorded delivery commit containment check could not be read";
+      lastFailure = "the pull request commit list could not be read";
       break;
     }
     if (!possession) {
       return refuse(
         "landing_proof_not_card_delivery",
         `pull request #${evidence.pullRequestNumber} is not this card's delivery: it is not linked to the card, ` +
-          "and it contains none of the card's recorded delivery commits",
+          "and none of the card's recorded delivery commits is one of its own commits",
       );
     }
     const onBase = await verifyMergedPullRequestOnBaseBranch(token, owner, repo, baseRef, mergeCommitSha, {
@@ -300,13 +300,13 @@ const MAX_RECORDED_DELIVERY_COMMITS = 10;
  * The merged PR must be THIS card's own delivery. Only two ties count:
  *  - the PR is linked to the card on record: a `pull_request` work product the
  *    attach route did not create, or a cached external-object link;
- *  - the PR head or merge commit contains a delivery commit recorded on the card
- *    (work-product head/merge commits, `executionState.deliveredHeadSha`),
- *    checked live with the GitHub compare API.
+ *  - a delivery commit recorded on the card (work-product head/merge commits,
+ *    `executionState.deliveredHeadSha`) is the PR head or merge commit, or is
+ *    one of the PR's own commits, listed live from GitHub.
  * A head branch name is not a tie: any merged PR can carry the card identifier
  * in its branch name, so the name proves nothing about delivery.
- * Returns null when nothing ties the PR to the card, or "unverifiable" when a
- * needed live containment check could not be read.
+ * Returns null when nothing ties the PR to the card, or "unverifiable" when the
+ * PR's commit list could not be read.
  */
 async function resolveCardDeliveryPossession(
   db: Db,
@@ -357,44 +357,53 @@ async function resolveCardDeliveryPossession(
     : null;
   const delivered = typeof state?.deliveredHeadSha === "string" ? state.deliveredHeadSha.trim().toLowerCase() : "";
   if (/^[0-9a-f]{40}$/.test(delivered)) recordedShas.add(delivered);
-  let unreadable = false;
-  for (const recorded of [...recordedShas].slice(0, MAX_RECORDED_DELIVERY_COMMITS)) {
+  const candidates = [...recordedShas].slice(0, MAX_RECORDED_DELIVERY_COMMITS);
+  for (const recorded of candidates) {
     if (recorded === pr.headSha || recorded === pr.mergeCommitSha) {
       return { kind: "recorded_delivery_commit", detail: `recorded delivery commit ${recorded.slice(0, 12)} is the PR commit` };
     }
-    for (const target of [pr.headSha, pr.mergeCommitSha]) {
-      const contained = await commitContains(pr.token, pr.owner, pr.repo, target, recorded);
-      if (contained === null) { unreadable = true; continue; }
-      if (contained) {
-        return {
-          kind: "recorded_delivery_commit",
-          detail: `PR commit ${target.slice(0, 12)} contains recorded delivery commit ${recorded.slice(0, 12)}`,
-        };
-      }
-    }
   }
-  return unreadable ? "unverifiable" : null;
+  if (candidates.length === 0) return null;
+  const prCommits = await listPullRequestCommits(pr.token, pr.owner, pr.repo, pr.pullRequestNumber);
+  if (prCommits === null) return "unverifiable";
+  const member = candidates.find((recorded) => prCommits.has(recorded));
+  if (member) {
+    return {
+      kind: "recorded_delivery_commit",
+      detail: `recorded delivery commit ${member.slice(0, 12)} is one of the PR's own commits`,
+    };
+  }
+  return null;
 }
 
-/** True when `container` contains `commit` (compare commit...container is ahead or identical). Null when unreadable. */
-async function commitContains(token: string, owner: string, repo: string, container: string, commit: string): Promise<boolean | null> {
-  let response: Response;
-  try {
-    response = await ghFetch(
-      `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(commit)}...${encodeURIComponent(container)}`,
-      { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
-    );
-  } catch {
-    return null;
+const PULL_REQUEST_COMMITS_PAGE_SIZE = 100;
+const MAX_PULL_REQUEST_COMMIT_PAGES = 3;
+
+/** The PR's own commit shas (lowercase), or null when unreadable. */
+async function listPullRequestCommits(
+  token: string, owner: string, repo: string, pullRequestNumber: number,
+): Promise<Set<string> | null> {
+  const shas = new Set<string>();
+  for (let page = 1; page <= MAX_PULL_REQUEST_COMMIT_PAGES; page += 1) {
+    let response: Response;
+    try {
+      response = await ghFetch(
+        `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullRequestNumber}/commits?per_page=${PULL_REQUEST_COMMITS_PAGE_SIZE}&page=${page}`,
+        { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
+      );
+    } catch {
+      return null;
+    }
+    if (!response.ok) return null;
+    const body = await response.json().catch(() => null) as unknown;
+    if (!Array.isArray(body)) return null;
+    for (const entry of body) {
+      const sha = entry && typeof entry === "object" ? (entry as { sha?: unknown }).sha : null;
+      if (typeof sha === "string") shas.add(sha.toLowerCase());
+    }
+    if (body.length < PULL_REQUEST_COMMITS_PAGE_SIZE) break;
   }
-  if (response.status === 404) return false;
-  if (!response.ok) return null;
-  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-  if (typeof body?.behind_by === "number") return body.behind_by === 0;
-  const status = typeof body?.status === "string" ? body.status : null;
-  if (status === "ahead" || status === "identical") return true;
-  if (status === "behind" || status === "diverged") return false;
-  return null;
+  return shas;
 }
 
 /**
