@@ -1185,12 +1185,16 @@ describe("execute — OpenCode V2 serve transport", () => {
   });
 
   it("keeps the usage already spent when a serve run times out", async () => {
-    const { result } = await runServe({ FAKE_HANG_TURN: "1" }, { timeoutSec: 1 });
+    // The turn hangs forever, so only the wall-clock timeout ends the run.
+    // Skip the MCP readiness gate and leave a wide margin so, even on a loaded
+    // host, startup and the turn's usage records land before the timeout fires
+    // (a 1s timeout could cut the run off before the turn began).
+    const { result } = await runServe({ FAKE_HANG_TURN: "1" }, { mcp: false, timeoutSec: 3 });
 
     expect(result.timedOut).toBe(true);
     expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
     expect(result.usageBasis).toBe("per_run");
-  });
+  }, 20_000);
 
   it("says PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path, once", async () => {
     const { result, logs, metadata } = await runServe({ PAPERCLIP_OPENCODE_PRINT_LOGS: "1" });
