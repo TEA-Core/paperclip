@@ -3851,9 +3851,9 @@ async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
  * A Git checkout passes only when HEAD is the recorded local branch, compared
  * by full ref name, or a detached HEAD at that branch's tip. A recorded branch
  * with no local ref is refused. A `git_worktree` row with no recorded branch
- * is a legacy row and is refused with a reprovision remedy; the other
- * strategies never record a branch binding, so an empty value there has
- * nothing to compare. Ordinary non-Git project directories are left alone.
+ * is a legacy row and is refused with a reprovision remedy. Other strategies
+ * are compared only when they record a branch; an empty value there is not
+ * refused. Ordinary non-Git project directories are left alone.
  * The recorded branch is not rewritten to whatever HEAD happens to name.
  */
 async function assertRecordedCheckoutBranchIdentity(input: {
@@ -5713,8 +5713,9 @@ function liveProjectPrimaryRestoreGuard(
 /**
  * Hygiene must not treat the checkout it is about to restore as a disposable
  * base when that path is the bound source. Canonical comparison covers a
- * symlink alias of the same checkout. Owner-root resolution is what keeps a
- * linked worktree from being selected as the base in the first place.
+ * symlink alias of the same checkout. The hygiene root is the toplevel of the
+ * configured base checkout, so a bound linked worktree configured as that base
+ * is protected only by this guard.
  */
 function sameSourceCheckoutRestoreGuard(input: {
   sourceCwd: string;
