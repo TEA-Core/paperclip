@@ -3773,7 +3773,8 @@ export type CheckoutBranchDriftReasonCode =
   | "branch_mismatch"
   | "detached_head_off_recorded_tip"
   | "recorded_ref_missing"
-  | "recorded_branch_metadata_missing";
+  | "recorded_branch_metadata_missing"
+  | "checkout_unreadable";
 
 export type CheckoutBranchDriftEvidence = {
   reason: "checkout_branch_drift";
@@ -3786,6 +3787,8 @@ export type CheckoutBranchDriftEvidence = {
   headSha: string | null;
   canonicalCwd: string;
   executionWorkspaceId: string | null;
+  /** Why Git could not read the checkout; set only for `checkout_unreadable`. */
+  probeError: string | null;
 };
 
 const LOCAL_BRANCH_REF_PREFIX = "refs/heads/";
@@ -3812,6 +3815,13 @@ function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence)
   const found =
     `"${evidence.actualRef ?? "<detached>"}" at HEAD ${evidence.headSha ?? "<unresolved>"}`;
   switch (evidence.reasonCode) {
+    case "checkout_unreadable":
+      return (
+        `Managed checkout branch drift: Git cannot read the checkout ${where} ` +
+        `Its branch cannot be verified against "${evidence.expectedRef ?? "<none recorded>"}" ` +
+        `(${evidence.probeError ?? "unknown error"}). Restore the checkout's permissions or ownership, ` +
+        `or reprovision the execution workspace. The recorded branch was left unchanged.`
+      );
     case "recorded_branch_metadata_missing":
       return (
         `Managed checkout branch drift: the workspace has no recorded branch, so the checkout on ${found} ` +
@@ -3837,21 +3847,58 @@ function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence)
   }
 }
 
-async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
-  canonicalCwd: string;
-  isGit: boolean;
-  headRef: string | null;
-  headSha: string | null;
-} | null> {
-  if (!await directoryExists(cwd)) return null;
-  const canonicalCwd = await resolvePathForWorktreeComparison(cwd);
-  const gitDir = await runGit(["rev-parse", "--git-dir"], canonicalCwd).catch(() => null);
-  if (!gitDir) return { canonicalCwd, isGit: false, headRef: null, headSha: null };
+type BoundCheckoutGitIdentity =
+  | { kind: "git"; canonicalCwd: string; headRef: string | null; headSha: string | null }
+  | { kind: "not_git"; canonicalCwd: string }
+  | { kind: "unreadable"; canonicalCwd: string; probeError: string };
+
+/**
+ * Whether `dir` or one of its ancestors has a `.git` entry, or one cannot be
+ * ruled out because a directory on the path cannot be read.
+ */
+async function mayBeInsideGitCheckout(dir: string) {
+  let current = dir;
+  for (;;) {
+    try {
+      await fs.lstat(path.join(current, ".git"));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+/**
+ * Read the identity of a bound checkout. Returns null only when the directory
+ * does not exist. A probe that fails is `unreadable` unless the path has no
+ * `.git` entry at all: Git reports "not a git repository" for an unreadable
+ * `.git` directory too, so its message cannot tell a plain directory apart.
+ */
+async function readBoundCheckoutGitIdentity(cwd: string): Promise<BoundCheckoutGitIdentity | null> {
+  let canonicalCwd = cwd;
+  let probed = false;
+  try {
+    if (!await directoryExists(cwd)) return null;
+    canonicalCwd = await resolvePathForWorktreeComparison(cwd);
+    probed = true;
+    await runGit(["rev-parse", "--git-dir"], canonicalCwd);
+  } catch (error) {
+    if (probed && !await mayBeInsideGitCheckout(canonicalCwd)) return { kind: "not_git", canonicalCwd };
+    return {
+      kind: "unreadable",
+      canonicalCwd,
+      probeError: error instanceof Error ? error.message : String(error),
+    };
+  }
   // Full symbolic ref, never `--short`: a shortened name is ambiguous when a
   // tag or a remote-tracking ref shares it.
   const headRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
   const headSha = await runGit(["rev-parse", "--verify", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
-  return { canonicalCwd, isGit: true, headRef, headSha };
+  return { kind: "git", canonicalCwd, headRef, headSha };
 }
 
 /**
@@ -3861,7 +3908,8 @@ async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
  * with no local ref is refused. A `git_worktree` row with no recorded branch
  * is a legacy row and is refused with a reprovision remedy. Other strategies
  * are compared only when they record a branch; an empty value there is not
- * refused. Ordinary non-Git project directories are left alone.
+ * refused. Ordinary non-Git project directories are left alone, but a checkout
+ * Git cannot read is refused: it is never started unverified.
  * The recorded branch is not rewritten to whatever HEAD happens to name.
  */
 async function assertRecordedCheckoutBranchIdentity(input: {
@@ -3874,46 +3922,52 @@ async function assertRecordedCheckoutBranchIdentity(input: {
   const expectedRaw = asString(input.expectedBranch, "").trim();
   if (!expectedRaw && input.strategy !== "git_worktree") return;
   const identity = await readBoundCheckoutGitIdentity(input.cwd);
-  if (!identity || !identity.isGit) return;
+  if (!identity || identity.kind === "not_git") return;
 
   const expectedRef = expectedRaw ? recordedBranchFullRef(expectedRaw) : null;
   let reasonCode: CheckoutBranchDriftReasonCode;
-  // `show-ref --verify` reads only the exact ref. Revision parsing would fall
-  // back to a tag such as `refs/tags/refs/heads/<name>` when the branch is gone,
-  // and an unborn HEAD can name a branch that has no ref at all.
-  const expectedTipSha = expectedRef
-    ? await runGit(["show-ref", "--verify", "--hash", expectedRef], identity.canonicalCwd).catch(() => null)
-    : null;
-  if (!expectedRef) {
+  let expectedTipSha: string | null = null;
+  if (identity.kind === "unreadable") {
+    reasonCode = "checkout_unreadable";
+  } else if (!expectedRef) {
     reasonCode = "recorded_branch_metadata_missing";
-  } else if (!expectedTipSha) {
-    reasonCode = "recorded_ref_missing";
-  } else if (identity.headRef === expectedRef) {
-    return;
-  } else if (identity.headRef === null) {
-    if (identity.headSha === expectedTipSha) return;
-    reasonCode = "detached_head_off_recorded_tip";
   } else {
-    reasonCode = "branch_mismatch";
+    // `show-ref --verify` reads only the exact ref. Revision parsing would fall
+    // back to a tag such as `refs/tags/refs/heads/<name>` when the branch is gone,
+    // and an unborn HEAD can name a branch that has no ref at all.
+    expectedTipSha = await runGit(["show-ref", "--verify", "--hash", expectedRef], identity.canonicalCwd)
+      .catch(() => null);
+    if (!expectedTipSha) {
+      reasonCode = "recorded_ref_missing";
+    } else if (identity.headRef === expectedRef) {
+      return;
+    } else if (identity.headRef === null) {
+      if (identity.headSha === expectedTipSha) return;
+      reasonCode = "detached_head_off_recorded_tip";
+    } else {
+      reasonCode = "branch_mismatch";
+    }
   }
 
+  const headRef = identity.kind === "git" ? identity.headRef : null;
   const evidence: CheckoutBranchDriftEvidence = {
     reason: "checkout_branch_drift",
     reasonCode,
     expectedBranch: expectedRef ? shortLocalBranchName(expectedRef) : null,
     expectedRef,
     expectedTipSha,
-    actualBranch: shortLocalBranchName(identity.headRef),
-    actualRef: identity.headRef,
-    headSha: identity.headSha,
+    actualBranch: shortLocalBranchName(headRef),
+    actualRef: headRef,
+    headSha: identity.kind === "git" ? identity.headSha : null,
     canonicalCwd: identity.canonicalCwd,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
+    probeError: identity.kind === "unreadable" ? identity.probeError : null,
   };
   const message = formatCheckoutBranchDriftMessage(evidence);
   if (input.recorder) {
     await input.recorder.recordOperation({
       phase: "worktree_prepare",
-      command: "git symbolic-ref HEAD",
+      command: identity.kind === "unreadable" ? "git rev-parse --git-dir" : "git symbolic-ref HEAD",
       cwd: identity.canonicalCwd,
       metadata: { checkoutBranchDrift: evidence },
       run: async () => ({
@@ -10433,8 +10487,8 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
         throw wrapped;
       }
-      // The recheck could not read the checkout, so it did not establish drift.
-      // Keep the original startup failure and its classification below.
+      // An unexpected recheck error did not establish drift. Keep the original
+      // startup failure and its classification below.
       await input.onLog?.(
         "stderr",
         `[service:${serviceName}] checkout branch recheck failed: ${drift instanceof Error ? drift.message : String(drift)}\n`,
@@ -10478,6 +10532,10 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     );
   });
 
+  // Callers await readiness only after more work, and a deferred start only
+  // after its transaction commits. A service that exits during that work must
+  // not surface as an unhandled rejection; each awaiting caller still gets it.
+  readinessPromise.catch(() => undefined);
   return { record, readiness: readinessPromise };
 }
 
@@ -11454,10 +11512,10 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     await persistRuntimeServiceRecord(persistenceDb, started.record);
     refs.push(toRuntimeServiceRef(started.record));
 
-    if (options?.deferReadiness && started.record.status === "starting" && !started.record.reused) {
-      // Attach a rejection handler immediately; the caller awaits the same promise after
-      // the DB transaction commits, but transaction failures may skip that wait path.
-      started.readiness.catch(() => undefined);
+    // Track every deferred start, not only one still `starting`: a service that
+    // exits while the row above is persisted is already `stopped`, and its
+    // readiness rejection must still fail the start.
+    if (options?.deferReadiness && !started.record.reused) {
       pendingReadiness.push({ ...started, service });
       startedServiceIds.push(started.record.id);
     }

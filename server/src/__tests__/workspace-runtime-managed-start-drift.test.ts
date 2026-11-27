@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { RUNTIME_EXPOSURE_APP_PORT_MIN, deriveViteHmrPort } from "@paperclipai/shared";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -37,6 +37,7 @@ import {
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
 } from "../services/workspace-runtime.ts";
+import { listLocalServiceRegistryRecords } from "../services/local-service-supervisor.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -843,6 +844,86 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     await expectNoStartingRuntimeRows();
   }, 30_000);
 
+  it.each([
+    { strategyType: "project_primary", action: "start" },
+    { strategyType: "git_worktree", action: "start" },
+    { strategyType: "project_primary", action: "restart" },
+  ])("refuses a $strategyType $action with 409 when Git cannot read the checkout", async ({ strategyType, action }) => {
+    const fixture = await makeLinkedSource();
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: "branch-a",
+      baseRef: "branch-a",
+      projectCwd: strategyType === "git_worktree" ? fixture.owner : null,
+      strategyType,
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    // Git finds the linked worktree's repository through its `.git` file, so
+    // without read access `rev-parse --git-dir` fails inside a real checkout.
+    const gitFile = path.join(fixture.source, ".git");
+    await fs.chmod(gitFile, 0o000);
+    let res: { status: number; body: unknown };
+    try {
+      res = await request(app())
+        .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/${action}`)
+        .send({});
+    } finally {
+      await fs.chmod(gitFile, 0o644);
+    }
+
+    expectDriftRefusal(res, "checkout_unreadable");
+    await expect(fs.stat(started)).rejects.toThrow();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source)).resolves.toBe("refs/heads/branch-a");
+    const row = await db.select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.workspaceId))
+      .then((rows) => rows[0]);
+    expect(row?.branchName).toBe("branch-a");
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain("checkout_unreadable");
+    expect(evidence).toContain(seeded.workspaceId);
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  it("refuses with 409 when Git loses access to the checkout between provisioning and spawn", async () => {
+    const fixture = await makeLinkedSource();
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const gitFile = path.join(fixture.source, ".git");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: "branch-a",
+      baseRef: "branch-a",
+      projectCwd: null,
+      strategyType: "project_primary",
+      provisionCommand: "true",
+      runtimeProvisionCommand: `chmod 000 ${quoteShell(gitFile)}`,
+      serviceCommand: httpCommand(started),
+    });
+    let res: { status: number; body: unknown };
+    try {
+      res = await request(app())
+        .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+        .timeout({ response: 20_000 })
+        .send({});
+    } finally {
+      await fs.chmod(gitFile, 0o644);
+    }
+
+    expectDriftRefusal(res, "checkout_unreadable");
+    await expect(fs.stat(started)).rejects.toThrow();
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain("checkout_unreadable");
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
   it("returns the pre-spawn refusal while the start transaction holds the workspace row lock", async () => {
     const fixture = await makeLinkedSource();
     const scope = await seedCompany();
@@ -1252,7 +1333,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       });
     }, 45_000);
 
-    it("keeps the original startup error when the drift recheck cannot read the checkout", async () => {
+    it("refuses as checkout_unreadable and keeps the startup error when the failure recheck cannot read the checkout", async () => {
       const fixture = await makeLinkedSource();
       const scope = await seedCompany();
       const seeded = await seedWorkspace({
@@ -1263,10 +1344,12 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         projectCwd: null,
         strategyType: "project_primary",
       });
+      let failure: unknown;
       try {
         // The service locks the checkout's parent directory and exits before
-        // readiness, so the recheck in the failure path gets EACCES.
-        await expect(startRuntimeServicesForWorkspaceControl(controlInput({
+        // readiness, so the recheck in the failure path gets EACCES. The start
+        // settles only after the child exited and the failure path finished.
+        failure = await startRuntimeServicesForWorkspaceControl(controlInput({
           scope,
           fixture,
           executionWorkspaceId: seeded.workspaceId,
@@ -1279,10 +1362,94 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             reuseScope: "execution_workspace",
             stopPolicy: { type: "manual" },
           },
-        }))).rejects.toThrow(/exited before readiness/);
+        })).then(() => null, (error: unknown) => error);
       } finally {
         await fs.chmod(fixture.root, 0o755);
       }
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).toMatchObject({
+        message: expect.stringMatching(/Git cannot read the checkout/),
+        resultJson: {
+          workspaceValidation: { reason: "checkout_branch_drift", reasonCode: "checkout_unreadable" },
+          originalError: expect.stringMatching(/exited before readiness/),
+        },
+      });
+      expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+      await expectNoStartingRuntimeRows();
+    }, 30_000);
+
+    it("fails a start whose service exits before its starting row is persisted", async () => {
+      const fixture = await makeLinkedSource();
+      const scope = await seedCompany();
+      const seeded = await seedWorkspace({
+        scope,
+        cwd: fixture.source,
+        branchName: "branch-a",
+        baseRef: "branch-a",
+        projectCwd: null,
+        strategyType: "project_primary",
+      });
+      const release = path.join(fixture.root, "release");
+      let releaseLock!: () => void;
+      const lockReleased = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+      let markLockHeld!: () => void;
+      const lockHeld = new Promise<void>((resolve) => {
+        markLockHeld = resolve;
+      });
+      // Hold back the start's row insert, so the service exits and its failure
+      // path marks the record stopped before the start reads that status.
+      const locker = db.transaction(async (tx) => {
+        await tx.execute(sql`LOCK TABLE workspace_runtime_services IN SHARE MODE`);
+        markLockHeld();
+        await lockReleased;
+      });
+      await lockHeld;
+      const registryRecords = () =>
+        listLocalServiceRegistryRecords({ metadata: { executionWorkspaceId: seeded.workspaceId } });
+      // Polls a condition the start exposes no event for.
+      async function waitFor(label: string, done: () => Promise<boolean>) {
+        const deadline = Date.now() + 15_000;
+        while (!await done()) {
+          if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      let failure: unknown;
+      try {
+        const pending = startRuntimeServicesForWorkspaceControl(controlInput({
+          scope,
+          fixture,
+          executionWorkspaceId: seeded.workspaceId,
+          service: {
+            name: "web",
+            command: `while [ ! -e ${quoteShell(release)} ]; do sleep 0.02; done; exit 2`,
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            lifecycle: "shared",
+            reuseScope: "execution_workspace",
+            stopPolicy: { type: "manual" },
+          },
+        })).then(() => null, (error: unknown) => error);
+        // The registry record is written after spawn and removed by the failure
+        // path right after it marks the record stopped.
+        await waitFor("the service registry record", async () => (await registryRecords()).length > 0);
+        await fs.writeFile(release, "");
+        await waitFor("the failure path", async () => (await registryRecords()).length === 0);
+        releaseLock();
+        failure = await pending;
+      } finally {
+        await fs.writeFile(release, "");
+        releaseLock();
+        await locker;
+      }
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).toMatchObject({ message: expect.stringMatching(/exited before readiness/) });
+      expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+      await expectNoStartingRuntimeRows();
     }, 30_000);
 
     it("releases the in-process port claim", async () => {
