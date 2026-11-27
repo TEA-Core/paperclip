@@ -268,6 +268,7 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
+import { readPublicationCloseEligibility } from "../services/publication-close-eligibility.js";
 import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
@@ -12940,6 +12941,19 @@ export function issueRoutes(
 
   router.get("/issues/:id/merge-arming/head-review", (req, res) => reviewCompletedIssueHead(req, res, false));
   router.post("/issues/:id/merge-arming/approve-head", (req, res) => reviewCompletedIssueHead(req, res, true));
+
+  router.get("/issues/:id/publication-close-eligibility", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(
+      req,
+      res,
+      getIssueById(req, id),
+      "Issue not found",
+    );
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    res.json(await readPublicationCloseEligibility(db, issue));
+  });
 
   router.get("/issues/:id/runner-goal", async (req, res) => {
     const id = req.params.id as string;

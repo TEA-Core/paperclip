@@ -1120,6 +1120,7 @@ export type {
   IssueBlockerDiagnosticNode,
   IssueBlockerDiagnosticsReadiness,
   IssueBlockerDiagnosticsResponse,
+  PublicationCloseEligibility,
   IssueWakeDiagnosticActivityRecord,
   IssueWakeDiagnosticEvent,
   IssueWakeDiagnosticWakeFailureClass,

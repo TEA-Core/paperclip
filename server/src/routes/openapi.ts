@@ -4375,6 +4375,37 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/publication-close-eligibility",
+  tags: ["issues"],
+  summary: "Read publication close eligibility for an issue",
+  description:
+    "Read-only. Requires issue:read on the issue, the same actor that can read the issue and its runs. " +
+    "Does not require company_scope:read and is not board-only. Every key is always present. Each boolean is never null. " +
+    "deliveryIdentity is true when the parsed execution-state delivery block is present. " +
+    "deliveryReceipt is true when any delivery receipt exists for this company and issue, in any state. " +
+    "cachedLinkedPullRequest is cached and advisory: it is true when the card has a cached GitHub pull-request mention " +
+    "whose cached state is open or unknown, including drafts. It is the cached read the accept path uses. " +
+    "This route does not call GitHub, so it does not refresh pull-request state and does not discover unmentioned pull requests. " +
+    "The done-close guard does both, so the close can decide differently. " +
+    "cachedLinkedPullRequestFetchedAt is the oldest GitHub fetch time among the cached pull-request rows that field reads. " +
+    "It is null when there is no such row or when one of them was never fetched. " +
+    "A true boolean means the accept path would refuse the card for that binding. This route never writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      deliveryIdentity: z.boolean(),
+      deliveryReceipt: z.boolean(),
+      cachedLinkedPullRequest: z.boolean(),
+      cachedLinkedPullRequestFetchedAt: z.string().datetime().nullable(),
+    }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
