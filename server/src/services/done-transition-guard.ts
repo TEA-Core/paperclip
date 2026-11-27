@@ -1865,11 +1865,24 @@ type PullRequestWorkProductLink = {
   pr: LinkedPullRequest | null;
 };
 
-async function readPullRequestWorkProductLinks(
+/**
+ * SUP-23348: the card identifier a branch head ref is anchored to — "sup-23348-fix"
+ * yields "sup-23348" — the parse-side counterpart of the `isAnchoredCardPullRequest`
+ * prefix predicate in merge-arming. Null when the ref carries no leading card
+ * anchor ("fm/fleet-fix", "feature/x").
+ */
+export function cardIdentifierAnchoredToBranch(branchName: string | null): string | null {
+  if (branchName === null || branchName.length === 0) return null;
+  const match = /^([a-z][a-z0-9]*)-(\d+)(?:-|$)/.exec(branchName.toLowerCase());
+  return match ? `${match[1]!}-${match[2]!}` : null;
+}
+
+export async function readPullRequestWorkProductLinks(
   db: Db,
   issue: {
     id: string;
     companyId: string;
+    identifier: string | null;
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
@@ -1896,11 +1909,54 @@ async function readPullRequestWorkProductLinks(
   const parsed = parseRepoUrl(context?.repoUrl ?? null);
   const deliveryRepo = parsed?.hostname === "github.com" ? `${parsed.owner}/${parsed.repo}`.toLowerCase() : null;
   const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+  const ownIdentifier = issue.identifier !== null && issue.identifier.length > 0 ? issue.identifier.toLowerCase() : null;
+  // SUP-23348: an anchor only names another card when it resolves to a real
+  // company-scoped issue that is demonstrably not this one. A typo, stale
+  // branch, or fabricated prefix resolves to nothing and stays fail-closed
+  // (the anchor is then never counted foreign).
+  const foreignAnchors = new Set<string>();
+  for (const product of products) {
+    const metadata = product.metadata ?? {};
+    const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
+    const headRefAnchor = cardIdentifierAnchoredToBranch(headRef);
+    if (headRefAnchor !== null && ownIdentifier !== null && headRefAnchor !== ownIdentifier) foreignAnchors.add(headRefAnchor);
+  }
+  const resolvedAnchorOwners = new Map<string, string>();
+  if (foreignAnchors.size > 0) {
+    try {
+      const anchorRows = await db
+        .select({ id: issues.id, identifier: issues.identifier })
+        .from(issues)
+        .where(and(eq(issues.companyId, issue.companyId), inArray(sql`lower(${issues.identifier})`, [...foreignAnchors])));
+      for (const row of anchorRows) {
+        if (typeof row.identifier === "string" && row.identifier.length > 0) {
+          resolvedAnchorOwners.set(row.identifier.toLowerCase(), row.id);
+        }
+      }
+    } catch {
+      // An unresolvable lookup is not proof of another card; every anchor it
+      // would have resolved stays fail-closed below.
+    }
+  }
   return products.map((product) => {
     const metadata = product.metadata ?? {};
     const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
     const branchIsKnown = headRef !== null && ownership.legitimate && ownership.branch !== null;
     const branchMatches = branchIsKnown && ownership.branch === headRef;
+    // SUP-23348: a head ref anchored to another card's identifier names another
+    // card's work no matter whether this card can resolve a delivery branch of
+    // its own (a reused unrelated workspace, a branchless workspace, no
+    // workspace at all) — but only once that anchor is proven to belong to a
+    // real, different issue in this company. A ref anchored to this card, or
+    // carrying no card anchor, still needs the proven branch/repo identity above.
+    const headRefAnchor = cardIdentifierAnchoredToBranch(headRef);
+    const anchorOwner = headRefAnchor !== null ? resolvedAnchorOwners.get(headRefAnchor) : undefined;
+    const anchoredToAnotherCard =
+      headRefAnchor !== null &&
+      ownIdentifier !== null &&
+      headRefAnchor !== ownIdentifier &&
+      anchorOwner !== undefined &&
+      anchorOwner !== issue.id;
     const repository = typeof metadata.repository === "string"
       ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
       : null;
@@ -1929,13 +1985,15 @@ async function readPullRequestWorkProductLinks(
         headRepoFullName: `${owner}/${repo}`,
       };
     }
-    const kind = !branchIsKnown
-      ? "unknown"
-      : own
-        ? "own"
-        : !branchMatches || (deliveryRepo !== null && repositoryName !== null)
-          ? "foreign"
-          : "unknown";
+    const kind = own
+      ? "own"
+      : anchoredToAnotherCard
+        ? "foreign"
+        : !branchIsKnown
+          ? "unknown"
+          : !branchMatches || (deliveryRepo !== null && repositoryName !== null)
+            ? "foreign"
+            : "unknown";
     return { kind, pr };
   });
 }
