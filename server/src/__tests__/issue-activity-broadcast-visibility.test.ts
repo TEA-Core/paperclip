@@ -334,7 +334,7 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
       .toMatchObject({ description: RESTRICTED_DESCRIPTION });
   });
 
-  it("withholds issue body fields from a plugin that cannot read issues", async () => {
+  it("withholds the issue description from a plugin that cannot read the issue", async () => {
     const { company } = await seedCompany(db);
     const restrictedIssue = await seedIssue(db, company.id, {
       title: RESTRICTED_TITLE,
@@ -371,7 +371,7 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
       const nonReaderEvent = nonReader.received[0]!;
       expect(nonReaderEvent.entityId).toBe(restrictedIssue.id);
       expect(JSON.stringify(nonReader.received)).not.toContain(RESTRICTED_DESCRIPTION);
-      expect(JSON.stringify(nonReader.received)).not.toContain(RESTRICTED_TITLE);
+      expect(nonReaderEvent.payload).toMatchObject({ title: RESTRICTED_TITLE });
 
       // A plugin granted issues.read still receives the full payload.
       expect(reader.received[0]!.payload).toMatchObject({

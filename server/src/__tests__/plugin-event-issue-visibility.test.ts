@@ -29,7 +29,7 @@ describe("plugin issue event visibility", () => {
     expect(pluginCanReadIssues(undefined)).toBe(false);
   });
 
-  it("strips current and previous issue body fields for a non-reader", () => {
+  it("strips the current and previous description of an unreadable issue and keeps its title", () => {
     const original = event({
       payload: {
         identifier: "PAP-1",
@@ -41,8 +41,42 @@ describe("plugin issue event visibility", () => {
     });
     expect(pluginEventForRecipient(original, false).payload).toEqual({
       identifier: "PAP-1",
+      title: "New title",
       status: "todo",
-      _previous: { status: "backlog" },
+      _previous: { title: "Old title", status: "backlog" },
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
+  });
+
+  it("strips the comment snippet of an unreadable issue's comment event", () => {
+    const original = event({
+      eventType: "issue.comment.created",
+      payload: { commentId: "comment-1", bodySnippet: "Restricted comment body", identifier: "PAP-1" },
+    });
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      commentId: "comment-1",
+      identifier: "PAP-1",
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
+  });
+
+  it("strips referenced issue titles from an unreadable issue's document event", () => {
+    const reference = { id: "issue-2", identifier: "PAP-2", title: "Referenced restricted title" };
+    const original = event({
+      eventType: "issue.document.updated",
+      payload: {
+        key: "plan",
+        addedReferencedIssues: [reference],
+        removedReferencedIssues: [reference],
+        currentReferencedIssues: [reference],
+      },
+    });
+    const stripped = { id: "issue-2", identifier: "PAP-2" };
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      key: "plan",
+      addedReferencedIssues: [stripped],
+      removedReferencedIssues: [stripped],
+      currentReferencedIssues: [stripped],
     });
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
