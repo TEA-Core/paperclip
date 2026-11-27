@@ -6806,25 +6806,34 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       }
       repairWarnings.push(...coherence.warnings);
     }
-    const validation = await validateLinkedGitWorktree({
+    let validation = await validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reuseWorktreePath,
       expectedBranchName: realized.branchName,
     });
-    if (!validation.valid) {
-      if (input.preserveRecordedCheckoutBranch === true) {
-        // A managed start/restart/repair reports a checkout that already
-        // drifted from its recorded branch as the 409 drift refusal, with its
-        // evidence. It throws only on drift; any other reuse failure falls
-        // through to the error below.
-        await assertRecordedCheckoutBranchIdentity({
-          cwd: reuseWorktreePath,
-          expectedBranch: realized.branchName,
-          strategy: realized.strategy,
-          executionWorkspaceId: input.workspace.id ?? null,
-          recorder: input.recorder ?? null,
-        });
+    if (!validation.valid && input.preserveRecordedCheckoutBranch === true) {
+      // A managed start/restart/repair reports a checkout that already
+      // drifted from its recorded branch as the 409 drift refusal, with its
+      // evidence. It throws only on drift; any other reuse failure falls
+      // through to the error below.
+      await assertRecordedCheckoutBranchIdentity({
+        cwd: reuseWorktreePath,
+        expectedBranch: realized.branchName,
+        strategy: realized.strategy,
+        executionWorkspaceId: input.workspace.id ?? null,
+        recorder: input.recorder ?? null,
+      });
+      // The identity guard accepts a detached HEAD only at the recorded tip.
+      // Every registration check precedes the branch check, so a detached
+      // `branch_mismatch` here is a registered worktree at the recorded tip:
+      // it is not drift, and the managed start leaves the checkout as it is.
+      if (validation.reasonCode === "branch_mismatch" && validation.actualBranchName === null) {
+        await assertGitIndexIntegrity(reuseWorktreePath);
+        await assertGitHeadResolvable(reuseWorktreePath);
+        validation = { valid: true };
       }
+    }
+    if (!validation.valid) {
       throw new WorkspaceRuntimeValidationFailure(
         // `repoRoot` is the repository the registration was looked up in, and
         // `baseCwd` is what it was derived from. Without them a `not_registered`

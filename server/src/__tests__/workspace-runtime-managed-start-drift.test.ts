@@ -636,6 +636,30 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     await expect(fs.stat(started)).resolves.toBeTruthy();
   }, 30_000);
 
+  it("starts a git_worktree row whose checkout is detached exactly at the recorded tip", async () => {
+    const fixture = await makeLinkedSource();
+    await git(["checkout", "-q", "--detach", "branch-a"], fixture.source);
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: "branch-a",
+      baseRef: "branch-a",
+      projectCwd: fixture.owner,
+      strategyType: "git_worktree",
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null)).resolves.toBeNull();
+    await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(fixture.commitX);
+  }, 30_000);
+
   it("starts a project_primary row that never recorded a branch", async () => {
     const fixture = await makeLinkedSource();
     const scope = await seedCompany();
