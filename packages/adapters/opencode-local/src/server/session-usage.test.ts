@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createOpenCodeSessionChargeLedger,
   foldOpenCodeSessionCounters,
   mergeOpenCodeSessionCounters,
   parseOpenCodeSessionTotals,
@@ -9,6 +10,7 @@ import {
   readOpenCodeStepUsage,
   reconcileOpenCodeRunUsage,
   subtractOpenCodeSessionTotals,
+  type OpenCodeSessionChargeLease,
   type OpenCodeSessionTotals,
 } from "./session-usage.js";
 
@@ -285,6 +287,112 @@ describe("reconcileOpenCodeRunUsage", () => {
       "session reported no usage; step sums used",
       "step_finish #1: tokens.input refused (-5)",
     ]);
+  });
+
+  it("keeps a run with no usage evidence at all incomplete, charged zero, and says so", () => {
+    const reconciled = reconcileOpenCodeRunUsage({
+      sessionUsage: null,
+      sessionUsageBaseline: totals(500, 40, 60, 0.05),
+      resumedSession: true,
+      stepUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      stepCostUsd: 0,
+    });
+    expect(reconciled.usage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(reconciled.costUsd).toBe(0);
+    expect(reconciled.complete).toBe(false);
+    expect(reconciled.issues).toEqual([
+      "session reported no usage; step sums used",
+      "no usage was reported by the session or its steps; the run is charged zero",
+    ]);
+  });
+});
+
+describe("reconcileOpenCodeRunUsage with overlapping runs on one session", () => {
+  const noSteps = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  const resumed = (lease: OpenCodeSessionChargeLease, final: OpenCodeSessionTotals) =>
+    reconcileOpenCodeRunUsage({
+      sessionUsage: final,
+      sessionUsageFinal: final,
+      sessionUsageBaseline: totals(100, 10, 20, 1),
+      resumedSession: true,
+      stepUsage: noSteps,
+      stepCostUsd: 0,
+      chargeLease: lease,
+    });
+
+  it("charges a session increase both runs see exactly once", () => {
+    const ledger = createOpenCodeSessionChargeLedger();
+    // Both runs read the same 100/10/20 $1.00 baseline, and both read the
+    // session at 120/12/24 $1.20 afterwards: a 20-token, $0.20 increase in all.
+    const first = ledger.open("ses_shared");
+    const second = ledger.open("ses_shared");
+    const a = resumed(first, totals(120, 12, 24, 1.2));
+    const b = resumed(second, totals(120, 12, 24, 1.2));
+
+    expect(a.usage).toEqual({ inputTokens: 20, cachedInputTokens: 2, outputTokens: 4 });
+    expect(a.costUsd).toBeCloseTo(0.2, 10);
+    expect(a.issues).toEqual([]);
+    expect(b.usage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(b.costUsd).toBeCloseTo(0, 10);
+    expect(b.complete).toBe(true);
+    expect(b.issues).toEqual(["session usage already charged to an overlapping run on this session was not charged again"]);
+  });
+
+  it("charges a later run only the growth beyond what an overlapping run was charged", () => {
+    const ledger = createOpenCodeSessionChargeLedger();
+    const first = ledger.open("ses_shared");
+    const second = ledger.open("ses_shared");
+    const a = resumed(first, totals(120, 12, 24, 1.2));
+    first.release();
+    const b = resumed(second, totals(130, 13, 26, 1.3));
+
+    expect(a.usage).toEqual({ inputTokens: 20, cachedInputTokens: 2, outputTokens: 4 });
+    expect(b.usage).toEqual({ inputTokens: 10, cachedInputTokens: 1, outputTokens: 2 });
+    expect((a.costUsd ?? 0) + (b.costUsd ?? 0)).toBeCloseTo(0.3, 10);
+  });
+
+  it("does not let a step-sum fallback charge growth an overlapping run already paid for", () => {
+    const ledger = createOpenCodeSessionChargeLedger();
+    const first = ledger.open("ses_shared");
+    const second = ledger.open("ses_shared");
+    // The first run's session reading already includes the second run's
+    // 10/1/2 steps; the second run then has only its own step sums.
+    resumed(first, totals(120, 12, 24, 1.2));
+    const b = reconcileOpenCodeRunUsage({
+      sessionUsage: null,
+      sessionUsageBaseline: totals(100, 10, 20, 1),
+      resumedSession: true,
+      stepUsage: { inputTokens: 10, cachedInputTokens: 1, outputTokens: 2 },
+      stepCostUsd: 0.1,
+      chargeLease: second,
+    });
+
+    expect(b.source).toBe("step_finish");
+    expect(b.usage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(b.complete).toBe(false);
+  });
+
+  it("forgets a session's record once its last overlapping run ends", () => {
+    const ledger = createOpenCodeSessionChargeLedger();
+    const first = ledger.open("ses_shared");
+    resumed(first, totals(120, 12, 24, 1.2));
+    first.release();
+    // A later, non-overlapping run on a session whose usage was reset below
+    // the old record still charges its own growth.
+    const later = ledger.open("ses_shared");
+    const reconciled = reconcileOpenCodeRunUsage({
+      sessionUsage: totals(60, 5, 10, 0.6),
+      sessionUsageFinal: totals(60, 5, 10, 0.6),
+      sessionUsageBaseline: totals(50, 4, 8, 0.5),
+      resumedSession: true,
+      stepUsage: noSteps,
+      stepCostUsd: 0,
+      chargeLease: later,
+    });
+    later.release();
+
+    expect(reconciled.usage).toEqual({ inputTokens: 10, cachedInputTokens: 1, outputTokens: 2 });
+    expect(reconciled.issues).toEqual([]);
   });
 });
 

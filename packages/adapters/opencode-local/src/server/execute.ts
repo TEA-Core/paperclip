@@ -70,6 +70,7 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
+  openCodeSessionChargeLedger,
   reconcileOpenCodeRunUsage,
   type OpenCodeRunUsageReconciliation,
 } from "./session-usage.js";
@@ -1582,6 +1583,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           })
         : null;
 
+      // Overlapping runs of one agent can resume the same session; the lease,
+      // opened before the transport reads the pre-run baseline, keeps their
+      // shared session growth from being charged to both runs.
+      const chargeLease =
+        useServeTransport && resumeSessionId ? openCodeSessionChargeLedger.open(resumeSessionId) : null;
       try {
         const proc = useServeTransport
           ? await runOpenCodeServeProcess({
@@ -1631,10 +1637,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 stepUsage: parsed.stepUsage,
                 stepCostUsd: parsed.stepCostUsd,
                 stepUsageIssues: parsed.stepUsageIssues,
+                chargeLease,
               })
             : null,
         };
       } finally {
+        chargeLease?.release();
         databaseGuard?.stop();
       }
     };
