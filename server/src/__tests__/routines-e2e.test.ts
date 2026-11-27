@@ -891,7 +891,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     });
     const { routineService } = await import("../services/routines.js");
     const svc = routineService(db);
-    const { trigger } = await svc.createTrigger(routineId, { kind: "schedule", cronExpression: "0 0 * * *", timezone: "UTC" }, {});
+    const { trigger } = await svc.createTrigger(routineId, { kind: "schedule", cronExpression: "0 0 * * *", timezone: "UTC", enabled: true }, {});
     await db.update(routineTriggers).set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
     const { logger } = await import("../middleware/logger.js");
     const warn = vi.spyOn(logger, "warn");
