@@ -20524,7 +20524,9 @@ export function issueRoutes(
           && executionPolicySeatsChanged(rowPolicy, resultingPolicy),
         // While a stage holds the card its seated participant is the
         // assignee by design (in_review, or blocked mid-review).
-        judgeAssignee: seatAssigneeWritten || !stageHoldsAssignee(row),
+        judgeAssignee:
+          (seatAssigneeWritten && normalizedAssigneeAgentId !== row.assigneeAgentId)
+          || !stageHoldsAssignee(row),
         // A reassign within the active stage hands it to another participant.
         assigneeMayHoldStageId: activeExecutionStageId(row),
       });

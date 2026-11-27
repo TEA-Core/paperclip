@@ -751,6 +751,45 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
     expectSeatConflict(moved, { seat: "approver", participantId: approverId, conflictingRole: "assignee" });
   });
 
+  it("PATCH: an in_review reviewer echoing itself as assignee is left alone, but a real move into a later seat is refused", async () => {
+    const { companyId, executorId, reviewerId, approverId } = await seed();
+    const reviewStage = { id: randomUUID(), ...agentStage("review", reviewerId, executorId) };
+    const approvalStage = { id: randomUUID(), ...agentStage("approval", reviewerId, approverId) };
+    const issue = await insertIssue({
+      companyId,
+      assigneeAgentId: reviewerId,
+      createdByUserId: BOARD_USER,
+      status: "in_review",
+      executionPolicy: { ...policy(reviewStage, approvalStage), returnAssigneeAgentId: executorId },
+    });
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStage.id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerId },
+        returnAssignee: { type: "agent", agentId: executorId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issue.id));
+
+    currentActor = agentKeyActor(companyId, reviewerId, await seedRun(companyId, reviewerId, issue.id));
+    const echoed = await request(app())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: reviewerId, comment: "Still reviewing" });
+    expect(echoed.status, JSON.stringify(echoed.body)).toBe(200);
+    expect(echoed.body.assigneeAgentId).toBe(reviewerId);
+
+    currentActor = boardActor(companyId);
+    const moved = await request(app())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: approverId });
+    expectSeatConflict(moved, { seat: "approver", participantId: approverId, conflictingRole: "assignee" });
+  });
+
   // --------------------------------------------------------------- checkout
 
   it("checkout: refuses a seated agent taking an unassigned card", async () => {
