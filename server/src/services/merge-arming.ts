@@ -3596,7 +3596,7 @@ export type DecisionHeadResolution =
        * branch. The final-delivery preflight then admits the verdict with no
        * certified head (merged before the verdict); no other caller reads it.
        */
-      mergedBeforeVerdict?: { mergeCommitSha: string; workProduct: string; baseRef: string };
+      mergedBeforeVerdict?: { mergeCommitSha: string; workProduct: string; baseRef: string; mergedAt: string };
       /**
        * SUP-25478: a remedy specific to this refusal, used by the final-delivery
        * preflight instead of its generic open-PR remedy when the generic one
@@ -3936,14 +3936,16 @@ export async function preflightFinalDelivery(
  * of it is agent-writable, so it only names the claim. Every distinct PR the
  * work products name is read live, and each must be: in the card's delivery
  * repository (base and head, so not a fork), MERGED into the card's base
- * branch, merged before this verdict, and merged at any merge commit its work
- * product records. The primary must also record a full 40-hex
- * `metadata.mergeCommitSha` and the reviewed head as `metadata.headSha`; the
- * board landing proof (verifyBoardLandingProof) then verifies that the PR
- * merged at that head and that merge commit, that the merge commit is on the
- * card's base branch, and that board-written evidence ties the PR to the card.
- * Only then is the `no-pr` refusal returned with `mergedBeforeVerdict` set, and
- * the final-delivery preflight admits the verdict with no certified head. No
+ * branch, and merged at any merge commit its work product records. The
+ * primary must also record a full 40-hex `metadata.mergeCommitSha` and must
+ * have merged at the reviewed head the control plane recorded
+ * (readRecordedReviewedHead); the board landing proof (verifyBoardLandingProof)
+ * then verifies that the PR merged at that head and that merge commit, that
+ * the merge commit is on the card's base branch, and that board-written
+ * evidence ties the PR to the card. Only then is the `no-pr` refusal returned
+ * with `mergedBeforeVerdict` set, carrying the latest live `merged_at`; the
+ * final-delivery preflight compares it with the decision row's timestamp under
+ * the write transaction and admits the verdict with no certified head. No
  * work product, or any work product not recorded as merged, returns the
  * refusal unchanged. Every other gap, live mismatch or GitHub failure keeps
  * refusing, with a named `landingProofRefusal` where a live check refused and
@@ -3955,8 +3957,6 @@ async function resolveMergedBeforeVerdictLanding(
   issueId: string,
   refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
 ): Promise<DecisionHeadResolution> {
-  // The verdict instant, taken before any read: every PR must have merged before it.
-  const verdictAt = Date.now();
   const products = await db
     .select({
       title: issueWorkProducts.title,
@@ -3983,8 +3983,7 @@ async function resolveMergedBeforeVerdictLanding(
   if (!primary) {
     return gap(
       "no single primary work product names the delivery. Mark the delivering pull_request work product primary, " +
-        "record its merge commit as metadata.mergeCommitSha and its reviewed head as metadata.headSha, then submit " +
-        "the final verdict again.",
+        "record its merge commit as metadata.mergeCommitSha, then submit the final verdict again.",
     );
   }
   const label = primary.externalId ?? primary.title;
@@ -3993,13 +3992,6 @@ async function resolveMergedBeforeVerdictLanding(
     return gap(
       `the primary work product ${label} has no recorded metadata.mergeCommitSha (a full 40-hex merge commit SHA). ` +
         "Record its merge commit as metadata.mergeCommitSha, then submit the final verdict again.",
-    );
-  }
-  const reviewedHeadSha = readFullSha(primary.metadata?.headSha);
-  if (!reviewedHeadSha) {
-    return gap(
-      `the primary work product ${label} has no recorded metadata.headSha (the full 40-hex head SHA the review ` +
-        "approved). Record the reviewed head as metadata.headSha, then submit the final verdict again.",
     );
   }
   const claims = new Map<string, {
@@ -4036,6 +4028,34 @@ async function resolveMergedBeforeVerdictLanding(
     );
   }
   const cardRepo = `${identity.repo.owner}/${identity.repo.repo}`;
+  const [issue] = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+      executionState: issues.executionState,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  if (!issue) return refusal;
+  const reviewedHeadSha = readRecordedReviewedHead(issue.executionState);
+  if (!reviewedHeadSha) {
+    return {
+      ...refusal,
+      landingProofRefusal: {
+        code: "merged_first_reviewed_head_unrecorded",
+        reason: "the control plane recorded no reviewed head (executionState.approvalStatus.approvedHeadSha) for this card",
+      },
+      remedy:
+        "every linked pull_request work product is MERGED, but the control plane recorded no reviewed head for this " +
+        "card: executionState.approvalStatus.approvedHeadSha is missing. It is written only when a review stage is " +
+        "approved over a live, certified PR head; work-product metadata.headSha is agent-writable and is not used. " +
+        "This path cannot admit the verdict; close the card with an accepted doneTransitionOverride (disposition " +
+        "merged-elsewhere) instead. Do not open a replacement PR.",
+    };
+  }
   const liveRefusal = (claimLabel: string, pr: { owner: string; repo: string; pullRequestNumber: number }, code: string, reason: string): DecisionHeadResolution => ({
     ...refusal,
     landingProofRefusal: { code, reason },
@@ -4043,9 +4063,10 @@ async function resolveMergedBeforeVerdictLanding(
       `every linked pull_request work product is MERGED, but the live GitHub check of ${claimLabel} ` +
       `(${pr.owner}/${pr.repo}#${pr.pullRequestNumber}) refused with ${code}: ${reason}. Every linked pull request ` +
       `must be MERGED from ${cardRepo} into the card's base branch ${baseRef} before the final verdict, at any merge ` +
-      "commit its work product records, and the primary must be merged at the reviewed head recorded as " +
-      "metadata.headSha. Fix the record, then submit the final verdict again. Do not open a replacement PR.",
+      `commit its work product records, and the primary must be merged at the recorded reviewed head ${reviewedHeadSha}. ` +
+      "Fix the record, then submit the final verdict again. Do not open a replacement PR.",
   });
+  let latestMergedAt: { ms: number; iso: string } | null = null;
   for (const [key, claim] of claims) {
     const { pr } = claim;
     if (`${pr.owner}/${pr.repo}`.toLowerCase() !== cardRepo.toLowerCase()) {
@@ -4075,10 +4096,7 @@ async function resolveMergedBeforeVerdictLanding(
     if (Number.isNaN(mergedAt)) {
       return liveRefusal(claim.label, pr, "merged_first_pr_unreadable", "GitHub reported no readable merged_at time");
     }
-    if (mergedAt >= verdictAt) {
-      return liveRefusal(claim.label, pr, "merged_first_merged_after_verdict",
-        `the pull request merged at ${live.mergedAt}, not before this verdict at ${new Date(verdictAt).toISOString()}`);
-    }
+    if (!latestMergedAt || mergedAt > latestMergedAt.ms) latestMergedAt = { ms: mergedAt, iso: live.mergedAt! };
     const liveMergeSha = readFullSha(live.mergeCommitSha);
     if (claim.recordedMergeShas.size > 1 || [...claim.recordedMergeShas].some((sha) => sha !== liveMergeSha)) {
       return liveRefusal(claim.label, pr, "merged_first_stale_record",
@@ -4086,20 +4104,10 @@ async function resolveMergedBeforeVerdictLanding(
     }
     if (key === primaryKey && readFullSha(live.headSha) !== reviewedHeadSha) {
       return liveRefusal(claim.label, pr, "merged_first_head_not_reviewed",
-        `the pull request merged at head ${live.headSha}, not the reviewed head ${reviewedHeadSha} recorded as metadata.headSha`);
+        `the pull request merged at head ${live.headSha}, not the reviewed head ${reviewedHeadSha} the control plane recorded`);
     }
   }
-  const [issue] = await db
-    .select({
-      id: issues.id,
-      companyId: issues.companyId,
-      projectId: issues.projectId,
-      projectWorkspaceId: issues.projectWorkspaceId,
-      executionWorkspaceId: issues.executionWorkspaceId,
-    })
-    .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-  if (!issue) return refusal;
+  if (!latestMergedAt) return refusal;
   // Dynamic: board-landing-proof.ts statically imports this module, so a static import would be circular.
   const { verifyBoardLandingProof } = await import("./board-landing-proof.js");
   const verified = await verifyBoardLandingProof(db, issue, { ...primaryPr, mergeCommitSha, headSha: reviewedHeadSha });
@@ -4118,8 +4126,33 @@ async function resolveMergedBeforeVerdictLanding(
   }
   return {
     ...refusal,
-    mergedBeforeVerdict: { mergeCommitSha: verified.proof.mergeCommitSha, workProduct: label, baseRef: verified.proof.baseRef },
+    mergedBeforeVerdict: {
+      mergeCommitSha: verified.proof.mergeCommitSha,
+      workProduct: label,
+      baseRef: verified.proof.baseRef,
+      mergedAt: latestMergedAt.iso,
+    },
   };
+}
+
+/**
+ * SUP-25478: the reviewed head of a merged-first landing, taken only from a
+ * record agents cannot write. `executionState` is not part of any issue update
+ * validator, so no agent PATCH sets it; the server alone writes it, and
+ * `approvalStatus.approvedHeadSha` only from a head it resolved live on GitHub
+ * (the final-delivery preflight, the merge-arming anchor, the approval-status
+ * reconciler, the board head-approval route). A review-entry delivery record
+ * is not used: a branch-only record carries a head the agent asserted, and a
+ * live-verified bound-PR record routes the decision-head resolver to the
+ * bound PR, so this `no-pr` path never sees it. Work-product
+ * `metadata.headSha` is agent-writable and is never used.
+ */
+function readRecordedReviewedHead(executionState: unknown): string | null {
+  const state = executionState && typeof executionState === "object" ? executionState as Record<string, unknown> : {};
+  const approval = state.approvalStatus && typeof state.approvalStatus === "object"
+    ? state.approvalStatus as Record<string, unknown>
+    : {};
+  return readFullSha(approval.approvedHeadSha);
 }
 
 /** A full 40-hex SHA, lower-cased, or null. */

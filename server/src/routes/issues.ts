@@ -4999,7 +4999,26 @@ export function issueRoutes(
       // certifies no head, and the post-commit hook records the arm as
       // skipped merged-before-verdict with that merge commit as evidence.
       if (decisionId && verdict.mergedBeforeVerdict && verdict.reason.startsWith("no-pr:")) {
-        const { mergeCommitSha, workProduct, baseRef } = verdict.mergedBeforeVerdict;
+        const { mergeCommitSha, workProduct, baseRef, mergedAt } = verdict.mergedBeforeVerdict;
+        // Every door inserts the decision row in this locked transaction with the
+        // default created_at = now(), the transaction timestamp, so now() here is
+        // the decision row's createdAt. The unlocked pre-check defers to it.
+        if (options.locked) {
+          const [stamp] = await options.locked.tx
+            .select({ decidedAtMs: sql<number>`extract(epoch from now()) * 1000`.mapWith(Number) })
+            .from(issueRows)
+            .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+          const mergedAtMs = Date.parse(mergedAt);
+          if (!stamp || !Number.isFinite(stamp.decidedAtMs) || !(mergedAtMs <= stamp.decidedAtMs)) {
+            const decidedAt = stamp && Number.isFinite(stamp.decidedAtMs) ? new Date(stamp.decidedAtMs).toISOString() : "an unreadable time";
+            const reason = `the pull request merged at ${mergedAt}, after this final verdict recorded at ${decidedAt}`;
+            throw conflict("Final repository delivery preflight refused; stage remains pending", {
+              code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId,
+              remedy: `Delivery owner ${deliveryOwnerIssueId}: every linked pull_request work product is MERGED, but ${reason}. A merged-first verdict must follow every merge; submit the final verdict again. ${verdict.reason}`,
+              landingProofRefusal: { code: "merged_first_merged_after_verdict", reason },
+            });
+          }
+        }
         patch.executionState = {
           ...rawState,
           approvalStatus: {

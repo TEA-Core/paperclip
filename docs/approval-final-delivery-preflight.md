@@ -55,11 +55,14 @@ A refusal returns HTTP 409 with `approval_final_delivery_preflight`, the underly
 A delivery that merged every pull request before the final stage armed (a merge-first delivery flow) has no open PR left, so the `no-pr` remedy above cannot be met (SUP-25478). When the resolver and the merged-mention fallback both end in `no-pr`, the preflight reads the card's own `pull_request` work products. Work-product status and metadata are agent-writable, so they only name the claim and are never trusted alone. The preflight admits the final verdict only when all of these hold:
 
 - The card has at least one `pull_request` work product, and every one has status `merged`.
-- Exactly one is primary (or there is only one). The primary carries a full 40-hex `metadata.mergeCommitSha` and the reviewed head as a full 40-hex `metadata.headSha`.
+- Exactly one is primary (or there is only one). The primary carries a full 40-hex `metadata.mergeCommitSha`.
+- The control plane recorded the reviewed head as `executionState.approvalStatus.approvedHeadSha`. Agents cannot write it: `executionState` is in no issue update validator, and the server writes `approvedHeadSha` only from a head it resolved live on GitHub (the final-delivery preflight, the merge-arming anchor, the approval-status reconciler, the board head-approval route). Work-product `metadata.headSha` is agent-writable and is never used. A review-entry delivery record is not used either: a branch-only record carries an agent-asserted head, and a bound-PR record routes the resolver to that PR, so it never reaches this path.
 - Every work product names a pull request (externalId `owner/repo#N`, or `metadata.repository` with `metadata.prNumber`) in the card's delivery repository. Letter case does not matter.
-- Every distinct pull request is read live from GitHub. Each one must be merged, with its base repository and head repository both the card's delivery repository (no fork), merged into the card's recorded base branch (`base.ref`), with a `merged_at` time before the verdict, and with a merge commit that equals any `metadata.mergeCommitSha` its work products record.
-- The primary pull request merged at the reviewed head (`metadata.headSha`).
-- The primary passes the board landing proof (`verifyBoardLandingProof`), given the recorded merge commit and the reviewed head. The proof requires the same merge commit and head, the card's repository by live name and immutable repository id, and board-written evidence that ties the PR to the card: a work product that only the board wrote. A board comment that names the PR does not unlock this path. The proof also requires the GitHub compare to show the merge commit on the card's recorded base branch, which must resolve as a live branch.
+- Every distinct pull request is read live from GitHub. Each one must be merged, with its base repository and head repository both the card's delivery repository (no fork), merged into the card's recorded base branch (`base.ref`), with a readable `merged_at` time, and with a merge commit that equals any `metadata.mergeCommitSha` its work products record.
+- The primary pull request merged at the recorded reviewed head (`approvedHeadSha`).
+- The primary passes the board landing proof (`verifyBoardLandingProof`), given the recorded merge commit and the recorded reviewed head. The proof requires the same merge commit and head, the card's repository by live name and immutable repository id, and board-written evidence that ties the PR to the card: a work product that only the board wrote. A board comment that names the PR does not unlock this path. The proof also requires the GitHub compare to show the merge commit on the card's recorded base branch, which must resolve as a live branch.
+
+- Every pull request merged at or before the final decision row's `createdAt`. Each door inserts that row in its locked write transaction with the default `created_at = now()`, the transaction timestamp, so the locked preflight reads `now()` in the same transaction and compares the latest live `merged_at` with it. A later `merged_at` refuses, and the stage stays pending.
 
 The decision then certifies no head. It is tagged `approvalStatus.finalDeliveryUncertified` with a `merged-before-verdict:` reason and the `mergeCommitSha`. The post-commit hook records `status:skipped:merged-before-verdict: …` with that merge commit, and it stamps and arms nothing. Merge-arming republish and the approval-status reconciler skip the decision with `head_uncertified`, as for any tagged decision. The done-tier guard still owns attribution: an agent close still needs an accepted Tier 1 or Tier 2 declaration. The existing stage-seat checks still apply, so an agent that is not the stage participant cannot record the verdict.
 
@@ -69,9 +72,10 @@ Every other case refuses as before. An open PR that resolves takes the ordinary 
 - `merged_first_wrong_repository`: the work product or the live PR names another repository.
 - `merged_first_fork_head`: the head is in a fork.
 - `merged_first_wrong_base`: the PR merged into another base branch.
-- `merged_first_merged_after_verdict`: the PR merged at or after the verdict.
+- `merged_first_reviewed_head_unrecorded`: the card has no recorded `approvalStatus.approvedHeadSha`. The remedy names the missing record and points to an accepted `doneTransitionOverride` with disposition `merged-elsewhere`.
+- `merged_first_merged_after_verdict`: a PR merged after the final decision row's `createdAt`.
 - `merged_first_stale_record`: a recorded merge commit is not the live one.
-- `merged_first_head_not_reviewed`: the primary merged at another head.
+- `merged_first_head_not_reviewed`: the primary merged at a head other than the recorded `approvedHeadSha`.
 - `merged_first_pr_unreadable`: GitHub returned 404, was rate limited, returned another HTTP error, timed out or failed on the network, or reported no readable `merged_at`.
 - The `landing_proof_*` codes of the board landing proof.
 

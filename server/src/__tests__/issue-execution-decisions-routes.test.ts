@@ -887,7 +887,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     async function mergedFirstReview(
       fixture: Awaited<ReturnType<typeof pendingDelivery>>,
       products: Product[],
-      { pulls = {}, boardWritten = true }: {
+      { pulls = {}, boardWritten = true, reviewedHeadSha = HEAD_SHA }: {
         /**
          * Live GitHub answers per PR number; a PR absent here reads as merged with its recorded
          * merge commit. An Error is thrown by the fetch (a network failure or timeout).
@@ -895,6 +895,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         pulls?: Record<number, Response | Error | Record<string, unknown>>;
         /** Record each work product as written by the board user (the landing proof's tie to the card). */
         boardWritten?: boolean;
+        /** The reviewed head the control plane certified (executionState.approvalStatus.approvedHeadSha); null records none. */
+        reviewedHeadSha?: string | null;
       } = {},
     ) {
       const reviewer = await seedAgent(db, fixture.company.id);
@@ -910,7 +912,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           mode: "normal", commentRequired: true,
           stages: [{ id: fixture.stageId, type: "review", approvalsNeeded: 1, participants: [participant] }],
         },
-        executionState: { ...initial.executionState, currentParticipant: participant },
+        executionState: {
+          ...initial.executionState,
+          currentParticipant: participant,
+          ...(reviewedHeadSha
+            ? { approvalStatus: { ...(initial.executionState as Record<string, any>)?.approvalStatus, approvedHeadSha: reviewedHeadSha } }
+            : {}),
+        },
       }).where(eq(issues.id, fixture.issue.id));
       for (const product of products) {
         const [row] = await db.insert(issueWorkProducts).values({
@@ -971,7 +979,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }
 
     const merged = (number: number, isPrimary: boolean, metadata: Record<string, unknown>): Product =>
-      ({ number, status: "merged", isPrimary, metadata: { mergedAt: MERGED_AT, headSha: HEAD_SHA, ...metadata } });
+      ({ number, status: "merged", isPrimary, metadata: { mergedAt: MERGED_AT, ...metadata } });
 
     // A refused merged-first verdict leaves the stage pending: no decision, no completion, no stamp.
     async function expectRefused(
@@ -1077,7 +1085,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       });
     });
 
-    it("refuses when a pull request merged at or after the verdict", async () => {
+    it("refuses when a pull request merged after the decision row's timestamp", async () => {
       const fixture = await pendingDelivery({ missing: true });
       const review = await mergedFirstReview(fixture, [
         merged(4412, true, { mergeCommitSha: MERGE_SHA }),
@@ -1089,11 +1097,12 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       });
     });
 
-    it("refuses when the primary merged at a head other than the reviewed head", async () => {
+    it("refuses when the primary merged at a head other than the recorded reviewed head, whatever metadata.headSha says", async () => {
       const fixture = await pendingDelivery({ missing: true });
       const live = livePull(4412, MERGE_SHA);
-      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
-        pulls: { 4412: { ...live, head: { ...live.head, sha: "b".repeat(40) } } },
+      const mergedHead = "b".repeat(40);
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA, headSha: mergedHead })], {
+        pulls: { 4412: { ...live, head: { ...live.head, sha: mergedHead } } },
       });
 
       await expectRefused(fixture, await review.approve(MERGE_SHA), {
@@ -1101,12 +1110,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       });
     });
 
-    it("refuses when the primary records no reviewed head", async () => {
+    it("does not use an agent-written metadata.headSha when the control plane recorded no reviewed head", async () => {
       const fixture = await pendingDelivery({ missing: true });
-      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA, headSha: undefined })]);
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA, headSha: HEAD_SHA })], {
+        reviewedHeadSha: null,
+      });
 
       await expectRefused(fixture, await review.approve(MERGE_SHA), {
-        remedy: expect.stringContaining("has no recorded metadata.headSha"),
+        landingProofRefusal: { code: "merged_first_reviewed_head_unrecorded" },
+        remedy: expect.stringContaining("approvalStatus.approvedHeadSha"),
       });
     });
 
@@ -1143,7 +1155,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(fixture.writes).toEqual([]);
     });
 
-    it("records the final verdict and skips the arm when every PR work product merged first", async () => {
+    it("records the final verdict and skips the arm when every PR work product merged at the recorded reviewed head before the verdict", async () => {
       const fixture = await pendingDelivery({ missing: true });
       const review = await mergedFirstReview(fixture, [
         merged(4412, true, { mergeCommitSha: MERGE_SHA }),
@@ -1162,8 +1174,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         reason: expect.stringMatching(new RegExp(`^merged-before-verdict: .*${MERGE_SHA}.*TEA-Core/paperclip#4412.*main`)),
         mergeCommitSha: MERGE_SHA,
       });
-      expect(state.approvalStatus.approvedHeadSha).toBeUndefined();
+      expect(state.approvalStatus.approvedHeadSha).toBe(HEAD_SHA);
       expect(state.approvalStatus.finalDelivery).toBeUndefined();
+      const [decision] = await db.select().from(issueExecutionDecisions);
+      expect(decision!.id).toBe(state.lastDecisionId);
+      expect(Date.parse(MERGED_AT)).toBeLessThanOrEqual(decision!.createdAt.getTime());
       expect(state.approvalStatus.publishSkipped).toMatchObject({
         reason: expect.stringContaining(`status:skipped:merged-before-verdict: `),
         headSha: null,
