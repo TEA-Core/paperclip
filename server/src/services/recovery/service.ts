@@ -1718,7 +1718,7 @@ export function recoveryService(
     const reasonPrefix = `external_pull_recovery_notice:${input.reason}:`;
     const episodePrefix = `${reasonPrefix}${input.issue.status}:${input.issue.assigneeAgentId ?? "none"}:`;
     const [latestNotice] = await runner
-      .select({ body: issueComments.body })
+      .select({ body: issueComments.body, createdAt: issueComments.createdAt })
       .from(issueComments)
       .where(and(
         eq(issueComments.companyId, input.issue.companyId),
@@ -1728,7 +1728,24 @@ export function recoveryService(
       ))
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(1);
-    if (latestNotice?.body.includes(episodePrefix)) return;
+    if (latestNotice?.body.includes(episodePrefix)) {
+      const [transitionSinceNotice] = await runner
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, input.issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issue.id),
+          gt(activityLog.createdAt, latestNotice.createdAt),
+          sql`(
+            ${activityLog.details}->'_previous'->'status' is not null or
+            ${activityLog.details}->'_previous'->'assigneeAgentId' is not null or
+            ${activityLog.details}->'_previous'->'assigneeUserId' is not null
+          )`,
+        ))
+        .limit(1);
+      if (!transitionSinceNotice) return;
+    }
     const marker = `${episodePrefix}${input.episodeId}`;
     await issueService(runner).addComment(
       input.issue.id,
