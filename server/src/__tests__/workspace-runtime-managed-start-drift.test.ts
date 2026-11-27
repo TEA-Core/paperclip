@@ -1399,10 +1399,12 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       const lockHeld = new Promise<void>((resolve) => {
         markLockHeld = resolve;
       });
-      // Hold back the start's row insert, so the service exits and its failure
-      // path marks the record stopped before the start reads that status.
+      // Hold the project row, so the start's row insert stops at its foreign-key
+      // check with its tuple already written. The service then exits, and its
+      // failure path marks the record stopped before the start reads that
+      // status. The child-exit persist queues behind that tuple, not ahead of it.
       const locker = db.transaction(async (tx) => {
-        await tx.execute(sql`LOCK TABLE workspace_runtime_services IN SHARE MODE`);
+        await tx.execute(sql`select id from projects where id = ${scope.projectId} for update`);
         markLockHeld();
         await lockReleased;
       });
@@ -1433,10 +1435,16 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             stopPolicy: { type: "manual" },
           },
         })).then(() => null, (error: unknown) => error);
-        // The registry record is written after spawn and removed by the failure
-        // path right after it marks the record stopped.
-        await waitFor("the service registry record", async () => (await registryRecords()).length > 0);
+        await waitFor("the starting row insert to wait on the project row", async () => {
+          const rows = await db.execute<{ waiting: number }>(sql`
+            select count(*)::int as waiting from pg_stat_activity
+            where wait_event_type = 'Lock' and query like 'insert into "workspace_runtime_services"%'
+          `);
+          return Number(rows[0]?.waiting ?? 0) > 0;
+        });
         await fs.writeFile(release, "");
+        // The failure path removes the registry record right after it marks the
+        // record stopped.
         await waitFor("the failure path", async () => (await registryRecords()).length === 0);
         releaseLock();
         failure = await pending;
