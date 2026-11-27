@@ -19,6 +19,7 @@ import {
   captureReviewEntryWorktree, recheckReviewEntryWorktree, type NoRepositoryWorktreeProbeInput, type ReviewEntryWorktreeSnapshot,
 } from "./hardened-git-probe.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { PROVISIONED_GIT_ADMIN_IDENTITY_KEY, parseGitAdminIdentity } from "./worktree-git-admin-identity.js";
 
 export type ReviewEntryPrecondition = NonNullable<UpdateIssue["reviewEntryPrecondition"]>;
 type Subject = Omit<typeof issues.$inferSelect, "parentLinkKind"> & { parentLinkKind: string | null };
@@ -127,6 +128,12 @@ export async function prepareReviewEntry(
 ): Promise<PreparedReviewEntry> {
   assertSubject(issue, expected, actor);
   const binding = await readBinding(db, issue);
+  const provisionedGitAdminIdentity = parseGitAdminIdentity(
+    binding.workspace.metadata?.[PROVISIONED_GIT_ADMIN_IDENTITY_KEY],
+  );
+  if (!provisionedGitAdminIdentity) {
+    fail("workspace_unverified", "No provisioned Git admin-directory identity is recorded. Reprovision this card in a fresh isolated worktree.");
+  }
   const record = await readRecord(db, issue, actor);
   const signal = AbortSignal.timeout(15_000);
   const { hostname, owner, repo } = record.repositoryLocation;
@@ -190,6 +197,9 @@ export async function prepareReviewEntry(
   if (!snapshot.ok) {
     if (providerRefusal) throw providerRefusal;
     fail("git_refused", snapshot.reason);
+  }
+  if (!isDeepStrictEqual(snapshot.gitAdminIdentity, provisionedGitAdminIdentity)) {
+    fail("git_refused", "The Git admin-directory pathname or device/inode differs from provisioning. Reprovision this card in a fresh isolated worktree.");
   }
   return { binding, record, snapshot, baseSha, defaultBranch, capturedAt: new Date(), issueBinding: issueProofBinding(issue) };
 }

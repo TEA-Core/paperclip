@@ -432,8 +432,12 @@ ancestors at or above the managed projects root constrain their own company only
 so another company's `/` configuration is not an invisible instance-wide blocker.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
-Provision summary-routine cards with their own isolated-worktree workspace after
-deployment; this change does not edit or migrate live routines.
+Provision summary-routine cards with their own fresh isolated-worktree workspace
+after deployment. Provisioning records the canonical Git admin-directory pathname
+and device/inode in workspace metadata; reuse retains that baseline, never learns
+a replacement from mutable Git files. Ordinary agent keys cannot set it. Legacy
+workspaces without it refuse entry with `review_entry_workspace_unverified` and
+must be reprovisioned. This change does not edit or migrate live routines.
 
 The owner yields its isolated directory while its conditional PATCH runs.
 This is a sole-owner local-worktree contract, not a privileged host freeze or a
@@ -453,13 +457,21 @@ nor close evidence.
 
 Each linked-worktree admin directory must have a bounded regular `gitdir`
 back-pointer and a consistent forward `.git` pointer to the same admin-directory
-device/inode. The common directory's registered mappings must be unambiguous;
-rewriting both pointers to borrow a sibling's index/HEAD is refused. A sibling
-registration whose linked `.git` target is missing (ENOENT, which Git reports as
-prunable) is skipped, because it holds no gitfile that could borrow an admin
-directory. Every other unreadable or inconsistent registration fails closed, and
-the submitting tree always needs its own valid back-pointer. Relative pointers resolve against
-their containing directory, as Git does.
+device/inode. Entry requires the submitting admin pathname and device/inode to
+match its provisioned baseline, including at the locked fingerprint recheck.
+Rewriting both pointers to borrow a sibling's index/HEAD refuses even if the old
+registration is prunable or removed. Another registration's HEAD symref to the
+submitting branch also refuses. A deleted sibling on an independent branch may
+remain registered: its missing linked `.git` target (ENOENT) is skipped after the
+HEAD check. Other unreadable or inconsistent registrations fail closed, and the
+submitting tree always needs its valid back-pointer. Relative pointers resolve
+against their containing directory, as Git does.
+
+Accepted filesystem residuals: tracked-file hardlinks can alias bytes outside
+the tree. A copied worktree directory or a hand-written `.git` file outside the
+registration mapping can share the submitting admin directory/index/HEAD without
+a path overlap or a changed provisioned identity. Entry does not discover these
+unregistered aliases. These limits do not provide an exclusion guarantee.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
@@ -468,9 +480,9 @@ The issue-locked transaction rechecks classification, debt, policy/state, owning
 run, repository binding, pinned revisions and observed writers and recomputes
 the ordinary stage transition. The full hardened clean/index/ignored-file,
 branch-attribution and `git fsck --strict` proof runs before the transaction;
-inside it a cheap recheck requires the same HEAD, branch, index digest, refs digest
-and status-manifest digest (porcelain status plus the allowed ignored entries),
-under one 15-second Git budget. A provider refusal keeps its typed code
+inside it a cheap recheck requires the same HEAD, branch, Git admin identity, index
+digest, refs digest and status-manifest digest (porcelain status plus the allowed
+ignored entries), under one 15-second Git budget. A provider refusal keeps its typed code
 (`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`);
 a tip the provider does not know (404/422 compare) is owed repository work.
 A `refs/tags/*` ref is admitted only when its peeled target is a commit reachable

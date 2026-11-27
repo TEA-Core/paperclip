@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { PROJECT_REPOSITORIES_DIR, PROJECT_REPOSITORIES_EXCLUDE_LINE } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { GitAdminIdentity, readGitAdminDirectoryIdentity } from "./worktree-git-admin-identity.js";
 
 // SUP-22880 / SUP-22570: the one Git runner for probes that read a workspace an
 // agent can write.
@@ -751,7 +752,7 @@ function refuse(reason: string): NoRepositoryWorktreeProbeResult {
 }
 
 type CleanWorktreeVerdict =
-  | { ok: true; branch: string; headSha: string; indexDigest: string; statusManifestDigest: string }
+  | { ok: true; branch: string; headSha: string; gitAdminIdentity: GitAdminIdentity; indexDigest: string; statusManifestDigest: string }
   | { ok: false; reason: string };
 
 /**
@@ -763,6 +764,7 @@ async function verifyCleanLinkedWorktree(
   worktreePath: string,
   expectedCommonDir: string,
   options: HardenedGitOptions,
+  refuseSharedBranch = false,
 ): Promise<CleanWorktreeVerdict> {
   const worktreeOptions: HardenedGitOptions = { ...options, ceilingDirectory: path.dirname(worktreePath) };
   let flags: string[];
@@ -795,6 +797,14 @@ async function verifyCleanLinkedWorktree(
   if (identity.commonDir !== expectedCommonDir || path.dirname(identity.gitDir) !== path.join(expectedCommonDir, "worktrees")) {
     return { ok: false, reason: "is not a linked worktree of the managed checkout" };
   }
+  let branchRef: string;
+  try {
+    branchRef = (await runHardenedGit(["-C", worktreePath, "symbolic-ref", "--quiet", "HEAD"], worktreeOptions)).trim();
+  } catch {
+    return { ok: false, reason: "has a detached HEAD" };
+  }
+  if (!branchRef.startsWith("refs/heads/")) return { ok: false, reason: "has a detached HEAD" };
+  let gitAdminIdentity: GitAdminIdentity;
   try {
     const backlink = await readOptionalRegularFile(path.join(identity.gitDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
     const target = backlink?.endsWith("\n") ? backlink.slice(0, -1) : backlink;
@@ -802,13 +812,27 @@ async function verifyCleanLinkedWorktree(
         await realpath(path.isAbsolute(target) ? target : `${identity.gitDir}/${target}`) !== path.join(worktreePath, ".git")) {
       return { ok: false, reason: "has a linked-worktree Git directory registered to a different path" };
     }
-    const ownAdmin = await lstat(identity.gitDir);
+    gitAdminIdentity = await readGitAdminDirectoryIdentity(identity.gitDir);
     for (const name of (await readdir(path.join(identity.commonDir, "worktrees"))).sort()) {
       if (options.deadline) remainingBudget(options.deadline);
       const registeredDir = path.join(identity.commonDir, "worktrees", name);
-      const registered = await lstat(registeredDir);
+      const registered = await lstat(registeredDir, { bigint: true });
       if (!registered.isDirectory() || registered.isSymbolicLink()) {
         return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      if (refuseSharedBranch && registeredDir !== identity.gitDir) {
+        if (await readOptionalRegularFile(path.join(registeredDir, "HEAD"), MAX_GITDIR_FILE_BYTES) === null) {
+          return { ok: false, reason: "has unverifiable linked-worktree HEAD registration" };
+        }
+        // Git resolves chained symrefs too. Check before skipping a prunable
+        // directory: its registered HEAD can still name the submitting branch.
+        const registeredBranch = (await runHardenedGit(
+          ["--git-dir", registeredDir, "symbolic-ref", "--quiet", "HEAD"],
+          { ...options, successExitCodes: [0, 1] },
+        )).trim();
+        if (registeredBranch === branchRef) {
+          return { ok: false, reason: "has another registered worktree HEAD sharing its branch" };
+        }
       }
       const pointer = await readOptionalRegularFile(path.join(registeredDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
       const linkedFile = pointer?.endsWith("\n") ? pointer.slice(0, -1) : pointer;
@@ -827,9 +851,13 @@ async function verifyCleanLinkedWorktree(
         return { ok: false, reason: "has unverifiable linked-worktree registration" };
       }
       const targetDir = forward.slice("gitdir: ".length);
-      const actual = await lstat(await realpath(path.isAbsolute(targetDir) ? targetDir : `${path.dirname(linkedPath)}/${targetDir}`));
+      const actual = await lstat(
+        await realpath(path.isAbsolute(targetDir) ? targetDir : `${path.dirname(linkedPath)}/${targetDir}`),
+        { bigint: true },
+      );
       if (actual.dev !== registered.dev || actual.ino !== registered.ino ||
-          registeredDir !== identity.gitDir && registered.dev === ownAdmin.dev && registered.ino === ownAdmin.ino) {
+          registeredDir !== identity.gitDir && registered.dev.toString() === gitAdminIdentity.device
+            && registered.ino.toString() === gitAdminIdentity.inode) {
         return { ok: false, reason: "has ambiguous or shared linked-worktree Git directory registration" };
       }
     }
@@ -838,13 +866,6 @@ async function verifyCleanLinkedWorktree(
   }
   const headSha = await readHeadCommit(worktreePath, worktreeOptions);
   if (!headSha) return { ok: false, reason: "has no HEAD commit" };
-  let branchRef: string;
-  try {
-    branchRef = (await runHardenedGit(["-C", worktreePath, "symbolic-ref", "--quiet", "HEAD"], worktreeOptions)).trim();
-  } catch {
-    return { ok: false, reason: "has a detached HEAD" };
-  }
-  if (!branchRef.startsWith("refs/heads/")) return { ok: false, reason: "has a detached HEAD" };
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
@@ -900,7 +921,7 @@ async function verifyCleanLinkedWorktree(
     return { ok: false, reason: "status could not be verified" };
   }
   if (!digests) return { ok: false, reason: "status could not be verified" };
-  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, ...digests };
+  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, gitAdminIdentity, ...digests };
 }
 
 /** Why `sha` may not stand as "level with the default branch"; null when it does. */
@@ -1126,12 +1147,13 @@ export type ReviewEntryWorktreeSnapshot =
       indexDigest: string;
       refsDigest: string;
       statusManifestDigest: string;
+      gitAdminIdentity: GitAdminIdentity;
     }
   | { ok: false; reason: string };
 
 type ReviewEntryFingerprint = Pick<
   Extract<ReviewEntryWorktreeSnapshot, { ok: true }>,
-  "branch" | "headSha" | "indexDigest" | "refsDigest" | "statusManifestDigest"
+  "branch" | "headSha" | "gitAdminIdentity" | "indexDigest" | "refsDigest" | "statusManifestDigest"
 >;
 
 const REVIEW_ENTRY_BUDGET_MS = 15_000;
@@ -1147,7 +1169,7 @@ async function reviewEntryFingerprint(
   options: HardenedGitOptions,
 ): Promise<{ ok: true; fingerprint: ReviewEntryFingerprint } | { ok: false; reason: string }> {
   const beforeRefs = await readRefs(worktreePath, options);
-  const verdict = await verifyCleanLinkedWorktree(worktreePath, commonDir, { ...options, cwd: path.dirname(commonDir) });
+  const verdict = await verifyCleanLinkedWorktree(worktreePath, commonDir, { ...options, cwd: path.dirname(commonDir) }, true);
   if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
   const afterRefs = await readRefs(worktreePath, options);
   if (beforeRefs !== afterRefs) return { ok: false, reason: "Git refs changed during first-entry capture" };
@@ -1156,6 +1178,7 @@ async function reviewEntryFingerprint(
     fingerprint: {
       branch: verdict.branch, headSha: verdict.headSha, indexDigest: verdict.indexDigest,
       statusManifestDigest: verdict.statusManifestDigest,
+      gitAdminIdentity: verdict.gitAdminIdentity,
       refsDigest: createHash("sha256").update(afterRefs).digest("hex"),
     },
   };
@@ -1235,8 +1258,8 @@ export async function recheckReviewEntryWorktree(
   try {
     const measured = await reviewEntryFingerprint(captured.worktreePath, captured.commonDir, { cwd: "/", deadline });
     if (!measured.ok) return measured;
-    const { branch, headSha, indexDigest, refsDigest, statusManifestDigest } = captured;
-    if (!isDeepStrictEqual(measured.fingerprint, { branch, headSha, indexDigest, refsDigest, statusManifestDigest })) {
+    const { branch, headSha, gitAdminIdentity, indexDigest, refsDigest, statusManifestDigest } = captured;
+    if (!isDeepStrictEqual(measured.fingerprint, { branch, headSha, gitAdminIdentity, indexDigest, refsDigest, statusManifestDigest })) {
       return { ok: false, reason: "The worktree, index, status, HEAD or refs changed after capture." };
     }
     return { ok: true };
