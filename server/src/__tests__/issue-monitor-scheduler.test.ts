@@ -588,6 +588,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         .then((rows) => rows.filter((row) => row.action === "issue.monitor_exhausted"));
     }
 
+    async function allWakeups(agentId: string) {
+      return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    }
+
     async function recoveryWakeups(agentId: string) {
       return db
         .select()
@@ -866,8 +870,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
       await rearm(issueId, "assignee", monitor);
       await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      const wakeRowsBeforeDeferral = (await allWakeups(agentId)).length;
 
       await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.tickTimers(new Date("2026-04-11T13:01:30.000Z"));
+      expect(await allWakeups(agentId)).toHaveLength(wakeRowsBeforeDeferral);
       const deferred = await readIssue(issueId);
       expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
       expect(deferred.monitorWakeRequestedAt).toBeNull();
@@ -893,8 +900,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         } else {
           await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, agentId));
         }
+        const wakeRowsBeforeDeferral = (await allWakeups(agentId)).length;
 
         await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:01:30.000Z"));
+        expect(await allWakeups(agentId)).toHaveLength(wakeRowsBeforeDeferral);
         const deferred = await readIssue(issueId);
         expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
         expect(deferred.monitorWakeRequestedAt).toBeNull();

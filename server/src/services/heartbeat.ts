@@ -12760,10 +12760,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows.length > 0);
   }
 
-  function isIssueMonitorRecoveryDeferral(err: unknown) {
-    if (!(err instanceof HttpError) || err.status !== 409) return false;
-    const details = (err.details ?? {}) as { scopeType?: unknown; reason?: unknown };
-    return details.scopeType !== undefined || details.reason === "paused";
+  const PERMANENT_ISSUE_MONITOR_OWNER_REFUSAL_REASONS = new Set<string>([
+    "terminated",
+    "pending_approval",
+    "missing",
+    "unknown_status",
+    "manager_missing",
+    "manager_company_mismatch",
+    "manager_terminated",
+    "reporting_cycle",
+    "reporting_chain_too_deep",
+  ]);
+
+  function isPermanentIssueMonitorOwnerRefusal(err: unknown) {
+    if (!(err instanceof HttpError)) return false;
+    if (err.status === 404) return true;
+    if (err.status !== 409) return false;
+    const details = (err.details ?? {}) as { reason?: unknown; invalidOrgChain?: unknown };
+    return (
+      details.invalidOrgChain === true ||
+      (typeof details.reason === "string" && PERMANENT_ISSUE_MONITOR_OWNER_REFUSAL_REASONS.has(details.reason))
+    );
   }
 
   async function performIssueMonitorRecovery(input: {
@@ -12938,45 +12955,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentId: input.claimed.assigneeAgentId!,
       idempotencyKey: ownerWakeKey,
     });
-    const wakeResult = ownerWakeAlreadySent ? true : await enqueueWakeup(input.claimed.assigneeAgentId!, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_monitor_recovery",
-      idempotencyKey: ownerWakeKey,
-      payload: withRecoveryContext(
-        {
+    const wakeResult = ownerWakeAlreadySent ? true : await (async () => {
+      const owner = await getAgent(input.claimed.assigneeAgentId!);
+      if (owner) {
+        const budgetBlock = await budgets.getInvocationBlock(input.claimed.companyId, owner.id, {
           issueId: input.claimed.id,
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-          ...(reviewPathContext ?? {}),
-        },
-        "status_only",
-      ),
-      requestedByActorType: input.actorType,
-      requestedByActorId: input.actorId,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: input.claimed.id,
-          source: "issue.monitor.recovery",
-          wakeReason: "issue_monitor_recovery",
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-          ...(reviewPathContext ?? {}),
-        },
-        "status_only",
-      ),
-    }).catch((err: unknown) => {
-      if (err instanceof HttpError && err.status >= 400 && err.status < 500 && !isIssueMonitorRecoveryDeferral(err)) {
-        return null;
+          projectId: input.claimed.projectId,
+        });
+        if (budgetBlock) {
+          throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
+        }
+        const invokability = await getAgentInvokability(owner);
+        if (!invokability.invokable && invokability.reason === "paused") {
+          throw conflict(invokability.message, { status: owner.status, reason: invokability.reason });
+        }
       }
+      return enqueueWakeup(input.claimed.assigneeAgentId!, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_monitor_recovery",
+        idempotencyKey: ownerWakeKey,
+        payload: withRecoveryContext(
+          {
+            issueId: input.claimed.id,
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: input.claimed.monitorNotes ?? null,
+            clearReason: input.clearReason,
+            serviceName: input.monitor?.serviceName ?? null,
+            timeoutAt: input.monitor?.timeoutAt ?? null,
+            maxAttempts: input.monitor?.maxAttempts ?? null,
+            ...(reviewPathContext ?? {}),
+          },
+          "status_only",
+        ),
+        requestedByActorType: input.actorType,
+        requestedByActorId: input.actorId,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: input.claimed.id,
+            source: "issue.monitor.recovery",
+            wakeReason: "issue_monitor_recovery",
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: input.claimed.monitorNotes ?? null,
+            clearReason: input.clearReason,
+            serviceName: input.monitor?.serviceName ?? null,
+            timeoutAt: input.monitor?.timeoutAt ?? null,
+            maxAttempts: input.monitor?.maxAttempts ?? null,
+            ...(reviewPathContext ?? {}),
+          },
+          "status_only",
+        ),
+      });
+    })().catch((err: unknown) => {
+      if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
       throw err;
     });
 
@@ -13117,9 +13148,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(issues)
         .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
         .where(eq(issues.id, input.claimed.id));
-      // A paused or budget-blocked owner refuses the recovery wake: the same deferral a
-      // normal fire gets. The monitor stays armed and a later tick retries.
-      if (isIssueMonitorRecoveryDeferral(err)) {
+      // Unlike a normal fire, which clears on a client error, a recovery refused for a
+      // transient reason (paused or budget-blocked owner) defers: the monitor stays armed
+      // and a later tick retries. Permanent owner refusals never reach this point.
+      if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         return { outcome: "skipped" as const, reason: "recovery_deferred" };
       }
       throw err;
