@@ -11,6 +11,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import { logActivityInTransaction } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 
 export const CHILD_CARRIER_ATTRIBUTION_ACTOR_ID = "system:child-carrier-attribution";
 
@@ -766,6 +767,12 @@ export async function carrierOwnerChildAttributionBlock(
   ownerIssueId: string,
   pr: { owner: string; repo: string; number: number; headSha?: string | null; headRef?: string | null },
 ): Promise<string | null> {
+  // The skip string is deliberately opaque and compared exactly by consumers;
+  // the operator-facing why goes to the log, with the child that caused it.
+  const skip = (reason: string, childIssueId: string | null = null): string => {
+    logger.info({ ownerIssueId, childIssueId, reason }, "child carrier owner gate skipped");
+    return CHILD_CARRIER_OWNER_GATE_SKIP;
+  };
   const descendants = await descendantIds(db, companyId, ownerIssueId);
   // Recorded obligations survive mutable workspace metadata. This is only an
   // applicability fence; complete current proof is read again after enumeration.
@@ -785,18 +792,23 @@ export async function carrierOwnerChildAttributionBlock(
           AND ${issues.companyId} = ${companyId} AND ${issues.status} <> 'cancelled'
       )`,
     ));
-  if (descendants.length === 0) return recorded.length > 0 ? CHILD_CARRIER_OWNER_GATE_SKIP : null;
+  if (descendants.length === 0) {
+    return recorded.length > 0 ? skip("recorded child attributions exist but the owner has no non-cancelled descendants") : null;
+  }
   if (recorded.length > 0) {
     const descendantSet = new Set<string>();
     for (const descendant of descendants) descendantSet.add(descendant.id);
-    if (recorded.some(({ childIssueId }) => !descendantSet.has(childIssueId))) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    const outside = recorded.find(({ childIssueId }) => !descendantSet.has(childIssueId));
+    if (outside) return skip("a recorded child attribution belongs to a card outside the owner's descendants", outside.childIssueId);
   }
-  const recordedScopeRefusal = recorded.length > 0 ? CHILD_CARRIER_OWNER_GATE_SKIP : null;
+  const recordedScopeRefusal = (reason: string): string | null => (recorded.length > 0 ? skip(reason) : null);
   const owner = await readChildWorkspace(db, companyId, ownerIssueId);
-  if (!owner) return recordedScopeRefusal;
-  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) return recordedScopeRefusal;
+  if (!owner) return recordedScopeRefusal("owner has no readable execution workspace branch");
+  if (pr.headRef && pr.headRef.toLowerCase() !== owner.branch.toLowerCase()) {
+    return recordedScopeRefusal("pull request head ref differs from the owner's workspace branch");
+  }
   if (pr.owner.toLowerCase() !== owner.repo.owner.toLowerCase() || pr.repo.toLowerCase() !== owner.repo.repo.toLowerCase()) {
-    return recordedScopeRefusal;
+    return recordedScopeRefusal("pull request repository differs from the owner's workspace repository");
   }
   const recordedChildIds = new Set<string>();
   for (const row of recorded) recordedChildIds.add(row.childIssueId);
@@ -804,28 +816,28 @@ export async function carrierOwnerChildAttributionBlock(
   for (const descendant of descendants) {
     const card = await readChildWorkspace(db, companyId, descendant.id);
     if (!card) {
-      if (recordedChildIds.has(descendant.id)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      if (recordedChildIds.has(descendant.id)) return skip("child with a recorded attribution has no readable workspace branch", descendant.id);
       continue;
     }
     if (
       card.repo.owner.toLowerCase() !== owner.repo.owner.toLowerCase()
       || card.repo.repo.toLowerCase() !== owner.repo.repo.toLowerCase()
     ) {
-      if (recordedChildIds.has(descendant.id)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      if (recordedChildIds.has(descendant.id)) return skip("child with a recorded attribution is in a different repository", descendant.id);
       continue;
     }
     sameRepo.push({ descendant, card });
   }
   if (sameRepo.length === 0) return null;
   const live = await fetchLivePullRequest(db, companyId, owner.repo.owner, owner.repo.repo, pr.number);
-  if (!live.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  if (!live.ok) return skip("live pull request lookup failed");
   if (!live.live.headRef || live.live.headRef !== owner.branch
-    || (pr.headRef && pr.headRef !== live.live.headRef)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    || (pr.headRef && pr.headRef !== live.live.headRef)) return skip("live pull request head ref does not match the owner's workspace branch");
   if (pr.headSha && live.live.headSha && pr.headSha.toLowerCase() !== live.live.headSha) {
-    return CHILD_CARRIER_OWNER_GATE_SKIP;
+    return skip("live pull request head sha differs from the requested head sha");
   }
   const headSha = live.live.headSha;
-  if (!headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
+  if (!headSha) return skip("live pull request has no head sha");
   const required = new Map<string, { shas: string[]; branch: string }>();
   // Every child in this owner gate must use the same immutable comparison base.
   const comparisonBase: { sha?: string } = {};
@@ -841,13 +853,13 @@ export async function carrierOwnerChildAttributionBlock(
       childBranch: card.branch,
       comparisonBase,
     });
-    if (!enumerated.ok) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!enumerated.ok) return skip("child branch commit enumeration against the pull request failed (branch missing or unreadable on GitHub)", descendant.id);
     const shas = normalizeShas(enumerated.shas);
     if (enumerated.shas.length === 0) {
       required.set(descendant.id, { shas: [], branch: card.branch });
       continue;
     }
-    if (!shas) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!shas) return skip("child branch commit list is malformed", descendant.id);
     required.set(descendant.id, { shas, branch: card.branch });
   }
   if (required.size === 0) return null;
@@ -865,15 +877,16 @@ export async function carrierOwnerChildAttributionBlock(
   for (const [childId, { shas, branch }] of required) {
     const row = attributions.find((item) => item.childIssueId === childId);
     if (shas.length === 0) {
-      if (row) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      if (row) return skip("child has no commits in the pull request but holds a current attribution", childId);
       continue;
     }
     const stored = row ? normalizeShas(row.commitShas) : null;
-    if (!row || !stored || stored.join() !== shas.join()) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (row.headSha !== headSha) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (row.branchName !== live.live.headRef) return CHILD_CARRIER_OWNER_GATE_SKIP;
-    if (!row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!row) return skip("required child has no current attribution", childId);
+    if (!stored || stored.join() !== shas.join()) return skip("child attribution commits differ from the live pull request commits", childId);
+    if (row.owner !== pr.owner.toLowerCase() || row.repo !== pr.repo.toLowerCase()) return skip("child attribution repository differs from the pull request", childId);
+    if (row.headSha !== headSha) return skip("child attribution head sha is stale", childId);
+    if (row.branchName !== live.live.headRef) return skip("child attribution branch differs from the live head ref", childId);
+    if (!row.childDecisionId) return skip("child attribution has no final approval decision yet", childId);
     const [childIssue] = await db
       .select({ executionState: issues.executionState })
       .from(issues)
@@ -884,13 +897,13 @@ export async function carrierOwnerChildAttributionBlock(
     const certificate = approval?.finalDelivery as Record<string, unknown> | null | undefined;
     // A historical approval is not authority after the current protected proof is cleared or superseded.
     if (state?.lastDecisionId !== row.childDecisionId || state?.lastDecisionOutcome !== "approved"
-      || certificate?.decisionId !== row.childDecisionId) return CHILD_CARRIER_OWNER_GATE_SKIP;
+      || certificate?.decisionId !== row.childDecisionId) return skip("child's last decision or final-delivery certificate does not match the attributed approval", childId);
     const binding = readBindingPr(childIssue?.executionState, branch, owner.repo);
     const claim = readClaim(childIssue?.executionState, owner.repo) ?? binding;
-    if (binding && (!binding.repoMatches || binding.branch !== row.branchName)) return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (binding && (!binding.repoMatches || binding.branch !== row.branchName)) return skip("child's recorded delivery binding does not match the attributed branch", childId);
     if (!claim || !claim.repoMatches
       || claim.prNumber !== row.pullRequestNumber || (claim.headSha !== null && claim.headSha !== row.headSha)) {
-      return CHILD_CARRIER_OWNER_GATE_SKIP;
+      return skip("child has no carrier claim or binding matching the pull request number and head", childId);
     }
     const [latest] = await db
       .select({ outcome: issueExecutionDecisions.outcome })
@@ -901,7 +914,7 @@ export async function carrierOwnerChildAttributionBlock(
       ))
       .orderBy(desc(issueExecutionDecisions.createdAt))
       .limit(1);
-    if (!latest || latest.outcome !== "approved") return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!latest || latest.outcome !== "approved") return skip("child's latest decision is not an approval", childId);
     const [decision] = await db
       .select({ outcome: issueExecutionDecisions.outcome })
       .from(issueExecutionDecisions)
@@ -911,7 +924,7 @@ export async function carrierOwnerChildAttributionBlock(
         eq(issueExecutionDecisions.companyId, companyId),
       ))
       .limit(1);
-    if (!decision || decision.outcome !== "approved") return CHILD_CARRIER_OWNER_GATE_SKIP;
+    if (!decision || decision.outcome !== "approved") return skip("child's attributed decision is not an approval", childId);
   }
   return null;
 }

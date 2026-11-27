@@ -21222,7 +21222,21 @@ export function issueRoutes(
         }
       }
       const boardMergedOnlyRecord = boardOrphanDeliveryRecord || boardTerminalCarrierRecord;
-      if (boundPrRequested && !boardMergedOnlyRecord && !boardDeliveryRefresh) {
+      // A board refresh keeps its pre-AS-05 contract, except when the recorded
+      // branch is an ancestor carrier's: that record can only be a child carrier
+      // claim, which needs the same exact live proof as the executor's write.
+      const boardCarrierClaim =
+        boardDeliveryRefresh
+        && boundPrRequested
+        && !boardMergedOnlyRecord
+        && requestedDeliveryIdentity.branch !== branchOwnership.branch
+        && (await classifyAncestorCarrierHead(
+          db,
+          existing.companyId,
+          existing.id,
+          requestedDeliveryIdentity.branch,
+        )) !== "absent";
+      if (boundPrRequested && !boardMergedOnlyRecord && (!boardDeliveryRefresh || boardCarrierClaim)) {
         // The card boundary first (no network): a bound-PR record still needs a
         // control-plane branch this card may lawfully deliver on. The
         // project_primary null-branch carve-out does NOT apply here — an AS-05

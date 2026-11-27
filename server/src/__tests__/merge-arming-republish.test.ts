@@ -5363,6 +5363,45 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(row!.executionWorkspaceId).toBe(child!.executionWorkspaceId);
   });
 
+  it("board refresh on an in_review child records a carrier claim for its ancestor carrier PR", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId } = await seedIssue({ executionRunId: runId });
+    const [child] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const ownerId = randomUUID();
+    const workspaceId = randomUUID();
+    const carrierBranch = "SUP-14823-carrier-branch";
+    await db.insert(issues).values({
+      id: ownerId, companyId, identifier: "SUP-14823-carrier", issueNumber: 2, title: "Carrier",
+      status: "in_progress", priority: "medium", projectId: child!.projectId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId, companyId, projectId: child!.projectId!, sourceIssueId: ownerId, mode: "isolated",
+      strategyType: "git_worktree", name: "carrier", status: "active", branchName: carrierBranch, repoUrl: REPO_URL,
+    });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, ownerId));
+    await db.update(issues).set({ parentId: ownerId, status: "in_review" }).where(eq(issues.id, issueId));
+    await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, child!.executionWorkspaceId!));
+    currentActor = boardActor(companyId);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockImplementation(async () => createMockResponse({
+      state: "open", draft: false, merged: false,
+      head: { ref: carrierBranch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } }, base: { ref: "main" },
+    }));
+
+    const response = await request(app).patch(`/api/issues/${issueId}`).send({
+      deliveryIdentity: {
+        repo: { owner: OWNER, repo: REPO }, branch: carrierBranch, headSha: HEAD_SHA,
+        prNumber: PR_NUMBER, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+      },
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+    expect(row!.executionState?.delivery).toBeUndefined();
+  });
+
   it("still writes as05_bound_pr for a shared-workspace child binding its ancestor carrier's PR, with no carrier claim (SUP-24619)", async () => {
     const runId = randomUUID();
     const carrierBranch = "SUP-14823-carrier-branch";
