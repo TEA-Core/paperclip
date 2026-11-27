@@ -12760,6 +12760,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows.length > 0);
   }
 
+  function isIssueMonitorRecoveryDeferral(err: unknown) {
+    if (!(err instanceof HttpError) || err.status !== 409) return false;
+    const details = (err.details ?? {}) as { scopeType?: unknown; reason?: unknown };
+    return details.scopeType !== undefined || details.reason === "paused";
+  }
+
   async function performIssueMonitorRecovery(input: {
     tx: Db;
     postCommitPublications: ActivityPublication[];
@@ -12967,6 +12973,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
         "status_only",
       ),
+    }).catch((err: unknown) => {
+      if (err instanceof HttpError && err.status >= 400 && err.status < 500 && !isIssueMonitorRecoveryDeferral(err)) {
+        return null;
+      }
+      throw err;
     });
 
     // enqueueWakeup returns null when it skipped the wake (e.g. the owner does not accept
@@ -13106,9 +13117,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(issues)
         .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
         .where(eq(issues.id, input.claimed.id));
-      // A paused or budget-blocked owner refuses the recovery wake with a 4xx: the same
-      // deferral a normal fire gets. The monitor stays armed and a later tick retries.
-      if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+      // A paused or budget-blocked owner refuses the recovery wake: the same deferral a
+      // normal fire gets. The monitor stays armed and a later tick retries.
+      if (isIssueMonitorRecoveryDeferral(err)) {
         return { outcome: "skipped" as const, reason: "recovery_deferred" };
       }
       throw err;

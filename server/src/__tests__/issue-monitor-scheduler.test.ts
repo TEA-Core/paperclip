@@ -942,6 +942,33 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(queued).toHaveLength(0);
     });
 
+    it("a terminated owner permanently refuses the wake: recovery completes once with owner_wake_not_queued", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+
+      await heartbeat.tickTimers(recoveryTickAt);
+
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(issue.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({ recoveryPolicy: "wake_owner", recoveryOutcome: "owner_wake_not_queued" });
+      const wakeRowsAfterRecovery = (await recoveryWakeups(agentId)).length;
+      expect(wakeRowsAfterRecovery).toBeLessThanOrEqual(1);
+      expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(0);
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+      expect(await recoveryWakeups(agentId)).toHaveLength(wakeRowsAfterRecovery);
+    });
+
     it.each([
       ["escalate_to_board", "issue_comments", ""],
       ["create_recovery_issue", "issues", "when (new.origin_kind = 'stranded_issue_recovery')"],
