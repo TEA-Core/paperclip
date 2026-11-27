@@ -3761,105 +3761,143 @@ export async function inspectManagedGitWorktreeBranch(input: {
   };
 }
 
-const RECORDED_BRANCH_SHA_LOOKALIKE = /^[0-9a-f]{40}$/i;
-
-function isConcreteRecordedBranch(branch: string | null | undefined): branch is string {
-  const value = asString(branch, "").trim();
-  if (!value || value === "HEAD") return false;
-  if (RECORDED_BRANCH_SHA_LOOKALIKE.test(value)) return false;
-  return true;
-}
+export type CheckoutBranchDriftReasonCode =
+  | "branch_mismatch"
+  | "detached_head_off_recorded_tip"
+  | "recorded_ref_missing"
+  | "recorded_branch_metadata_missing";
 
 export type CheckoutBranchDriftEvidence = {
   reason: "checkout_branch_drift";
-  reasonCode: "branch_mismatch";
-  expectedBranch: string;
+  reasonCode: CheckoutBranchDriftReasonCode;
+  expectedBranch: string | null;
+  expectedRef: string | null;
+  expectedTipSha: string | null;
   actualBranch: string | null;
+  actualRef: string | null;
   headSha: string | null;
   canonicalCwd: string;
   executionWorkspaceId: string | null;
 };
 
+const LOCAL_BRANCH_REF_PREFIX = "refs/heads/";
+
+/**
+ * The full local branch ref for a recorded branch name. A recorded value is
+ * always a local branch name, so the comparison never shortens a ref:
+ * `origin/topic` is `refs/heads/origin/topic`, not `topic`, and a branch
+ * named like a 40-hex commit is an ordinary branch.
+ */
+function recordedBranchFullRef(recorded: string) {
+  return recorded.startsWith(LOCAL_BRANCH_REF_PREFIX) ? recorded : `${LOCAL_BRANCH_REF_PREFIX}${recorded}`;
+}
+
+function shortLocalBranchName(fullRef: string | null) {
+  if (!fullRef) return null;
+  return fullRef.startsWith(LOCAL_BRANCH_REF_PREFIX) ? fullRef.slice(LOCAL_BRANCH_REF_PREFIX.length) : fullRef;
+}
+
 function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence) {
-  return (
-    `Managed checkout branch drift: expected "${evidence.expectedBranch}" but found ` +
-    `"${evidence.actualBranch ?? "<detached>"}" at HEAD ${evidence.headSha ?? "<unresolved>"} ` +
+  const where =
     `in canonical cwd "${evidence.canonicalCwd}" ` +
-    `(execution workspace ${evidence.executionWorkspaceId ?? "<none>"}). ` +
-    `The recorded branch was left unchanged.`
-  );
-}
-
-function normalizeRecordedBranchRef(raw: string) {
-  return raw.replace(/^refs\/heads\//, "").replace(/^origin\//, "");
-}
-
-function recordedBranchMatchesCheckout(expectedRaw: string, actualBranch: string | null) {
-  if (!actualBranch) return false;
-  return normalizeRecordedBranchRef(actualBranch) === normalizeRecordedBranchRef(expectedRaw);
+    `(execution workspace ${evidence.executionWorkspaceId ?? "<none>"}).`;
+  const found =
+    `"${evidence.actualRef ?? "<detached>"}" at HEAD ${evidence.headSha ?? "<unresolved>"}`;
+  switch (evidence.reasonCode) {
+    case "recorded_branch_metadata_missing":
+      return (
+        `Managed checkout branch drift: the workspace has no recorded branch, so the checkout on ${found} ` +
+        `cannot be verified ${where} Reprovision the execution workspace to record its branch.`
+      );
+    case "recorded_ref_missing":
+      return (
+        `Managed checkout branch drift: the recorded branch "${evidence.expectedBranch}" has no local ref ` +
+        `"${evidence.expectedRef}"; found ${found} ${where} ` +
+        `Restore the local branch or reprovision the execution workspace. The recorded branch was left unchanged.`
+      );
+    case "detached_head_off_recorded_tip":
+      return (
+        `Managed checkout branch drift: expected "${evidence.expectedRef}" at ${evidence.expectedTipSha ?? "<unresolved>"} ` +
+        `but found a detached HEAD ${evidence.headSha ?? "<unresolved>"} ${where} ` +
+        `The recorded branch was left unchanged.`
+      );
+    case "branch_mismatch":
+      return (
+        `Managed checkout branch drift: expected "${evidence.expectedRef}" but found ${found} ${where} ` +
+        `The recorded branch was left unchanged.`
+      );
+  }
 }
 
 async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
   canonicalCwd: string;
   isGit: boolean;
-  branch: string | null;
+  headRef: string | null;
   headSha: string | null;
 } | null> {
   if (!await directoryExists(cwd)) return null;
   const canonicalCwd = await resolvePathForWorktreeComparison(cwd);
   const gitDir = await runGit(["rev-parse", "--git-dir"], canonicalCwd).catch(() => null);
-  if (!gitDir) return { canonicalCwd, isGit: false, branch: null, headSha: null };
-  const branch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], canonicalCwd).catch(() => null);
-  const headSha = await runGit(["rev-parse", "HEAD"], canonicalCwd).catch(() => null);
-  return { canonicalCwd, isGit: true, branch, headSha };
+  if (!gitDir) return { canonicalCwd, isGit: false, headRef: null, headSha: null };
+  // Full symbolic ref, never `--short`: a shortened name is ambiguous when a
+  // tag or a remote-tracking ref shares it.
+  const headRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
+  const headSha = await runGit(["rev-parse", "--verify", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
+  return { canonicalCwd, isGit: true, headRef, headSha };
 }
 
 /**
  * Re-read a bound checkout after restore, provisioning, and service startup.
- * A concrete recorded branch on a Git checkout must still be the branch that
- * is checked out. Ordinary non-Git project directories are left alone. The
- * recorded branch is not rewritten to whatever HEAD happens to name.
+ * A Git checkout passes only when HEAD is the recorded local branch, compared
+ * by full ref name, or a detached HEAD at that branch's tip. A recorded branch
+ * with no local ref is refused. A `git_worktree` row with no recorded branch
+ * is a legacy row and is refused with a reprovision remedy; the other
+ * strategies never record a branch binding, so an empty value there has
+ * nothing to compare. Ordinary non-Git project directories are left alone.
+ * The recorded branch is not rewritten to whatever HEAD happens to name.
  */
 async function assertRecordedCheckoutBranchIdentity(input: {
   cwd: string;
   expectedBranch: string | null | undefined;
   strategy?: string | null;
   executionWorkspaceId?: string | null;
-  repoRoot?: string | null;
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<void> {
   const expectedRaw = asString(input.expectedBranch, "").trim();
-  if (!isConcreteRecordedBranch(expectedRaw)) return;
+  if (!expectedRaw && input.strategy !== "git_worktree") return;
   const identity = await readBoundCheckoutGitIdentity(input.cwd);
   if (!identity || !identity.isGit) return;
-  if (!identity.branch) return;
-  if (recordedBranchMatchesCheckout(expectedRaw, identity.branch)) return;
-  const expectedLocalBranch = normalizeRecordedBranchRef(expectedRaw);
-  const isLocalBranch = await runGit(
-    ["show-ref", "--verify", "--quiet", `refs/heads/${expectedLocalBranch}`],
-    identity.canonicalCwd,
-  ).then(() => true, () => false);
-  if (!isLocalBranch) return;
 
-  let actualBranch: string | null = identity.branch;
-  if (input.strategy === "git_worktree") {
-    const inspection = await inspectManagedGitWorktreeBranch({
-      worktreePath: identity.canonicalCwd,
-      expectedBranchName: expectedLocalBranch,
-      repoRoot: input.repoRoot ?? null,
-    }).catch(() => null);
-    if (inspection?.valid) return;
-    if (inspection && inspection.actualBranchName !== undefined) {
-      actualBranch = inspection.actualBranchName;
+  const expectedRef = expectedRaw ? recordedBranchFullRef(expectedRaw) : null;
+  let reasonCode: CheckoutBranchDriftReasonCode;
+  let expectedTipSha: string | null = null;
+  if (!expectedRef) {
+    reasonCode = "recorded_branch_metadata_missing";
+  } else if (identity.headRef === expectedRef) {
+    return;
+  } else {
+    expectedTipSha = await runGit(
+      ["rev-parse", "--verify", "--quiet", `${expectedRef}^{commit}`],
+      identity.canonicalCwd,
+    ).catch(() => null);
+    if (!expectedTipSha) {
+      reasonCode = "recorded_ref_missing";
+    } else if (identity.headRef === null) {
+      if (identity.headSha === expectedTipSha) return;
+      reasonCode = "detached_head_off_recorded_tip";
+    } else {
+      reasonCode = "branch_mismatch";
     }
   }
-  if (recordedBranchMatchesCheckout(expectedRaw, actualBranch)) return;
 
   const evidence: CheckoutBranchDriftEvidence = {
     reason: "checkout_branch_drift",
-    reasonCode: "branch_mismatch",
-    expectedBranch: expectedLocalBranch,
-    actualBranch,
+    reasonCode,
+    expectedBranch: expectedRef ? shortLocalBranchName(expectedRef) : null,
+    expectedRef,
+    expectedTipSha,
+    actualBranch: shortLocalBranchName(identity.headRef),
+    actualRef: identity.headRef,
     headSha: identity.headSha,
     canonicalCwd: identity.canonicalCwd,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
@@ -3868,7 +3906,7 @@ async function assertRecordedCheckoutBranchIdentity(input: {
   if (input.recorder) {
     await input.recorder.recordOperation({
       phase: "worktree_prepare",
-      command: "git symbolic-ref --short HEAD",
+      command: "git symbolic-ref HEAD",
       cwd: identity.canonicalCwd,
       metadata: { checkoutBranchDrift: evidence },
       run: async () => ({
@@ -3882,7 +3920,6 @@ async function assertRecordedCheckoutBranchIdentity(input: {
     workspaceValidation: evidence,
   });
 }
-
 
 async function validateLinkedGitWorktree(input: {
   repoRoot: string;
@@ -7774,6 +7811,11 @@ export function resetRuntimeServicePortReservationsForTests() {
   inFlightAllocatedPorts.clear();
 }
 
+/** Test-only: the loopback ports an in-flight start still claims in-process. */
+export function listRuntimeServicePortReservationsForTests() {
+  return [...inFlightAllocatedPorts.keys()];
+}
+
 function reservePortIfFree(port: number, now = Date.now()): boolean {
   const heldUntil = inFlightAllocatedPorts.get(port);
   if (heldUntil !== undefined && heldUntil > now) return false;
@@ -9554,6 +9596,16 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
+  const assertSpawnCheckoutBranch = async () => {
+    if (input.assertRecordedCheckoutBranch !== true) return;
+    await assertRecordedCheckoutBranchIdentity({
+      cwd: input.workspace.cwd,
+      expectedBranch: input.workspace.branchName,
+      strategy: input.workspace.strategy,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      recorder: input.recorder ?? null,
+    });
+  };
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
   const startedByRunId = input.startedByRunId === undefined ? input.runId : input.startedByRunId;
   const identity = resolveRuntimeServiceReuseIdentity({
@@ -10037,26 +10089,24 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     }
   }
 
+  // Every refusal between the reservations above and the spawn below leaves
+  // through this one rollback: release the port claims, and remove the broker
+  // exposure with its persisted row marked stopped instead of "starting".
   try {
     await ensureServerWorkspaceLinksCurrent(serviceCwd, {
       onLog: input.onLog,
     });
+    await assertSpawnCheckoutBranch();
   } catch (error) {
     releasePortReservation(reservedPort);
     releasePortReservation(claimedIdentityPort);
-    if (reservedExposure) await cleanupRecordExposure(record);
+    if (reservedExposure) {
+      record.status = "stopped";
+      record.healthStatus = "unhealthy";
+      record.stoppedAt = new Date().toISOString();
+      await cleanupRecordExposure(record);
+    }
     throw error;
-  }
-
-  if (input.assertRecordedCheckoutBranch === true) {
-    await assertRecordedCheckoutBranchIdentity({
-      cwd: input.workspace.cwd,
-      expectedBranch: input.workspace.branchName,
-      strategy: input.workspace.strategy,
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      repoRoot: input.workspace.baseCwd,
-      recorder: input.recorder ?? null,
-    });
   }
 
   const shell = resolveShell();
@@ -10223,16 +10273,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         }
       }
     }
-    if (input.assertRecordedCheckoutBranch === true) {
-      await assertRecordedCheckoutBranchIdentity({
-        cwd: input.workspace.cwd,
-        expectedBranch: input.workspace.branchName,
-        strategy: input.workspace.strategy,
-        executionWorkspaceId: input.executionWorkspaceId ?? null,
-        repoRoot: input.workspace.baseCwd,
-        recorder: input.recorder ?? null,
-      });
-    }
+    await assertSpawnCheckoutBranch();
 
     record.status = "running";
     record.healthStatus = "healthy";
@@ -10336,30 +10377,21 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
     }
     if (err instanceof WorkspaceRuntimeValidationFailure) throw err;
-    if (input.assertRecordedCheckoutBranch === true) {
-      try {
-        await assertRecordedCheckoutBranchIdentity({
-          cwd: input.workspace.cwd,
-          expectedBranch: input.workspace.branchName,
-          strategy: input.workspace.strategy,
-          executionWorkspaceId: input.executionWorkspaceId ?? null,
-          repoRoot: input.workspace.baseCwd,
-          recorder: input.recorder ?? null,
-        });
-      } catch (drift) {
-        if (drift instanceof WorkspaceRuntimeValidationFailure) {
-          const wrapped = new WorkspaceRuntimeValidationFailure(
-            `${drift.message} Original startup error: ${failureMessage}`,
-            {
-              ...drift.resultJson,
-              originalError: failureMessage,
-            },
-          );
-          wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
-          throw wrapped;
-        }
-        throw drift;
+    try {
+      await assertSpawnCheckoutBranch();
+    } catch (drift) {
+      if (drift instanceof WorkspaceRuntimeValidationFailure) {
+        const wrapped = new WorkspaceRuntimeValidationFailure(
+          `${drift.message} Original startup error: ${failureMessage}`,
+          {
+            ...drift.resultJson,
+            originalError: failureMessage,
+          },
+        );
+        wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
+        throw wrapped;
       }
+      throw drift;
     }
 
     if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);

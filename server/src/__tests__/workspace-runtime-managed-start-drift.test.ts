@@ -8,6 +8,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import request from "supertest";
 import { eq } from "drizzle-orm";
+import { RUNTIME_EXPOSURE_APP_PORT_MIN, deriveViteHmrPort } from "@paperclipai/shared";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -26,9 +27,14 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.ts";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.ts";
+import type { BrokerClient, BrokerListenerRequest } from "../services/runtime-exposure/broker-client.ts";
 import {
   ensurePersistedExecutionWorkspaceAvailable,
+  listRuntimeServicePortReservationsForTests,
+  resetRuntimeServicePortReservationsForTests,
   resetRuntimeServicesForTests,
+  setWorkspaceRuntimeExposureDepsForTests,
+  startRuntimeServicesForWorkspaceControl,
 } from "../services/workspace-runtime.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -72,6 +78,10 @@ type CompanyScope = {
 };
 
 
+
+const HEX_BRANCH = "ab".repeat(20);
+
+type LinkedSource = Awaited<ReturnType<typeof makeLinkedSource>>;
 
 async function makeLinkedSource() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup24747-drift-"));
@@ -227,6 +237,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
 
   afterEach(async () => {
     await resetRuntimeServicesForTests({ terminateProcesses: true });
+    resetRuntimeServicePortReservationsForTests();
     await db.delete(workspaceRuntimeServices);
     await db.delete(workspaceOperations);
     await db.delete(issueComments);
@@ -293,7 +304,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
   async function seedWorkspace(input: {
     scope: CompanyScope;
     cwd: string;
-    branchName: string;
+    branchName: string | null;
     baseRef: string;
     projectCwd?: string | null;
     provisionCommand?: string | null;
@@ -453,6 +464,18 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     return `${quoteShell(process.execPath)} -e ${quoteShell(script)}`;
   }
 
+  /** A refusal is a client error with a message, never an unhandled 500. */
+  function expectCleanRefusal(res: { status: number; body: unknown }) {
+    expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);
+  }
+
+  async function expectNoStartingRuntimeRows() {
+    const rows = await db.select({ id: workspaceRuntimeServices.id, status: workspaceRuntimeServices.status })
+      .from(workspaceRuntimeServices);
+    expect(rows.filter((row) => row.status === "starting")).toEqual([]);
+  }
+
   async function operationText(workspaceId: string) {
     const rows = await db.select().from(workspaceOperations).where(eq(workspaceOperations.executionWorkspaceId, workspaceId));
     return JSON.stringify(rows);
@@ -540,12 +563,13 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
   }, 30_000);
 
   it.each([
-    ["a tag ref", "v1-tag", async (f: Awaited<ReturnType<typeof makeLinkedSource>>) => {
-      await git(["tag", "v1-tag", "branch-b"], f.owner);
-    }],
     ["a refs/heads/ form", "refs/heads/branch-a", async () => {}],
-    ["a deliberately detached checkout", "branch-a", async (f: Awaited<ReturnType<typeof makeLinkedSource>>) => {
+    ["a detached checkout at the recorded tip", "branch-a", async (f: LinkedSource) => {
       await git(["checkout", "-q", "--detach", "branch-a"], f.source);
+    }],
+    ["a local branch named like a 40-hex commit", HEX_BRANCH, async (f: LinkedSource) => {
+      await git(["branch", HEX_BRANCH, "branch-a"], f.owner);
+      await git(["switch", "-q", HEX_BRANCH], f.source);
     }],
   ])("starts when the recorded ref is %s", async (_label, recordedRef, prepare) => {
     const fixture = await makeLinkedSource();
@@ -565,9 +589,288 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     const res = await request(app())
       .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
       .send({});
-    expect(res.status).toBeLessThan(300);
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
     await expect(fs.stat(started)).resolves.toBeTruthy();
   }, 30_000);
+
+  it("starts a project_primary row that never recorded a branch", async () => {
+    const fixture = await makeLinkedSource();
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: null,
+      baseRef: "branch-a",
+      projectCwd: null,
+      strategyType: "project_primary",
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
+  }, 30_000);
+
+  it.each([
+    {
+      label: "a local branch named like a 40-hex commit, checkout on another branch",
+      recordedRef: HEX_BRANCH,
+      reasonCode: "branch_mismatch",
+      prepare: async (f: LinkedSource) => {
+        await git(["branch", HEX_BRANCH, "branch-b"], f.owner);
+      },
+    },
+    {
+      label: "a detached checkout at a commit that is not the recorded tip",
+      recordedRef: "branch-a",
+      reasonCode: "detached_head_off_recorded_tip",
+      prepare: async (f: LinkedSource) => {
+        await git(["checkout", "-q", "--detach", "branch-b"], f.source);
+      },
+    },
+    {
+      label: "a recorded branch with no local ref",
+      recordedRef: "deleted-topic",
+      reasonCode: "recorded_ref_missing",
+      prepare: async () => {},
+    },
+    {
+      label: "a local origin/ branch for a recorded branch of the bare name",
+      recordedRef: "branch-a",
+      reasonCode: "branch_mismatch",
+      prepare: async (f: LinkedSource) => {
+        await git(["branch", "origin/branch-a", "branch-a"], f.owner);
+        await git(["switch", "-q", "origin/branch-a"], f.source);
+      },
+    },
+    {
+      label: "a tag ref",
+      recordedRef: "v1-tag",
+      reasonCode: "recorded_ref_missing",
+      prepare: async (f: LinkedSource) => {
+        await git(["tag", "v1-tag", "branch-a"], f.owner);
+      },
+    },
+  ])("refuses a start when the recorded ref is $label", async ({ recordedRef, reasonCode, prepare }) => {
+    const fixture = await makeLinkedSource();
+    await prepare(fixture);
+    const headRefBefore = await git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null);
+    const headBefore = await git(["rev-parse", "HEAD"], fixture.source);
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: recordedRef,
+      baseRef: "branch-a",
+      projectCwd: null,
+      strategyType: "project_primary",
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+
+    expectCleanRefusal(res);
+    await expect(fs.stat(started)).rejects.toThrow();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null))
+      .resolves.toBe(headRefBefore);
+    await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(headBefore);
+    const row = await db.select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.workspaceId))
+      .then((rows) => rows[0]);
+    expect(row?.branchName).toBe(recordedRef);
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain(reasonCode);
+    expect(evidence).toContain(seeded.workspaceId);
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  it("refuses a legacy git_worktree row with no recorded branch and names the reprovision remedy", async () => {
+    const fixture = await makeLinkedSource();
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: null,
+      baseRef: "branch-a",
+      projectCwd: fixture.owner,
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+
+    expectCleanRefusal(res);
+    await expect(fs.stat(started)).rejects.toThrow();
+    await expect(git(["symbolic-ref", "--short", "HEAD"], fixture.source)).resolves.toBe("branch-a");
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain("recorded_branch_metadata_missing");
+    expect(evidence).toContain("Reprovision the execution workspace");
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  describe("a refusal immediately before spawn releases what the start reserved", () => {
+    function controlInput(input: {
+      scope: CompanyScope;
+      fixture: LinkedSource;
+      executionWorkspaceId: string;
+      service: Record<string, unknown>;
+    }) {
+      return {
+        db,
+        actor: { id: null, name: "Board", companyId: input.scope.companyId },
+        issue: null,
+        workspace: {
+          baseCwd: input.fixture.source,
+          source: "project_primary" as const,
+          projectId: input.scope.projectId,
+          workspaceId: null,
+          repoUrl: null,
+          repoRef: null,
+          strategy: "project_primary" as const,
+          cwd: input.fixture.source,
+          branchName: "branch-a",
+          worktreePath: null,
+          warnings: [],
+          created: false,
+          branchCreatedByRuntime: false,
+        },
+        executionWorkspaceId: input.executionWorkspaceId,
+        config: { workspaceRuntime: { services: [input.service] } },
+        adapterEnv: {},
+        assertRecordedCheckoutBranch: true,
+      };
+    }
+
+    async function driftedWorkspace() {
+      const fixture = await makeLinkedSource();
+      // The checkout leaves its recorded branch after restore and provisioning,
+      // so only the guard right before spawn can see it.
+      await git(["checkout", "-q", "branch-b"], fixture.source);
+      const scope = await seedCompany();
+      const seeded = await seedWorkspace({
+        scope,
+        cwd: fixture.source,
+        branchName: "branch-a",
+        baseRef: "branch-a",
+        projectCwd: null,
+        strategyType: "project_primary",
+      });
+      return { fixture, scope, seeded };
+    }
+
+    it("releases the in-process port claim", async () => {
+      const { fixture, scope, seeded } = await driftedWorkspace();
+      const started = path.join(fixture.root, "started");
+
+      await expect(startRuntimeServicesForWorkspaceControl(controlInput({
+        scope,
+        fixture,
+        executionWorkspaceId: seeded.workspaceId,
+        service: {
+          name: "web",
+          command: httpCommand(started),
+          port: { type: "auto" },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+          lifecycle: "shared",
+          reuseScope: "execution_workspace",
+          stopPolicy: { type: "manual" },
+        },
+      }))).rejects.toThrow(/Managed checkout branch drift/);
+
+      await expect(fs.stat(started)).rejects.toThrow();
+      expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+      await expectNoStartingRuntimeRows();
+    }, 30_000);
+
+    it("removes the HTTPS exposure and does not leave its record in starting", async () => {
+      const previousHttpsMode = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "auto";
+      try {
+        // The refusal comes before any bind, so the synthetic host only has to
+        // offer one pair; no listener ever opens on it.
+        const appPort = RUNTIME_EXPOSURE_APP_PORT_MIN + 700;
+        const brokerCalls: string[] = [];
+        const reserved = new Map<string, BrokerListenerRequest[]>();
+        const broker: BrokerClient = {
+          async reserve(runtimeId, requested) {
+            brokerCalls.push("reserve");
+            const handle = `handle-${runtimeId}`;
+            reserved.set(handle, requested);
+            return { handle, reservedPorts: requested.map((listener) => listener.port) };
+          },
+          async expose(_runtimeId, handle) {
+            brokerCalls.push("expose");
+            return { handle, publicPorts: (reserved.get(handle) ?? []).map((listener) => listener.port) };
+          },
+          async remove(_runtimeId, handle) {
+            brokerCalls.push("remove");
+            const listeners = reserved.get(handle) ?? [];
+            reserved.delete(handle);
+            return { removedPorts: listeners.map((listener) => listener.port) };
+          },
+          async list() {
+            return [];
+          },
+        };
+        setWorkspaceRuntimeExposureDepsForTests({
+          broker,
+          isPortAvailable: async (port) => port === appPort || port === deriveViteHmrPort(appPort),
+          isBrokerAvailable: async () => true,
+          resolveHostname: async () => "runner.tail123.ts.net",
+          probeHealth: async () => true,
+          now: () => new Date().toISOString(),
+          diagnoseListenerBinds: async () => null,
+        });
+        const { fixture, scope, seeded } = await driftedWorkspace();
+        const started = path.join(fixture.root, "started");
+
+        await expect(startRuntimeServicesForWorkspaceControl(controlInput({
+          scope,
+          fixture,
+          executionWorkspaceId: seeded.workspaceId,
+          service: {
+            name: "preview",
+            command: httpCommand(started),
+            port: { type: "auto", envKey: "PORT" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            expose: {
+              type: "tailscale_https",
+              hostname: "auto",
+              publicPort: "same",
+              includePaperclipViteHmr: true,
+              failurePolicy: "fail_closed",
+            },
+          },
+        }))).rejects.toThrow(/Managed checkout branch drift/);
+
+        await expect(fs.stat(started)).rejects.toThrow();
+        expect(brokerCalls).toContain("reserve");
+        expect(brokerCalls).toContain("remove");
+        expect(brokerCalls).not.toContain("expose");
+        expect(reserved.size).toBe(0);
+        const rows = await db.select().from(workspaceRuntimeServices)
+          .where(eq(workspaceRuntimeServices.executionWorkspaceId, seeded.workspaceId));
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.status).toBe("stopped");
+        expect((rows[0]?.exposure as { state?: string } | null)?.state).toBe("removed");
+        expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+      } finally {
+        if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+        else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
+      }
+    }, 30_000);
+  });
 
   it("surfaces drift on readiness and keeps the original early-exit error", async () => {
     async function openBarrier() {

@@ -69,6 +69,7 @@ import {
   workspaceLoginHandoffFailureStatus,
 } from "../services/workspace-login-handoff-issuer.js";
 import { conflict, unprocessable } from "../errors.js";
+import { checkoutBranchDriftAsHttpConflict } from "../services/checkout-branch-drift-conflict.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -1024,7 +1025,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           if (action === "start" || action === "restart" || action === "repair") {
             await reconcileFailedRuntimeStart(error);
           }
-          throw error;
+          throw checkoutBranchDriftAsHttpConflict(error);
         }
       },
     });
