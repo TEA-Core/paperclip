@@ -869,7 +869,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       state?: string | null;
       draft?: boolean;
       number?: number;
-      headRefName?: string;
+      /** null omits the cached head branch anchor entirely. */
+      headRefName?: string | null;
       headSha?: string;
       baseRef?: string | null;
       owner?: string;
@@ -883,7 +884,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       state: overrides.state ?? "open",
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
-      head: { ref: overrides.headRefName ?? "SUP-42-branch" },
+      ...(overrides.headRefName === null ? {} : { head: { ref: overrides.headRefName ?? "SUP-42-branch" } }),
       ...(overrides.headSha === undefined ? {} : { headSha: overrides.headSha }),
       ...(overrides.baseRef === undefined ? {} : { baseRef: overrides.baseRef }),
       title: `Fix thing (SUP-${number})`,
@@ -2192,6 +2193,25 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     it("accepts a cached open draft mention when the live read proves it merged (SUP-24033)", async () => {
       const issueId = await insertIssue();
       await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    // SUP-25333: a cached open+draft mention captured without a head branch
+    // anchor must not be refused by cached delivery narrowing before the live
+    // read supplies the authoritative head branch.
+    it("accepts a stale cached open draft with no cached head branch when the live read proves it merged on the delivery branch (SUP-25333)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true, headRefName: null });
       installRoutes(mergedCarrierRoutes());
 
       const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");

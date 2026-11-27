@@ -1,8 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { and, eq } from "drizzle-orm";
 import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
@@ -10,7 +8,7 @@ import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCom
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
-import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
+import { instructionGitExcludeProgram, resolveAgentsGid } from "./agent-instruction-files.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
 import { stagedMode, workingCopyPermissions } from "./agent-file-permissions.js";
@@ -26,22 +24,6 @@ export class AgentDirectoryReuseInvalidatedError extends Error {}
 const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
-const execFileAsync = promisify(execFile);
-
-async function workingCopyGid(): Promise<number | null> {
-  // Share the live tree only with the fork runtime's agents group, and only
-  // when this process may assign it. Otherwise keep the owner-only layout.
-  let gid: number | null = null;
-  const configured = process.env.PAPERCLIP_AGENTS_GID?.trim();
-  if (configured) gid = /^\d+$/.test(configured) ? Number(configured) : null;
-  else {
-    const { stdout } = await execFileAsync("getent", ["group", "agents"], { timeout: 5000, maxBuffer: 4096 }).catch(() => ({ stdout: "" }));
-    const named = stdout.trim().split(":")[2];
-    if (named && /^\d+$/.test(named)) gid = Number(named);
-  }
-  if (gid === null || process.platform === "win32") return null;
-  return process.getuid?.() === 0 || process.getegid?.() === gid || process.getgroups?.().includes(gid) ? gid : null;
-}
 
 const STAGED_MODE_VERSION = 3;
 const legacyStagedMode = (mode: number) => (mode & ~0o7777) | (mode & 0o100 ? 0o750 : 0o640);
@@ -50,7 +32,9 @@ const ownerOnlyMode = (mode: number) => (mode & ~0o7777) | (mode & 0o700);
 const permissionDenied = (error: unknown) => ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "");
 
 async function workingCopyParents(agentRoot: string): Promise<number | null> {
-  let gid = await workingCopyGid();
+  // Share the live tree only with the agents group, and only when this process
+  // may assign it. Otherwise keep the owner-only layout.
+  let gid = process.platform === "win32" ? null : await resolveAgentsGid();
   let parent = agentRoot;
   for (const segment of ["file-sync", "runs"]) {
     parent = path.join(parent, segment);

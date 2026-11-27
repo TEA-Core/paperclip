@@ -37,9 +37,42 @@ workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
 
-When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
-named `agents` group) and the server process may assign it (it is root or a
-member), the fork stages live directories with modes derived from owner bits:
+The runtime's agents group is resolved by name (`agents`) only. When the name
+does not resolve (no such group, no `getent`, or a lookup timeout), no group is
+used and the server logs a warning, whatever `PAPERCLIP_AGENTS_GID` says.
+`PAPERCLIP_AGENTS_GID` is accepted only when it equals the named group's gid;
+an override that differs, is gid `0`, or is the server's own primary group is
+refused and no group is used. The group is used only when the server process
+may assign it (it is root or a member).
+
+Editor saves, bundle initialization/import, and adoption of revision-backed files
+write instruction files as `0640` and directories as `0750`, both owned by the
+agents group, explicitly independent of umask. Group read is intentional; group
+write and world access are never granted. When no agents group resolves, these
+writes stay owner-only (`0600` files, `0700` directories) and grant no group
+access. Each write replaces the file with a new inode in the final mode and
+group. It also sets every existing directory from the instruction root down to
+that file to the same layout, so a loose (for example `0777`) directory is
+tightened. Each of those directories must be owned by the server user.
+
+For canonical storage under `<instance>/companies/`, each existing directory
+from the instance root down to the instruction root (the agent directory
+included) must be owned by the server user and must not be world-writable. A
+server-owned directory there that is only group-writable loses group write in
+place. Nothing outside the instance root is checked or changed.
+
+A write is refused with `INSTRUCTION_STORAGE_UNSAFE` when a directory is owned
+by another user (`reason: "foreign-owner"`), when an ancestor is world-writable
+(`"world-writable-ancestor"`), or when a mode cannot be tightened
+(`"cannot-tighten"`). Files that are not written are not bulk-migrated. The
+adoption marker remains private (`0600`).
+
+Instruction files are readable by every member of the agents group. Do not put
+secrets (API keys, tokens, passwords, credentials) in instruction files or
+doctrine; give agents secrets through secret references in their environment
+variables instead.
+
+When the agents group resolves as described above, the fork stages live directories with modes derived from owner bits:
 at most `02750` (setgid, group read/traverse), owned by that group.
 The `file-sync/`, `runs/`, and run directories have at most `0750`, without
 setgid inheritance. Files retain their owner permissions and gain

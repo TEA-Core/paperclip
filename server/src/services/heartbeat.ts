@@ -458,7 +458,7 @@ import {
   DEFAULT_SELF_DECLARED_RUN_TTL_MS,
 } from "./run-stillborn.js";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
-import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishActivity, publishPluginDomainEvent, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -1085,6 +1085,11 @@ function countConsecutivePreAdapterSetupFailures(
 const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
+// Statuses the scheduled monitor dispatcher selects (tickDueIssueMonitors).
+const ISSUE_MONITOR_DISPATCH_STATUSES = ["in_progress", "in_review", "blocked"] as const;
+const ISSUE_MONITOR_UNFIREABLE_ACTION = "issue.monitor_unfireable";
+// Transaction-scoped advisory lock key that serializes the unfireable scan.
+const ISSUE_MONITOR_UNFIREABLE_SCAN_LOCK_KEY = "paperclip:issue-monitor-unfireable-scan";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 // A reviewer that runs to completion and comments without deciding is deliberately
 // deferring, not dead, so its stage keeps getting re-armed instead of escalating.
@@ -13443,30 +13448,155 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  // Dispatch eligibility for a scheduled monitor, independent of time and of
+  // an in-flight claim: no human assignee, an agent assignee or the default
+  // `wake_owner` policy, and a dispatchable status. `tickDueIssueMonitors` and
+  // the unfireable scan both derive from this one predicate so the two stay
+  // exact complements.
+  function issueMonitorEligibleSql() {
+    return and(
+      isNull(issues.assigneeUserId),
+      or(
+        sql`${issues.assigneeAgentId} is not null`,
+        sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
+      ),
+      inArray(issues.status, [...ISSUE_MONITOR_DISPATCH_STATUSES]),
+    )!;
+  }
+
+  // A claim older than five minutes is treated as abandoned and can be taken
+  // again. A fresh claim is an in-flight wake, not an unfireable monitor.
+  function issueMonitorClaimableSql(now: Date) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
-    const hasDispatchTarget = or(
-      sql`${issues.assigneeAgentId} is not null`,
-      sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
-    );
+    return or(
+      isNull(issues.monitorWakeRequestedAt),
+      lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+    )!;
+  }
+
+  // The scheduler fires a monitor only when it is due, eligible and claimable.
+  function issueMonitorFireableSql(now: Date) {
+    return and(
+      sql`${issues.monitorNextCheckAt} is not null`,
+      lte(issues.monitorNextCheckAt, now),
+      issueMonitorEligibleSql(),
+      issueMonitorClaimableSql(now),
+    )!;
+  }
+
+  // A due monitor that is not eligible (an issue in `todo`/`backlog`/a closed
+  // status, a human assignee, or no assignee with a non-`wake_owner` policy)
+  // can never fire, and would otherwise stay armed with no activity row at all
+  // (SUP-25400: an agent release moves the issue to `todo` and drops the
+  // assignee but leaves the monitor scheduled). Record one
+  // `issue.monitor_unfireable` row per due schedule so the loss is visible in
+  // the issue activity API. Detection only: the monitor stays armed and no wake
+  // is routed. A due, eligible monitor that only fails the claim check is an
+  // in-flight wake and is not reported.
+  //
+  // A row whose `details.nextCheckAt` equals the current `monitorNextCheckAt`
+  // marks that schedule as reported; a re-arm to another time is reported again
+  // when it comes due. The scan and its inserts run in one transaction that
+  // holds a transaction-scoped advisory lock on a fixed key, so an overlapping
+  // tick (the scheduler interval has no in-flight guard) skips the scan instead
+  // of racing the NOT EXISTS check and writing a duplicate row.
+  async function reportUnfireableDueIssueMonitors(now: Date) {
+    const publications: ActivityPublication[] = [];
+    const reported = await db.transaction(async (tx) => {
+      const [lock] = await tx.execute<{ acquired: boolean }>(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${ISSUE_MONITOR_UNFIREABLE_SCAN_LOCK_KEY}, 0)) as acquired`,
+      );
+      if (!lock?.acquired) return 0;
+
+      const rows = await tx
+        .select(issueMonitorDispatchColumns)
+        .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(
+          and(
+            eq(companies.status, "active"),
+            sql`${issues.monitorNextCheckAt} is not null`,
+            lte(issues.monitorNextCheckAt, now),
+            sql`not (${issueMonitorEligibleSql()})`,
+            sql`not exists (
+              select 1 from ${activityLog}
+              where ${activityLog.companyId} = ${issues.companyId}
+                and ${activityLog.entityType} = 'issue'
+                and ${activityLog.entityId} = ${issues.id}::text
+                and ${activityLog.action} = ${ISSUE_MONITOR_UNFIREABLE_ACTION}
+                and ${activityLog.details}->>'nextCheckAt' = to_char(
+                  date_trunc('milliseconds', ${issues.monitorNextCheckAt}) at time zone 'UTC',
+                  'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                )
+            )`,
+          ),
+        )
+        .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+        .limit(50);
+
+      let count = 0;
+      for (const row of rows as IssueMonitorDispatchRow[]) {
+        if (!row.monitorNextCheckAt) continue;
+        const monitor =
+          normalizeIssueExecutionPolicy(row.executionPolicy ?? null)?.monitor ??
+          null;
+        const recoveryPolicy = monitorRecoveryPolicy(monitor);
+        const reasons: string[] = [];
+        if (
+          !(ISSUE_MONITOR_DISPATCH_STATUSES as readonly string[]).includes(
+            row.status,
+          )
+        ) {
+          reasons.push("status_not_dispatchable");
+        }
+        if (row.assigneeUserId) reasons.push("human_assignee");
+        else if (!row.assigneeAgentId && recoveryPolicy !== "wake_owner") {
+          reasons.push("no_assignee_agent");
+        }
+        await logActivityInTransaction(
+          tx as unknown as Db,
+          {
+            companyId: row.companyId,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            agentId: null,
+            runId: null,
+            action: ISSUE_MONITOR_UNFIREABLE_ACTION,
+            entityType: "issue",
+            entityId: row.id,
+            details: {
+              identifier: row.identifier,
+              status: row.status,
+              assigneeAgentId: row.assigneeAgentId,
+              assigneeUserId: row.assigneeUserId,
+              nextCheckAt: row.monitorNextCheckAt.toISOString(),
+              attemptCount: row.monitorAttemptCount ?? 0,
+              notes: row.monitorNotes ?? null,
+              serviceName: monitor?.serviceName ?? null,
+              recoveryPolicy,
+              reason: reasons[0] ?? "not_dispatchable",
+              reasons,
+              source: "scheduled",
+            },
+          },
+          publications,
+        );
+        count += 1;
+      }
+      return count;
+    });
+    // Publish only after the rows are committed.
+    for (const publication of publications) publishActivity(publication);
+    return reported;
+  }
+
+  async function tickDueIssueMonitors(now = new Date()) {
+    const fireable = issueMonitorFireableSql(now);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
       .innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(
-        and(
-          eq(companies.status, "active"),
-          sql`${issues.monitorNextCheckAt} is not null`,
-          lte(issues.monitorNextCheckAt, now),
-          isNull(issues.assigneeUserId),
-          hasDispatchTarget,
-          inArray(issues.status, ["in_progress", "in_review", "blocked"]),
-          or(
-            isNull(issues.monitorWakeRequestedAt),
-            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-          ),
-        ),
-      )
+      .where(and(eq(companies.status, "active"), fireable))
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
       .limit(50);
 
@@ -13481,20 +13611,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             monitorWakeRequestedAt: now,
             updatedAt: now,
           })
-          .where(
-            and(
-              eq(issues.id, due.id),
-              sql`${issues.monitorNextCheckAt} is not null`,
-              lte(issues.monitorNextCheckAt, now),
-              isNull(issues.assigneeUserId),
-              hasDispatchTarget,
-              inArray(issues.status, ["in_progress", "in_review", "blocked"]),
-              or(
-                isNull(issues.monitorWakeRequestedAt),
-                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-              ),
-            ),
-          )
+          .where(and(eq(issues.id, due.id), issueMonitorFireableSql(now)))
           .returning();
         return (updated ?? null) as IssueMonitorDispatchRow | null;
       });
@@ -13524,10 +13641,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    let unfireable = 0;
+    try {
+      unfireable = await reportUnfireableDueIssueMonitors(now);
+    } catch (err) {
+      logger.error({ err }, "issue monitor unfireable scan failed");
+    }
+
     return {
       checked: dueMonitors.length,
       triggered,
       skipped,
+      unfireable,
     };
   }
 
