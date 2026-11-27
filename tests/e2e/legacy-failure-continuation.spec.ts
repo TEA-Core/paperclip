@@ -112,12 +112,12 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await expect(notice.getByRole("link", { name: "Inspect run" }))
           .toHaveAttribute("href", new RegExp(`/agents/${agent.id}/runs/${sourceRunId}$`));
         await expect(notice.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
-        const presentation = await notice.evaluate(element => {
-          const style = getComputedStyle(element);
-          return { border: style.borderTopWidth, background: style.backgroundColor };
-        });
-        expect(parseFloat(presentation.border)).toBeGreaterThan(0);
-        expect(presentation.background).not.toBe("rgba(0, 0, 0, 0)");
+        // Poll: a refetch can remount the notice between locator resolution and
+        // evaluation, and a detached node reports empty computed styles.
+        await expect.poll(() => notice.evaluate(element => parseFloat(getComputedStyle(element).borderTopWidth)))
+          .toBeGreaterThan(0);
+        await expect.poll(() => notice.evaluate(element => getComputedStyle(element).backgroundColor))
+          .not.toBe("rgba(0, 0, 0, 0)");
         await test.info().attach("recovery-notice", { body: await notice.screenshot(), contentType: "image/png" });
       }
       if (action === "queued_interrupt") {
