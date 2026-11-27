@@ -872,10 +872,27 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const OTHER_MERGE_SHA = "e".repeat(40);
     const HEAD_SHA = "d".repeat(40);
     type Product = { number: number; status: string; isPrimary: boolean; metadata: Record<string, unknown> };
+    const REPO_ID = 4242;
+    // GitHub's live view of the delivery PRs: each one merged into TEA-Core/paperclip
+    // main with the merge commit its work product records.
+    const livePull = (number: number, mergeCommit: string) => ({
+      number, state: "closed", draft: false, merged: true, merge_commit_sha: mergeCommit,
+      head: { ref: `delivery-${number}`, sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
+      base: { ref: "main", repo: { id: REPO_ID, node_id: "R_paperclip", full_name: "TEA-Core/paperclip" } },
+    });
 
     // An agent reviewer holds the final stage and closes with a structured Tier 1
     // landedAtTip declaration, so the real tier guard runs before the preflight.
-    async function mergedFirstReview(fixture: Awaited<ReturnType<typeof pendingDelivery>>, products: Product[]) {
+    async function mergedFirstReview(
+      fixture: Awaited<ReturnType<typeof pendingDelivery>>,
+      products: Product[],
+      { pulls = {}, boardWritten = true }: {
+        /** Live GitHub answers per PR number; a PR absent here reads as merged with its recorded merge commit. */
+        pulls?: Record<number, Response | Record<string, unknown>>;
+        /** Record each work product as written by the board user (the landing proof's tie to the card). */
+        boardWritten?: boolean;
+      } = {},
+    ) {
       const reviewer = await seedAgent(db, fixture.company.id);
       const [run] = await db.insert(heartbeatRuns).values({
         companyId: fixture.company.id, agentId: reviewer.id, status: "running",
@@ -892,17 +909,37 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         executionState: { ...initial.executionState, currentParticipant: participant },
       }).where(eq(issues.id, fixture.issue.id));
       for (const product of products) {
-        await db.insert(issueWorkProducts).values({
+        const [row] = await db.insert(issueWorkProducts).values({
           companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
           externalId: `TEA-Core/paperclip#${product.number}`, title: `PR #${product.number} TEA-Core/paperclip`,
           url: `https://github.com/TEA-Core/paperclip/pull/${product.number}`, status: product.status,
           reviewState: "none", isPrimary: product.isPrimary, healthStatus: "unknown", metadata: product.metadata,
+        }).returning();
+        await db.insert(activityLog).values({
+          companyId: fixture.company.id,
+          actorType: boardWritten ? "user" : "agent",
+          actorId: boardWritten ? "board-user" : reviewer.id,
+          action: "issue.work_product_created", entityType: "issue", entityId: fixture.issue.id,
+          details: { workProductId: row!.id },
         });
       }
-      // Every named commit is on the base branch.
+      // Every named commit is on the base branch; GitHub serves the live PRs and the repository identity.
       const served = github.getMockImplementation()!;
-      github.mockImplementation(async (input, init) =>
-        String(input).includes("/compare/") ? Response.json({ status: "behind", ahead_by: 0 }) : served(input, init));
+      github.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url.includes("/compare/")) return Response.json({ status: "behind", ahead_by: 0 });
+        if (url.endsWith("/repos/TEA-Core/paperclip")) {
+          return Response.json({ id: REPO_ID, node_id: "R_paperclip", full_name: "TEA-Core/paperclip" });
+        }
+        const pull = url.match(/\/repos\/TEA-Core\/paperclip\/pulls\/(\d+)$/);
+        const product = pull ? products.find((candidate) => candidate.number === Number(pull[1])) : undefined;
+        if (pull && product) {
+          const live = pulls[product.number]
+            ?? livePull(product.number, String(product.metadata.mergeCommitSha ?? OTHER_MERGE_SHA));
+          return live instanceof Response ? live.clone() : Response.json(live);
+        }
+        return served(input, init);
+      });
       const app = createApp(db, agentActor(fixture.company, reviewer, run!.id));
       return {
         approve: (mergeCommit: string) => request(app).patch(`/api/issues/${fixture.issue.id}`).send({
@@ -948,6 +985,78 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(state.approvalStatus.publishSkipped.reason).toContain(MERGE_SHA);
       expect(fixture.writes).toEqual([]);
       expect(fixture.armCalls).toEqual([]);
+    });
+
+    it("refuses a forged mergeCommitSha that names the base tip rather than the PR's merge commit", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        pulls: { 4412: livePull(4412, OTHER_MERGE_SHA) },
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        reason: expect.stringContaining("no-pr"),
+        landingProofRefusal: { code: "landing_proof_sha_mismatch" },
+        remedy: expect.stringContaining("landing_proof_sha_mismatch"),
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("refuses a merged PR that targets another repository than the card's delivery repository", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const live = livePull(4412, MERGE_SHA);
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        pulls: { 4412: { ...live, base: { ref: "main", repo: { id: 9999, full_name: "Someone/fork" } } } },
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        landingProofRefusal: { code: "landing_proof_repo_identity_mismatch" },
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
+    it("refuses when GitHub cannot serve the live pull request", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        pulls: { 4412: Response.json({ message: "Validation Failed" }, { status: 422 }) },
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        landingProofRefusal: { code: "landing_proof_unverifiable", reason: expect.stringContaining("HTTP 422") },
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
+    it("refuses when only agent-written records tie the merged PR to the card", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        boardWritten: false,
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        landingProofRefusal: { code: "landing_proof_not_card_delivery" },
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     });
 
     it("still refuses when the merged primary carries no recorded mergeCommitSha", async () => {

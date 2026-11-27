@@ -5008,6 +5008,7 @@ export function issueRoutes(
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: ${verdict.remedy ?? "provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again."} ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
+        ...(verdict.landingProofRefusal ? { landingProofRefusal: verdict.landingProofRefusal } : {}),
       });
     }
     patch.executionState = {
