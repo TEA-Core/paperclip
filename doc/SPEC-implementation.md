@@ -532,7 +532,6 @@ writers are still checked across companies without exposing foreign IDs or paths
 The read performs no Git command/provider proof, locking or mutation and grants
 no admission token.
 
-
 For a stranded pending execution-policy review/approval stage whose recorded
 agent participant is not its assignee, a board actor authorized to assign to
 that participant may call `POST /api/issues/{id}/restore-participant` with
