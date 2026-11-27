@@ -12713,6 +12713,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  // The recovery issue records its exhaustion in `originFingerprint` and is created on
+  // its own connection, so it survives a failed completion transaction. Any status and
+  // visibility counts: a recovery issue that was resolved while the completion kept
+  // failing still is this exhaustion's effect and must not be opened a second time.
+  async function findIssueMonitorRecoveryIssueForExhaustion(
+    claimed: IssueMonitorDispatchRow,
+    recoveryFingerprint: string,
+  ) {
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, claimed.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+          eq(issues.originId, claimed.id),
+          eq(issues.originFingerprint, recoveryFingerprint),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   // The idempotency key of a recovery wake names one exhaustion (issue, clear reason,
   // claimed schedule). A queued or coalesced row with that key means an earlier attempt
   // at this same exhaustion already delivered the wake, so a retry must not send it again.
@@ -12778,9 +12802,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (input.recoveryPolicy === "create_recovery_issue") {
       const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}`;
-      let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(
-        input.claimed,
-      );
+      let recoveryIssue =
+        (await findIssueMonitorRecoveryIssueForExhaustion(input.claimed, recoveryFingerprint)) ??
+        (await findOpenIssueMonitorRecoveryIssue(input.claimed));
       const reusedRecoveryIssue =
         recoveryIssue !== null && recoveryIssue.originFingerprint !== recoveryFingerprint;
       if (!recoveryIssue) {
@@ -12806,7 +12830,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       // The recovery issue is the effect; waking its assignee is best effort. A paused or
-      // budget-blocked assignee must not undo or repeat the issue creation.
+      // budget-blocked assignee must not undo or repeat the issue creation, and a recovery
+      // issue already resolved or hidden needs no wake.
+      const recoveryIssueOpen =
+        recoveryIssue.hiddenAt === null && recoveryIssue.status !== "done" && recoveryIssue.status !== "cancelled";
       let recoveryWakeQueued = false;
       const recoveryWakeKey = `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
       if (
@@ -12818,7 +12845,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }))
       ) {
         recoveryWakeQueued = true;
-      } else if (recoveryIssue.assigneeAgentId) {
+      } else if (recoveryIssueOpen && recoveryIssue.assigneeAgentId) {
         try {
           recoveryWakeQueued = Boolean(
             await enqueueWakeup(recoveryIssue.assigneeAgentId, {
@@ -12989,8 +13016,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // comment and every recovery activity row are written on this transaction,
     // so they commit or roll back with the clear and the exhaustion row. The
     // effects that cannot join it (the recovery issue and the wakes) are
-    // idempotent per exhaustion: an open recovery issue is reused, and a wake
-    // whose per-exhaustion idempotency key is already queued is not sent again.
+    // idempotent per exhaustion: the recovery issue this exhaustion opened is
+    // found by its origin fingerprint in any status, so a resolved one is never
+    // opened again; another open recovery issue is reused; and a wake whose
+    // per-exhaustion idempotency key is already queued is not sent again.
     // Realtime publications wait until the transaction commits.
     const postCommitPublications: ActivityPublication[] = [];
     try {
