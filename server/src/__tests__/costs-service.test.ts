@@ -16,7 +16,7 @@ import {
   issues,
   projects,
 } from "@paperclipai/db";
-import { costService } from "../services/costs.ts";
+import { boundCostEventCounters, COST_EVENT_COST_CENTS_LIMIT, costService } from "../services/costs.ts";
 import { financeService } from "../services/finance.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -407,6 +407,30 @@ describe("cost routes", () => {
   });
 });
 
+describe("boundCostEventCounters", () => {
+  it("passes storable counters through, including values above 2^31", () => {
+    expect(
+      boundCostEventCounters({ inputTokens: 3_000_000_000, cachedInputTokens: 0, outputTokens: 2, costCents: 5 }),
+    ).toEqual({ counters: { inputTokens: 3_000_000_000, cachedInputTokens: 0, outputTokens: 2, costCents: 5 }, rejected: [] });
+  });
+
+  it("rejects out-of-range, negative, fractional and non-numeric counters with a reason each", () => {
+    const { counters, rejected } = boundCostEventCounters({
+      inputTokens: 2 ** 60,
+      cachedInputTokens: -1,
+      outputTokens: 2.5,
+      costCents: Number.NaN,
+    });
+    expect(counters).toEqual({ inputTokens: Number.MAX_SAFE_INTEGER, cachedInputTokens: 0, outputTokens: 2, costCents: 0 });
+    expect(rejected.map((entry) => [entry.field, entry.reason])).toEqual([
+      ["inputTokens", "out_of_range"],
+      ["cachedInputTokens", "negative"],
+      ["outputTokens", "not_an_integer"],
+      ["costCents", "not_a_number"],
+    ]);
+  });
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -479,6 +503,84 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(event.inputTokens).toBe(2_732_577);
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent?.spentMonthlyCents).toBe(0);
+  });
+
+  async function seedCostAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Token Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "opencode_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("stores one event's token counters above 2^31 instead of losing the event", async () => {
+    const { companyId, agentId } = await seedCostAgent();
+
+    const event = await costs.createEvent(companyId, {
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5",
+      inputTokens: 3_000_000_000,
+      cachedInputTokens: 2_147_483_648,
+      outputTokens: 4_000_000_000,
+      costCents: 12,
+      occurredAt: new Date("2026-04-10T00:00:00.000Z"),
+    });
+
+    const [stored] = await db.select().from(costEvents).where(eq(costEvents.id, event.id));
+    expect(stored?.inputTokens).toBe(3_000_000_000);
+    expect(stored?.cachedInputTokens).toBe(2_147_483_648);
+    expect(stored?.outputTokens).toBe(4_000_000_000);
+    const rejections = await db.select().from(activityLog).where(eq(activityLog.action, "cost_event.counters_rejected"));
+    expect(rejections).toHaveLength(0);
+  });
+
+  it("keeps the event and records an error when a counter is beyond what its column can store", async () => {
+    const { companyId, agentId } = await seedCostAgent();
+
+    const event = await costs.createEvent(companyId, {
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5",
+      inputTokens: 1e20,
+      cachedInputTokens: 5,
+      outputTokens: 7,
+      costCents: 3_000_000_000,
+      occurredAt: new Date("2026-04-10T00:00:00.000Z"),
+    });
+
+    const [stored] = await db.select().from(costEvents).where(eq(costEvents.id, event.id));
+    expect(stored?.inputTokens).toBe(Number.MAX_SAFE_INTEGER);
+    expect(stored?.cachedInputTokens).toBe(5);
+    expect(stored?.outputTokens).toBe(7);
+    expect(stored?.costCents).toBe(COST_EVENT_COST_CENTS_LIMIT);
+    const [rejection] = await db.select().from(activityLog).where(eq(activityLog.action, "cost_event.counters_rejected"));
+    expect(rejection?.entityId).toBe(event.id);
+    expect(rejection?.details).toEqual({
+      rejected: [
+        { field: "inputTokens", value: "100000000000000000000", storedAs: Number.MAX_SAFE_INTEGER, reason: "out_of_range" },
+        { field: "costCents", value: "3000000000", storedAs: COST_EVENT_COST_CENTS_LIMIT, reason: "out_of_range" },
+      ],
+    });
   });
 
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {

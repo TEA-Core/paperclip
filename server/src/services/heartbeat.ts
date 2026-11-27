@@ -345,7 +345,7 @@ import {
   appendWithByteCap,
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
-import { costService } from "./costs.js";
+import { boundCostEventCounters, costService } from "./costs.js";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -24179,15 +24179,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const runtimeStateBefore = await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
-    const inputTokens = usage?.inputTokens ?? 0;
-    const outputTokens = usage?.outputTokens ?? 0;
-    const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const billedCostUsd = resolveCacheAdjustedCostUsd(result);
-    const additionalCostCents = normalizeBilledCostCents(
-      billedCostUsd,
-      billingType,
-    );
+    const rawCostCents = normalizeBilledCostCents(billedCostUsd, billingType);
+    // The runtime totals take the same storable values as the cost event, so
+    // an out-of-range counter cannot fail this update before the event is
+    // written. costs.createEvent bounds the raw values again and records the
+    // rejection on the event.
+    const rawCounters = {
+      inputTokens: usage?.inputTokens ?? 0,
+      cachedInputTokens: usage?.cachedInputTokens ?? 0,
+      outputTokens: usage?.outputTokens ?? 0,
+      costCents: rawCostCents,
+    };
+    const {
+      counters: {
+        inputTokens,
+        cachedInputTokens,
+        outputTokens,
+        costCents: additionalCostCents,
+      },
+    } = boundCostEventCounters(rawCounters);
     const hasTokenUsage =
       inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
@@ -24237,10 +24249,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         billingType,
         costStatus,
         model: result.model ?? "unknown",
-        inputTokens,
-        cachedInputTokens,
-        outputTokens,
-        costCents: additionalCostCents,
+        ...rawCounters,
         occurredAt: new Date(),
       });
     }

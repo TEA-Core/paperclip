@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, integer, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, integer, bigint, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { issues } from "./issues.js";
@@ -22,9 +22,10 @@ export const costEvents = pgTable(
     billingType: text("billing_type").notNull().default("unknown"),
     costStatus: text("cost_status").notNull().default("reported"),
     model: text("model").notNull(),
-    inputTokens: integer("input_tokens").notNull().default(0),
-    cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
-    outputTokens: integer("output_tokens").notNull().default(0),
+    // bigint: one run's token counters can exceed the 32-bit integer range.
+    inputTokens: bigint("input_tokens", { mode: "number" }).notNull().default(0),
+    cachedInputTokens: bigint("cached_input_tokens", { mode: "number" }).notNull().default(0),
+    outputTokens: bigint("output_tokens", { mode: "number" }).notNull().default(0),
     costCents: integer("cost_cents").notNull(),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

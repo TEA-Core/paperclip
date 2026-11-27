@@ -5,6 +5,8 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
+import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 
 export interface CostDateRange {
@@ -14,6 +16,60 @@ export interface CostDateRange {
 
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
+
+/**
+ * The largest counter values a cost event can store. The token columns are
+ * bigint read back as JS numbers, so the bound is the largest exact integer;
+ * `cost_cents` is a 32-bit integer column.
+ */
+export const COST_EVENT_TOKEN_LIMIT = Number.MAX_SAFE_INTEGER;
+export const COST_EVENT_COST_CENTS_LIMIT = 2_147_483_647;
+
+type CostEventCounterField = "inputTokens" | "cachedInputTokens" | "outputTokens" | "costCents";
+
+export type CostEventCounterRejection = {
+  field: CostEventCounterField;
+  value: string;
+  storedAs: number;
+  reason: "out_of_range" | "negative" | "not_an_integer" | "not_a_number";
+};
+
+/**
+ * Bound a cost event's counters to what its columns can store. A value the
+ * column cannot hold would make the insert fail and lose the whole event, so
+ * the value is rejected instead: out-of-range values are stored at the column
+ * limit, negative or non-numeric values as 0, fractions floored. Each
+ * rejection is returned so the caller records it; the event itself is kept.
+ */
+export function boundCostEventCounters(input: {
+  inputTokens?: number | null;
+  cachedInputTokens?: number | null;
+  outputTokens?: number | null;
+  costCents: number;
+}) {
+  const rejected: CostEventCounterRejection[] = [];
+  const bound = (field: CostEventCounterField, raw: unknown, limit: number): number => {
+    const value = raw === undefined || raw === null ? 0 : raw;
+    const reject = (storedAs: number, reason: CostEventCounterRejection["reason"]) => {
+      rejected.push({ field, value: String(value), storedAs, reason });
+      return storedAs;
+    };
+    if (typeof value !== "number" || Number.isNaN(value)) return reject(0, "not_a_number");
+    if (value < 0) return reject(0, "negative");
+    if (value > limit) return reject(limit, "out_of_range");
+    if (!Number.isInteger(value)) return reject(Math.floor(value), "not_an_integer");
+    return value;
+  };
+  return {
+    counters: {
+      inputTokens: bound("inputTokens", input.inputTokens, COST_EVENT_TOKEN_LIMIT),
+      cachedInputTokens: bound("cachedInputTokens", input.cachedInputTokens, COST_EVENT_TOKEN_LIMIT),
+      outputTokens: bound("outputTokens", input.outputTokens, COST_EVENT_TOKEN_LIMIT),
+      costCents: bound("costCents", input.costCents, COST_EVENT_COST_CENTS_LIMIT),
+    },
+    rejected,
+  };
+}
 
 function sumAsNumber(column: typeof costEvents.costCents | typeof costEvents.inputTokens | typeof costEvents.cachedInputTokens | typeof costEvents.outputTokens) {
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
@@ -68,17 +124,38 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         throw unprocessable("Agent does not belong to company");
       }
 
+      const { counters, rejected } = boundCostEventCounters(data);
       const event = await db
         .insert(costEvents)
         .values({
           ...data,
+          ...counters,
           companyId,
           biller: data.biller ?? data.provider,
           billingType: data.billingType ?? "unknown",
-          cachedInputTokens: data.cachedInputTokens ?? 0,
         })
         .returning()
         .then((rows) => rows[0]);
+
+      if (rejected.length > 0) {
+        // The event is kept with bounded counters; the rejected values are
+        // recorded so the undercount is visible rather than silent.
+        logger.error(
+          { companyId, costEventId: event.id, heartbeatRunId: event.heartbeatRunId, rejected },
+          "cost event counters out of storable range were rejected",
+        );
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "cost-ledger",
+          action: "cost_event.counters_rejected",
+          entityType: "cost_event",
+          entityId: event.id,
+          agentId: event.agentId,
+          runId: event.heartbeatRunId,
+          details: { rejected },
+        });
+      }
 
       const [agentMonthSpend, companyMonthSpend] = await Promise.all([
         getMonthlySpendTotal(db, { companyId, agentId: event.agentId }),
