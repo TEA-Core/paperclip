@@ -74,8 +74,12 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 // (`resolveLinkedPullRequestsWithState`), which runs on every done transition.
 // Without it the guard throws and the route answers 500 instead of the
 // authorization status under test.
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
-  where: mockDbSelectWhere,
+// The landing-debt probe reads activity_log; these fixtures have no debt rows.
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((table?: unknown) => ({
+  where: (...args: unknown[]) =>
+    (table as Record<symbol, unknown> | undefined)?.[Symbol.for("drizzle:Name")] === "activity_log"
+      ? Promise.resolve([])
+      : (mockDbSelectWhere as (...a: unknown[]) => unknown)(...args),
   innerJoin: () => ({ where: () => Promise.resolve([]) }),
 })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
@@ -249,7 +253,7 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
-    logActivityInTransaction: mockLogActivity,
+    logActivityInTransaction: mockLogActivity, logActivityInTransactionBestEffort: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -399,8 +403,11 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.rejectInteraction.mockResolvedValue(null);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({
-      where: mockDbSelectWhere,
+    mockDbSelectFrom.mockImplementation((table?: unknown) => ({
+      where: (...args: unknown[]) =>
+        (table as Record<symbol, unknown> | undefined)?.[Symbol.for("drizzle:Name")] === "activity_log"
+          ? dbChainNode([])
+          : (mockDbSelectWhere as (...a: unknown[]) => unknown)(...args),
       // See the hoisted default above: the fork's merge-arming done-transition
       // guard joins external_object_mentions to external_objects, and the GET
       // read path also chains three innerJoins (listIssueLinkedCases).
@@ -4238,6 +4245,176 @@ describe("issue execution policy routes", () => {
         },
       });
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    // SUP-24762: a human reviewer holds the review stage, so the stored agent
+    // assignee is null. A comment-only PATCH sets no issue field and must not
+    // be judged as a write of that null assignee.
+    function humanReviewHandoff() {
+      return {
+        ...issueWithParticipants([]),
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "human-reviewer",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "user", userId: "human-reviewer" }],
+          }],
+        }),
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", agentId: null, userId: "human-reviewer" },
+          returnAssignee: { type: "agent", agentId: maintainerId, userId: null },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    async function patchHumanReviewed(actor: TestActor | undefined, body: Record<string, unknown>) {
+      const issue = humanReviewHandoff();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
+        observeCrossIssueInfluence: vi.fn(async () => null),
+      }));
+      return request(await createApp(actor)).patch(`/api/issues/${issueId}`).send(body);
+    }
+
+    const humanReviewActors: Array<[string, TestActor | undefined]> = [
+      ["the board", undefined],
+      ["the canonical Maintainer agent", {
+        type: "agent",
+        agentId: maintainerId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }],
+      ["the author agent", {
+        type: "agent",
+        agentId: authorId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }],
+    ];
+
+    it.each(humanReviewActors)("lets a comment-only PATCH through on a human-reviewed Wiki handoff as %s (SUP-24762)", async (_name, actor) => {
+      const res = await patchHumanReviewed(actor, { comment: "status note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      const attributionKeys = new Set([
+        "actorAgentId",
+        "actorAgentApiKeyId",
+        "actorRunId",
+        "actorRunStopId",
+        "actorUserId",
+        "boardApiKeyId",
+        "expectedUpdatedAt",
+      ]);
+      const fieldKeys = Object.entries(patch)
+        .filter(([key, value]) => value !== undefined && !attributionKeys.has(key))
+        .map(([key]) => key);
+      expect(fieldKeys).toEqual([]);
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps refusing a comment that rides with a title write on a human-reviewed Wiki handoff (SUP-24762)", async () => {
+      const res = await patchHumanReviewed(undefined, {
+        comment: "rename",
+        title: "Weekly report — handoff to Wiki Maintainer (edited)",
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // CodeRabbit r2 on SUP-24762: reviewRequest and deliveryIdentity are removed
+    // from updateFields and add executionState only after the route guard. The
+    // route must still refuse such a write on a human-held handoff before a
+    // closed workspace reopens, as it did before the field-less skip.
+    it.each([
+      ["a deliveryIdentity", {
+        deliveryIdentity: {
+          repo: { owner: "TEA-Core", repo: "paperclip" },
+          branch: "PAP-1550-wiki",
+          headSha: "a".repeat(40),
+        },
+      }],
+      ["a reviewRequest", { reviewRequest: { instructions: "Please check the summary." } }],
+      // A null reviewRequest clears the request and still writes executionState.
+      ["a null reviewRequest", { reviewRequest: null }],
+    ])("refuses a board comment with %s on a human-held Wiki handoff before reopening its closed workspace (SUP-24762)", async (_name, extra) => {
+      const workspaceId = "78787878-7878-4787-8787-787878787878";
+      const issue = { ...humanReviewHandoff(), executionWorkspaceId: workspaceId };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: workspaceId,
+        mode: "isolated_workspace",
+        status: "archived",
+        closedAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+        ok: false,
+        code: "rebuild_failed",
+        message: "Failed to rebuild the execution workspace",
+      });
+      vi.doMock("../services/merge-arming.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/merge-arming.js")>(),
+        resolveIssueRepoContext: vi.fn(async () => ({ repoUrl: "https://github.com/TEA-Core/paperclip" })),
+        resolveCardDeliveryBranchOwnership: vi.fn(async () => ({
+          legitimate: true,
+          branch: "PAP-1550-wiki",
+          branchIsOwn: true,
+          ownerIssueId: issueId,
+          carrierOwnerTerminal: false,
+          refusalReason: null,
+        })),
+      }));
+
+      let res;
+      try {
+        res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({
+          comment: "refreshing the review record",
+          ...extra,
+        });
+      } finally {
+        // The module mock must not leak into later tests that use merge-arming.
+        vi.doUnmock("../services/merge-arming.js");
+      }
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      });
+      expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
   });
 

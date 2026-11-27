@@ -43,6 +43,7 @@ import type {
 } from "@paperclipai/shared";
 import { toolPolicyConditionsSchema } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
+import { canonicalizeUuid } from "../lib/uuid.js";
 import {
   effectiveToolProfileBindings,
   profileIdsInBindingOrder,
@@ -77,6 +78,12 @@ type ToolAccessContext = {
 type RedactionResult = {
   summary: ToolRedactedValueSummary;
   redactionPlan: { redactedFieldCount: number; redactedFields: string[] };
+  /**
+   * Hash of the display-truncated arguments (strings cut at 500 characters,
+   * arrays at 50 items): the argumentsHash earlier builds persisted. Equal to
+   * `summary.sha256` whenever nothing was truncated.
+   */
+  legacyArgumentsHash: string;
 };
 
 type PolicyConditionEvaluation = {
@@ -287,8 +294,19 @@ function trustRuleIsActive(policy: typeof toolPolicies.$inferSelect, now = new D
   return true;
 }
 
-function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string): string {
-  return `side_effect:${sha256({
+/**
+ * Derived side-effect key. Builds before full-argument hashing wrote the
+ * unversioned `side_effect:` form over a truncated-argument hash; this build
+ * writes only the `side_effect:v2:` form, which also names the calling
+ * principal. The key format records which build wrote a row: a durable marker
+ * that survives restarts and rolling deploys, unlike any process-local clock.
+ * Callers cannot supply keys in this namespace (see `recordInvocation`), so
+ * only the server writes them.
+ */
+const DERIVED_SIDE_EFFECT_KEY_PREFIX = "side_effect:";
+
+function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string, format: "v2" | "legacy"): string {
+  const scope = {
     companyId: ctx.companyId,
     runId: ctx.heartbeatRunId,
     issueId: ctx.issueId,
@@ -297,7 +315,28 @@ function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string)
     catalogEntryId: ctx.catalogEntryId,
     toolName: ctx.toolName,
     argumentsHash,
-  })}`;
+  };
+  if (format === "legacy") return `${DERIVED_SIDE_EFFECT_KEY_PREFIX}${sha256(scope)}`;
+  return `${DERIVED_SIDE_EFFECT_KEY_PREFIX}v2:${sha256({ ...scope, actorType: ctx.actorType, actorId: ctx.actorId, agentId: ctx.agentId })}`;
+}
+
+/**
+ * How long a derived-key retry replays a failure that never reached the tool
+ * (a policy denial, a rate limit, or a failure before dispatch). Afterwards an
+ * identical retry is recorded, authorized, and executed as a new invocation.
+ */
+const SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS = 5 * 60_000;
+
+function failureReplayExpired(invocation: typeof toolInvocations.$inferSelect, now = Date.now()): boolean {
+  // Dispatch started (startedAt): the side effect may have landed even though
+  // the call then failed (crash, timeout, blocked result, a bookkeeping error
+  // after the tool returned), so it is never dispatched again.
+  if (invocation.startedAt) return false;
+  // A human decision (declined, or approval lifecycle) is final for the call.
+  if (invocation.approvalState !== "not_required") return false;
+  if (!["failed", "denied", "rate_limited"].includes(invocation.status)) return false;
+  const settledAt = invocation.completedAt ?? invocation.updatedAt;
+  return now - settledAt.getTime() >= SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS;
 }
 
 function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success" | "denied" | "timeout" {
@@ -307,43 +346,89 @@ function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success"
   return "denied";
 }
 
+/**
+ * Hash-only stand-in for a redacted value. `argumentsHashText` renders it as a
+ * bare token outside any JSON string, which no JSON argument can produce:
+ * every caller-supplied value renders as valid JSON, so a caller string that
+ * spells the token is still a quoted string and hashes differently. Distinct
+ * redacted values stay distinct; the summary shows only "[REDACTED]".
+ */
+class RedactedValueDigest {
+  constructor(readonly hex: string) {}
+}
+
+function redactedValueDigest(value: unknown): RedactedValueDigest {
+  return new RedactedValueDigest(createHash("sha256").update(`tool-argument-redacted:${stableStringify(value)}`).digest("hex"));
+}
+
+/** `stableStringify`, plus the bare token for a redacted value. */
+function argumentsHashText(value: unknown): string {
+  if (value instanceof RedactedValueDigest) return `<redacted:${value.hex}>`;
+  if (Array.isArray(value)) return `[${value.map(argumentsHashText).join(",")}]`;
+  if (!isRecord(value)) return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${argumentsHashText(value[key])}`).join(",")}}`;
+}
+
 function summarizeAndRedact(value: unknown): RedactionResult {
   const redactedFields: string[] = [];
-  const visit = (current: unknown, path: string): unknown => {
+  // `shown` is the display/summary tree; `hashed` is what the arguments hash
+  // covers. A JSON "__proto__" key is an own data property of parsed input, so
+  // `hashed` keeps it as one (plain assignment would drop it or swap the
+  // prototype), and redacted values hash by a digest of the value.
+  const visit = (current: unknown, path: string): { shown: unknown; hashed: unknown } => {
     if (typeof current === "string") {
       if (SECRET_VALUE_RE.test(current)) {
         redactedFields.push(path || "$");
-        return "[REDACTED]";
+        return { shown: "[REDACTED]", hashed: redactedValueDigest(current) };
       }
-      return current.length > 500 ? `${current.slice(0, 500)}...[truncated]` : current;
+      return { shown: current, hashed: current };
     }
-    if (Array.isArray(current)) return current.slice(0, 50).map((entry, index) => visit(entry, `${path}[${index}]`));
-    if (!isRecord(current)) return current;
-    const out: Record<string, unknown> = {};
+    if (Array.isArray(current)) {
+      const entries = current.map((entry, index) => visit(entry, `${path}[${index}]`));
+      return { shown: entries.map((entry) => entry.shown), hashed: entries.map((entry) => entry.hashed) };
+    }
+    if (!isRecord(current)) return { shown: current, hashed: current };
+    const shown: Record<string, unknown> = {};
+    const hashed: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(current)) {
       const nestedPath = path ? `${path}.${key}` : key;
+      let entry: { shown: unknown; hashed: unknown };
       if (SENSITIVE_KEY_RE.test(key)) {
         redactedFields.push(nestedPath);
-        out[key] = "[REDACTED]";
+        entry = { shown: "[REDACTED]", hashed: redactedValueDigest(nested) };
       } else {
-        out[key] = visit(nested, nestedPath);
+        entry = visit(nested, nestedPath);
       }
+      shown[key] = entry.shown;
+      Object.defineProperty(hashed, key, { value: entry.hashed, enumerable: true, writable: true, configurable: true });
     }
+    return { shown, hashed };
+  };
+  const truncateForDisplay = (current: unknown): unknown => {
+    if (typeof current === "string") {
+      return current.length > 500 ? `${current.slice(0, 500)}...[truncated]` : current;
+    }
+    if (Array.isArray(current)) return current.slice(0, 50).map(truncateForDisplay);
+    if (!isRecord(current)) return current;
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(current)) out[key] = truncateForDisplay(nested);
     return out;
   };
-  const redacted = visit(value ?? {}, "");
-  const text = stableStringify(redacted);
+  const { shown, hashed } = visit(value ?? {}, "");
+  const shownText = stableStringify(shown);
+  const displayText = stableStringify(truncateForDisplay(shown));
   return {
     summary: {
-      summary: text.length > 4000 ? `${text.slice(0, 4000)}...[truncated]` : text,
-      sizeBytes: Buffer.byteLength(text),
-      sha256: sha256(redacted),
+      summary: displayText.length > 4000 ? `${displayText.slice(0, 4000)}...[truncated]` : displayText,
+      sizeBytes: Buffer.byteLength(shownText),
+      sha256: createHash("sha256").update(argumentsHashText(hashed)).digest("hex"),
       redactedFields,
     },
     redactionPlan: {
       redactedFieldCount: redactedFields.length,
       redactedFields,
     },
+    legacyArgumentsHash: createHash("sha256").update(displayText).digest("hex"),
   };
 }
 
@@ -986,9 +1071,9 @@ export function toolAccessPolicyService(db: Db) {
     | { ok: true; ctx: ToolAccessContext; redaction: RedactionResult }
     | { ok: false; decision: ToolAccessDecision; redaction: RedactionResult }
   > {
+    const heartbeatRunId = canonicalizeUuid(input.runContext?.heartbeatRunId);
     const redaction = summarizeAndRedact(input.request.arguments ?? {});
     let agentId = input.actor.agentId ?? (input.actor.actorType === "agent" ? input.actor.actorId : null);
-    let heartbeatRunId = input.runContext?.heartbeatRunId ?? null;
     let issueId = input.runContext?.issueId ?? null;
     let projectId = input.runContext?.projectId ?? null;
     let routineId = input.runContext?.routineId ?? null;
@@ -1534,7 +1619,7 @@ export function toolAccessPolicyService(db: Db) {
       agentId: input.actor.agentId ?? null,
       issueId: input.runContext?.issueId ?? null,
       gatewayId: input.runContext?.gatewayId ?? null,
-      runId: input.runContext?.heartbeatRunId ?? null,
+      runId: canonicalizeUuid(input.runContext?.heartbeatRunId),
       connectionId: input.request.connectionId ?? null,
       catalogEntryId: input.request.catalogEntryId ?? null,
       applicationId: input.request.applicationId ?? null,
@@ -1613,69 +1698,185 @@ export function toolAccessPolicyService(db: Db) {
     }
   }
 
+  type InvocationWriter = Pick<Db, "select" | "insert" | "update">;
+
+  /**
+   * A recorded key belongs to the principal that recorded it: the stored row's
+   * actor type, actor id and agent id must equal the caller's. Any other
+   * caller in the company gets a bare 409 that reveals nothing of the stored
+   * outcome (no invocation id, result, provider links or failure text). The
+   * same principal's retry, in this or a later run, finds and replays its row.
+   */
+  async function callerInvocationByIdempotencyKey(ctx: ToolAccessContext, idempotencyKey: string, writer: InvocationWriter) {
+    const [existing] = await writer.select().from(toolInvocations).where(and(
+      eq(toolInvocations.companyId, ctx.companyId),
+      eq(toolInvocations.idempotencyKey, idempotencyKey),
+    ));
+    if (!existing) return null;
+    if (existing.actorType !== ctx.actorType || existing.actorId !== ctx.actorId || existing.agentId !== ctx.agentId) {
+      throw conflict("This idempotency key is already used by another caller.", { reasonCode: "idempotency_key_conflict" });
+    }
+    return existing;
+  }
+
+  function ownsInvocation(ctx: ToolAccessContext, invocation: typeof toolInvocations.$inferSelect) {
+    return invocation.actorType === ctx.actorType && invocation.actorId === ctx.actorId
+      && invocation.agentId === ctx.agentId && invocation.runId === ctx.heartbeatRunId;
+  }
+
+  function replayLegacyInvocation(ctx: ToolAccessContext, invocation: typeof toolInvocations.$inferSelect, key: string) {
+    if (!ownsInvocation(ctx, invocation) || failureReplayExpired(invocation)) return null;
+    const marker = isRecord(invocation.argumentsSummary) ? invocation.argumentsSummary.sideEffectReplayKey : null;
+    if (typeof marker === "string") {
+      // This build owns the summary marker. A legacy-hash collision is not an
+      // exact retry: it gets its own v2 row, while old builds retain base replay.
+      return marker === key ? replayRecorded(invocation) : null;
+    }
+    throw conflict(
+      "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
+      { reasonCode: "tool_invocation_replay_ambiguous", invocationId: invocation.id },
+    );
+  }
+
+  /**
+   * A stored row is replayed only once it has an outcome. A row still pending,
+   * authorized, awaiting approval or executing has none yet, so the caller gets 409 in-progress
+   * rather than a replay with no result; its retry after the outcome replays.
+   */
+  function replayRecorded(invocation: typeof toolInvocations.$inferSelect) {
+    if (["pending", "authorized", "awaiting_approval", "executing"].includes(invocation.status)) {
+      throw conflict("An identical call is still running; retry after it finishes.", { reasonCode: "tool_invocation_in_progress", invocationId: invocation.id });
+    }
+    return { invocation, replayed: true, actionRequest: null };
+  }
+
   async function recordInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
     const { ctx, redaction } = loaded;
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
+    const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
+    // Derived keys are server-generated and name their owner; a caller key in
+    // that namespace could claim (and permanently block) another principal's
+    // derived key, so it is refused before anything is recorded.
+    if (input.request.idempotencyKey?.startsWith(DERIVED_SIDE_EFFECT_KEY_PREFIX)) {
+      throw badRequest("Idempotency keys starting with \"side_effect:\" are reserved for the server.", { reasonCode: "idempotency_key_reserved" });
+    }
     const idempotencyKey = input.request.idempotencyKey
-      ?? (input.request.sideEffecting ? sideEffectIdempotencyKey(ctx, argumentsHash) : null);
-    if (idempotencyKey) {
-      const [existing] = await db.select().from(toolInvocations).where(and(
-        eq(toolInvocations.companyId, input.companyId),
-        eq(toolInvocations.idempotencyKey, idempotencyKey),
-      ));
-      if (existing) return { invocation: existing, replayed: true, actionRequest: null };
-    }
-    const status = accessDecision.decision === "allow"
-      ? "authorized"
-      : accessDecision.decision === "require_approval"
-        ? "awaiting_approval"
-        : accessDecision.decision === "rate_limited"
-          ? "rate_limited"
-          : "denied";
-    const [invocation] = await db.insert(toolInvocations).values({
-      companyId: ctx.companyId,
-      idempotencyKey,
-      actorType: ctx.actorType,
-      actorId: ctx.actorId,
-      agentId: ctx.agentId,
-      issueId: ctx.issueId,
-      runId: ctx.heartbeatRunId,
-      applicationId: ctx.applicationId,
-      connectionId: ctx.connectionId,
-      catalogEntryId: ctx.catalogEntryId,
-      catalogVersionHash: ctx.catalogVersionHash,
-      catalogSchemaHash: ctx.catalogSchemaHash,
-      providerType: ctx.providerType,
-      applicationKey: ctx.applicationKey,
-      upstreamToolName: ctx.upstreamToolName,
-      riskLevel: ctx.riskLevel,
-      toolName: ctx.toolName,
-      argumentsHash,
-      argumentsSummary: redaction.summary,
-      policyDecision: accessDecision.decision,
-      matchedPolicyIds: accessDecision.matchedPolicyIds,
-      approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
-      status,
-      errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
-      errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
-      completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
-    }).returning();
-    let actionRequest = null;
-    if (accessDecision.decision === "require_approval") {
-      [actionRequest] = await db.insert(toolActionRequests).values({
+      ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash, "v2") : null);
+    const store = async (writer: InvocationWriter) => {
+      if (idempotencyKey) {
+        const existing = await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+        if (existing && !(derivedKey && failureReplayExpired(existing))) {
+          return replayRecorded(existing);
+        }
+        if (existing) {
+          // Release the derived key from the expired failure so this retry
+          // records (and is authorized as) a fresh invocation. A concurrent
+          // retry that released it first owns the key: replay its row.
+          const [released] = await writer.update(toolInvocations)
+            .set({ idempotencyKey: null, updatedAt: new Date() })
+            .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
+            .returning({ id: toolInvocations.id });
+          const winner = released ? null : await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+          if (winner) return replayRecorded(winner);
+        }
+      }
+      const legacyKey = derivedKey ? sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy") : null;
+      let storageKey = idempotencyKey;
+      if (legacyKey) {
+        const [legacy] = await writer.select().from(toolInvocations).where(and(
+          eq(toolInvocations.companyId, ctx.companyId),
+          eq(toolInvocations.idempotencyKey, legacyKey),
+        ));
+        if (legacy) {
+          const replay = replayLegacyInvocation(ctx, legacy, idempotencyKey!);
+          if (replay) return replay;
+        } else {
+          // Keep the actual invocation under the key old binaries read. Its
+          // server-owned JSONB marker identifies the full arguments for new
+          // binaries, with no schema change or unsynchronized shadow outcome.
+          // If that legacy key is occupied, use the principal-scoped full key.
+          storageKey = legacyKey;
+        }
+      }
+      const status = accessDecision.decision === "allow"
+        ? "authorized"
+        : accessDecision.decision === "require_approval"
+          ? "awaiting_approval"
+          : accessDecision.decision === "rate_limited"
+            ? "rate_limited"
+            : "denied";
+      const argumentsSummary = derivedKey ? { ...redaction.summary, sideEffectReplayKey: idempotencyKey } : redaction.summary;
+      const insertInvocation = (key: string | null) => writer.insert(toolInvocations).values({
         companyId: ctx.companyId,
-        invocationId: invocation.id,
+        idempotencyKey: key,
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        agentId: ctx.agentId,
         issueId: ctx.issueId,
-        status: "pending",
-        canonicalArgumentsHash: invocation.argumentsHash ?? argumentsHash,
-        canonicalArgumentsSummary: redaction.summary,
-        requestedByAgentId: ctx.actorType === "agent" ? ctx.agentId : null,
-        requestedByUserId: ctx.actorType === "user" ? ctx.actorId : null,
-      }).returning();
-    }
-    return { invocation, replayed: false, actionRequest };
+        runId: ctx.heartbeatRunId,
+        applicationId: ctx.applicationId,
+        connectionId: ctx.connectionId,
+        catalogEntryId: ctx.catalogEntryId,
+        catalogVersionHash: ctx.catalogVersionHash,
+        catalogSchemaHash: ctx.catalogSchemaHash,
+        providerType: ctx.providerType,
+        applicationKey: ctx.applicationKey,
+        upstreamToolName: ctx.upstreamToolName,
+        riskLevel: ctx.riskLevel,
+        toolName: ctx.toolName,
+        argumentsHash,
+        argumentsSummary,
+        policyDecision: accessDecision.decision,
+        matchedPolicyIds: accessDecision.matchedPolicyIds,
+        approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
+        status,
+        errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
+        errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
+        completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
+      }).onConflictDoNothing({ target: [toolInvocations.companyId, toolInvocations.idempotencyKey] }).returning();
+      let [invocation] = await insertInvocation(storageKey);
+      if (!invocation && storageKey === legacyKey && idempotencyKey) {
+        // Another full identity or an old binary reserved the legacy key first.
+        const [winner] = await writer.select().from(toolInvocations).where(and(
+          eq(toolInvocations.companyId, ctx.companyId),
+          eq(toolInvocations.idempotencyKey, legacyKey!),
+        ));
+        if (winner) {
+          const replay = replayLegacyInvocation(ctx, winner, idempotencyKey);
+          if (replay) return replay;
+          [invocation] = await insertInvocation(idempotencyKey);
+        }
+      }
+      if (!invocation) {
+        const winner = idempotencyKey && await callerInvocationByIdempotencyKey(ctx, idempotencyKey, writer);
+        if (winner) return replayRecorded(winner);
+        throw conflict("The invocation reservation changed; retry after it settles.", { reasonCode: "tool_invocation_in_progress" });
+      }
+      let actionRequest = null;
+      if (accessDecision.decision === "require_approval") {
+        [actionRequest] = await writer.insert(toolActionRequests).values({
+          companyId: ctx.companyId,
+          invocationId: invocation.id,
+          issueId: ctx.issueId,
+          status: "pending",
+          canonicalArgumentsHash: invocation.argumentsHash ?? argumentsHash,
+          canonicalArgumentsSummary: redaction.summary,
+          requestedByAgentId: ctx.actorType === "agent" ? ctx.agentId : null,
+          requestedByUserId: ctx.actorType === "user" ? ctx.actorId : null,
+        }).returning();
+      }
+      return { invocation, replayed: false, actionRequest };
+    };
+    if (!derivedKey || !idempotencyKey) return store(db);
+    return db.transaction(async (tx) => {
+      // Both legacy and v2 storage slots name this same full identity. Hold
+      // its lock across lookup, expired-key release, insert and approval
+      // recording, even if a different call releases the legacy slot meanwhile.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyKey}, 0))`);
+      return store(tx);
+    });
   }
 
   async function matchingApprovedActionRequestCount(input: {

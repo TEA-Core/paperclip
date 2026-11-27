@@ -21,7 +21,7 @@ The canonical host directory keeps its existing physical location:
     AGENTS.md
     notes/
     any-supported-file
-  file-sync/                   controller-only operational state
+  file-sync/                   operational state (live copies may be agents-group readable)
     adopted.json
     canonical-manifest.json   metadata/hash cache, no file contents
     runs/<initial-run>/
@@ -36,6 +36,80 @@ the task workspace. Remote providers currently confine file sync to their
 workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
+
+The runtime's agents group is resolved by name (`agents`) only. When the name
+does not resolve (no such group, no `getent`, or a lookup timeout), no group is
+used and the server logs a warning, whatever `PAPERCLIP_AGENTS_GID` says.
+`PAPERCLIP_AGENTS_GID` is accepted only when it equals the named group's gid;
+an override that differs, is gid `0`, or is the server's own primary group is
+refused and no group is used. The group is used only when the server process
+may assign it (it is root or a member).
+
+Editor saves, bundle initialization/import, and adoption of revision-backed files
+write instruction files as `0640` and directories as `0750`, both owned by the
+agents group, explicitly independent of umask. Group read is intentional; group
+write and world access are never granted. When no agents group resolves, these
+writes stay owner-only (`0600` files, `0700` directories) and grant no group
+access. Each write replaces the file with a new inode in the final mode and
+group. It also sets every existing directory from the instruction root down to
+that file to the same layout, so a loose (for example `0777`) directory is
+tightened. Each of those directories must be owned by the server user.
+
+For canonical storage under `<instance>/companies/`, each existing directory
+from the instance root down to the instruction root (the agent directory
+included) must be owned by the server user and must not be world-writable. A
+server-owned directory there that is only group-writable loses group write in
+place. Nothing outside the instance root is checked or changed.
+
+A write is refused with `INSTRUCTION_STORAGE_UNSAFE` when a directory is owned
+by another user (`reason: "foreign-owner"`), when an ancestor is world-writable
+(`"world-writable-ancestor"`), or when a mode cannot be tightened
+(`"cannot-tighten"`). Files that are not written are not bulk-migrated. The
+adoption marker remains private (`0600`).
+
+Instruction files are readable by every member of the agents group. Do not put
+secrets (API keys, tokens, passwords, credentials) in instruction files or
+doctrine; give agents secrets through secret references in their environment
+variables instead.
+
+When the agents group resolves as described above, the fork stages live directories with modes derived from owner bits:
+at most `02750` (setgid, group read/traverse), owned by that group.
+The `file-sync/`, `runs/`, and run directories have at most `0750`, without
+setgid inheritance. Files retain their owner permissions and gain
+group read only when the canonical file grants both owner read and group read;
+group execute then follows owner execute (`0755` becomes `0750`). Files without
+canonical group-read intent stay owner-only (`0600` stays `0600`, `0700` stays
+`0700`, and `0604` becomes `0600`). No world access or group write is granted.
+The run directory stays `0700` throughout copying and all descendant mode/group
+assignments; only the completed tree is opened to the group. This also applies
+when staging retries in an existing run directory.
+Modes are applied explicitly, independent of umask. If any group or mode
+assignment is denied, the run falls back to a fresh copy behind a `0700` run
+directory and its receipt does not claim group staging. Without an assignable
+group the run also stays private. Both private paths keep only owner permission
+bits on all staged entries; no canonical group/world permission bits are copied.
+Staging never changes canonical files: a file still at its staged mode is saved
+with its canonical mode; only a mode the run itself set is saved. Receipts record
+the staging formula version, so copies staged by the earlier group build (`0640`
+files, `0750` executables) still map those modes back to the canonical mode.
+Version 3 also records the owner-only formula for private runs. Earlier private
+copies kept canonical modes when staged, so their live modes are saved as they are.
+The canonical manifest cache and warm-run `owner.json` fence are created
+atomically as `0600`, including after a warm handoff. Their parent directories
+deny group write, so peers cannot create, replace, or unlink these files under
+umask `002`. Unsafe old manifest caches are discarded and rebuilt.
+Replacing an existing canonical file retains that file's own group, even when its
+parent or the live copy has a different group. If the server may not assign that
+group (`EPERM`/`EINVAL`), the file is still replaced and a warning names the path
+and group. Files and folders a run creates take their canonical parent
+folder's group (never the live copy's agents group), with the same best-effort
+warning. A new file's mode follows the staging rule (owner bits, group read at
+most, never group write; `0664` becomes `0640`), and new folders are `0750`. Runtime ancestor permissions are unchanged.
+
+The fork runs every adapter as one shared principal in the agents group, so any
+adapter process can read the live copies of other agents and other companies
+while their runs are live. This visibility is an accepted policy of the
+shared-principal model; there is no per-agent or per-company group.
 
 Regular files (including binary bytes) and directories are supported, up to
 100,000 entries (files and folders), 256 MiB per file and 2 GiB total. Symlinks,

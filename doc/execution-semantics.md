@@ -188,7 +188,7 @@ The active-lock lifecycle is part of the checkout contract:
 - checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
 - the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
 - the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
-- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership. A current typed review or approval participant can take over an adopted issue-less author's stamp; it cannot displace a normal issue-scoped worker.
 - external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
@@ -204,6 +204,68 @@ from the claiming run. A board or user claim, a claim for a different agent, an
 assignment that does not set `in_progress`, and a claim from a run scoped to a
 different issue still wake the assignee.
 
+A `running` run whose context names no issue also owns a card it created
+(`originRunId`) or reassigned to its own agent (its `issue.updated` activity
+records an `assigneeAgentId` change to that agent; a write that only names the
+current assignee is not proof), as long as that agent is still the assignee and
+the run has not been silent for 90 minutes. Every
+execution gate treats that run as the card's live holder: a wake for the same
+agent on the card (assignment, monitor, comment, stage, recovery) is held behind
+it instead of starting a second run, the run is stamped as the card's execution
+holder, a queued run for the card is not claimed, and checkout by another run is
+refused. A held wake is never merged into that run, because merging would scope
+the run to the card. Held wakes on open cards are promoted when the run finishes,
+including wakes on cards whose lock a status write cleared while the run was
+live, and when the silent-run hard-stop, stale-lock sweep, checkout self-heal,
+issue release, or admin force-release clears the lock. A promotion-only visit
+does not reopen a `done` or `cancelled` card. The stale-lock sweep also visits
+already-unlocked open cards with held wakes and promotes eligible work once no
+live holder remains. The stale-lock sweep
+also lapses a stamped hold whose issue-less author has produced no output for
+90 minutes while a wake is held behind it or a successor run for the card is
+already queued; a run with recent output never lapses there, and the lapse
+never touches a run whose context names a card.
+Only an authenticated run claim is recorded on an `issue.updated` activity
+row or as a card's `originRunId`: an agent JWT is minted for one run, while a
+board request or an agent API key can only claim a run through an
+unauthenticated header, which is never copied into either proof. A plugin
+call never stores a supplied run as `originRunId`. A plugin interaction
+drops a supplied `sourceRunId`, so accepting it does not copy that run onto
+the child. The host holds no authenticated run for that call, so a claimed
+agent and run pair is not proof. Task acceptance never copies a stored
+interaction's run/agent pair into the child's `originRunId`, including pending
+pre-upgrade rows. The interaction retains its source attribution.
+The issue update service rejects any caller-supplied `originRunId` at runtime
+with `400 issue_origin_run_id_immutable`, including through its company-scoped
+wrapper. The typed API also forbids the field. Creation provenance is set only
+at creation; reassignment compares against the row-locked assignee and clears
+it internally. Public create, child-create,
+and PATCH bodies reject the field as an unknown key.
+The adopted-holder predicate also checks legacy `paperclipIssue.id`: an absent
+or matching nested ID remains eligible; a nested ID naming another card does not.
+Transactional board-stage decisions collect and flush lock-clear actions after
+commit, independently of the separate stage notification.
+An agent API key cannot release an adopted
+author hold by naming its run in a header; that release requires the
+authenticated author run or board authority. Other activity actions keep their
+attribution. A reassignment drops `originRunId`. A later
+self-assign proves itself only through the latest assignee-change row, not
+an older row that names the same assignee. An adopted stamp
+never makes the issue-less author the card's interruptible run, including
+when its recorded context is null or names no issue; a checked-out run that
+did not author the card remains interruptible. A reassignment also drops an
+adopted author's stamped hold, so the new assignee's wakes are not held
+behind the previous author. A wake for the current review or approval
+participant of a different agent does not wait behind an adopted issue-less
+author. Native reviewers still require their authenticated, current review
+assignment and committer wake. The claim takes the execution stamp under the
+issue row lock without cancelling the author's unrelated run. While the
+reviewer holds the card, the old author's PATCH and checkout are refused.
+A same-agent wake still waits behind its live author. Wakes after the run has
+finished use the normal admission gates. A
+run whose context names a different issue does not own the cards it creates or
+assigns.
+
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, and for the issuer
@@ -218,7 +280,10 @@ stop leaves the approval committed.
 Under the issue row lock, a non-terminal assignee change retains a running
 holder identified by the issue's existing execution or checkout binding. It
 clears checkout permission but preserves execution admission across the saved
-update, a delayed cancellation and a failed cancellation. A request header alone
+update, a delayed cancellation and a failed cancellation. The one exception
+is an adopted issue-less author: its stamped hold ends at the reassignment,
+because the stamp proves authorship for the previous assignee, not work on
+this card. A request header alone
 grants neither cancellation nor a hold. If only a legacy issue-context binding
 remains, admission recovers it by company and issue, not by the new assignee.
 
@@ -643,6 +708,134 @@ Use an issue-backed recovery action only when the recovery is genuinely independ
 
 A comment or system notice can be evidence for a recovery action, but it is not a recovery action by itself. Comment-only recovery is not a healthy liveness path because it does not define a typed owner, wake or monitor policy, retry bound, timeout, escalation path, or resolution outcome.
 
+#### Board-accepted unresolved recovery carrier park
+
+The board can explicitly accept an intentionally unresolved carrier disposition
+with `POST /api/issues/:id/recovery-carrier-park`. The read-only
+`GET /api/issues/:id/recovery-carrier-park/candidate` supplies current identity,
+ownership, status-version and terminal-blocker expectations; the board chooses
+the historical rejected confirmation and supplies its acceptance reason.
+The rejected confirmation is provenance, not consent by itself.
+
+Admission requires the exact same-company source/action/carrier linkage, an
+escalated/exhausted board-owned action without wake/monitor policy, current
+decision and blocker snapshots, and no carrier-subtree execution, queued work,
+execution locks or scheduled monitor. A source with a scheduled monitor must
+settle that schedule before parking; this operation never clears it.
+Deferred issue-execution receipts count as queued work, including verified
+interaction input and persisted issue/task identities in wake context or deferred
+skip metadata; park admission must not silently abandon that input.
+Unfinished `skipped` receipts with a deferrable reason also count as pending
+execution on the carrier tree or exact action. Acceptance rejects them atomically
+rather than retiring or discarding them. Finished skips, terminal skip reasons
+and unrelated bare-source receipts do not create a carrier execution conflict.
+
+The acceptance binding, ordinary manual pause hold and audit event commit
+together. Source and recovery-action rows are read-only: no resolution,
+cancellation, attempt/evidence refresh, supersession, replacement action, monitor
+or wake is authorized. Repeated identical acceptance returns the same hold.
+While the acceptance is active, the exact-action binding gates automatic action
+upserts and source recovery re-arm, including exhaustion drain; board release
+lifts that gate but is not new source repair authority. Independent authorized
+board resolution remains separate. This is not a general source-task pause.
+The active company/action binding is unique; unbound or released holds do not
+occupy that slot.
+New bindings store the database's canonical source, action, decision, assignee
+and blocker UUIDs. Equivalent blocker ordering and UUID letter case do not make
+an otherwise identical acceptance stale; persisted consent is not rewritten.
+Source and admission gates compare uppercase, compact and braced UUID spellings
+consistently, including older bindings, without casting untrusted saved JSON,
+rewriting stored consent or touching the action row. Malformed aliases sharing
+the protected UUID's hex digits fail closed. Admission also checks the
+server-derived action identity in queued wake context.
+Exhaustion drain excludes the exact parked action before its bounded candidate
+page, so parked rows cannot hide later eligible work. Carrier eligibility and
+wake preflight use the lock-holding transaction; wake publication follows commit.
+Locked preflight distinguishes a board park, an existing live monitor and ordinary
+unavailability. Park refusal posts no missing-owner notice or fallback audit.
+An existing monitor keeps its schedule and metadata without creating a carrier.
+Monitor admission rereads the exact action under the source lock and skips a
+stale or independently resolved action without falling back to a new carrier.
+Due and future checks use one clock sample taken after acquiring that lock.
+Recovery notices recheck the exact source/action under the source lock, including
+the comment's source-recency update.
+Attention projection treats uppercase legacy UUIDs as the same identity without
+rewriting consent. A candidate with live blockers remains discoverable, but its
+board form explains the blocker that prevents terminal-only admission.
+Stale execution-pointer cleanup retains the source lock and pointer compare-and-set
+checks without suppressing unrelated source maintenance. Healthy-child blocker
+repair rechecks the source-action gate under the source lock and preserves an
+operator's terminal source close that won that lock. Active typed parks prevent
+automatic stale-review carrier archival; ordinary unparked cleanup and review-stage
+archival rules are unchanged.
+
+The carrier stays visible and nonterminal. Its accepted park is separate from
+the source's unresolved escalation and from actual dependency counts/tree
+liveness. Terminal blocker history is retained; the ordinary all-done re-block
+PATCH guard is unchanged. Exhaustion, a generic pause, comments and historical
+rejection never create acceptance. A stale binding surfaces attention and keeps
+the manual execution hold; it cannot grant a fresh run.
+Attention reads direct blocker facts and park consent in one company-scoped
+statement, including when the caller already owns a transaction. The graph uses
+that same root-blocker snapshot, so neither a concurrent reopen nor a late park
+acceptance can combine live blocker facts with unrelated accepted consent.
+Deferred promotion rechecks the typed park under the issue lock. The ordinary
+pause's verified-interaction exception cannot bypass a carrier park: a legacy
+deferred receipt is cancelled without a run and cannot replay on release.
+Action-associated wake admission locks the source and carrier before an
+issue-scoped target or queue insertion. Action-only coalescing preserves its
+existing run-first order before that gate. A typed park takes priority over
+ordinary holds anywhere in its subtree;
+nested ordinary holds remain active and require their own explicit release.
+Typed inheritance follows the full same-company parent chain in one recursive
+read for non-root lookups, using UNION cycle deduplication and a visited set.
+The root fast path, ordinary 100-node budget and nearest fallback stay unchanged.
+Native dependency/child-completion producers persist a terminal skipped intent
+when the carrier is parked. A native dispatch attempt suppressed by a park also
+marks its original intent skipped; release cannot replay it. Other native
+deferral policies remain unchanged.
+
+Early scheduling, cutoff and budget deferrals take the same exact-action and
+issue locks before coalescing or persisting replay work. A typed park refuses
+that work and terminally skips the original native intent; ordinary quiescence
+still defers normally. The dormant wake-queue module preserves the same typed
+fence instead of granting its ordinary verified-interaction exception.
+
+Action-only coalescing isolates a nonfatal context-snapshot update in a
+savepoint when it already owns a transaction. Its diagnostic run-log event is
+recorded after that transaction settles, including with a one-connection pool.
+A coalesced receipt associated with a queued, running or scheduled-retry run
+still counts as active admission work even if its diagnostic snapshot failed.
+
+Blocked-recovery candidate selection excludes the current typed paused subtree
+and sources with an exact protected active/escalated action before applying
+its bounded ordinary-work limit. The fence applies only while the park is
+active; board release lifts it.
+This is not a bare-source or global exhausted-action exemption; locked per-issue
+checks still handle parks accepted after candidate selection.
+
+A typed park intentionally excludes comment delivery. Existing manual-pause
+admission rejects ordinary issue-comment writes, and the composer stays disabled.
+Internal wake attempts do not create a deferred delivery queue. Board release
+does not replay those attempts or start work.
+
+Only an explicit board `POST /api/issues/:id/recovery-carrier-park/:holdId/release`
+retires the acceptance and releases this hold. It checks the bound action's UUID
+identity regardless of letter case, audits atomically and repeats idempotently.
+It changes no source/action row, starts no work, and does not approve a review
+stage or authorize repair. The park gate refuses only automated supersession,
+re-mint, upsert and monitor/carrier re-arm of the exact bound action while the
+acceptance is active; unrelated source sweeps (stranded, stale-lock, orphan)
+keep running, and release lifts the gate.
+Ordinary subtree resume/release cannot bypass that operation. No timer, TTL,
+sentinel blocker or consent backfill exists. Rollback retains the pause and audit
+evidence; it must not release holds or revive source recovery as cleanup.
+Deleting a carrier is refused while its typed park is active, or while a
+released binding still protects unresolved source effects. The shared removal
+service takes source locks before the carrier lock and rechecks the fence.
+Deletion cannot cascade away that fence or clear the bound unresolved action's
+carrier pointer; an unrelated ordinary card remains deletable.
+
 #### Recovery action freshness
 
 Source-scoped recovery actions are snapshots of the source issue's liveness state at the time the action was opened. They must be revalidated after newer durable source activity, including source issue status changes, assignee changes, blocker changes, execution policy or monitor changes, document or work-product updates that define a valid waiting path, and structured resume or disposition updates.
@@ -751,6 +944,16 @@ letting the former assignee change the monitor.
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
+Closing an issue still clears a future-dated monitor, but the issue update that
+closes it (PATCH, a review-approval comment, a stage decision, or any other
+service caller), or the routine retirement that cancels a superseded routine
+execution sibling, writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
+`recoveryPolicy` (nullable), the existing actor/run attribution, and
+`reason: cleared_by_close_future_check`. This is a searchable cancellation record,
+not a transfer or a later wake. Past-due watchdogs retain their ordinary clear
+reason and require no disposition. The activity response contract is published
+in OpenAPI and the MCP `paperclipListIssueActivity` output schema.
+
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its
 retained `scheduledRetryAt` is historical and must not produce a waiting or overdue
@@ -762,6 +965,8 @@ Because `serviceName` and `notes` remain visible in issue activity and wake cont
 Monitor bounds are enforced. Paperclip rejects attempts to re-arm a monitor whose `timeoutAt` or `maxAttempts` is already exhausted. When a scheduled monitor reaches an exhausted bound at trigger time, Paperclip clears it and follows `recoveryPolicy`: `wake_owner` queues a bounded recovery wake for the assignee, `create_recovery_issue` opens visible issue-backed recovery work, and `escalate_to_board` records a board-visible escalation comment/activity.
 
 A due monitor on an issue with no assignee has no agent to wake. When its `recoveryPolicy` is `wake_owner` (the default), Paperclip clears the monitor with `clearReason: invalid_assignee` and raises one board-owned `no_live_path_unowned` recovery action for the issue, unless the issue already has an active recovery action. The monitor does not count as an attempt and does not set `lastTriggeredAt`. The clear is guarded by the claimed `monitorNextCheckAt`; if the monitor was re-armed concurrently, the new schedule is left untouched and the clear is skipped. Monitors with `create_recovery_issue` or `escalate_to_board` on an unassigned issue are not selected and stay armed.
+
+The scheduler selects a due monitor only on an `in_progress`, `in_review`, or `blocked` issue with no human assignee, and, when the issue has no agent assignee, only with the `wake_owner` policy. A due monitor outside that set cannot fire. Examples: an issue in `todo` or `backlog`, an agent release that moved the issue to `todo` and cleared the assignee but left the monitor scheduled, a human assignee, or an unassigned `create_recovery_issue` or `escalate_to_board` monitor. For each such schedule, Paperclip records one `issue.monitor_unfireable` activity row on the issue. The row has `details.reason` and `details.reasons` (`status_not_dispatchable`, `human_assignee`, `no_assignee_agent`), `nextCheckAt`, `status`, the assignee ids, and `recoveryPolicy`. This is detection only: the monitor stays armed, no wake is queued, and no recovery action is created. A due monitor that is eligible but has a wake claim from the last five minutes is an in-flight wake and gets no row. The scan runs under a transaction-scoped advisory lock, so an overlapping scheduler tick skips it and cannot write a second row for the same schedule. If the monitor is re-armed to a different `nextCheckAt` and that schedule also comes due without a dispatch, Paperclip records a new row. To find a lost scheduled wake, read `GET /api/issues/{id}/activity`: a past-due `monitorNextCheckAt` has an `issue.monitor_unfireable` row or an `issue.monitor_triggered`/`issue.monitor_skipped` row for that schedule.
 
 Use `blocked` instead of a monitor when no Paperclip assignee owns a responsible polling path. In that case, name the external owner/action or create first-class recovery/blocker work.
 
@@ -823,6 +1028,43 @@ latest run failed on provider quota. That card gets no monitor and no board
 item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
+
+The Wiki handoff guard is also skipped for a field-less write. In a field-less
+write, every present key is `undefined` or request attribution: `actorAgentId`,
+`actorAgentApiKeyId`, `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
+write when the route adds no field to it and the request carries no
+`reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
+call too. A field-less write sets no assignee, so the guard does not
+judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
+a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
+card is `in_review`, or `done` with its review stage complete. Known limit:
+when the card has another status while its review stage is still pending, for
+example `blocked`, or `todo` with a pending stage, the PATCH route adds fields
+to the write before the field-less check. The comment is then still refused
+with 422 `wiki_handoff_unassigned`. When the write carries any other key, the
+attribution keys still count as present keys. Thus an attributed `status` or
+`unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key that comes with attribution keys is not field-less, even
+when its value is `undefined`, because the update normalizes that value to
+`null` and clears the stored policy. Thus an attributed
+`executionPolicy: undefined` write still runs the guard. A bare
+`executionPolicy: undefined` write, with no other present key, skips the guard
+and clears the stored policy, as the paragraph above states. That behavior
+predates the field-less skip, and the field-less skip does not change it.
+
+The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
+can close the final stage of an unassigned Wiki handoff card. That hand-back
+has no return-to, so the route drops the no-op `assigneeAgentId: null` and
+`assigneeUserId: null` keys and marks the write with an internal
+`boardStageDecision` flag. The guard admits it only when the write carries no
+assignee key and the stored row has no agent and no user assignee. Any assignee
+write, including one naming the canonical Maintainer, and any owned row stay
+guarded as before. Only that route sets the flag. The plugin host forwards just
+the patch fields the plugin SDK declares for `issues.update`
+(`PluginIssueUpdatePatch`). It drops every other key, including the issue
+service's internal flags (`boardStageDecision`, `workflowControlledAssignment`,
+`companyGuard`, `expectedUpdatedAt`).
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
@@ -1046,6 +1288,8 @@ An expired legacy run records that provider work never started. Stranded-work re
 One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. The candidate query leaves out runs the bound does not expire: a run whose retry alarm is in the future, and a run whose issue another running run holds. So older runs that must wait cannot fill the pages and hide a newer stuck run. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. The query also leaves out a run whose `issueId` is not a canonical issue id (for example a number or padded text). Such a run names no issue and holds no issue lock; this pass never expires it. A malformed recovery action id or comment id in a run's context is read as absent, so it cannot make the decision fail. If one candidate still fails, the pass logs it, skips it, and continues; cancellations already committed keep their effects. A pass that stops at either cap resumes after the last run it visited on the next pass, and a pass that reaches the end of the list starts the next one from the oldest run. So every listed run is visited within ceil(listed / 2,000) passes, and a run the bound expires is cancelled within ceil(expirable ahead of it / 100) passes. The resume position lives in server memory; a restart begins at the oldest run.
 
 Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
+
+A queued run whose `retry_of_run_id` is its own id can never be claimed: the claim's lineage walk cannot resolve it. The claim gate therefore cancels such a run at the next claim attempt with error code `retry_lineage_invalid`, which releases its issue lock without waiting for the 24-hour bound. Stranded-work recovery never writes this lineage: it binds `retry_of_run_id` only on a run that has no lineage yet and is not the predecessor itself, and it skips the issue when its last re-read finds a live newest run. When the atomic claim leaves a queued run in the queue for any other reason, it appends one `warn` run event per run and reason (except a run another claimer already took), with the reason in `payload.claimStaleReason`.
 
 The stale-lock sweep leaves native runs with their finalization coordinator while
 same-session recovery or accepted-result finalization is pending. A provider can

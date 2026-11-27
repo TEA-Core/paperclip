@@ -23,6 +23,7 @@ import {
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
+  issueChildCarrierAttributions,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issueExecutionDecisions,
@@ -975,6 +976,47 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(res.body.receipt.headSha).toBe(HEAD_SHA);
     expect(mockGhFetch).toHaveBeenCalledTimes(1);
     expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(1);
+  });
+
+  it.each([
+    ["39 hex characters", "a".repeat(39)],
+    ["41 hex characters", "a".repeat(41)],
+    ["64 hex characters", "a".repeat(64)],
+    ["65 hex characters", "a".repeat(65)],
+    ["40 uppercase hex characters", "A".repeat(40)],
+    ["a trailing newline", `${"a".repeat(40)}\n`],
+    ["an empty string", ""],
+    ["null", null],
+    ["an array", ["a".repeat(40)]],
+  ])("rejects a recovery head SHA with %s as 400 before any GitHub read or persistence", async (_label, headSha) => {
+    const { companyId, issueId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    // The live PR head equals the requested head, so only validation can refuse it.
+    mockGhFetch.mockResolvedValue(createMockResponse({
+      state: "open",
+      merged: false,
+      draft: false,
+      head: {
+        sha: headSha,
+        ref: DELIVERY_BRANCH,
+        repo: { name: REPO, owner: { login: OWNER } },
+      },
+    }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({
+      owner: OWNER,
+      repo: REPO,
+      pullRequestNumber: 579,
+      headSha,
+      reason: "restore approved publication",
+      idempotencyKey: "recover-invalid-head",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toMatch(/headSha/);
+    expect(mockGhFetch).not.toHaveBeenCalled();
+    expect(await db.select().from(issueDeliveryReceipts)).toHaveLength(0);
+    expect(await db.select().from(issueDeliveryReceiptLinks)).toHaveLength(0);
   });
 
   it("publishes the recovered target head once and consumes its receipt exactly once", async () => {
@@ -1950,6 +1992,68 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const requestRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_requested");
     const outcomeRows = async () => (await db.select().from(activityLog)).filter((event) => event.action === "issue.merge_release_outcome");
 
+    it.each(["release", "release-override"] as const)("refuses %s before a status write when child-only attribution already exists", async (route) => {
+      const { issueId, companyId } = await seedReleasable();
+      const ancestorId = randomUUID();
+      await db.insert(issues).values({
+        id: ancestorId, companyId, identifier: "SUP-900", issueNumber: 900,
+        title: "Carrier", status: "in_progress", priority: "medium",
+      });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER,
+        branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA],
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      const body = route === "release" ? { headSha: HEAD_SHA, reason: RELEASE_REASON }
+        : { headSha: HEAD_SHA, overrideReason: RELEASE_REASON };
+      installReleaseTransport({ onStatusRead: () => { throw new Error("provider status is unavailable"); } });
+      const unavailable = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(unavailable.status).toBe(409);
+      expect(unavailable.body.message).toContain("child-carrier-attribution");
+
+      installReleaseTransport();
+      const refused = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(refused.status).toBe(409);
+      expect(refused.body.message).toContain("child-carrier-attribution");
+      expect(statusWrites()).toEqual([]);
+      expect(markerWrites()).toEqual([]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+
+      await db.delete(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.id, proof!.id));
+      const released = await request(app).post(`/api/issues/${issueId}/merge-arming/${route}`).send(body);
+      expect(released.status).toBe(200);
+      expect(released.body.outcome).toBe("released");
+    });
+
+    it.each([201, 502])("voids a possible success instead of confirming release when child-only authority appears during the write (HTTP %s)", async (firstStatus) => {
+      const { issueId, companyId } = await seedReleasable();
+      const ancestorId = randomUUID();
+      await db.insert(issues).values({
+        id: ancestorId, companyId, identifier: "SUP-24619-carrier", issueNumber: 24619,
+        title: "Carrier", status: "in_progress", priority: "medium",
+      });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: PR_NUMBER,
+        branchName: DELIVERY_BRANCH, headSha: HEAD_SHA, commitShas: [HEAD_SHA], state: "invalidated",
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      installReleaseTransport({ postStatus: (call) => ({ ok: call !== 1 || firstStatus === 201, status: call === 1 ? firstStatus : 201 }) });
+      const transport = mockGhFetch.getMockImplementation()!;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/statuses/") && init?.method === "POST") {
+          await db.update(issueChildCarrierAttributions).set({ state: "current" }).where(eq(issueChildCarrierAttributions.id, proof!.id));
+        }
+        return transport(url, init);
+      });
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(response.body.outcome).toBe("stale");
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      expect((await outcomeRows())[0]).toMatchObject({ details: { outcome: "stale" } });
+    });
+
     it("publishes paperclip/approved for exactly the live head with the release description, and logs it", async () => {
       const { issueId } = await seedReleasable();
       installReleaseTransport();
@@ -2315,14 +2419,15 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       let head = HEAD_SHA;
       installReleaseTransport({
         liveHeadNow: () => head,
-        postStatus: () => { head = OTHER_HEAD; return { ok: false, status: 502 }; },
+        postStatus: (call) => { if (call === 1) { head = OTHER_HEAD; return { ok: false, status: 502 }; } return { ok: true, status: 201 }; },
       });
 
       const res = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
       expect(res.status).toBe(409);
       expect(res.body.message).toContain("head-mismatch");
-      expect(statusWrites()).toHaveLength(1);
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state)).toEqual(["success", "failure"]);
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
     });
 
     it("retries a transient write failure while the head is unchanged", async () => {
@@ -2334,6 +2439,18 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("released");
       expect(statusWrites()).toHaveLength(2);
+    });
+
+    it.each([false, true])("voids a possibly accepted terminal release failure (void rejected %s)", async (voidRejected) => {
+      const { issueId } = await seedReleasable();
+      installReleaseTransport({ postStatus: (call) => call <= 3
+        ? { ok: false, status: 502 }
+        : { ok: !voidRejected, status: voidRejected ? 403 : 201 } });
+      const response = await request(app).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
+      expect(response.body.outcome).toBe("failed");
+      expect(statusWrites().map(([, init]) => JSON.parse(String(init?.body)).state).at(-1)).toBe("failure");
+      expect(await releaseConfirmationOf(issueId)).toBeUndefined();
+      if (voidRejected) expect(response.body.message).toMatch(/could NOT|unconfirmed/i);
     });
 
     // The card's review certified one PR for delivery (executionState.approvalStatus.finalDelivery).
@@ -4286,10 +4403,10 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         });
         const operation = await hold({ companyId });
         try {
-          const started = Date.now();
+          const started = performance.now();
           const res = await request(app({ totalMs: 500, compensationMs: 300, fetchMs: 1000 })).post(`/api/issues/${issueId}/merge-arming/release`).send({ headSha: HEAD_SHA, reason: RELEASE_REASON });
 
-          expect(Date.now() - started).toBeLessThan(5000);
+          expect(performance.now() - started).toBeLessThan(5000);
           expect(res.body.outcome).toBe(outcome);
           if (outcome === "failed") expect(res.body.message).toMatch(/deadline|nothing was published|status_read: HTTP 0 timeout/);
           if (name === "the outcome audit insert") expect(res.body.auditRecorded).toBe(false);
@@ -5174,6 +5291,124 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
   });
 
+  it.each([[true, false, false], [false, false, false], [true, true, false], [false, false, true]])("preserves delivery state and heads (stall %s, self-owned refresh %s, stale binding %s)", async (stallPolicy, withReviewRequest, withStaleDelivery) => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, stallPolicy });
+    const [child] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const ownerId = randomUUID();
+    const workspaceId = randomUUID();
+    const branch = "SUP-14823-carrier-branch";
+    await db.insert(issues).values({
+      id: ownerId, companyId, identifier: "SUP-14823-carrier", issueNumber: 2, title: "Carrier",
+      status: "in_progress", priority: "medium", projectId: child!.projectId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId, companyId, projectId: child!.projectId!, sourceIssueId: ownerId, mode: "isolated",
+      strategyType: "git_worktree", name: "carrier", status: "active", branchName: branch, repoUrl: REPO_URL,
+    });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, ownerId));
+    await db.update(issues).set({ parentId: ownerId }).where(eq(issues.id, issueId));
+    await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, child!.executionWorkspaceId!));
+    if (withStaleDelivery) {
+      await db.update(issues).set({ executionPolicy: null, executionState: { ...child!.executionState, delivery: {
+        kind: "as05_bound_pr", branch: "previous-carrier", headSha: "a".repeat(40),
+        repo: { owner: OWNER, repo: REPO }, prNumber: PR_NUMBER + 1,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER + 1}`,
+        cardBranch: "SUP-14824-branch", sourceIssueId: issueId,
+      } } }).where(eq(issues.id, issueId));
+    }
+    if (withReviewRequest) {
+      const policy = child!.executionPolicy as { stages: Array<{ id: string }> };
+      await db.update(issues).set({
+        status: "in_review", assigneeUserId: "stall-reviewer-user",
+        executionState: {
+          status: "pending", currentStageId: policy.stages[0]!.id, currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "user", userId: "stall-reviewer-user" },
+          returnAssignee: { type: "agent", agentId }, completedStageIds: [],
+          lastDecisionId: null, lastDecisionOutcome: null, reviewRequest: null,
+        },
+      }).where(eq(issues.id, issueId));
+    }
+    const deliveryBranch = withReviewRequest
+      ? (await db.select({ branch: executionWorkspaces.branchName }).from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, child!.executionWorkspaceId!)))[0]!.branch!
+      : branch;
+    currentActor = withReviewRequest ? boardActor(companyId) : agentActor(companyId, agentId, runId);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockImplementation(async () => createMockResponse({
+      state: "open", draft: false, merged: false,
+      head: { ref: deliveryBranch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } }, base: { ref: "main" },
+    }));
+    const response = await request(app).patch(`/api/issues/${issueId}`).send({
+      ...(withReviewRequest ? { reviewRequest: { instructions: "Review the exact delivery." } } : { status: "in_review" }),
+      deliveryIdentity: {
+        repo: { owner: OWNER, repo: REPO }, branch: deliveryBranch, headSha: HEAD_SHA,
+        prNumber: PR_NUMBER, prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+      },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    if (withReviewRequest) {
+      expect(row!.executionState).toMatchObject({
+        delivery: { branch: deliveryBranch, headSha: HEAD_SHA, prNumber: PR_NUMBER },
+        reviewRequest: { instructions: "Review the exact delivery." },
+      });
+      expect(row!.executionState?.childCarrierClaim).toBeUndefined();
+    } else {
+      expect(row!.executionState).toMatchObject({ childCarrierClaim: { prNumber: PR_NUMBER, headSha: HEAD_SHA } });
+      expect(row!.executionState?.delivery).toBeUndefined();
+    }
+    expect(row!.executionState?.deliveredHeadSha).toBe(stallPolicy ? HEAD_SHA : undefined);
+    expect(row!.executionWorkspaceId).toBe(child!.executionWorkspaceId);
+  });
+
+  it("still writes as05_bound_pr for a shared-workspace child binding its ancestor carrier's PR, with no carrier claim (SUP-24619)", async () => {
+    const runId = randomUUID();
+    const carrierBranch = "SUP-14823-carrier-branch";
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      sharedWorkspaceOwnerBranch: carrierBranch,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockImplementation(async () =>
+      createMockResponse({
+        state: "open",
+        draft: false,
+        merged: false,
+        head: { ref: carrierBranch, sha: HEAD_SHA, repo: { full_name: `${OWNER}/${REPO}` } },
+        base: { ref: "main" },
+      }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: carrierBranch,
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = (row!.executionState ?? {}) as Record<string, unknown>;
+    expect(state.childCarrierClaim).toBeUndefined();
+    const delivery = state.delivery as Record<string, unknown> | undefined;
+    expect(delivery?.kind).toBe("as05_bound_pr");
+    expect(delivery?.prNumber).toBe(PR_NUMBER);
+    expect(delivery?.cardBranch).toBe(carrierBranch);
+  });
+
   it("rejects deliveryIdentity when the recorded branch is not the card's execution-workspace branch (SUP-15909)", async () => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
@@ -5954,6 +6189,152 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       });
     expect(record.status, JSON.stringify(record.body)).toBe(200);
     expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+  });
+
+  describe("a project_primary stamp with enableIsolatedWorkspaces on and a project override policy (SUP-24798)", () => {
+    async function setProjectPolicy(issueId: string, policy: Record<string, unknown> | null) {
+      const [row] = await db.select({ projectId: issues.projectId }).from(issues).where(eq(issues.id, issueId));
+      await db.update(projects).set({ executionWorkspacePolicy: policy }).where(eq(projects.id, row!.projectId!));
+    }
+
+    function stampIdentity(branch: string) {
+      return { repo: { owner: OWNER, repo: REPO }, branch, headSha: HEAD_SHA };
+    }
+
+    beforeEach(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    });
+
+    afterEach(async () => {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    });
+
+    it("accepts the board stamp onto the card's own null-branch row when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14824-1-restored");
+    });
+
+    it("accepts the board stamp that names the card's stored executionWorkspaceId when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: boundWorkspaceId, deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+    });
+
+    it("accepts the agent's entry-into-review stamp onto the card's own null-branch row when allowIssueOverride is false", async () => {
+      const runId = randomUUID();
+      const { companyId, issueId, agentId } = await seedIssue({
+        executionRunId: runId,
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = agentActor(companyId, agentId, runId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", deliveryIdentity: stampIdentity("SUP-14824-project-primary") });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+      expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-project-primary");
+      const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("in_review");
+    });
+
+    it("still refuses a different executionWorkspaceId with 422 workspace_issue_override_disallowed when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      const otherWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: otherWorkspaceId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details?.code).toBe("workspace_issue_override_disallowed");
+      expect(await boundWorkspaceOf(issueId)).toBe(boundWorkspaceId);
+    });
+
+    it("still refuses an executionWorkspacePreference that rides with the stored executionWorkspaceId when allowIssueOverride is false", async () => {
+      const { companyId, issueId } = await seedIssue({
+        status: "in_review",
+        strategyType: "project_primary",
+        deliveryBranch: null,
+      });
+      await setProjectPolicy(issueId, { enabled: true, allowIssueOverride: false });
+      const boundWorkspaceId = await boundWorkspaceOf(issueId);
+      currentActor = boardActor(companyId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: boundWorkspaceId, executionWorkspacePreference: "reuse_existing" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details?.code).toBe("workspace_issue_override_disallowed");
+    });
+
+    for (const [label, policy] of [
+      ["allowIssueOverride true", { enabled: true, allowIssueOverride: true }],
+      ["allowIssueOverride unset", { enabled: true }],
+    ] as const) {
+      it(`keeps the board stamp and a different-row rebind accepted when ${label}`, async () => {
+        const { companyId, issueId } = await seedIssue({
+          status: "in_review",
+          strategyType: "project_primary",
+          deliveryBranch: null,
+        });
+        await setProjectPolicy(issueId, { ...policy });
+        currentActor = boardActor(companyId);
+
+        const stamp = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ deliveryIdentity: stampIdentity("SUP-14824-1-restored") });
+        expect(stamp.status, JSON.stringify(stamp.body)).toBe(200);
+        expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+
+        const otherWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
+        const rebind = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ executionWorkspaceId: otherWorkspaceId });
+        expect(rebind.status, JSON.stringify(rebind.body)).toBe(200);
+        expect(await boundWorkspaceOf(issueId)).toBe(otherWorkspaceId);
+      });
+    }
   });
 
   it("refuses a board terminal-carrier record that also rebinds the card, then accepts the record alone", async () => {

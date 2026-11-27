@@ -23,6 +23,12 @@ export interface GitWorkspaceSnapshot {
 }
 
 export const PROJECT_REPOSITORIES_DIR = ".paperclip-repositories";
+/**
+ * The info/exclude line Paperclip appends so a task workspace's project
+ * repositories stay out of its Git status. The no-repository-landing close
+ * accepts only this exact line as written by the server, so every writer uses it.
+ */
+export const PROJECT_REPOSITORIES_EXCLUDE_LINE = `/${PROJECT_REPOSITORIES_DIR}/`;
 
 export interface ExpensiveWorkspaceGitInput {
   localDir: string;
@@ -646,7 +652,7 @@ export async function withShallowGitWorkspaceClone<T>(
       });
     }
     if (input.snapshot.repositories?.length) {
-      await fs.appendFile(path.join(cloneDir, ".git/info/exclude"), `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+      await fs.appendFile(path.join(cloneDir, ".git/info/exclude"), `\n${PROJECT_REPOSITORIES_EXCLUDE_LINE}\n`);
     }
     return await fn(cloneDir);
   } finally {
