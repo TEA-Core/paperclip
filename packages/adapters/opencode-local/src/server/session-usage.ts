@@ -5,9 +5,11 @@
  * the session's cumulative tokens and cost. They are the durable record of what
  * a run spent: a `step_finish` record can be dropped from the stream entirely
  * (upstream anomalyco/opencode#53207), so stdout step sums alone can
- * under-report a turn. A resumed run must subtract the pre-run snapshot so the
- * reported usage stays per-run, which is what the adapter's
- * `usageBasis: "per_run"` result promises the server.
+ * under-report a turn. Only a run that started its session reports the
+ * session totals; a run that resumed a session which already had usage reports
+ * its own validated step sums, so overlapping runs on one session are never
+ * charged for each other's work. Either way the result is per-run, which is
+ * what the adapter's `usageBasis: "per_run"` result promises the server.
  */
 export type OpenCodeSessionUsage = {
   inputTokens: number;
@@ -344,7 +346,8 @@ export function subtractOpenCodeSessionTotals(
 /**
  * Reconcile this run's usage from the serve transport's durable session state.
  *
- * The cumulative session totals minus the pre-run baseline (read from
+ * For a run that started its session (or resumed one with no usage yet) the
+ * cumulative session totals minus the pre-run baseline (read from
  * `GET /api/session/{id}` before the prompt) are exactly what this run spent,
  * so the result is scoped `per_run` and the server's legacy session-delta
  * heuristic steps aside. The totals are `complete` only when a final record
@@ -356,8 +359,10 @@ export function subtractOpenCodeSessionTotals(
  *
  * Without a session reading — an older server that never emits usage events,
  * or a resume whose baseline payload lacked counters, where the cumulative
- * total would silently include prior runs — the validated per-step sums stand
- * in. They cover only this run's steps, but a dropped `step_finish` can
+ * total would silently include prior runs — and for any run that resumed a
+ * session which already had usage, the validated per-step sums stand in: a
+ * sibling run on the same session can move the cumulative total, so only the
+ * run's own steps are attributable to it. They cover only this run's steps, but a dropped `step_finish` can
  * under-report them, so they are never marked complete.
  *
  * A zero cost with nonzero tokens means the model is unpriced, not free: the
@@ -378,10 +383,17 @@ export function reconcileOpenCodeRunUsage(input: {
 }): OpenCodeRunUsageReconciliation {
   const finalRecord = input.sessionUsageFinal ?? null;
   const cumulative = mergeOpenCodeSessionTotals(input.sessionUsage, finalRecord);
-  const baselineUsable = !input.resumedSession || input.sessionUsageBaseline !== null;
+  const baseline = input.sessionUsageBaseline;
+  const baselineHasUsage =
+    baseline !== null &&
+    (baseline.usage.inputTokens > 0 ||
+      baseline.usage.cachedInputTokens > 0 ||
+      baseline.usage.outputTokens > 0 ||
+      (baseline.costUsd ?? 0) > 0);
+  const startedSession = !input.resumedSession || (baseline !== null && !baselineHasUsage);
   const stepIssues = input.stepUsageIssues ?? [];
-  if (cumulative && baselineUsable) {
-    const delta = subtractOpenCodeSessionTotals(cumulative, input.sessionUsageBaseline);
+  if (cumulative && startedSession) {
+    const delta = subtractOpenCodeSessionTotals(cumulative, baseline);
     const complete = finalRecord !== null || (input.sessionUsage !== null && input.sessionUsageComplete !== false);
     const issues: string[] = [];
     let usage = delta.usage;
@@ -409,9 +421,11 @@ export function reconcileOpenCodeRunUsage(input: {
       issues,
     };
   }
-  const reason = cumulative
-    ? "resumed session has no pre-run usage baseline; step sums used"
-    : "session reported no usage; step sums used";
+  const reason = !cumulative
+    ? "session reported no usage; step sums used"
+    : baseline === null
+      ? "resumed session has no pre-run usage baseline; step sums used"
+      : "resumed session already had usage; this run's own step sums used";
   const stepTokens =
     input.stepUsage.inputTokens + input.stepUsage.cachedInputTokens + input.stepUsage.outputTokens;
   return {

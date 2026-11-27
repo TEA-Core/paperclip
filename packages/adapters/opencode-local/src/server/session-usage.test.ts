@@ -118,17 +118,82 @@ describe("reconcileOpenCodeRunUsage", () => {
     });
   });
 
-  it("subtracts the pre-run baseline on a resumed session", () => {
+  it("charges a resumed session that already had usage its own step sums", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(505, 41, 62, 0.06),
         sessionUsageBaseline: totals(500, 40, 60, 0.05),
         resumedSession: true,
         stepUsage: steps,
+        stepCostUsd: 0.01,
+      }),
+    ).toEqual({
+      usage: steps,
+      costUsd: 0.01,
+      usageBasis: "per_run",
+      source: "step_finish",
+      complete: false,
+      issues: ["resumed session already had usage; this run's own step sums used"],
+    });
+  });
+
+  it("charges overlapping resumed runs on one session their own steps, not each other's", () => {
+    // Runs A and B both resume session S at 100/10/20. A spends 50/5/10 and B
+    // 30/3/6, so S reads 180/18/36 when each finishes. Each run is charged its
+    // own step sums, exactly what the step-sum reporting charged before: 80 in
+    // total, never the 110 that cumulative-minus-own-baseline would charge.
+    const baseline = totals(100, 10, 20, 0.1);
+    const after = totals(180, 18, 36, 0.18);
+    const runA = reconcileOpenCodeRunUsage({
+      sessionUsage: after,
+      sessionUsageFinal: after,
+      sessionUsageBaseline: baseline,
+      resumedSession: true,
+      stepUsage: { inputTokens: 50, cachedInputTokens: 5, outputTokens: 10 },
+      stepCostUsd: 0.05,
+    });
+    const runB = reconcileOpenCodeRunUsage({
+      sessionUsage: after,
+      sessionUsageFinal: after,
+      sessionUsageBaseline: baseline,
+      resumedSession: true,
+      stepUsage: { inputTokens: 30, cachedInputTokens: 3, outputTokens: 6 },
+      stepCostUsd: 0.03,
+    });
+    expect(runA.usage).toEqual({ inputTokens: 50, cachedInputTokens: 5, outputTokens: 10 });
+    expect(runB.usage).toEqual({ inputTokens: 30, cachedInputTokens: 3, outputTokens: 6 });
+    expect(runA.usage.inputTokens + runB.usage.inputTokens).toBe(80);
+    expect(runA.costUsd! + runB.costUsd!).toBeCloseTo(0.08, 10);
+    expect([runA.usageBasis, runB.usageBasis]).toEqual(["per_run", "per_run"]);
+  });
+
+  it("names refused step counters on a resumed session's step sums", () => {
+    const reconciled = reconcileOpenCodeRunUsage({
+      sessionUsage: totals(505, 41, 62, 0.06),
+      sessionUsageBaseline: totals(500, 40, 60, 0.05),
+      resumedSession: true,
+      stepUsage: steps,
+      stepCostUsd: 0.01,
+      stepUsageIssues: ["step_finish #1: tokens.input refused (-5)"],
+    });
+    expect(reconciled.usage).toEqual(steps);
+    expect(reconciled.issues).toEqual([
+      "resumed session already had usage; this run's own step sums used",
+      "step_finish #1: tokens.input refused (-5)",
+    ]);
+  });
+
+  it("subtracts a zero baseline on a resumed session that had no usage yet", () => {
+    expect(
+      reconcileOpenCodeRunUsage({
+        sessionUsage: totals(5, 1, 2, 0.01),
+        sessionUsageBaseline: totals(0, 0, 0, 0),
+        resumedSession: true,
+        stepUsage: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2 },
         stepCostUsd: 0,
       }),
     ).toEqual(
-      expect.objectContaining({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, usageBasis: "per_run", source: "session_usage", costUsd: expect.closeTo(0.01, 10) }),
+      expect.objectContaining({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, source: "session_usage", complete: true, costUsd: 0.01 }),
     );
   });
 
@@ -216,7 +281,7 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(105, 20, 9, 0.5),
-        sessionUsageBaseline: totals(100, 20, 7, null),
+        sessionUsageBaseline: totals(0, 0, 0, null),
         resumedSession: true,
         stepUsage: steps,
         stepCostUsd: 0,
@@ -244,11 +309,11 @@ describe("reconcileOpenCodeRunUsage", () => {
 
   it("marks the usage complete from the final session record after a partial update", () => {
     const reconciled = reconcileOpenCodeRunUsage({
-      sessionUsage: totals(505, 41, 67, 0.05),
+      sessionUsage: totals(5, 1, 7, 0.005),
       sessionUsageComplete: false,
-      sessionUsageFinal: totals(509, 41, 67, 0.06),
-      sessionUsageBaseline: totals(500, 40, 60, 0.05),
-      resumedSession: true,
+      sessionUsageFinal: totals(9, 1, 7, 0.01),
+      sessionUsageBaseline: null,
+      resumedSession: false,
       stepUsage: steps,
       stepCostUsd: 0,
     });

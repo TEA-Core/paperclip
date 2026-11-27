@@ -1680,7 +1680,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMessageOverride: string | null = null,
     ): Promise<AdapterExecutionResult> => {
       // Reconciled usage wins when the serve transport produced it: it is
-      // scoped to this run (session cumulative minus pre-run baseline) and is
+      // scoped to this run (session totals for a run that started the session,
+      // its own validated step sums for a resumed one) and is
       // reported with `usageBasis: "per_run"` so the server passes it through.
       // Otherwise the step sums stand, exactly as before (no usageBasis).
       const reconciled = attempt.usageReconciliation;
