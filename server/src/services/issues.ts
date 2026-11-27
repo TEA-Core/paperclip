@@ -159,6 +159,7 @@ import {
 import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
   resolveProjectDefaultIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { isTerminalRecoveryAction as isTerminalRecoveryActionShared } from "./issue-continuation-path.js";
@@ -189,6 +190,49 @@ import { redactSensitiveText } from "../redaction.js";
  */
 export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionOptions) {
   return redactSecretTokens(redactCurrentUserText(body, opts));
+}
+
+const issuesWithRecordedLostFutureMonitorCheck = new WeakSet<object>();
+
+export function recordedLostFutureMonitorCheck(issue: object | null | undefined): boolean {
+  return !!issue && issuesWithRecordedLostFutureMonitorCheck.has(issue);
+}
+
+export async function logLostFutureMonitorCheck(
+  tx: Db,
+  before: typeof issues.$inferSelect,
+  after: typeof issues.$inferSelect,
+  attribution: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId" | "boardApiKeyId" | "agentApiKeyId">,
+  activityPublications?: ActivityPublication[],
+): Promise<boolean> {
+  const lostAt = before.monitorNextCheckAt;
+  if (
+    before.status === after.status ||
+    (after.status !== "done" && after.status !== "cancelled") ||
+    after.monitorNextCheckAt ||
+    !lostAt ||
+    lostAt.getTime() <= after.updatedAt.getTime()
+  ) {
+    return false;
+  }
+  const lostMonitorPolicy = normalizeIssueExecutionPolicy(before.executionPolicy ?? null)?.monitor;
+  const lostMonitorState = parseIssueExecutionState(before.executionState)?.monitor;
+  await logActivityInTransaction(tx, {
+    companyId: after.companyId,
+    ...attribution,
+    boardApiKeyId: attribution.boardApiKeyId,
+    action: "issue.monitor_cleared",
+    entityType: "issue",
+    entityId: after.id,
+    details: {
+      identifier: after.identifier ?? null,
+      previousNextCheckAt: lostAt.toISOString(),
+      recoveryPolicy: lostMonitorPolicy?.recoveryPolicy ?? lostMonitorState?.recoveryPolicy ?? null,
+      reason: "cleared_by_close_future_check",
+      notes: lostMonitorPolicy?.notes ?? before.monitorNotes ?? lostMonitorState?.notes ?? null,
+    },
+  }, activityPublications);
+  return true;
 }
 
 export const ISSUE_VERSION_CONFLICT_CODE = "issue_version_conflict";
@@ -270,6 +314,7 @@ import {
   logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
+  type LogActivityInput,
 } from "./activity-log.js";
 import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
@@ -12013,6 +12058,7 @@ export function issueService(
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        actorAgentApiKeyId?: string | null;
         boardApiKeyId?: string | null;
         /**
          * Internal only. Set by `provisionIssueExecutionWorkspace` when it writes
@@ -12094,6 +12140,7 @@ export function issueService(
         actorRunId,
         actorRunStopId,
         actorUserId,
+        actorAgentApiKeyId,
         boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
@@ -12554,6 +12601,7 @@ export function issueService(
       // the pre-transaction read. A lock that appears between those reads is
       // still cleared by the write, and the held wake must be promoted.
       const clearedExecutionRunId: { value: string | null } = { value: null };
+      const lostFutureMonitorCheckRecorded = { value: false };
 
       const runUpdate = async (tx: any) => {
         // The receipt baseline must be read under the same row lock as the
@@ -12809,6 +12857,16 @@ export function issueService(
           return null;
         }
         await recordChatCompletion(tx, receiptExisting, updated);
+        if (await logLostFutureMonitorCheck(tx as unknown as Db, receiptExisting, updated, {
+          actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+          actorId: actorAgentId ?? actorUserId ?? "issue_service",
+          boardApiKeyId: boardApiKeyId ?? null,
+          agentApiKeyId: actorAgentApiKeyId ?? null,
+          agentId: actorAgentId ?? null,
+          runId: actorAgentId ? actorRunId ?? null : null,
+        }, activityPublications)) {
+          lostFutureMonitorCheckRecorded.value = true;
+        }
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
         if (actorUserId && issueData.status !== undefined) {
@@ -13235,6 +13293,9 @@ export function issueService(
       }
       if (!isTransactionHandle(dbOrTx) && !postCommitActions) {
         await executeIssuePostCommitActions(db, ownedPostCommitActions);
+      }
+      if (result && lostFutureMonitorCheckRecorded.value) {
+        issuesWithRecordedLostFutureMonitorCheck.add(result);
       }
       return result;
     },

@@ -47,6 +47,8 @@ Read tools:
 - `paperclipGetIssue`
 - `paperclipGetHeartbeatContext`
 - `paperclipListComments`
+- `paperclipListIssueActivity` — returns `{ items }` in both text and structured content;
+  its output schema includes future-check cancellation records from issue close.
 - `paperclipGetComment`
 - `paperclipListIssueApprovals`
 - `paperclipListDocuments`

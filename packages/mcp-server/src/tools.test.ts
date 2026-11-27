@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createPaperclipMcpServer } from "./index.js";
 import { PaperclipApiClient } from "./client.js";
 import { createToolDefinitions } from "./tools.js";
 
@@ -139,6 +142,55 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain(
       "monitor cannot be combined with executionPolicy",
     );
+  });
+
+  it("returns issue activity with the future-check cancellation record intact", async () => {
+    const activity = {
+      id: "activity-1", companyId: "company-1", actorType: "agent", actorId: "agent-1",
+      agentId: "agent-1", runId: "run-1", action: "issue.monitor_cleared",
+      entityType: "issue", entityId: "issue-1", createdAt: "2026-11-25T20:38:28.132Z",
+      details: {
+        identifier: "PAP-1135", previousNextCheckAt: "2026-11-26T19:00:00.000Z",
+        recoveryPolicy: "wake_owner", reason: "cleared_by_close_future_check", notes: "Verify deployment tomorrow",
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([activity]));
+    vi.stubGlobal("fetch", fetchMock);
+    const { server } = createPaperclipMcpServer({
+      apiUrl: "http://localhost:3100/api", apiKey: "test-token", companyId: null, agentId: null, runId: null,
+    });
+    const client = new Client({ name: "activity-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const { tools } = await client.listTools();
+      const advertised = tools.find((tool) => tool.name === "paperclipListIssueActivity");
+      expect(advertised?.outputSchema).toMatchObject({
+        properties: { items: { items: { anyOf: [
+          { properties: { details: { properties: { reason: { const: "cleared_by_close_future_check" } } } } },
+          expect.anything(),
+        ] } } },
+      });
+      const response = await client.callTool({ name: "paperclipListIssueActivity", arguments: { issueId: "PAP-1135" } });
+      expect(String(fetchMock.mock.calls[0]![0])).toBe("http://localhost:3100/api/issues/PAP-1135/activity");
+      expect(response.structuredContent).toEqual({ items: [activity] });
+      const textResponse = z.object({
+        content: z.array(z.object({ type: z.literal("text"), text: z.string() })),
+      }).parse(response);
+      expect(JSON.parse(textResponse.content[0]!.text)).toEqual(response.structuredContent);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("returns an MCP error instead of activity data after an activity read denial", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockJsonResponse({ error: "Forbidden" }, 403)));
+    const response = await getTool("paperclipListIssueActivity").execute({ issueId: "PAP-1135" });
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ status: 403, body: { error: "Forbidden" } });
   });
 
   it("lists the company skill library with the default company id", async () => {

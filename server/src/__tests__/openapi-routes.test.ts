@@ -6,6 +6,9 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { z } from "zod";
+import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
+import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -501,6 +504,41 @@ describe("openapi routes", () => {
     );
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["409"]).toBeDefined();
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();
+  });
+
+  it("serves the future-monitor loss activity contract advertised by MCP", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    expect(res.status).toBe(200);
+    const api = res.body.paths["/api/issues/{id}/activity"].get.responses["200"]
+      .content["application/json"].schema.items.oneOf[0];
+    const tool = createToolDefinitions(new PaperclipApiClient({
+      apiUrl: "http://localhost:3100/api", apiKey: "test-token", companyId: null, agentId: null, runId: null,
+    })).find((candidate) => candidate.name === "paperclipListIssueActivity");
+    expect(tool?.outputSchema).toBeDefined();
+    const output = z.toJSONSchema(tool!.outputSchema!);
+    const required = ["identifier", "previousNextCheckAt", "recoveryPolicy", "reason", "notes"];
+    const actorType = { type: "string", enum: ["agent", "user", "system", "plugin"] };
+    const previousNextCheckAt = { type: "string", format: "date-time" };
+    const recoveryPolicy = { type: "string", enum: ["wake_owner", "create_recovery_issue", "escalate_to_board"] };
+    const reason = "cleared_by_close_future_check";
+    expect(api.properties.details).toMatchObject({
+      required, properties: { previousNextCheckAt, recoveryPolicy: { ...recoveryPolicy, nullable: true }, reason: { enum: [reason] } },
+    });
+    expect(api.properties.actorType).toEqual(actorType);
+    expect(api.required).toEqual(expect.arrayContaining(["actorType", "actorId", "agentId", "runId", "details"]));
+    expect(output).toMatchObject({
+      properties: { items: { items: { anyOf: [{
+        required: api.required,
+        properties: {
+          actorType,
+          details: { required, properties: {
+            previousNextCheckAt,
+            recoveryPolicy: { anyOf: [recoveryPolicy, { type: "null" }] },
+            reason: { const: reason },
+          } },
+        },
+      }, expect.anything()] } } },
+    });
   });
 
   it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
