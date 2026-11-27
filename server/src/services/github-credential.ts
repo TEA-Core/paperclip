@@ -158,8 +158,12 @@ async function ghAppFetch(
     GH_FETCH_TIMEOUT_MS,
   );
   try {
+    // `redirect: "error"`: a 3xx from the App API is never followed. Following one would
+    // re-send the App JWT to wherever the Location points and turn a refused lookup into a
+    // different request than the one the caller authorized; fail closed instead.
     const res = await fetch(`${GH_API_BASE}${path}`, {
       method,
+      redirect: "error",
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${jwt}`,
@@ -242,6 +246,17 @@ export async function resolveAppInstallationToken(
   const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}:${permissionsKey}`;
   const now = Date.now();
 
+  // Refuse, before any secret read or network call, an owner/repo the wire could read
+  // differently than the caller's check did (see githubRepoNameProblem).
+  if (owner && repo) {
+    const problem = githubRepoNameProblem(owner, repo);
+    if (problem) {
+      logger.warn({ companyId, problem }, "GitHub App installation token refused: owner/repo is not a GitHub name");
+      return null;
+    }
+  }
+  const requireExactScope = Boolean(owner && repo) && isReadOnlyRepoPermissions(permissions);
+
   const cached = appTokenCache.get(cacheKey);
   if (cached && !isExpired(cached, now)) {
     return {
@@ -294,7 +309,15 @@ export async function resolveAppInstallationToken(
   let installationId: string;
   try {
     if (owner && repo) {
-      const installation = await ghAppFetch(`/repos/${owner}/${repo}/installation`, jwt, "GET", undefined, signal);
+      // Each segment is percent-encoded so the path GitHub routes on is exactly the
+      // owner/repo the caller checked: no `?`, `#`, `/` or dot-segment can re-shape it.
+      const installation = await ghAppFetch(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/installation`,
+        jwt,
+        "GET",
+        undefined,
+        signal,
+      );
       installationId = String(installation.id);
     } else {
       const installations = await ghAppFetch(`/app/installations`, jwt, "GET", undefined, signal);
@@ -335,10 +358,10 @@ export async function resolveAppInstallationToken(
   if (permissions) mintBody.permissions = permissions;
   if (owner && repo) mintBody.repositories = [repo];
 
-  let tokenResponse: { token: string; expires_at: string };
+  let tokenResponse: { token: string; expires_at: string; repositories?: unknown; permissions?: unknown };
   try {
     tokenResponse = await ghAppFetch(
-      `/app/installations/${installationId}/access_tokens`,
+      `/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
       jwt,
       "POST",
       Object.keys(mintBody).length > 0 ? mintBody : undefined,
@@ -360,6 +383,17 @@ export async function resolveAppInstallationToken(
     logger.warn(
       { companyId, secretName: app.privateKeySecretName },
       "GitHub App returned empty token; falling back to PAT",
+    );
+    return null;
+  }
+
+  // A read-only single-repo mint (the writer-Auditor assurance shape) is only as narrow as
+  // GitHub actually made it: the response must name exactly the requested repository and
+  // exactly the requested permissions, or the token is refused — neither returned nor cached.
+  if (requireExactScope && !mintResponseMatchesReadOnlyRepo(tokenResponse, owner!, repo!)) {
+    logger.warn(
+      { companyId, secretName: app.privateKeySecretName, owner, repo },
+      "GitHub App minted a token whose scope is not exactly the requested read-only single repo; refusing it",
     );
     return null;
   }
@@ -438,6 +472,11 @@ export async function resolveGitHubToken(
  * Normalize a workspace repoUrl to lowercase `owner/repo` so rows can be
  * compared exactly, regardless of URL scheme, host, `.git` suffix, trailing
  * slash, or casing. GitHub owner/repo references are case-insensitive.
+ *
+ * This deliberately ERASES the host: `https://gitlab.example.com/owner/repo`
+ * and `https://github.com/owner/repo` normalize to the same string. Callers
+ * that depend on that collapse keep using it; any comparison that must not
+ * treat those two as the same repository uses {@link parseRepoUrlRef}.
  */
 export function normalizeRepoUrl(repoUrl: string): string {
   let normalized = repoUrl.trim();
@@ -446,6 +485,168 @@ export function normalizeRepoUrl(repoUrl: string): string {
   normalized = normalized.replace(/\/+$/, "");
   normalized = normalized.replace(/\.git$/i, "");
   return normalized.toLowerCase();
+}
+
+/** The host a workspace registration must carry to be eligible for a GitHub assurance mint (SUP-23880). */
+export const GITHUB_CANONICAL_HOST = "github.com";
+
+/**
+ * A workspace repoUrl split into host + `owner/repo` segments WITHOUT erasing
+ * host identity — the host-aware counterpart of {@link normalizeRepoUrl}.
+ * Casing of owner/repo is preserved as registered; only the host is lowercased
+ * (hosts are case-insensitive). The `.git` suffix and trailing slash are part
+ * of a clone URL's spelling, not of the repository's identity, so they are
+ * stripped from the canonical repo segment.
+ */
+export interface RepoUrlRef {
+  /** Lowercased host as written in the URL; "" for a bare `owner/repo` form with no host at all. */
+  host: string;
+  /** Owner segment with the casing it was registered with. */
+  owner: string;
+  /** Repo segment with the casing it was registered with, `.git` suffix and trailing slash stripped. */
+  repo: string;
+}
+
+/**
+ * Parse a workspace repoUrl into {@link RepoUrlRef}. Returns null for anything
+ * that is not exactly one host (or none) followed by exactly `owner/repo` —
+ * deeper paths, empty segments — so authorization comparisons fail closed
+ * instead of half-matching.
+ *
+ * Only HTTP(S) URLs and the scp-like `user@host:owner/repo` form are supported
+ * transports (SUP-23892): any other URI scheme (`file://github.com/…`,
+ * `ssh://…`, `ftp://…`) returns null BEFORE the host is considered, so an
+ * unsupported transport cannot lend a well-known host's identity — notably
+ * GitHub's — to a URL that is not a GitHub workspace URL.
+ *
+ * The URL form must also read the same under the WHATWG URL parser (the one
+ * `fetch`, git's HTTP stack and browsers agree with): its host and path must
+ * equal what the pattern read, or the URL is null. Without that, a string such
+ * as `https://attacker.example\@github.com/o/r` reads as host `github.com` to
+ * the pattern but `attacker.example` to every real client.
+ */
+export function parseRepoUrlRef(repoUrl: string): RepoUrlRef | null {
+  const trimmed = repoUrl.trim();
+  if (!trimmed) return null;
+  // URL form: http(s)://[userinfo@]host/owner/repo — .git suffix and trailing slash optional.
+  // The scheme is pinned to https/http: any other scheme fails closed here rather
+  // than parsing into a host that could impersonate a supported one.
+  const urlForm =
+    /^https?:\/\/(?:[^/@]+@)?([^/?#]+)(\/([^/?#]+)\/([^/?#]+?)(?:\.git)?\/?)$/i.exec(trimmed);
+  if (urlForm) {
+    let whatwg: URL;
+    try {
+      whatwg = new URL(trimmed);
+    } catch {
+      return null;
+    }
+    // The ref carries the host a real client contacts (WHATWG), and only when the pattern
+    // read that same host and path: IDNA-mapped, percent-decoded or tab-stripped hosts and
+    // any userinfo that WHATWG reads as a delimiter all disagree here and fail closed.
+    if (
+      whatwg.host !== urlForm[1]!.toLowerCase() ||
+      whatwg.pathname !== urlForm[2] ||
+      whatwg.search !== "" ||
+      whatwg.hash !== ""
+    ) {
+      return null;
+    }
+    return { host: whatwg.host, owner: urlForm[3]!, repo: urlForm[4]! };
+  }
+  // scp-like form: user@host:owner/repo
+  const scpForm = /^[\w.@-]+@([\w.-]+):([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(trimmed);
+  if (scpForm) {
+    return { host: scpForm[1]!.toLowerCase(), owner: scpForm[2]!, repo: scpForm[3]! };
+  }
+  // Bare owner/repo: carries no host, so a caller requiring host identity must fail closed on it.
+  const bare = /^([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(trimmed);
+  if (bare) {
+    return { host: "", owner: bare[1]!, repo: bare[2]! };
+  }
+  return null;
+}
+
+/**
+ * The canonical GitHub owner/repo of a workspace registration, or null when the
+ * URL is not GitHub-hosted — any host other than exactly `github.com`,
+ * including a hostless bare `owner/repo` form, and any URI that places
+ * `github.com` after an unsupported transport such as `file://` (the parser
+ * refuses unsupported schemes before the host is compared, SUP-23892). The
+ * writer-Auditor assurance mint authorizes only against this ref: the
+ * request's owner/repo must equal the returned strings exactly, so aliases
+ * (different casing, trailing `.git`, URL-form owner, trailing whitespace)
+ * refuse instead of normalizing into an authorization match. A ref whose
+ * owner/repo is not a wire-safe GitHub name ({@link githubRepoNameProblem}) is
+ * null too, so a canonical ref always reaches GitHub byte-for-byte as checked.
+ */
+export function canonicalGitHubRepoRef(repoUrl: string): RepoUrlRef | null {
+  const ref = parseRepoUrlRef(repoUrl);
+  if (!ref || ref.host !== GITHUB_CANONICAL_HOST) return null;
+  return githubRepoNameProblem(ref.owner, ref.repo) ? null : ref;
+}
+
+/** GitHub's own name limits: an account/organization login is at most 39 characters, a repository name at most 100. */
+const GITHUB_OWNER_MAX_LENGTH = 39;
+const GITHUB_REPO_MAX_LENGTH = 100;
+
+// Control characters, any whitespace, `%` and `\`: every one is read differently by some
+// layer between the check and GitHub (WHATWG strips tabs/newlines, decodes `%XX`, treats
+// `\` as `/`), and none can appear in a real GitHub owner or repository name.
+const UNSAFE_GITHUB_NAME_CHARS = /[\p{Cc}\s%\\]/u;
+
+/**
+ * Why `owner`/`repo` cannot be sent to the GitHub API as-is, or null when both are
+ * wire-safe: no unsafe character, not a `.`/`..` path segment, and within GitHub's
+ * length limits. The message names the segment and rule only, never the value.
+ */
+function githubRepoNameProblem(owner: string, repo: string): string | null {
+  for (const [segment, value, max] of [
+    ["owner", owner, GITHUB_OWNER_MAX_LENGTH],
+    ["repo", repo, GITHUB_REPO_MAX_LENGTH],
+  ] as const) {
+    if (value.length > max) return `${segment} exceeds GitHub's ${max}-character limit`;
+    if (UNSAFE_GITHUB_NAME_CHARS.test(value)) {
+      return `${segment} contains a control character, whitespace, percent sign or backslash`;
+    }
+    if (value === "." || value === "..") return `${segment} is a dot path segment`;
+  }
+  return null;
+}
+
+/** The read-only single-repository permission set the writer-Auditor assurance mint requests (SUP-23880). */
+export const GITHUB_READ_ONLY_REPO_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({
+  contents: "read",
+  metadata: "read",
+});
+
+/** True when `permissions` is exactly {@link GITHUB_READ_ONLY_REPO_PERMISSIONS}: no other key, no other level. */
+function isReadOnlyRepoPermissions(permissions: unknown): boolean {
+  if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) return false;
+  const entries = Object.entries(permissions);
+  const expected = Object.entries(GITHUB_READ_ONLY_REPO_PERMISSIONS);
+  return (
+    entries.length === expected.length &&
+    expected.every(([name, level]) => (permissions as Record<string, unknown>)[name] === level)
+  );
+}
+
+/**
+ * True when a mint response grants exactly the read-only single-repo scope requested:
+ * one repository whose name and owner/name match (case-insensitively, as GitHub names
+ * do) and exactly {@link GITHUB_READ_ONLY_REPO_PERMISSIONS}. A missing field is a mismatch.
+ */
+function mintResponseMatchesReadOnlyRepo(
+  response: { repositories?: unknown; permissions?: unknown },
+  owner: string,
+  repo: string,
+): boolean {
+  const repositories = response.repositories;
+  if (!Array.isArray(repositories) || repositories.length !== 1) return false;
+  const granted = repositories[0] as { name?: unknown; full_name?: unknown } | null;
+  if (typeof granted?.name !== "string" || typeof granted.full_name !== "string") return false;
+  if (granted.name.toLowerCase() !== repo.toLowerCase()) return false;
+  if (granted.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) return false;
+  return isReadOnlyRepoPermissions(response.permissions);
 }
 
 export async function resolveGitHubTokenCandidatesForRepo(
