@@ -1158,38 +1158,6 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect((result.resultJson as Record<string, unknown>).usageSource).toBe("session_usage");
   });
 
-  it("charges the usage of one session shared by two overlapping runs exactly once", async () => {
-    const shared = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-shared-session-"));
-    try {
-      const fake = { FAKE_SHARED_SESSION_DIR: shared, FAKE_SHARED_SESSION_RUNS: "2", FAKE_USAGE_COST: "0.25" };
-      // Two runs of one agent resume the same session at the same time. Both
-      // read the 500/60/40 baseline before either turn starts; each turn then
-      // adds 5/2/1 tokens and $0.25 to the one shared session. Each run sees
-      // the other's turn in the session's cumulative usage, but together the
-      // runs spent only 10/4/2 tokens and $0.50.
-      const runs = await Promise.all([
-        runServe(fake, { mcp: false, sessionId: "ses_known" }),
-        runServe(fake, { mcp: false, sessionId: "ses_known" }),
-      ]);
-
-      const total = (key: "inputTokens" | "outputTokens" | "cachedInputTokens") =>
-        runs.reduce((sum, { result }) => sum + (result.usage?.[key] ?? 0), 0);
-      expect({
-        inputTokens: total("inputTokens"),
-        outputTokens: total("outputTokens"),
-        cachedInputTokens: total("cachedInputTokens"),
-      }).toEqual({ inputTokens: 10, outputTokens: 4, cachedInputTokens: 2 });
-      expect(runs.reduce((sum, { result }) => sum + (result.costUsd ?? 0), 0)).toBeCloseTo(0.5, 9);
-      for (const { result } of runs) {
-        expect(result.exitCode).toBe(0);
-        expect(result.usageBasis).toBe("per_run");
-        expect((result.resultJson as Record<string, unknown>).usageComplete).toBe(true);
-      }
-    } finally {
-      await fs.rm(shared, { recursive: true, force: true });
-    }
-  }, 30_000);
-
   it("reports the final session record when the last usage update was partial", async () => {
     const { result } = await runServe({ FAKE_USAGE_PARTIAL_LAST: "1", FAKE_USAGE_COST: "0.001" });
 

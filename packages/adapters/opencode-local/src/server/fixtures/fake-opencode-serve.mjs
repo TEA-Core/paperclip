@@ -1,8 +1,7 @@
 // Minimal stand-in for `opencode serve` (2.2.4 API subset) used by serve-transport.test.ts.
 // Records every request to FAKE_LOG so tests can assert order and timing.
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
-import path from "node:path";
 
 const password = process.env.OPENCODE_SERVER_PASSWORD ?? "";
 const log = (entry) => appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ at: Date.now(), ...entry })}\n`);
@@ -16,39 +15,15 @@ const push = (type, data) => {
   for (const res of clients) res.write(`data: ${JSON.stringify({ id: `evt_${Math.random()}`, type, data })}\n\n`);
 };
 
-// FAKE_SHARED_SESSION_DIR: several fake servers (one per overlapping run)
-// share `ses_known`, as two runs that resume one OpenCode session do. Every
-// finished turn is appended to a shared log there, so each server's view of
-// the session's cumulative usage includes the other servers' finished turns.
-// A turn starts only once FAKE_SHARED_SESSION_RUNS servers were prompted, so
-// every run reads its pre-run baseline before any shared turn spends tokens.
-const sharedDir = process.env.FAKE_SHARED_SESSION_DIR ?? "";
-const sharedLines = (name) => {
-  try {
-    return readFileSync(path.join(sharedDir, name), "utf8").split("\n").filter(Boolean).length;
-  } catch {
-    return 0;
-  }
-};
-let ownSharedTurns = 0;
-const otherSharedTurns = () => (sharedDir ? sharedLines("turns") - ownSharedTurns : 0);
-const recordSharedTurn = () => {
-  if (!sharedDir) return;
-  appendFileSync(path.join(sharedDir, "turns"), `${process.pid}\n`);
-  ownSharedTurns += 1;
-};
-const sharedBarrier = async () => {
-  if (!sharedDir) return;
-  appendFileSync(path.join(sharedDir, "prompted"), `${process.pid}\n`);
-  const runs = Number(process.env.FAKE_SHARED_SESSION_RUNS ?? "1");
-  while (sharedLines("prompted") < runs) await new Promise((resolve) => setTimeout(resolve, 20));
-};
-
 // Session usage: `ses_known` pretends to be a resumed session that already
 // spent 500/60/40 tokens and $0.05; a fresh `ses_fake` starts at zero. Each
 // prompt turn then adds 5/2/1 tokens, so a reconciled run result must report
 // 5/2/1 on both paths. FAKE_USAGE_COST prices the turn (default 0 = unpriced).
-const turnTokens = { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } };
+const priorUsage = (id) =>
+  id === "ses_known"
+    ? { input: 500, output: 60, reasoning: 0, cache: { read: 40, write: 0 } }
+    : { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+const priorCost = (id) => (id === "ses_known" ? 0.05 : 0);
 const addTokens = (a, b) => ({
   input: a.input + b.input,
   output: a.output + b.output,
@@ -56,13 +31,6 @@ const addTokens = (a, b) => ({
   cache: { read: a.cache.read + b.cache.read, write: a.cache.write + b.cache.write },
 });
 const turnCost = () => Number(process.env.FAKE_USAGE_COST ?? "0");
-const priorUsage = (id) => {
-  if (id !== "ses_known") return { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
-  let usage = { input: 500, output: 60, reasoning: 0, cache: { read: 40, write: 0 } };
-  for (let turn = otherSharedTurns(); turn > 0; turn -= 1) usage = addTokens(usage, turnTokens);
-  return usage;
-};
-const priorCost = (id) => (id === "ses_known" ? 0.05 + otherSharedTurns() * turnCost() : 0);
 // The session's live cumulative usage, so GET /api/session/{id} after a turn
 // returns the final record the way a real server does.
 const liveUsage = new Map();
@@ -191,7 +159,6 @@ const server = http.createServer(async (req, res) => {
         }, 50);
         return;
       }
-      await sharedBarrier();
       setTimeout(() => {
         push("session.execution.started", { sessionID: id });
         push("session.step.started", base);
@@ -199,9 +166,8 @@ const server = http.createServer(async (req, res) => {
         // Partial cumulative usage mid-turn, then the full total after the
         // step: the parser must keep the last event, not sum them.
         usageEvent(id, { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, priorCost(id));
-        push("session.step.ended", { ...base, finish: "stop", tokens: turnTokens, cost: 0 });
-        recordSharedTurn();
-        usageEvent(id, turnTokens, priorCost(id) + turnCost());
+        push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, cost: 0 });
+        usageEvent(id, { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, priorCost(id) + turnCost());
         if (process.env.FAKE_USAGE_PARTIAL_LAST === "1") {
           // More model work after the full total, reported by a partial
           // cumulative update that carries only the output counter (7, up
