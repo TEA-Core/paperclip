@@ -41,8 +41,9 @@ import { buildPaperclipWakePayload, heartbeatService, isNeverLaunchedDispatchRun
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
-import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueRecoveryActionService, type UpsertIssueRecoveryActionInput } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 // SUP-21902: the done-transition guard resolves a company GitHub token and
@@ -4458,6 +4459,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it("wakes dependents blocked on the source issue when recovery resolution closes it", async () => {
     const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
     const dependentIssueId = randomUUID();
+    // The dependent re-blocked (generation 2) after a completed canonical wake
+    // that was requested in its earlier generation; that wake must not
+    // suppress the cascade for the current generation.
+    const generationTwoAt = new Date(Date.now() - 60 * 60 * 1000);
     await db.insert(issues).values({
       id: dependentIssueId,
       companyId,
@@ -4467,12 +4472,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: coderId,
       issueNumber: 2,
       identifier: `${prefix}-2`,
+      blockedTransitionAt: generationTwoAt,
     });
     await db.insert(issueRelations).values({
       companyId,
       issueId: sourceIssueId,
       relatedIssueId: dependentIssueId,
       type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: coderId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId,
+        blockerIssueIds: [sourceIssueId],
+      }),
+      requestedAt: new Date(generationTwoAt.getTime() - 60 * 60 * 1000),
+      updatedAt: new Date(generationTwoAt.getTime() + 30 * 60 * 1000),
     });
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -5721,6 +5741,324 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(afterSweep?.outcome).toBe("exhausted");
     expect(afterSweep?.attemptCount).toBe(5);
     expect(afterSweep?.maxAttempts).toBe(5);
+  });
+
+  // -- SUP-24251 (redo of SUP-22273): re-mint depth cap while the owner is live --
+
+  async function seedOwnerRun(companyId: string, agentId: string, startedAt: Date) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "succeeded",
+      startedAt,
+      finishedAt: startedAt,
+    });
+  }
+
+  // Fakes Date three hours back; the returned `at(n)` is n minutes after that anchor.
+  function startRemintClock() {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const anchor = new Date(Date.now() - 3 * 60 * 60_000);
+    vi.setSystemTime(anchor);
+    return (minutes: number) => new Date(anchor.getTime() + minutes * 60_000);
+  }
+
+  // The SUP-21709 lineage: the first action walked to the ceiling and the
+  // recovery owner (an agent, not the board) resolved it `restored`.
+  async function seedAgentRestoredAtCeiling(input: UpsertIssueRecoveryActionInput) {
+    const svc = issueRecoveryActionService(db);
+    const first = await svc.upsertSourceScoped(input);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    const restored = await svc.resolveActiveForIssue({
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      fingerprint: input.fingerprint,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Recovery owner restored the execution path.",
+    });
+    expect(restored?.id).toBe(first.id);
+  }
+
+  function reviewParticipantRemintInput(input: { companyId: string; sourceIssueId: string; ownerAgentId: string }) {
+    return {
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: input.ownerAgentId,
+      cause: "execution_review_participant_recovery",
+      fingerprint: `source_scoped_recovery:${input.companyId}:${input.sourceIssueId}:execution_review_participant_recovery`,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+  }
+
+  it("SUP-24251 T4: pins re-mint depth one below the ceiling across agent restored resolves while the owner is live", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const input = reviewParticipantRemintInput({ companyId, sourceIssueId, ownerAgentId: managerId });
+      await seedAgentRestoredAtCeiling(input);
+
+      await seedOwnerRun(companyId, managerId, at(10));
+      vi.setSystemTime(at(20));
+      const firstRemint = await svc.upsertSourceScoped(input);
+      vi.setSystemTime(at(30));
+      await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        fingerprint: input.fingerprint,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "Recovery owner restored the execution path again.",
+      });
+      await seedOwnerRun(companyId, managerId, at(40));
+      vi.setSystemTime(at(50));
+      const secondRemint = await svc.upsertSourceScoped(input);
+
+      // Without the cap both re-mints are born terminal at 5/5 (the run-agnostic
+      // ceiling) because an agent `restored` resolve opens no fresh budget.
+      expect(
+        [firstRemint, secondRemint].map(({ status, outcome, attemptCount }) => ({ status, outcome, attemptCount })),
+      ).toEqual([
+        { status: "active", outcome: null, attemptCount: 4 },
+        { status: "active", outcome: null, attemptCount: 4 },
+      ]);
+
+      // The reserved attempt survives the stale-wake sweep: the owner ran after
+      // the predecessor's restore, so the sweep holds instead of burning 4 -> 5.
+      vi.setSystemTime(at(60));
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 60_000 });
+      expect(sweep).toMatchObject({ skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 });
+      const [afterSweep] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, secondRemint.id));
+      expect(afterSweep).toMatchObject({ status: "active", outcome: null, attemptCount: 4 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251 T4: a board reset still opens a fresh attempt budget while the owner is live", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const input = reviewParticipantRemintInput({ companyId, sourceIssueId, ownerAgentId: managerId });
+      const first = await svc.upsertSourceScoped(input);
+      // The sweep's exhaustion stamp: escalated, exhausted, maxAttempts persisted.
+      await db
+        .update(issueRecoveryActions)
+        .set({ status: "escalated", outcome: "exhausted", attemptCount: 5, maxAttempts: 5, ownerType: "board", ownerAgentId: null })
+        .where(eq(issueRecoveryActions.id, first.id));
+      vi.setSystemTime(at(10));
+      const cleared = await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        fingerprint: input.fingerprint,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "Board granted a fresh budget.",
+        boardResolution: true,
+      });
+      expect(cleared?.id).toBe(first.id);
+      await seedOwnerRun(companyId, managerId, at(20));
+
+      vi.setSystemTime(at(30));
+      const successor = await svc.upsertSourceScoped(input);
+
+      expect(successor).toMatchObject({ status: "active", outcome: null, attemptCount: 1 });
+      expect(successor.evidence.lineageReset).toBeTruthy();
+      expect(successor.lastAttemptAt ? new Date(successor.lastAttemptAt).toISOString() : null).toBe(at(30).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { label: "the owner has not run since the predecessor's last update", kind: "stranded_assigned_issue" as const, ownerRunMinute: -10 },
+    { label: "the kind is not a stranded-participant kind", kind: "missing_disposition" as const, ownerRunMinute: 10 },
+  ])("SUP-24251: a re-mint at the ceiling still mints terminal when $label", async ({ kind, ownerRunMinute }) => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const input = { ...reviewParticipantRemintInput({ companyId, sourceIssueId, ownerAgentId: managerId }), kind };
+      await seedAgentRestoredAtCeiling(input);
+      await seedOwnerRun(companyId, managerId, at(ownerRunMinute));
+
+      vi.setSystemTime(at(20));
+      const successor = await svc.upsertSourceScoped(input);
+
+      expect(successor).toMatchObject({ status: "escalated", outcome: "exhausted", attemptCount: 5, maxAttempts: 5 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: caps a board-owned review_stage_unarmed re-mint while its pending participant is live", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const input = {
+        companyId,
+        sourceIssueId,
+        kind: "review_stage_unarmed" as const,
+        ownerType: "board" as const,
+        ownerAgentId: null,
+        previousOwnerAgentId: coderId,
+        cause: "review_stage_unarmed",
+        fingerprint: `review_stage_unarmed:${companyId}:${sourceIssueId}`,
+        nextAction: "Re-arm the pending review stage.",
+        wakePolicy: null,
+      };
+      await seedAgentRestoredAtCeiling(input);
+      await seedOwnerRun(companyId, coderId, at(10));
+
+      vi.setSystemTime(at(20));
+      const successor = await svc.upsertSourceScoped(input);
+
+      expect(successor).toMatchObject({ status: "active", outcome: null, attemptCount: 4 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: an explicit attemptCount re-mint keeps its own count and wake clock while the owner is live", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const input = reviewParticipantRemintInput({ companyId, sourceIssueId, ownerAgentId: managerId });
+      await seedAgentRestoredAtCeiling(input);
+      await seedOwnerRun(companyId, managerId, at(10));
+
+      vi.setSystemTime(at(20));
+      const successor = await svc.upsertSourceScoped({ ...input, attemptCount: 2 });
+
+      expect(successor).toMatchObject({ status: "active", attemptCount: 2 });
+      expect(successor.lastAttemptAt ? new Date(successor.lastAttemptAt).toISOString() : null).toBe(at(20).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The production escalation path: the first execution_review_participant_recovery
+  // action, routed to the coder's manager, walked to the ceiling and resolved
+  // `restored` by the recovery owner at minute 0. The coder's failed review run
+  // stays the issue's latest run, so every re-park below cites it again.
+  async function seedRestoredReviewParticipantEscalation() {
+    const fixture = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssue } = fixture;
+    const svc = issueRecoveryActionService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssue.id));
+    const [reviewIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssue.id, status: "failed" });
+    const escalate = (opts: { boardEscalation?: boolean } = {}) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue: reviewIssue!,
+        previousStatus: "in_review",
+        latestRun: {
+          id: runId,
+          agentId: coderId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { issueId: sourceIssue.id },
+          livenessState: "needs_followup",
+        },
+        recoveryCause: "execution_review_participant_recovery",
+        ...opts,
+      });
+
+    await escalate();
+    const first = await svc.getActiveForIssue(companyId, sourceIssue.id);
+    expect(first).toMatchObject({ status: "active", ownerAgentId: managerId, attemptCount: 1 });
+    await db.update(issueRecoveryActions).set({ attemptCount: 5 }).where(eq(issueRecoveryActions.id, first!.id));
+    const restored = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      actionId: first!.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Recovery owner restored the review participant.",
+    });
+    expect(restored?.id).toBe(first!.id);
+    const [predecessor] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, first!.id));
+    return { ...fixture, svc, recovery, escalate, predecessorUpdatedAt: predecessor!.updatedAt };
+  }
+
+  it("SUP-24251: a capped escalation re-mint starts its wake clock at the predecessor, so a lost wake does not burn the reserved attempt", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId, svc, recovery, escalate, predecessorUpdatedAt } =
+        await seedRestoredReviewParticipantEscalation();
+      await seedOwnerRun(companyId, managerId, at(10));
+
+      // The escalation path passes `lastAttemptAt: now`; its wake is lost (no run).
+      vi.setSystemTime(at(20));
+      await escalate();
+      const successor = await svc.getActiveForIssue(companyId, sourceIssueId);
+      expect(successor).toMatchObject({ status: "active", ownerAgentId: managerId, attemptCount: 4 });
+      expect(successor!.lastAttemptAt ? new Date(successor!.lastAttemptAt).toISOString() : null)
+        .toBe(predecessorUpdatedAt.toISOString());
+
+      // Past the 4 x 5 min backoff each time: only the live-owner hold stops a burn.
+      const sweeps = [];
+      for (const minute of [51, 82]) {
+        vi.setSystemTime(at(minute));
+        sweeps.push(await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 }));
+      }
+      expect(sweeps.map(({ skippedOwnerLive, reFired, maxAttemptsReached }) => ({ skippedOwnerLive, reFired, maxAttemptsReached })))
+        .toEqual([
+          { skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+          { skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+        ]);
+      const [afterSweeps] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, successor!.id));
+      expect(afterSweeps).toMatchObject({ status: "active", outcome: null, attemptCount: 4 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: a board-owned escalation re-mint caps on its live pending participant, not the predecessor's idle owner", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, coderId, sourceIssueId, svc, escalate, predecessorUpdatedAt } =
+        await seedRestoredReviewParticipantEscalation();
+      // The pending participant runs (on another card); the predecessor's owner does not.
+      await seedOwnerRun(companyId, coderId, at(10));
+
+      vi.setSystemTime(at(20));
+      await escalate({ boardEscalation: true });
+      const successor = await svc.getActiveForIssue(companyId, sourceIssueId);
+
+      // Without the participant-first check this mints escalated, exhausted, 5/5.
+      expect(successor).toMatchObject({
+        status: "active",
+        outcome: null,
+        ownerType: "board",
+        ownerAgentId: null,
+        previousOwnerAgentId: coderId,
+        attemptCount: 4,
+      });
+      expect(successor!.lastAttemptAt ? new Date(successor!.lastAttemptAt).toISOString() : null)
+        .toBe(predecessorUpdatedAt.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not reset an exhausted escalated action to active on re-mint", async () => {

@@ -19,6 +19,8 @@ const runner: CommandManagedRuntimeRunner = {
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
       signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null,
     }));
+    // The child may exit before stdin is flushed; ignore the resulting EPIPE.
+    child.stdin?.on("error", () => {});
     child.stdin?.end(input.stdin ?? "");
   }),
 };

@@ -12,6 +12,7 @@ import {
   issueComments,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issues,
   projects,
@@ -34,6 +35,7 @@ import {
   type CandidateRow,
 } from "./approval-status-reconciler.js";
 import { clearAutoMergeDisarmRecord, recordPendingAutoMergeDisarm } from "./merge-arming.js";
+import { disarmTiming } from "./auto-merge-disarm.js";
 
 // SUP-15851 C1: `latestDecisionPerStage` is a pure helper (rows in, one Map by
 // stage out); this probe needs no DB and runs regardless of embedded-Postgres
@@ -430,6 +432,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   let db: Db;
   let companyId: string;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const promptDelays = disarmTiming.promptDelaysMs;
 
   function approvedState(overrides: Record<string, unknown> = {}) {
     return {
@@ -498,6 +501,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   beforeEach(async () => {
+    // Exercise the tick explicitly; do not leak prompt retries past fixture cleanup.
+    disarmTiming.promptDelaysMs = [];
     vi.resetAllMocks();
 
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -545,6 +550,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   afterEach(async () => {
+    disarmTiming.promptDelaysMs = promptDelays;
     // SUP-15211: clear audit rows first (they FK-reference the company).
     await db.delete(activityLog);
     await db.delete(issueDeliveryReceiptLinks);
@@ -1013,6 +1019,62 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments.map((c) => c.body)).toEqual([
         expect.stringMatching(/^\[Merge-arming\] armed: Auto-merge enabled for TEA-Core\/paperclip#42/),
       ]);
+    });
+
+    // SUP-24085 F1-later: the current decision was admitted over a card with
+    // no open PR and certified no head. A PR linked later, even with a ready
+    // receipt, must not be stamped by the reconciler for that decision.
+    it("skips an uncertified no-pr decision and never stamps its later-linked PR (SUP-24085 F1-later)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+            finalDeliveryUncertified: { decisionId: "decision-42", reason: "no-pr: no open linked PR resolvable at decision time" },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["head_uncertified"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      const [receipt] = await db.select().from(issueDeliveryReceipts);
+      expect(receipt?.state).toBe("ready");
+    });
+
+    it("still republishes when the uncertified tag belongs to an earlier decision (SUP-24085)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+            finalDeliveryUncertified: { decisionId: "decision-old", reason: "no-pr: no open linked PR resolvable at decision time" },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
     });
 
     it("SUP-15459: a mid-ladder approved card is skipped:non-terminal-ladder and never re-stamps paperclip/approved", async () => {
@@ -3280,6 +3342,47 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.authorType).toBe("system");
     });
 
+    it.each([0, 1, 2])("returns each re-arm slot refused by a current child-only attribution after %s prior attempts", async (priorAttempts) => {
+      const issueId = await insertIssue({ executionState: approvedState({
+        approvalStatus: {
+          publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+          armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts, at: APPROVED_AT },
+        },
+      }) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      const ancestorId = await insertIssue({ identifier: "SUP-900", status: "backlog", executionState: {} });
+      const [proof] = await db.insert(issueChildCarrierAttributions).values({
+        companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+        owner: "tea-core", repo: "paperclip", pullRequestNumber: 42,
+        branchName: "SUP-42-branch", headSha: NEW_HEAD, commitShas: [NEW_HEAD],
+        writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+      }).returning();
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      for (let tick = 0; tick < 4; tick += 1) {
+        const summary = await runApprovalStatusReconcilerTick(db);
+        expect(summary.rearmDetails).toHaveLength(1);
+        expect(summary.rearmDetails[0]).toContain("child-carrier-attribution");
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(row!.executionState?.approvalStatus).toMatchObject({
+          armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts },
+          armOutcome: { kind: "skipped" },
+        });
+      }
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toEqual([]);
+      await db.delete(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.id, proof!.id));
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.rearmDetails[0]).toContain("armed:");
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toHaveLength(1);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState?.approvalStatus).toMatchObject({ armReattempt: { headSha: NEW_HEAD, attempts: priorAttempts + 1 } });
+    });
+
     const RELEASE_STATUS = {
       id: 7001,
       context: PAPERCLIP_APPROVED,
@@ -3476,7 +3579,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
           throw new Error(`unmocked ghFetch URL: ${url}`);
         });
         const summary = await runApprovalStatusReconcilerTick(db);
-        return { summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
+        return { issueId, summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
       }
 
       it("is taken back when it is revoked while the enable call is in flight", async () => {
@@ -3487,11 +3590,19 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
       });
 
-      it("is not armed by the retry after a transient failure", async () => {
-        const { enables, summary } = await seedAndTick({ revokeOn: "first-attempt-502" });
+      it("stops retries without abandoning a possibly accepted arm", async () => {
+        const { issueId, enables, queries } = await seedAndTick({ revokeOn: "first-attempt-502" });
 
         expect(enables()).toBe(1);
-        expect(summary.rearmDetails.join("\n")).toContain("authority-changed");
+        const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        const state = row?.executionState;
+        const approval = state && typeof state === "object" && "approvalStatus" in state ? state.approvalStatus : null;
+        expect(approval).toMatchObject({ armOutcome: { kind: "failed" } });
+        if (approval && typeof approval === "object" && "autoMergeDisarm" in approval && approval.autoMergeDisarm) {
+          expect(approval.autoMergeDisarm).toMatchObject({ headSha: NEW_HEAD, number: 42 });
+        } else {
+          expect(queries().some((query) => query.includes("disablePullRequestAutoMerge"))).toBe(true);
+        }
       });
     });
 
@@ -3555,13 +3666,20 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
               expect(details).toContain("authority-revoked");
               expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
             } else {
-              // The retry never reached the provider.
+              // This retry never reached the provider; its earlier 502 is still uncertain.
               expect(enables).toBe(1);
-              expect(details).toContain("authority-changed");
-              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(false);
             }
             const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
-            expect(((row!.executionState as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {}).autoMergeDisarm).toBeUndefined();
+            const state = row?.executionState;
+            const approval = state && typeof state === "object" && "approvalStatus" in state ? state.approvalStatus : null;
+            const record = approval && typeof approval === "object" && "autoMergeDisarm" in approval ? approval.autoMergeDisarm : undefined;
+            if (moment === "enable") {
+              expect(record).toBeUndefined();
+            } else if (record) {
+              expect(record).toMatchObject({ headSha: NEW_HEAD, number: 42 });
+            } else {
+              expect(queries.some((query) => query.includes("disablePullRequestAutoMerge"))).toBe(true);
+            }
           });
         }
       }
@@ -3768,6 +3886,52 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
       expect((approvalStatus.armOutcome as { kind: string }).kind).toBe("armed");
       expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 1 });
+    });
+
+    it("returns the reserved re-arm slot when child attribution appears only after backfill publication", async () => {
+      const issueId = await insertIssue({ executionState: approvedState({
+        approvalStatus: {
+          approvedHeadSha: null, publishedHeadSha: null,
+          publishSkipped: { reason: "status:skipped:head_unresolvable: pr_error: HTTP 500", headSha: null, at: APPROVED_AT },
+        },
+      }) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      const ancestorId = await insertIssue({ identifier: "SUP-900", status: "backlog", executionState: {} });
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_SAME_HEAD_BODY },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+      const provider = mockGhFetch.getMockImplementation()!;
+      let pullReads = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === PR_URL && ++pullReads === 3) {
+          await db.insert(issueChildCarrierAttributions).values({
+            companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+            owner: "tea-core", repo: "paperclip", pullRequestNumber: 42,
+            branchName: "some-branch-name", headSha: NEW_HEAD, commitShas: [NEW_HEAD],
+            writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+          });
+        }
+        return provider(url, init);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.backfilled).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.rearmDetails[0]).toContain("child-carrier-attribution");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState?.approvalStatus).toMatchObject({
+        publishedHeadSha: NEW_HEAD,
+        armOutcome: { kind: "skipped" },
+        armReattempt: { headSha: NEW_HEAD, attempts: 0 },
+      });
+      expect(mockGhFetch.mock.calls.filter(([url]) => url === GRAPHQL_URL)).toEqual([]);
     });
 
     it("a force-push that lands between scan and the arm-boundary re-check suppresses the re-arm (finding: stale-live-head-authorization-race)", async () => {

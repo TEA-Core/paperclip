@@ -10,6 +10,36 @@ export interface IssueTreeHoldReleasePolicy {
   note?: string | null;
 }
 
+/** Affirmative board consent, independent of the unresolved source action. */
+export interface RecoveryCarrierParkBinding {
+  version: 1;
+  sourceIssueId: string;
+  recoveryActionId: string;
+  decisionInteractionId: string;
+  expectedStatus: string;
+  expectedStatusVersion: number;
+  expectedAssigneeAgentId: string | null;
+  expectedAssigneeUserId: string | null;
+  expectedActionUpdatedAt: string;
+  expectedDecisionUpdatedAt: string;
+  expectedBlockers: Array<{ id: string; status: string; statusVersion: number }>;
+  reason: string;
+}
+
+export interface RecoveryCarrierParkSummary {
+  state: "accepted" | "stale";
+  holdId: string;
+  sourceIssueId: string;
+  recoveryActionId: string;
+  decisionInteractionId: string;
+  reason: string;
+}
+
+export interface RecoveryCarrierParkCandidate extends Omit<RecoveryCarrierParkBinding,
+  "version" | "reason" | "decisionInteractionId" | "expectedDecisionUpdatedAt"> {
+  decisions: Array<{ id: string; summary: string | null; updatedAt: string }>;
+}
+
 export interface IssueTreePreviewRun {
   id: string;
   issueId: string;
@@ -98,6 +128,7 @@ export interface IssueTreeHold {
   status: IssueTreeHoldStatus;
   reason: string | null;
   releasePolicy: IssueTreeHoldReleasePolicy | null;
+  recoveryCarrierPark?: RecoveryCarrierParkBinding | null;
   createdByActorType: "user" | "agent" | "system";
   createdByAgentId: string | null;
   createdByUserId: string | null;

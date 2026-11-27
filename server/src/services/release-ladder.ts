@@ -115,7 +115,7 @@ async function decisionProblem(
       .select({ companyId: agents.companyId, status: agents.status })
       .from(agents)
       .where(eq(agents.id, decision.actorAgentId));
-    if (!agent || agent.companyId !== row.companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+    if (!agent || agent.companyId !== row.companyId || (agent.status === "terminated" || agent.status === "deleted") || agent.status === "pending_approval") {
       return "made by an agent that is not a current agent of this company";
     }
     // Inside the head-bound release a paused agent's approval has lapsed (the ordinary approval path keeps it).

@@ -1,3 +1,5 @@
+import { redactSecretTokens } from "../log-redaction.js";
+
 // Redaction for HTTP log payloads.
 //
 // `customProps` in logger.ts copies `req.body` / `req.params` / `req.query`
@@ -136,12 +138,17 @@ export function stripSecretBearingUrlParts(value: string): string {
   }
 }
 
-export function redactSensitive(value: unknown, depth = 0): unknown {
+function redactWalk(
+  value: unknown,
+  depth: number,
+  scrubTokens: boolean,
+): unknown {
   if (depth > MAX_DEPTH) return undefined;
+  if (scrubTokens && typeof value === "string") return redactSecretTokens(value);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (depth + 1 > MAX_DEPTH) return undefined;
-    return value.map((entry) => redactSensitive(entry, depth + 1));
+    return value.map((entry) => redactWalk(entry, depth + 1, scrubTokens));
   }
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
@@ -150,12 +157,26 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
       continue;
     }
     if (typeof entry === "string" && isUrlishKey(key)) {
-      out[key] = stripSecretBearingUrlParts(entry);
+      const stripped = stripSecretBearingUrlParts(entry);
+      out[key] = scrubTokens ? redactSecretTokens(stripped) : stripped;
       continue;
     }
-    out[key] = redactSensitive(entry, depth + 1);
+    out[key] = redactWalk(entry, depth + 1, scrubTokens);
   }
   return out;
+}
+
+export function redactSensitive(value: unknown, depth = 0): unknown {
+  return redactWalk(value, depth, false);
+}
+
+/**
+ * Log-only redaction for HTTP log lines: {@link redactSensitive} plus masking
+ * of credential-shaped tokens in every string leaf. Response sanitisation keeps
+ * using {@link redactSensitive}.
+ */
+export function redactHttpLogPayload(value: unknown): unknown {
+  return redactWalk(value, 0, true);
 }
 
 function collectSensitiveStringValuesInto(

@@ -534,7 +534,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         );
       if (
         !agent ||
-        ["paused", "terminated", "pending_approval"].includes(agent.status) ||
+        ["paused", "terminated", "deleted", "pending_approval"].includes(agent.status) ||
         (agent.budgetMonthlyCents > 0 &&
           agent.spentMonthlyCents >= agent.budgetMonthlyCents)
       )
@@ -625,7 +625,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           eq(agents.id, input.assignedAgentId),
         ),
       );
-    if (!agent || ["terminated", "pending_approval"].includes(agent.status))
+    if (!agent || ["terminated", "deleted", "pending_approval"].includes(agent.status))
       throw badRequest("Select an available company agent");
     await inboundPlacement(companyId, agent.id);
     if (agent.permissions.trustPreset === "low_trust_review") {

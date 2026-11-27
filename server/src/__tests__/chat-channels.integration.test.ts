@@ -4750,7 +4750,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     await expect(executeConnectorTool(db, binding, "slack_post_message", limited)).rejects.toMatchObject({ status: 429, details: { state: "failed", actionId: expect.any(String) } });
     const [limitedAction] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, endpoint.id), eq(chatActions.providerActionId, `slack-tool:${binding.issueId}:${limited.idempotencyKey}`)));
-    await executeConnectorTool(db, binding, "slack_post_message", limited);
+    // A replay inside the rate-limit window surfaces the persisted failure;
+    // it never resolves as a success-shaped replay with a null result.
+    await expect(executeConnectorTool(db, binding, "slack_post_message", limited)).rejects.toMatchObject({ details: { replayed: true, invocationId: expect.any(String) } });
     expect(postFetch.mock.calls.filter(call => String(call[0]).endsWith("/chat.postMessage"))).toHaveLength(1);
     await db.update(chatActions).set({ result: { ...limitedAction.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, limitedAction.id));
     await expect(executeConnectorTool(db, binding, "slack_post_message", limited)).resolves.toMatchObject({ status: "completed" });
@@ -4766,7 +4768,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(executeConnectorTool(db, binding, "slack_post_message", uncertain)).rejects.toMatchObject({ details: { state: "uncertain" } });
     const [uncertainAction] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, endpoint.id), eq(chatActions.providerActionId, `slack-tool:${binding.issueId}:${uncertain.idempotencyKey}`)));
     const countBefore = postFetch.mock.calls.length;
-    await executeConnectorTool(db, binding, "slack_post_message", uncertain);
+    await expect(executeConnectorTool(db, binding, "slack_post_message", uncertain)).rejects.toMatchObject({ details: { replayed: true, invocationId: expect.any(String) } });
     expect(postFetch.mock.calls).toHaveLength(countBefore);
     await expect(executeSlackTool(db, binding, "slack_delivery", { actionId: uncertainAction.id }, postFetch as typeof fetch)).resolves.toMatchObject({ state: "delivered", receipt: { reconciled: true } });
     await expect(executeConnectorTool(db, binding, "slack_create_channel", { name: "approval-required", is_private: true, idempotencyKey: randomUUID() })).rejects.toMatchObject({ reasonCode: expect.stringMatching(/approval/) });

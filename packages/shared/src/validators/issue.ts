@@ -471,6 +471,24 @@ export const gitCommitShaSchema = z
  */
 export const GIT_COMMIT_SHA_WIRE_PATTERN = new RegExp(`^\\s*${GIT_COMMIT_SHA_DIGITS}\\s*$`);
 
+/**
+ * SUP-25193: board-attached landing proof (`POST /issues/:id/landing-proof`).
+ * Names one merged pull request in the card's project repository and at least
+ * one of its commits; the server verifies every field against GitHub.
+ */
+export const attachIssueLandingProofSchema = z.object({
+  owner: z.string().trim().min(1),
+  repo: z.string().trim().min(1),
+  pullRequestNumber: z.number().int().positive(),
+  mergeCommitSha: gitCommitShaSchema.optional(),
+  headSha: gitCommitShaSchema.optional(),
+  reason: z.string().trim().min(1).max(2000),
+}).strict().refine(
+  (body) => body.mergeCommitSha !== undefined || body.headSha !== undefined,
+  { message: "mergeCommitSha or headSha is required", path: ["mergeCommitSha"] },
+);
+export type AttachIssueLandingProof = z.infer<typeof attachIssueLandingProofSchema>;
+
 // R20: bounds only. The cross-field rule (afterRounds within the resolved
 // round ceiling) needs the server's default ceiling, so it is enforced where
 // every policy write normalizes: normalizeIssueExecutionPolicy.
@@ -616,6 +634,8 @@ export const issueExecutionStateSchema = z.object({
    * ladder intact.
    */
   delivery: z.unknown().optional(),
+  // Preserve the untrusted claim, without admitting other unknown state keys.
+  childCarrierClaim: z.unknown().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({

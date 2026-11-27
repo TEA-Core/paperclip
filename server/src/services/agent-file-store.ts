@@ -9,9 +9,10 @@ import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, 
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
-import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, createInstructionDirectory, resolveAgentsGid, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
+import type { ConsumedChangeConsent } from "./change-consent-gate.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Agent = typeof agents.$inferSelect;
@@ -68,7 +69,8 @@ export async function adoptAgentFiles(tx: Tx, agent: Agent): Promise<string> {
   const markerRoot = path.join(path.dirname(root), "file-sync");
   const marker = "adopted.json";
   await assertInstructionPathSafe(root, deriveBundleState(agent).entryFile);
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const gid = await resolveAgentsGid();
+  await createInstructionDirectory(root, { gid });
   const filename = await assertInstructionPathSafe(markerRoot, marker);
   const adopted = await fs.readFile(filename, "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
@@ -81,8 +83,8 @@ export async function adoptAgentFiles(tx: Tx, agent: Agent): Promise<string> {
   const legacy = await tx.select({ entryFile: agentInstructionHeads.entryFile, contentBase64: agentInstructionRevisions.contentBase64 })
     .from(agentInstructionHeads).innerJoin(agentInstructionRevisions, eq(agentInstructionHeads.revisionId, agentInstructionRevisions.id))
     .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
-  for (const entry of legacy) await materializeInstructionBytes(root, entry.entryFile, Buffer.from(entry.contentBase64, "base64"));
-  await materializeInstructionBytes(markerRoot, marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })));
+  for (const entry of legacy) await materializeInstructionBytes(root, entry.entryFile, Buffer.from(entry.contentBase64, "base64"), { gid });
+  await materializeInstructionBytes(markerRoot, marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })), { privateFile: true, gid });
   return root;
 }
 
@@ -163,11 +165,11 @@ export async function snapshotAgentFiles(root: string, enforceLimits = true): Pr
 
 export function agentFileStore(db: Db) {
   async function locked<T>(companyId: string, agentId: string, actor: AuthorizationActor, write: boolean,
-    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor) => Promise<T>) {
+    fn: (tx: Tx, agent: Agent, root: string, bound: AuthorizationActor) => Promise<T>, consent?: ConsumedChangeConsent) {
     return db.transaction(async tx => {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
       if (!agent) throw notFound("Agent not found");
-      const bound = write ? await authorizeInstructionCommit(tx, actor, agent) : await authorizeInstructionRead(tx, actor, agent);
+      const bound = write ? await authorizeInstructionCommit(tx, actor, agent, consent) : await authorizeInstructionRead(tx, actor, agent);
       const root = await adoptAgentFiles(tx, agent);
       return fn(tx, agent, root, bound);
     });
@@ -196,7 +198,8 @@ export function agentFileStore(db: Db) {
     },
     read: (companyId: string, agentId: string, relative: string, actor: AuthorizationActor) =>
       locked(companyId, agentId, actor, false, (_tx, _agent, root) => readAgentFile(root, instructionPath(relative))),
-    write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor) =>
+    /** `consent`: the receipt the route got when it consumed this request's accepted confirmation. */
+    write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor, consent?: ConsumedChangeConsent) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         const relative = agentFilePath(input.path);
         if (input.bytes) assertFileSize(input.bytes.length, relative);
@@ -219,10 +222,10 @@ export function agentFileStore(db: Db) {
         else await materializeInstructionBytes(root, relative, input.bytes);
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash });
         return { contentHash: incomingHash, changed: true };
-      }),
-    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) =>
+      }, consent),
+    apply: (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest; snapshot?: DirectorySnapshot }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
-        const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
+        const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : input.snapshot ?? await snapshotAgentFiles(input.sourceDir);
         const entryPath = deriveBundleState(agent).entryFile;
         if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
         if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
@@ -279,8 +282,9 @@ export function agentFileStore(db: Db) {
           total += size;
         }
         assertDirectorySize(total, finalEntries.size);
-        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
-          ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
+        // Folders a run creates never get group write in the canonical tree.
+        await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root, newDirectoryMode: 0o750,
+          ...(input.checkpoint || input.snapshot ? { snapshots: { source: incoming, current } } : {}) });
         await audit(tx, agent, bound, { sourceRunId: actor.runId, contract: AGENT_FILES_CONTRACT });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
       }),

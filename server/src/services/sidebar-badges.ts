@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, not } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, heartbeatRuns } from "@paperclipai/db";
 import { isHeartbeatRunVisibleInMine, type SidebarBadges } from "@paperclipai/shared";
@@ -59,7 +59,7 @@ export function sidebarBadgeService(db: Db) {
           and(
             eq(heartbeatRuns.companyId, companyId),
             eq(agents.companyId, companyId),
-            not(eq(agents.status, "terminated")),
+            notInArray(agents.status, ["terminated", "deleted"]),
           ),
         )
         .orderBy(heartbeatRuns.agentId, desc(heartbeatRuns.createdAt));

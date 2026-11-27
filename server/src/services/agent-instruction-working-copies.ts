@@ -167,7 +167,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       await fs.mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
       // Atomic replacement also allows interrupted preparation to restage an
       // already-read-only sibling without writing through its existing inode.
-      await materializeInstructionBytes(localRoot, relative, instructionBytes(text));
+      await materializeInstructionBytes(localRoot, relative, instructionBytes(text), { privateTree: true });
       await fs.chmod(filename, name === entryFile ? 0o600 : 0o400);
     }
     if (target) {

@@ -23,6 +23,7 @@ export const AGENT_STATUSES = [
   "error",
   "pending_approval",
   "terminated",
+  "deleted",
 ] as const;
 export type AgentStatus = (typeof AGENT_STATUSES)[number];
 

@@ -9,8 +9,11 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+import { isTransactionHandle } from "./db-handle.js";
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
+import { REVIEW_PARTICIPANT_LIVE_WINDOW_MS, participantRanSince } from "./recovery/participant-liveness.js";
 
+import { isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "./recovery-carrier-park-state.js";
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
@@ -27,6 +30,21 @@ const MAX_UPSERT_RETRIES = 3;
  * source of truth instead of drifting apart.
  */
 export const DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS = 5;
+
+/**
+ * SUP-24251 (redo of SUP-22273): the stranded-participant recovery kinds whose
+ * attempt accounting stands down while the action's owner agent (or, on a
+ * board-owned row, the pending participant it was minted for) is live. For
+ * these kinds the stale-wake sweep neither burns an attempt nor escalates
+ * while that agent ran after `lastAttemptAt`, and a re-mint caps its inherited
+ * depth one below the ceiling while that agent ran after the predecessor's
+ * last update. A live agent that cannot clear the card is not a wedge; an idle
+ * one still walks the action to exhaustion exactly as before.
+ */
+export const OWNER_LIVE_HOLD_RECOVERY_KINDS: ReadonlySet<string> = new Set<IssueRecoveryActionKind>([
+  "stranded_assigned_issue",
+  "review_stage_unarmed",
+]);
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -662,6 +680,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      if (await isRecoveryActionBoardParked(db, input.companyId, existing.id)) return existing;
       // A distinct failure identity must not overwrite the active action of a
       // prior identity. Resolve the prior action and insert a new one, so the
       // operator gets a new notice for the new failure.
@@ -894,7 +913,37 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       // (`predecessorBudgetExhausted` true) keeps `runAgnosticRepark` false and
       // still wins — the SUP-13698 reset to attempt 1.
       const effectivePredecessorExhausted = predecessorBudgetExhausted && !runAgnosticRepark;
-      const carriedAttemptCount = effectivePredecessorExhausted ? 1 : cumulativeDepth + 1;
+      // SUP-24251 (redo of SUP-22273): for a stranded-participant kind whose
+      // owner (or, on a board-owned mint, the pending participant) ran after
+      // the predecessor's last update, the agent is live, not wedged. Cap the
+      // inherited depth one below the ceiling so the successor is neither born
+      // at the ceiling for the next sweep to escalate nor minted terminal by the
+      // run-agnostic gate below. An explicit `attemptCount` and a board budget
+      // reset stay authoritative; an owner idle since the predecessor keeps the
+      // uncapped carry-forward. The successor's own agents come before the
+      // predecessor's: a board-owned mint for a pending participant names that
+      // participant in `previousOwnerAgentId`, and the predecessor's former
+      // owner is not the agent the successor waits on.
+      const liveOwnerAgentId =
+        input.ownerAgentId ?? input.previousOwnerAgentId ?? prev?.ownerAgentId ?? prev?.previousOwnerAgentId ?? null;
+      const ownerLiveDepthCap =
+        input.attemptCount === undefined &&
+        !effectivePredecessorExhausted &&
+        prev != null &&
+        liveOwnerAgentId != null &&
+        OWNER_LIVE_HOLD_RECOVERY_KINDS.has(input.kind) &&
+        (await participantRanSince(
+          db,
+          input.companyId,
+          liveOwnerAgentId,
+          new Date(prev.updatedAt).getTime(),
+          REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+        ));
+      const carriedAttemptCount = effectivePredecessorExhausted
+        ? 1
+        : ownerLiveDepthCap
+          ? Math.min(cumulativeDepth + 1, Math.max(1, effectiveMaxAttempts - 1))
+          : cumulativeDepth + 1;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
@@ -1027,7 +1076,22 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra))
+        .values(buildInsertValues(
+          // A capped successor's wake clock starts at the predecessor's last
+          // update, so the stale-wake sweep's live-owner hold sees the same
+          // owner run that justified the cap instead of burning the reserved
+          // attempt on its first pass. This overrides the caller's
+          // `lastAttemptAt`: the escalation path stamps the mint time there,
+          // which is after that run, so a lost initial wake would otherwise
+          // let the sweep burn the reserved attempt and escalate.
+          ownerLiveDepthCap
+            ? { ...input, lastAttemptAt: asDatabaseDate(prev.updatedAt) }
+            : input,
+          ownerType,
+          now,
+          nextAttemptCount,
+          insertEvidenceExtra,
+        ))
         .returning();
       return toReadModel(created!);
     } catch (error) {
@@ -1063,6 +1127,23 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction | null> {
+    if (!issueRowLocked && !isTransactionHandle(dbOrTx)) {
+      return db.transaction(async tx => {
+        const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId),
+        )).for("update");
+        if (!source) return null;
+        const runner = tx as unknown as Db; // The source lock also serializes board park admission.
+        return createIssueRecoveryActionService(runner, true).resolveActiveForIssue(input);
+      });
+    }
+    if (!issueRowLocked) {
+      // Explicit transaction callers must retain the same source lock through
+      // resolution; a statement snapshot taken before park commit is not enough.
+      await dbOrTx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId),
+      )).for("update");
+    }
     const now = new Date();
     const predicates = [
       eq(issueRecoveryActions.companyId, input.companyId),
@@ -1081,6 +1162,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     if (input.fingerprint) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
+    predicates.push(recoveryActionNotBoardParked(input.companyId, sql`${issueRecoveryActions.id}`));
     if (!input.boardResolution) {
       // SUP-13698: a sweep-escalated action that exhausted its attempt ceiling
       // (`escalated` + `outcome: "exhausted"`) is terminal until an explicit
