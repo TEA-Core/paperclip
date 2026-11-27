@@ -37,7 +37,8 @@ import {
   DONE_TIER_TIER2_JSON,
   DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE,
   DONE_TIER_TIER2_RECORD_ONLY_JSON,
-  renderDoneTierDeclaration,
+  resolveDoneTierDeclarationSources,
+  DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
   TIER1_FORM,
   TIER2_FORM,
   TIER2_RECORD_ONLY_FORM,
@@ -486,6 +487,15 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
       expect(result.allowed).toBe(true);
       expect(result.reason).toContain("control-plane-operation-no-deliverable");
+    });
+
+    it("allows transition with decision-only-no-repository-deliverable override", async () => {
+      const override: DoneTransitionOverride = {
+        disposition: "decision-only-no-repository-deliverable",
+        reason: "The recorded decision has no repository deliverable.",
+      };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
     });
 
     it("does not treat unknown disposition as override", async () => {
@@ -5583,55 +5593,26 @@ describe("evaluateDoneTierDeclaration", () => {
   }
 
   describe("structured done-tier rendering", () => {
+    const resolvedBody = (body: string | null, declaration: Parameters<typeof resolveDoneTierDeclarationSources>[1]) => {
+      const resolution = resolveDoneTierDeclarationSources(body, declaration);
+      if (!resolution.ok) throw new Error(`unexpected conflict: ${resolution.conflict.message}`);
+      return resolution.commentBody;
+    };
+
     it("renders Tier 2 evidence and preserves the caller body", () => {
-      expect(renderDoneTierDeclaration("Closing now", {
+      expect(resolvedBody("Closing now", {
         tier: "tier2",
         probeEvidence: "Health check returned 200",
       })).toBe("Closing now\n\nClosed at Tier 2 (live): Health check returned 200");
     });
 
-    it("replaces conflicting canonical tier declarations", () => {
-      expect(renderDoneTierDeclaration(
-        "Context\nClosed at Tier 0 (decision-only): stale reason",
-        {
-          tier: "tier2",
-          probeEvidence: "Health check returned 200",
-        },
-      )).toBe(
-        "Context\n\nClosed at Tier 2 (live): Health check returned 200",
-      );
-      expect(renderDoneTierDeclaration(
-        "Context\nClosed at Tier 2 (live): stale evidence",
-        {
-          tier: "tier1",
-          reason: "Merged change is ready",
-          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
-        },
-      )).toBe(
-        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.",
-      );
-    });
-
-    it("replaces a conflicting declaration even when the requested tier is also present", () => {
-      expect(renderDoneTierDeclaration(
-        "Context\nClosed at Tier 2 (live): stale evidence\nClosed at Tier 1 (landed, not liveness-probed): valid declaration. Liveness unverified.",
-        {
-          tier: "tier1",
-          reason: "Updated reason",
-          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
-        },
-      )).toBe(
-        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Updated reason. Liveness unverified.",
-      );
-    });
-
     it("renders both Tier 1 landing states with exactly one landing token", () => {
-      expect(renderDoneTierDeclaration(null, {
+      expect(resolvedBody(null, {
         tier: "tier1",
         reason: "Merged change is ready",
         landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.");
-      expect(renderDoneTierDeclaration(null, {
+      expect(resolvedBody(null, {
         tier: "tier1",
         reason: "Landing delegated",
         landing: { mode: "landingDelegated", prNumber: 123, carrier: "done-close-landing-backstop" },
@@ -5639,7 +5620,7 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     it("renders a no-repository Tier 1 close without a SHA or PR", () => {
-      expect(renderDoneTierDeclaration(null, {
+      expect(resolvedBody(null, {
         tier: "tier1",
         reason: "No repository artifact was produced",
         landing: { mode: "noRepositoryLanding" },
@@ -5648,28 +5629,331 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
-    it("preserves the body when the existing Tier 2 declaration matches", () => {
-      const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
-      expect(renderDoneTierDeclaration(body, {
+    it("treats a decorated (not line-start) mention as prose, not a second source", () => {
+      expect(resolvedBody("> quoted: Closed at Tier 2 (live): old line", {
+        tier: "tier2",
+        probeEvidence: "Health check returned 200",
+      })).toBe("> quoted: Closed at Tier 2 (live): old line\n\nClosed at Tier 2 (live): Health check returned 200");
+    });
+  });
+
+  // SUP-25336: the comment declaration and the structured doneTier are parsed
+  // independently BEFORE rendering. Two sources are accepted only when the
+  // comment holds exactly the canonical line the structured object renders to;
+  // every other dual-source request is a typed conflict, never a silent
+  // replacement of the caller's declaration.
+  describe("done-tier dual-source resolution (SUP-25336)", () => {
+    const SOURCE_RECORD_ONLY_EVIDENCE =
+      "record-only probe `curl -fsS -H 'Authorization: Bearer sk-live-SECRET' https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+    const SOURCE_RECORD_ONLY_LINE = `Closed at Tier 2 (live): ${SOURCE_RECORD_ONLY_EVIDENCE}`;
+    const MERGE_HEAD_EVIDENCE =
+      "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: health endpoint reports the fix is live";
+    const TIER1_DECLARATION = {
+      tier: "tier1" as const,
+      reason: "Merged change is ready",
+      landing: { mode: "landedAtTip" as const, mergeCommit: "abcdef1234567" },
+    };
+    const TIER1_LINE =
+      "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.";
+
+    beforeEach(() => {
+      // The backstop cases below must resolve nothing on GitHub and write no
+      // activity row themselves; reset the providers so any call is visible.
+      setupDbMock({});
+      mockResolveGitHubToken.mockReset();
+      ghFetchMock.mockReset();
+      vi.mocked(logActivity).mockClear();
+    });
+
+    function conflictOf(body: string | null, declaration: Parameters<typeof resolveDoneTierDeclarationSources>[1]) {
+      const resolution = resolveDoneTierDeclarationSources(body, declaration);
+      expect(resolution.ok).toBe(false);
+      if (resolution.ok) throw new Error("expected a dual-source conflict");
+      expect(resolution.conflict.code).toBe(DONE_TIER_DUAL_SOURCE_CONFLICT_CODE);
+      expect(resolution.conflict.code).toBe("done_tier_dual_source_conflict");
+      return resolution.conflict;
+    }
+
+    it("SUP-23944 shape: a valid canonical record-only comment plus prose-only structured probeEvidence is a typed conflict, not a replacement", () => {
+      const comment = `Sweep consumed; closing on live probe evidence.\n\n${SOURCE_RECORD_ONLY_LINE}`;
+      const conflict = conflictOf(comment, {
+        tier: "tier2",
+        probeEvidence: "Re-ran the sweep probe and it passed; the consumption point is healthy.",
+      });
+      expect(conflict.conflicts).toEqual(["structured_declaration_malformed", "sources_not_equivalent"]);
+      expect(conflict.sources.comment).toMatchObject({ status: "valid", declarationCount: 1 });
+      expect(conflict.sources.structured).toMatchObject({ status: "malformed", tier: "tier2" });
+      expect(conflict.differingFields).toEqual(["declaration"]);
+      expect(conflict.remedy).toContain("Send exactly one done-tier source");
+    });
+
+    it("conflict excerpts are bounded and never echo the probe command", () => {
+      const conflict = conflictOf(`Context\n${SOURCE_RECORD_ONLY_LINE}`, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE.replace("2026-11-04T09:15:00Z", "2026-11-04T09:16:00Z"),
+      });
+      const serialized = JSON.stringify(conflict);
+      expect(serialized).not.toContain("sk-live-SECRET");
+      expect(serialized).not.toContain("Authorization");
+      expect(serialized).toContain("`<command redacted>`");
+      for (const excerpt of [
+        conflict.sources.structured.excerpt,
+        ...conflict.sources.comment.declarations.map((entry) => entry.excerpt),
+      ]) {
+        expect(excerpt.length).toBeLessThanOrEqual(160);
+      }
+    });
+
+    it("conflict excerpts never echo unbackticked prose commands from malformed sources", () => {
+      const prose = "ran curl -H 'Authorization: Bearer sk-live-PROSE-SECRET' https://svc/health, passed";
+      const structured = conflictOf(`Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}`, { tier: "tier2", probeEvidence: prose });
+      const comment = conflictOf(`Closed at Tier 2 (live): ${prose}`, { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE });
+      for (const conflict of [structured, comment]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-PROSE-SECRET");
+        expect(serialized).not.toContain("Authorization");
+        expect(serialized).not.toContain("curl");
+      }
+      expect(structured.sources.structured.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${prose.length} chars>`,
+      );
+      expect(comment.sources.comment.declarations[0]?.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${prose.length} chars>`,
+      );
+      expect(structured.sources.comment.declarations[0]?.excerpt).toContain("record-only probe `<command redacted>` target ");
+    });
+
+    it.each([
+      [
+        "record-only target and predicate",
+        "record-only probe `probe-cmd` target svc-Bearer-sk-live-LEAK-target observed 2026-11-04T09:15:00Z result: pass ran curl -H Authorization: Bearer sk-live-LEAK-predicate",
+      ],
+      [
+        "merge-head postMerge",
+        "probe `probe-cmd` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: ran curl -H Authorization: Bearer sk-live-LEAK-postmerge",
+      ],
+    ])("rebuilt Tier 2 excerpts redact free-text fields (%s) on both sides", (_label, evidence) => {
+      const fromComment = conflictOf(`Closed at Tier 2 (live): ${evidence}`, { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE });
+      const fromStructured = conflictOf(TIER1_LINE, { tier: "tier2", probeEvidence: evidence });
+      expect(fromComment.sources.comment.status).toBe("valid");
+      expect(fromStructured.sources.structured.status).toBe("valid");
+      for (const conflict of [fromComment, fromStructured]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+        expect(serialized).toMatch(/redacted, \d+ chars>/);
+      }
+    });
+
+    it("rebuilt Tier 1 excerpts redact the reason and carrier on both sides", () => {
+      const leaky = {
+        tier: "tier1" as const,
+        reason: "ran curl -H Authorization: Bearer sk-live-LEAK-reason",
+        landing: { mode: "landingDelegated" as const, prNumber: 42, carrier: "done-close-landing-backstop" as const },
+      };
+      const leakyLine =
+        "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #42 via sk-live-LEAK-carrier — ran curl -H Authorization: Bearer sk-live-LEAK-reason. Liveness unverified.";
+      const fromComment = conflictOf(leakyLine, TIER1_DECLARATION);
+      const fromStructured = conflictOf(TIER1_LINE, leaky);
+      expect(fromComment.sources.comment.status).toBe("valid");
+      expect(fromStructured.sources.structured.excerpt).toContain(
+        "landing-delegated PR #42 via <carrier redacted, 27 chars> — <reason redacted,",
+      );
+      for (const conflict of [fromComment, fromStructured]) {
+        const serialized = JSON.stringify(conflict);
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+      }
+    });
+
+    it("accepts an exactly equivalent dual source and keeps the original comment with one declaration", () => {
+      const comment = `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}\n\nFollow-up: none.`;
+      const resolution = resolveDoneTierDeclarationSources(comment, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE,
+      });
+      expect(resolution).toEqual({ ok: true, source: "equivalent", commentBody: comment });
+      if (!resolution.ok) return;
+      expect(resolution.commentBody?.split("\n").filter((line) => line.startsWith("Closed at Tier"))).toHaveLength(1);
+    });
+
+    it("accepts an exactly equivalent Tier 1 dual source unchanged", () => {
+      const comment = `Context\n\n${TIER1_LINE}\n\nFollow-up`;
+      expect(resolveDoneTierDeclarationSources(comment, TIER1_DECLARATION)).toEqual({
+        ok: true,
+        source: "equivalent",
+        commentBody: comment,
+      });
+    });
+
+    it("accepts an equivalent merge-head Tier 2 dual source unchanged", () => {
+      const comment = `Context\nClosed at Tier 2 (live): ${MERGE_HEAD_EVIDENCE}`;
+      expect(resolveDoneTierDeclarationSources(comment, { tier: "tier2", probeEvidence: MERGE_HEAD_EVIDENCE })).toEqual({
+        ok: true,
+        source: "equivalent",
+        commentBody: comment,
+      });
+    });
+
+    it("structured-only renders exactly one canonical line after the caller body", () => {
+      expect(resolveDoneTierDeclarationSources("Sweep consumed.", {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE,
+      })).toEqual({ ok: true, source: "structured", commentBody: `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}` });
+    });
+
+    it("comment-only passes the comment through untouched for the evaluator", () => {
+      const comment = `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}\nClosed at Tier 0 (decision-only): extra`;
+      expect(resolveDoneTierDeclarationSources(comment, undefined)).toEqual({ ok: true, source: "comment", commentBody: comment });
+      expect(resolveDoneTierDeclarationSources(null, null)).toEqual({ ok: true, source: "none", commentBody: null });
+    });
+
+    it("refuses a full Tier 2 prefix inside probeEvidence instead of stripping it", () => {
+      const conflict = conflictOf(SOURCE_RECORD_ONLY_LINE, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_LINE,
+      });
+      expect(conflict.conflicts).toContain("structured_declaration_malformed");
+      expect(conflict.conflicts).toContain("sources_not_equivalent");
+      expect(conflict.sources.structured.excerpt).toBe(
+        `Closed at Tier 2 (live): <unparsed evidence redacted, ${SOURCE_RECORD_ONLY_LINE.length} chars>`,
+      );
+    });
+
+    it("structured-only full-prefix input is not stripped: it renders verbatim and the evaluator refuses it", async () => {
+      const rendered = resolveDoneTierDeclarationSources(null, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_LINE,
+      });
+      expect(rendered).toEqual({
+        ok: true,
+        source: "structured",
+        commentBody: `Closed at Tier 2 (live): ${SOURCE_RECORD_ONLY_LINE}`,
+      });
+      if (!rendered.ok) return;
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "record_only" as const },
+        rendered.commentBody,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+    });
+
+    it("refuses multiple canonical comment declarations as ambiguous, even when one matches", () => {
+      const conflict = conflictOf(
+        `Context\n${SOURCE_RECORD_ONLY_LINE}\n${TIER1_LINE}`,
+        { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE },
+      );
+      expect(conflict.conflicts).toEqual(["comment_declaration_ambiguous", "sources_not_equivalent"]);
+      expect(conflict.sources.comment).toMatchObject({ status: "ambiguous", declarationCount: 2 });
+      expect(conflict.differingFields).toEqual(["declarationCount"]);
+    });
+
+    it("refuses the same canonical line repeated twice as ambiguous", () => {
+      const conflict = conflictOf(
+        `${SOURCE_RECORD_ONLY_LINE}\n\n${SOURCE_RECORD_ONLY_LINE}`,
+        { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE },
+      );
+      expect(conflict.conflicts).toContain("comment_declaration_ambiguous");
+    });
+
+    it.each([
+      ["a Tier 1 comment and a Tier 2 structured object", `Context\n${TIER1_LINE}`, { tier: "tier2" as const, probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE }],
+      ["a Tier 2 comment and a Tier 1 structured object", `Context\n${SOURCE_RECORD_ONLY_LINE}`, TIER1_DECLARATION],
+      ["a Tier 0 comment and a Tier 2 structured object", "Context\nClosed at Tier 0 (decision-only): stale reason", { tier: "tier2" as const, probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE }],
+    ])("refuses different tiers: %s", (_label, comment, declaration) => {
+      const conflict = conflictOf(comment, declaration);
+      expect(conflict.conflicts).toEqual(["sources_not_equivalent"]);
+      expect(conflict.differingFields).toEqual(["tier"]);
+      expect(conflict.sources.comment.status).toBe("valid");
+      expect(conflict.sources.structured.status).toBe("valid");
+    });
+
+    it("refuses different record-only observation timestamps and names the differing field", () => {
+      const conflict = conflictOf(SOURCE_RECORD_ONLY_LINE, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE.replace("2026-11-04T09:15:00Z", "2026-11-04T09:15:00Z-2026-11-04T09:20:00Z"),
+      });
+      expect(conflict.conflicts).toEqual(["sources_not_equivalent"]);
+      expect(conflict.differingFields).toEqual(["observedEnd"]);
+
+      const moved = conflictOf(SOURCE_RECORD_ONLY_LINE, {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE.replace("2026-11-04T09:15:00Z", "2026-11-04T10:15:00Z"),
+      });
+      expect(moved.differingFields).toEqual(["observedStart"]);
+    });
+
+    it("refuses a different Tier 1 landing and names the differing fields", () => {
+      const conflict = conflictOf(TIER1_LINE, { ...TIER1_DECLARATION, landing: { mode: "landedAtTip", mergeCommit: "1234567abcdef" } });
+      expect(conflict.differingFields).toEqual(["landing.mergeCommit"]);
+      const reason = conflictOf(TIER1_LINE, { ...TIER1_DECLARATION, reason: "Updated reason" });
+      expect(reason.differingFields).toEqual(["reason"]);
+    });
+
+    it("refuses an equivalent pair whose shared evidence is malformed prose", () => {
+      const conflict = conflictOf("Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up", {
         tier: "tier2",
         probeEvidence: "existing evidence",
-      })).toBe(body);
+      });
+      expect(conflict.conflicts).toEqual(["comment_declaration_malformed", "structured_declaration_malformed"]);
+      expect(conflict.differingFields).toEqual([]);
     });
 
-    it("preserves the body when the existing Tier 1 declaration matches", () => {
-      const body = "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.\n\nFollow-up";
-      expect(renderDoneTierDeclaration(body, {
-        tier: "tier1",
-        reason: "Merged change is ready",
-        landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
-      })).toBe(body);
-    });
-
-    it("replaces an existing same-tier declaration with the supplied declaration", () => {
-      expect(renderDoneTierDeclaration("Closed at Tier 2 (live): stale evidence", {
+    it("refuses a malformed comment declaration (evidence on the next line) beside a structured object", () => {
+      const conflict = conflictOf(`Closed at Tier 2 (live):\n${SOURCE_RECORD_ONLY_EVIDENCE}`, {
         tier: "tier2",
-        probeEvidence: "new evidence",
-      })).toBe("Closed at Tier 2 (live): new evidence");
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE,
+      });
+      expect(conflict.conflicts).toEqual(["comment_declaration_malformed", "sources_not_equivalent"]);
+      expect(conflict.sources.comment.status).toBe("malformed");
+    });
+
+    it("refuses a stale same-tier declaration instead of replacing it", () => {
+      const conflict = conflictOf("Closed at Tier 2 (live): stale evidence", {
+        tier: "tier2",
+        probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE,
+      });
+      expect(conflict.conflicts).toEqual(["comment_declaration_malformed", "sources_not_equivalent"]);
+    });
+
+    it("service backstop: a dual-source conflict refuses before any guard probe or close audit", async () => {
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...tierIssue, deliveryRequirement: "record_only", projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        actorId: "execution-control-reconciliation",
+        closeComment: `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}`,
+        structuredDoneTier: { tier: "tier2", probeEvidence: "Re-ran the sweep probe and it passed." },
+      });
+      expect(verdict.allowed).toBe(false);
+      if (verdict.allowed) return;
+      expect(verdict.code).toBe("done_tier_dual_source_conflict");
+      if (verdict.code !== "done_tier_dual_source_conflict") return;
+      expect(verdict.conflict.conflicts).toContain("sources_not_equivalent");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(logActivity).not.toHaveBeenCalled();
+    });
+
+    it("service backstop: an equivalent dual source closes with the original comment and one declaration", async () => {
+      const closeComment = `Sweep consumed.\n\n${SOURCE_RECORD_ONLY_LINE}`;
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...tierIssue, deliveryRequirement: "record_only", projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        actorId: "execution-control-reconciliation",
+        closeComment,
+        structuredDoneTier: { tier: "tier2", probeEvidence: SOURCE_RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed, JSON.stringify(verdict)).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeComment).toBe(closeComment);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(verdict.closeRowAudits[0]?.details).toMatchObject({
+        tierForm: "record-only",
+        observed: "2026-11-04T09:15:00Z",
+        closingRunId: null,
+      });
     });
 
     it("renders structured declarations only after both close doors resolve to done", () => {
@@ -6312,6 +6596,145 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
+    describe("record-only pass contradictions", () => {
+      it.each([
+        ["exit_nonzero", "exit 2"],
+        ["exited_nonzero", "exited 2"],
+        ["failed_positive", "failed=1"],
+        ["scanned_zero", "scanned=0"],
+        ["non_clean", "non-clean"],
+        ["failed_closed", "failed closed. All four configured repos shape"],
+        ["refused", "REFUSED"],
+        ["partial_failure", "partial failure"],
+      ])("refuses %s in a pass predicate", async (marker, prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier2Audit).toBeUndefined();
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.reason).toContain(marker);
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(result.remedy).toContain("Report the non-clean cycle and do not close");
+      });
+
+      it.each(["exit -2", "exited +02", "failed=001", "scanned=00", "NON-CLEAN", "FAILED CLOSED. ALL four repos"])(
+        "refuses integer and case variants: %s",
+        async (prose) => {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        },
+      );
+
+      it.each([
+        "scanned=0.0", "scanned=-0", "scanned=0e5", "scanned=.0", "scanned=0.", "failed=1.5", "failed=1e2",
+        "failed=+.5e1", "exit 2.0", "exit -0.5", "exited 1e1", "exit 2.",
+        "failed=1e-400", "exit 1e-400", "exited -1e-400",
+      ])("refuses complete decimal contradiction form: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+      });
+
+      it.each([
+        "scanned=0.5", "scanned=+.5", "scanned=1e2", "scanned=0.001", "failed=0.0", "failed=-1", "failed=0e3",
+        "failed=.0", "exit 0.0", "exit -0", "exited 00.00", "exit 0e5", "scanned=1e-400",
+      ])("does not refuse non-contradicting decimal form: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.code).not.toBe("done_transition_record_only_probe_contradiction");
+        expect(result.allowed).toBe(true);
+      });
+
+      it("refuses a contradiction on the same-run comment path", async () => {
+        setupDbMock({
+          heartbeatRuns: [
+            { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+          ],
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), null, "run-1",
+          () => Promise.resolve([mockComment(tier2Line(`${RECORD_ONLY_EVIDENCE}; exit 2`), "run-1")]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+      });
+
+      it("keeps a structured system-backstop contradiction from producing a close audit", async () => {
+        const result = await evaluateDoneTransitionGuardForBackstopClose({
+          db: mockDb,
+          issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+          actorId: "execution-control-reconciliation",
+          closeComment: null,
+          structuredDoneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}; exit 2` },
+        });
+        expect(result.allowed).toBe(false);
+        if (result.allowed) return;
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(logActivity).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        "exit criteria met",
+        "anon request refused 401",
+        "failed closed on anon request, expected negative path confirmed",
+        "the scan failed closed on anonymous requests as expected",
+        "exit 0; exited 0; exit -0; exited +00; failed=0; scanned=12",
+        "preexit 2; failed=0; scanned=01; unREFUSED; non-cleanliness",
+      ])("accepts harmless trailing prose: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only" });
+      });
+
+      it.each([
+        "scanned=0, failed=4 because required check-run App token was unavailable",
+        "scan failed closed with exit 2 in all four repos due unavailable GH_CI_ONLY_TOKEN/GH_TOKEN",
+        "the scan failed closed on all 4 repos because GH_CI_ONLY_TOKEN and GH_TOKEN are unavailable",
+        "scan failed with exit 2 due to missing check-run App token",
+        "all four scans exited 2 because the CheckRun App token is unavailable",
+        "scan executed but failed closed (exit 2; scanned=0, failed=4, check-run App token unavailable)",
+        "exited 2 with check-run App token unavailable for all four repositories (scan failure recorded, not a clean scan)",
+      ])("refuses recurrence evidence: %s", async (prose) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(`${RECORD_ONLY_EVIDENCE}; ${prose}`),
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+        expect(result.tier2Audit).toBeUndefined();
+      });
+
+      it("accepts a clean recurrence scan with separate REFUSED-vet lines", async () => {
+        const evidence = RECORD_ONLY_EVIDENCE.replace(
+          "the sweep consumption point served 42 fresh records",
+          "scanned=4 failed=0 matched=29 armed=0 exit 0",
+        );
+        const result = await evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(),
+          `${tier2Line(evidence)}\n\nVet: REFUSED missing paperclip/approved; exit 1`,
+          null, () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "record-only", probeEvidence: evidence });
+      });
+    });
+
     // SUP-24299: "Liveness unverified." is the Tier 1 suffix. The record-only
     // matcher ends in a catch-all predicate, so it used to accept the suffix as
     // predicate text and the close landed as both live and unverified.
@@ -6374,10 +6797,12 @@ describe("evaluateDoneTierDeclaration", () => {
       });
 
       it("refuses the marker on a structured doneTier rendering of the record-only form", async () => {
-        const rendered = renderDoneTierDeclaration("Closing.", {
+        const resolution = resolveDoneTierDeclarationSources("Closing.", {
           tier: "tier2",
           probeEvidence: `${RECORD_ONLY_EVIDENCE} ${MARKER}`,
         });
+        if (!resolution.ok) throw new Error("unexpected dual-source conflict");
+        const rendered = resolution.commentBody;
         const result = await evaluateDoneTierDeclaration(
           mockDb,
           recordOnlyTierIssue(),
@@ -7110,6 +7535,50 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  describe("Tier 0 decision-only via accompanying comment", () => {
+    it("allows a non-empty decision-only declaration only when the decision-only override is active", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier0");
+    });
+
+    it("does not allow a Tier 0 declaration without the decision-only override", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    it("rejects Tier 1 evidence when the decision-only override requires Tier 0", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): There is nothing to land. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+        null,
+        null,
+        { allowTier0DecisionOnly: true },
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Tier 0");
+    });
+  });
+
   describe("Tier 1 via accompanying comment", () => {
     describe("no-repository landing", () => {
       const comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.";
@@ -7256,6 +7725,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).toContain('issue.deliveryRequirement === "record_only"');
       expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
       expect(route).toContain("TIER2_RECORD_ONLY_FORM");
+      expect((route.match(/tier0Alternative/g) ?? []).length).toBeGreaterThanOrEqual(3);
+      expect(route).toContain('` or "Closed at Tier 0 (decision-only): <reason>"`');
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
@@ -9829,7 +10300,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(await reclassifiedRows(issueId)).toEqual([]);
   });
 
-  it("audits a record_only reclassification without a close, and leaves the later plain close unchanged", async () => {
+  it("audits a record_only reclassification without a close, and refuses the later plain close while landing debt remains", async () => {
     const { issueId, identifier } = await seedCard("repository_delivery");
 
     const flip = await request(app)
@@ -9848,17 +10319,21 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     const comments = await systemCommentsFor(issueId);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("Delivery requirement reclassified");
-    expect(comments[0]).toContain("from `repository_delivery` to `record_only` by user `cloud-user-1`");
+    expect(comments[0]).toContain("changed from `repository_delivery` to `record_only` by user `cloud-user-1`");
 
-    // The two-request path stays open: the later close takes the record-only skip.
+    // The two-request path is closed: the debt survives the relabel, no probe-able
+    // repository exists here, and the refusal names the exit.
     const close = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Close after the earlier reclassification." });
-    expect(close.status, JSON.stringify(close.body)).toBe(200);
-    expect(await storedCard(issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
+    expect(close.status, JSON.stringify(close.body)).toBe(409);
+    expect(close.body.code).toBe("done_transition_missing_delivery");
+    expect(close.body.details.remedy).toContain("probe-able repository and branch or a merged PR");
+    expect(close.body.details.remedy).toContain("cancel the issue");
+    expect((await storedCard(issueId)).status).not.toBe("done");
     const rows = activityFor(issueId);
-    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
-    expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+
     expect(await reclassifiedRows(issueId)).toHaveLength(1);
   });
 
@@ -9938,7 +10413,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(reclassified).toHaveLength(1);
     expect(reclassified[0]).toMatchObject({ landingCheckOwed: false });
     const comments = await systemCommentsFor(issueId);
-    expect(comments[0]).toContain("The issue was already closed");
+    expect(comments[0]).toContain("creates no new landing debt");
   });
 
   it("writes no reclassification audit when the stored value is already record_only or the requested value is not record_only", async () => {

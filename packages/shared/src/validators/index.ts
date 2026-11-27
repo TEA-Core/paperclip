@@ -453,6 +453,8 @@ export {
   issueExecutionStateSchema,
   gitCommitShaSchema,
   GIT_COMMIT_SHA_WIRE_PATTERN,
+  attachIssueLandingProofSchema,
+  type AttachIssueLandingProof,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
@@ -570,6 +572,10 @@ export {
 
 export {
   createIssueTreeHoldSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
+  type ParkRecoveryCarrier,
+  type ReleaseRecoveryCarrierPark,
   issueTreeControlModeSchema,
   issueTreeHoldReleasePolicySchema,
   previewIssueTreeControlSchema,

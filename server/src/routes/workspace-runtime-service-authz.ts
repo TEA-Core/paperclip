@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
@@ -39,7 +39,7 @@ async function listReportingSubtreeAgentIds(db: Db, companyId: string, actorAgen
       reportsTo: agents.reportsTo,
     })
     .from(agents)
-    .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+    .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
 
   const reportsByManager = new Map<string, string[]>();
   for (const agent of companyAgents) {

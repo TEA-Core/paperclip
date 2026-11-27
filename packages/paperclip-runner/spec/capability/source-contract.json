@@ -53,6 +53,10 @@
       "always_agent_tool",
       "get_task_history"
     ],
+    "paperclipListIssueActivity": [
+      "always_agent_tool",
+      "get_task_history"
+    ],
     "paperclipGetComment": [
       "always_agent_tool",
       "get_task_history"

@@ -149,10 +149,12 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     const removed = await agentService(db).remove(agentId);
 
     expect(removed?.id).toBe(agentId);
-    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
-    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
-    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
-    await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agentRow).toMatchObject({ status: "deleted", name: "Deleted agent" });
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(1);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(1);
+    const remainingActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(remainingActivity.map((row) => row.action)).toContain("heartbeat.completed");
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {

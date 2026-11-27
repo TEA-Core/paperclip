@@ -300,6 +300,31 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     await tempDb?.cleanup();
   });
 
+  it.each([false, true])("enforces durable landing debt on a record-only merge card (owed=%s)", async (owed) => {
+    const company = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, company, {
+      cardTitle: "Record the completed operator merge",
+      cardDescription: mergeGateMarker([404]),
+    });
+    await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, fixture.cardId));
+    if (owed) await db.insert(activityLog).values({
+      companyId: fixture.companyId, actorType: "system", actorId: "test",
+      action: "issue.delivery_requirement_reclassified", entityType: "issue", entityId: fixture.cardId,
+      details: { landingCheckOwed: true, landingDebtDisposition: "outstanding" },
+    });
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: async () => ({ ...MERGED_EVIDENCE }),
+    });
+    const result = await service.sweepMergedOperatorMergeCards();
+    expect(result.closed).toBe(owed ? 0 : 1);
+    const [stored] = await db.select().from(issues).where(eq(issues.id, fixture.cardId));
+    expect(stored?.status).toBe(owed ? "todo" : "done");
+    if (owed) {
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, fixture.cardId));
+      expect(rows.find((row) => row.action === "issue.delivery_requirement_reclassified")?.details?.landingDebtDisposition).toBe("outstanding");
+    }
+  });
+
   it("closes a card whose named pull request merged, records evidence, and wakes the dependent", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {

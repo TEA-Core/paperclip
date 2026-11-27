@@ -1,5 +1,7 @@
+import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
+import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
 import { createIssueReadTiming } from "../services/issue-read-timing.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -45,6 +47,13 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
+import {
+  BOARD_LANDING_PROOF_ACTION,
+  BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
+  boardLandingProofIneligibility,
+  loadAttachedBoardLandingProof,
+  verifyBoardLandingProof,
+} from "../services/board-landing-proof.js";
 import {
   activityLog,
   agentSessionGoalActions,
@@ -104,6 +113,7 @@ import {
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
+  attachIssueLandingProofSchema,
   runnerGoalActionRequestSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
@@ -215,9 +225,14 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
-import { redactIssueCommentBody } from "../services/issues.js";
+import { recordedLostFutureMonitorCheck, redactIssueCommentBody } from "../services/issues.js";
 import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
+import {
+  carrierArmBlock,
+  classifyAncestorCarrierHead,
+  recordChildCarrierDecision,
+} from "../services/child-carrier-attribution.js";
 import {
   armMergeOnApproval,
   parseRepoUrl,
@@ -289,7 +304,9 @@ import {
 } from "../services/plan-review-context.js";
 import {
   countLadderedChildren,
+  boardLandingProofCloseBlocker,
   evaluateDoneTransitionGuard,
+  prepareLandingDebtClose,
   evaluateDoneTierDeclaration,
   resolveCitedCommits,
   DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
@@ -297,13 +314,15 @@ import {
   TIER2_FORM,
   TIER2_RECORD_ONLY_FORM,
   findMissingAdr072CloseLadderStages,
-  renderDoneTierDeclaration,
+  resolveDoneTierDeclarationSources,
+  DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
   measureNoRepositoryLandingForClose,
   noRepositoryLandingAuditDetails,
   noRepositoryStructuredFormSuffix,
   noRepositoryTier1FormSuffix,
   TIER1_FORM,
   verifyNoRepositoryLandingAtTransition,
+  verifyZeroDeltaCloseAtTransition,
   writeAuditLog,
   writeGuardSkippedAuditLog,
   writeDoneTransitionRefusedAuditLog,
@@ -311,6 +330,7 @@ import {
   type DoneTransitionOverride,
   type NoRepositoryLandingCloseRequest,
   type NoRepositoryLandingMeasurement,
+  type ZeroDeltaCloseMeasurement,
 } from "../services/done-transition-guard.js";
 import {
   decideIssueReviewPathRecovery,
@@ -4483,6 +4503,15 @@ function parseStrictIsoTimestampMs(value: unknown): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+/** Fields of the just-written issue row the landing-debt discharge re-checks. */
+type IssueRowForLandingDebt = {
+  statusVersion: number;
+  deliveryRequirement: string;
+  executionWorkspaceId: string | null;
+  projectWorkspaceId: string | null;
+  projectId: string | null;
+};
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -4545,12 +4574,16 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
-  const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
+  });
+  const svc = issueService(db, {
+    onExecutionLockCleared: async ({ run, issueId }) => {
+      await heartbeat.releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId);
+    },
   });
   const commentWasCreatedByAssigneeRun = async (
     comment: { companyId: string; createdByRunId?: string | null },
@@ -4867,7 +4900,7 @@ export function issueRoutes(
     patch: Record<string, unknown>,
     decision: MergeArmingDecision | null | undefined,
     policy: Parameters<typeof ladderIsTerminallyApproved>[0] = issue.executionPolicy,
-    options: { overrideAccepted?: boolean; prefetched?: FinalDeliveryPrefetch | null; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
+    options: { overrideAccepted?: boolean; zeroDeltaProven?: boolean; prefetched?: FinalDeliveryPrefetch | null; locked?: { prefetch: FinalDeliveryPrefetch | null; tx: Db } } = {},
   ): Promise<void> {
     const rawPatchState = patch.executionState as Record<string, unknown> | undefined;
     const priorApprovalStatus = rawPatchState?.approvalStatus as Record<string, unknown> | undefined;
@@ -4930,6 +4963,15 @@ export function issueRoutes(
     const decisionId = state?.lastDecisionId;
     if (verdict.kind !== "resolved") {
       if (options.overrideAccepted) return;
+      if (options.zeroDeltaProven && verdict.reason.startsWith("no-pr:")) {
+        if (decisionId) {
+          patch.executionState = {
+            ...rawState,
+            approvalStatus: { ...prior, finalDeliveryUncertified: { decisionId, reason: `zero-delta: ${verdict.reason}` } },
+          };
+        }
+        return;
+      }
       // SUP-24085: a stage approval that leaves the ladder pending on a later stage
       // does not complete the card, so a card that owns no open PR is not refused.
       // The decision certifies no head: the tag stops the post-commit hook from
@@ -4952,7 +4994,10 @@ export function issueRoutes(
       approvalStatus: {
         ...prior, approvedHeadSha: verdict.headSha,
         ...(decisionId
-          ? { finalDelivery: { ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId } }
+          ? { finalDelivery: {
+            ...verdict.pr, headSha: verdict.headSha, displayName: verdict.displayName, decisionId,
+            ...(verdict.childCarrierProof ? { childCarrierProof: verdict.childCarrierProof } : {}),
+          } }
           : {}),
       },
     };
@@ -4995,6 +5040,11 @@ export function issueRoutes(
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
+    try {
+      await recordChildCarrierDecision(db, issue.companyId, issue.id);
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "child carrier decision was not attached; stamp and arm still follow the attribution row");
+    }
     // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
     // invoke this hook after the transaction commits, so the decision row and
     // completedStageIds are already durable — the predicate is evaluable here.
@@ -5321,12 +5371,25 @@ export function issueRoutes(
         // `errored` outcome so the miss is diagnosable from GET /api/issues/{id} alone.
         let armingOutcome: ArmingOutcome | { kind: "errored"; message: string };
         try {
-          // Bound to the head the stamp was just published on, when the publisher named one: GitHub then
-          // refuses to enable auto-merge if the PR has moved on since.
-          armingOutcome = await armMergeOnApproval(
-            db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr,
-            /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "") ? { expectedHeadOid: statusOutcome.headSha as string } : {},
+          const armBlock = await carrierArmBlock(
+            db,
+            issue.companyId,
+            issue.id,
+            statusOutcome.certifiedPr
+              ? {
+                  owner: statusOutcome.certifiedPr.owner,
+                  repo: statusOutcome.certifiedPr.repo,
+                  number: statusOutcome.certifiedPr.number,
+                  headSha: statusOutcome.headSha ?? null,
+                }
+              : null,
           );
+          armingOutcome = armBlock
+            ? { kind: "skipped", message: armBlock }
+            : await armMergeOnApproval(
+                db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr,
+                /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "") ? { expectedHeadOid: statusOutcome.headSha as string } : {},
+              );
         } catch (armingErr) {
           logger.warn({ err: armingErr, issueId: issue.id }, "armMergeOnApproval threw; recording errored outcome");
           armingOutcome = {
@@ -5536,6 +5599,8 @@ export function issueRoutes(
         ok: true;
         overrideAccepted?: boolean;
         noRepositoryLanding?: boolean;
+        zeroDeltaMeasurement?: ZeroDeltaCloseMeasurement;
+        finalizeLandingDebt: (tx: Db, locked: IssueRowForLandingDebt) => Promise<void>;
         recordGuardSkipDisposition?: () => void;
         // SUP-23925: the tier1/tier2 close rows are returned, not written. The
         // door that lands the terminal write persists them on the SAME
@@ -5544,6 +5609,41 @@ export function issueRoutes(
         closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
       }
     | { ok: false; status: number; body: Record<string, unknown> };
+
+  // SUP-25336: every door that accepts a structured doneTier resolves the comment
+  // and structured sources here, BEFORE any rendering, status write or comment
+  // write. A dual-source conflict leaves one refusal row and throws a typed 422
+  // whose details carry only source status, differing fields and sanitized
+  // excerpts. Returns the comment body to evaluate and persist.
+  async function resolveDoneTierSourcesOrRefuse(input: {
+    issue: { id: string; companyId: string; identifier: string | null };
+    commentBody: string | null | undefined;
+    doneTier: DoneTierDeclaration | null | undefined;
+    door: "patch" | "comment_auto_approval" | "recovery_action_resolution";
+    runId: string | null;
+  }): Promise<string | null> {
+    const resolution = resolveDoneTierDeclarationSources(input.commentBody, input.doneTier);
+    if (resolution.ok) return resolution.commentBody;
+    const { conflict } = resolution;
+    await writeDoneTransitionRefusedAuditLog(db, input.issue, {
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      httpStatus: 422,
+      reason: conflict.message,
+      runId: input.runId,
+      door: input.door,
+      conflicts: conflict.conflicts,
+      differingFields: conflict.differingFields,
+    });
+    throw unprocessable(conflict.message, {
+      code: conflict.code,
+      issueId: input.issue.id,
+      identifier: input.issue.identifier ?? null,
+      conflicts: conflict.conflicts,
+      sources: conflict.sources,
+      differingFields: conflict.differingFields,
+      remedy: conflict.remedy,
+    });
+  }
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
   // land an issue on `done`: the status PATCH and the comment auto-approval path.
@@ -5591,6 +5691,10 @@ export function issueRoutes(
     // record-only Tier 2 close whose closing run cannot be resolved, so an
     // agent cannot skip the lifetime gate by dropping the run id header.
     closingAgentId?: string | null;
+    // SUP-24402: only a door that re-runs verifyZeroDeltaCloseAtTransition
+    // inside its status write sets this; every other door leaves it unset, and
+    // the zero-delta repository_delivery Tier 2 form then refuses.
+    zeroDeltaRecheckedAtWrite?: boolean;
     // SUP-24429: the requirement stored before the request, passed by a door
     // whose request can change it. The guard's record-only skip then applies
     // only when this is record_only too.
@@ -5608,13 +5712,22 @@ export function issueRoutes(
       storedDeliveryRequirement,
     } = input;
 
+    // Fresh-create IDs cannot carry pre-existing debt.
+    const debt = await prepareLandingDebtClose(db, issue, input.createDoor);
     const guardResult = await evaluateDoneTransitionGuard(
       db,
       issue,
       override,
       decisionCarried,
       storedDeliveryRequirement,
+      debt.owed,
+      // SUP-25193: a board-attached landing proof counts only on a board close.
+      { acceptBoardLandingProof: boardActor },
     );
+    // `locked` is the row the terminal write just returned: that UPDATE holds the
+    // issue row lock until commit, so the debt rows read here are serialized.
+    const finalizeLandingDebt = (tx: Db, locked: IssueRowForLandingDebt) =>
+      debt.finalize(tx, locked, guardResult);
     const overrideAccepted =
       !!override && guardResult.allowed && guardResult.reason === `Override accepted: ${override.disposition}`;
     // SUP-24298: `issue.done_transition_guard_skipped` is the guard's "transition
@@ -5752,7 +5865,7 @@ export function issueRoutes(
         skipReason: "board_actor_bypass",
         decisionCarried,
       });
-      return { ok: true, overrideAccepted, closeRowAudits: [] };
+      return { ok: true, overrideAccepted, closeRowAudits: [], finalizeLandingDebt };
     }
 
     const tierResult = await evaluateDoneTierDeclaration(
@@ -5763,6 +5876,15 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
+      {
+        allowTier0DecisionOnly: override?.disposition === "decision-only-no-repository-deliverable",
+        zeroDeltaRecheckedAtWrite: input.zeroDeltaRecheckedAtWrite === true,
+        recordOnlyReviewDecision:
+          issue.deliveryRequirement === "record_only" &&
+          decisionCarried &&
+          guardResult.skipped &&
+          guardResult.skipReason === "record_only_delivery_skipped",
+      },
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5789,6 +5911,9 @@ export function issueRoutes(
       const tier2CommentForm = issue.deliveryRequirement === "record_only"
         ? TIER2_RECORD_ONLY_FORM
         : TIER2_FORM;
+      const tier0Alternative = override?.disposition === "decision-only-no-repository-deliverable"
+        ? ` or "Closed at Tier 0 (decision-only): <reason>"`
+        : "";
       const remedy = tierResult.remedy ?? (input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${structuredForms}` +
@@ -5797,6 +5922,7 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${structuredForms}` +
@@ -5805,12 +5931,13 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
+          tier0Alternative +
           ` — per SUP-12693.`);
       // SUP-24298: one refusal row per refused write, written before the deduped
       // thread comment (a coalesced remedy comment must not erase the write's own
       // trace) and whether or not this door persists the comment.
       await writeDoneTransitionRefusedAuditLog(db, issue, {
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         httpStatus: 422,
         reason: tierResult.reason,
         decisionCarried,
@@ -5953,10 +6080,15 @@ export function issueRoutes(
     // A no-repository close is still re-probed inside the write transaction, so
     // its skip row is handed to the caller to write once that close commits.
     if (tierResult.landing === "noRepositoryLanding") {
-      return { ok: true, overrideAccepted, noRepositoryLanding: true, recordGuardSkipDisposition, closeRowAudits };
+      return { ok: true, overrideAccepted, noRepositoryLanding: true, recordGuardSkipDisposition, closeRowAudits, finalizeLandingDebt };
+    }
+    // A zero-delta close is likewise re-checked inside the write transaction,
+    // so its measurement, close rows and skip row are handed to the caller the same way.
+    if (tierResult.zeroDeltaMeasurement) {
+      return { ok: true, overrideAccepted, zeroDeltaMeasurement: tierResult.zeroDeltaMeasurement, recordGuardSkipDisposition, closeRowAudits, finalizeLandingDebt };
     }
     recordGuardSkipDisposition();
-    return { ok: true, overrideAccepted, noRepositoryLanding: false, closeRowAudits };
+    return { ok: true, overrideAccepted, noRepositoryLanding: false, closeRowAudits, finalizeLandingDebt };
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -6158,7 +6290,7 @@ export function issueRoutes(
       }),
       resolvesInCompany: async (agentId) => {
         const agent = await agentsSvc.getById(agentId);
-        return Boolean(agent && agent.companyId === input.companyId);
+        return Boolean(agent && agent.companyId === input.companyId && agent.status !== "deleted");
       },
     });
   // R20: whether the policy's stall arbiter can take work right now. The engine
@@ -6189,7 +6321,7 @@ export function issueRoutes(
       agent &&
         agent.companyId === input.companyId &&
         agent.status !== "paused" &&
-        agent.status !== "terminated" &&
+        agent.status !== "terminated" && agent.status !== "deleted" &&
         agent.status !== "pending_approval",
     );
   };
@@ -8440,6 +8572,20 @@ export function issueRoutes(
     // every assignee write surface, in every status — ahead of the
     // in_progress early return that previously let it write until close.
     if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return false;
+    if (
+      issue.status === "in_review" &&
+      issue.executionRunId &&
+      issue.executionRunId !== req.actor.runId
+    ) {
+      const holder = await heartbeat.getRun(issue.executionRunId);
+      if (holder?.status === "running" && holder.agentId !== actorAgentId) {
+        throw conflict("Issue run ownership conflict", {
+          issueId: issue.id,
+          executionRunId: holder.id,
+          actorRunId: req.actor.runId ?? null,
+        });
+      }
+    }
     if (issue.status !== "in_progress") {
       return true;
     }
@@ -10130,12 +10276,37 @@ export function issueRoutes(
 
   async function resolveActiveIssueRun(issue: {
     id: string;
+    companyId?: string | null;
     assigneeAgentId: string | null;
     executionRunId?: string | null;
+    checkoutRunId?: string | null;
   }) {
     let runToInterrupt = issue.executionRunId
       ? await heartbeat.getRun(issue.executionRunId)
       : null;
+
+    // An issue-less author run adopted through the SUP-20121 stamp is not the
+    // card's own run: the adoption stamps both pointers, but the run is only
+    // interruptible here when it is not the card's recorded author, or when
+    // a server-recorded context names this card. Authorship is the recorded
+    // origin/activity proof, never the pointer alone: a null or empty
+    // context says nothing either way, and a checked-out run that did not
+    // author the card keeps the base interrupt behavior.
+    if (runToInterrupt) {
+      const contextSnapshot = runToInterrupt.contextSnapshot;
+      const stampedIssueId =
+        contextSnapshot && typeof contextSnapshot === "object" &&
+        typeof (contextSnapshot as Record<string, unknown>).issueId === "string"
+          ? ((contextSnapshot as Record<string, unknown>).issueId as string)
+          : null;
+      if (
+        stampedIssueId !== issue.id &&
+        issue.companyId &&
+        (await runIsIssueAuthor(db, issue.companyId, issue.id, runToInterrupt.id))
+      ) {
+        runToInterrupt = null;
+      }
+    }
 
     if (
       (!runToInterrupt || runToInterrupt.status !== "running") &&
@@ -10659,7 +10830,7 @@ export function issueRoutes(
     if (resolved.agent.status === "pending_approval") {
       throw conflict("Cannot assign work to pending approval agents");
     }
-    if (resolved.agent.status === "terminated") {
+    if ((resolved.agent.status === "terminated" || resolved.agent.status === "deleted")) {
       throw conflict("Cannot assign work to terminated agents");
     }
     // Agents must not route work to a paused peer/manager: the assignment is
@@ -12705,6 +12876,7 @@ export function issueRoutes(
     try {
       outcome = await publishHeadBoundRelease(rdb, existing.companyId, target, {
         headSha, description, expectedBranch: target.branch, revalidate: resolveTarget,
+        issueId: existing.id,
         deadlines: opts.mergeReleaseDeadlines, signal: envelope, confirmedStatusId, recordConfirmation,
         abandon: scope ? ctx.cancelScope : undefined,
       });
@@ -12933,6 +13105,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const decisionId = randomUUID();
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [];
 
     type BoardDecisionTransactionResult = {
       updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
@@ -13095,6 +13268,7 @@ export function issueRoutes(
           } as Parameters<typeof svc.update>[1],
           tx,
           postCommitActivityPublications,
+          postCommitIssueActions,
         );
         if (!updated) return null;
 
@@ -13180,6 +13354,7 @@ export function issueRoutes(
     }
 
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    await flushIssuePostCommitActions(postCommitIssueActions);
 
     // SUP-15805 CR-1: the board decision is a real stage transition. Enqueue the
     // same execution-stage wake the PATCH path would, so an approved-next-stage
@@ -14226,6 +14401,186 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
+  // SUP-25193: board-only landing proof. A delivered card whose completed review
+  // stage names only a user, and which records no deliveryIdentity, has no other
+  // way to prove its landing, so landing debt from an earlier record_only
+  // reclassification blocks `done` for good. The board names the merged PR; the
+  // server verifies it against GitHub and records it. Attaching discharges
+  // nothing: a later board close re-verifies the proof and discharges the debt
+  // atomically with the accepted close (prepareLandingDebtClose). Agents are refused.
+  router.post("/issues/:id/landing-proof", validate(attachIssueLandingProofSchema), async (req, res) => {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing || !(await assertIssueReadAllowed(req, res, existing))) return;
+    const decision = await decideIssueAccess(req, existing, "issue:mutate");
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    const body = req.body as {
+      owner: string; repo: string; pullRequestNumber: number;
+      mergeCommitSha?: string; headSha?: string; reason: string;
+    };
+    const refusalDetails = {
+      issueId: existing.id,
+      identifier: existing.identifier ?? null,
+      owner: body.owner,
+      repo: body.repo,
+      pullRequestNumber: body.pullRequestNumber,
+    };
+    const ineligible = boardLandingProofIneligibility(existing);
+    if (ineligible) {
+      res.status(409).json({
+        error: `Landing proof refused: ${ineligible}`,
+        code: "landing_proof_not_applicable",
+        details: { ...refusalDetails, reason: ineligible },
+      });
+      return;
+    }
+    const landingDebtOwed = (await prepareLandingDebtClose(db, existing)).owed;
+    const cannotClose = await boardLandingProofCloseBlocker(db, existing, landingDebtOwed);
+    if (cannotClose) {
+      res.status(409).json({
+        error: `Landing proof refused: ${cannotClose}`,
+        code: "landing_proof_cannot_close",
+        details: { ...refusalDetails, reason: cannotClose },
+      });
+      return;
+    }
+    const verified = await verifyBoardLandingProof(db, existing, body);
+    if (!verified.ok) {
+      res.status(422).json({
+        error: `Landing proof refused: ${verified.reason}`,
+        code: verified.code,
+        details: { ...refusalDetails, reason: verified.reason },
+      });
+      return;
+    }
+    const proof = verified.proof;
+    const actor = getActorInfo(req);
+    const outcome = await db.transaction(async (tx) => {
+      const [locked] = await tx.select().from(issueRows)
+        .where(and(eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId)))
+        .for("update");
+      const lockedIneligible = locked ? boardLandingProofIneligibility(locked) : "the card no longer exists";
+      if (lockedIneligible) return { kind: "ineligible" as const, reason: lockedIneligible };
+      if (
+        locked!.projectId !== existing.projectId ||
+        locked!.projectWorkspaceId !== existing.projectWorkspaceId ||
+        locked!.executionWorkspaceId !== existing.executionWorkspaceId
+      ) {
+        return { kind: "ineligible" as const, reason: "the card's repository binding changed during verification; retry" };
+      }
+      // Replaying the same verified evidence returns the recorded proof and writes nothing.
+      const latest = await loadAttachedBoardLandingProof(tx as unknown as Db, existing);
+      if (
+        latest &&
+        latest.evidence.owner === proof.owner &&
+        latest.evidence.repo === proof.repo &&
+        latest.evidence.pullRequestNumber === proof.pullRequestNumber &&
+        latest.evidence.mergeCommitSha === proof.mergeCommitSha &&
+        latest.evidence.headSha === proof.headSha
+      ) {
+        return { kind: "replayed" as const, activityId: latest.activityId };
+      }
+      const activity = await logActivityInTransaction(tx as unknown as Db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        boardApiKeyId: actor.boardApiKeyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+        action: BOARD_LANDING_PROOF_ACTION,
+        entityType: "issue",
+        entityId: existing.id,
+        issueId: existing.id,
+        details: {
+          identifier: existing.identifier ?? null,
+          owner: proof.owner,
+          repo: proof.repo,
+          pullRequestNumber: proof.pullRequestNumber,
+          prUrl: proof.prUrl,
+          mergeCommitSha: proof.mergeCommitSha,
+          headSha: proof.headSha,
+          headRef: proof.headRef,
+          headRepoFullName: proof.headRepoFullName,
+          baseRef: proof.baseRef,
+          repoUrl: proof.repoUrl,
+          repositoryId: proof.repositoryId,
+          repositoryNodeId: proof.repositoryNodeId,
+          possession: proof.possession,
+          reason: body.reason,
+          verifiedAt: new Date().toISOString(),
+          landingDebtOwed,
+          // Discharge happens only on the accepted close, never here.
+          landingDebtDischarged: false,
+        },
+      });
+      // The SUP-23031 possession shape: a pull_request work product carrying the
+      // merge commit and head. Existing recorded values are never overwritten.
+      const externalId = `${proof.owner}/${proof.repo}#${proof.pullRequestNumber}`;
+      const [product] = await tx.select().from(issueWorkProducts).where(and(
+        eq(issueWorkProducts.companyId, existing.companyId),
+        eq(issueWorkProducts.issueId, existing.id),
+        eq(issueWorkProducts.type, "pull_request"),
+        eq(issueWorkProducts.externalId, externalId),
+      ));
+      if (product) {
+        const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+        await tx.update(issueWorkProducts).set({
+          metadata: {
+            ...metadata,
+            mergeCommitSha: metadata.mergeCommitSha ?? proof.mergeCommitSha,
+            headSha: metadata.headSha ?? proof.headSha,
+            landingProofActivityId: activity.id,
+          },
+          updatedAt: new Date(),
+        }).where(eq(issueWorkProducts.id, product.id));
+      } else {
+        await tx.insert(issueWorkProducts).values({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          type: "pull_request",
+          provider: "github",
+          externalId,
+          title: `PR #${proof.pullRequestNumber} ${proof.owner}/${proof.repo}`,
+          url: proof.prUrl,
+          status: "merged",
+          reviewState: "none",
+          isPrimary: false,
+          healthStatus: "unknown",
+          metadata: {
+            prNumber: proof.pullRequestNumber,
+            repository: `${proof.owner}/${proof.repo}`,
+            mergeCommitSha: proof.mergeCommitSha,
+            headSha: proof.headSha,
+            landingProofActivityId: activity.id,
+            // Never counts as prior evidence that this PR is the card's delivery.
+            source: BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
+          },
+        });
+      }
+      return { kind: "attached" as const, activityId: activity.id };
+    });
+    if (outcome.kind === "ineligible") {
+      res.status(409).json({
+        error: `Landing proof refused: ${outcome.reason}`,
+        code: "landing_proof_not_applicable",
+        details: { ...refusalDetails, reason: outcome.reason },
+      });
+      return;
+    }
+    res.status(outcome.kind === "attached" ? 201 : 200).json({
+      issueId: existing.id,
+      identifier: existing.identifier ?? null,
+      proofActivityId: outcome.activityId,
+      replayed: outcome.kind === "replayed",
+      proof,
+      landingDebtOwed,
+      landingDebtDischarged: false,
+      next: "Close the card with a board PATCH {\"status\":\"done\"}; the close re-verifies this proof and discharges any landing debt atomically.",
+    });
+  });
+
   router.post(
     "/issues/:id/recovery-actions/resolve",
     validate(resolveIssueRecoveryActionSchema),
@@ -14373,10 +14728,10 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const finalDeliveryPrefetch =
-        sourceIssueStatus === "done" && existing.status !== "done" && existing.deliveryRequirement !== "record_only"
-          ? await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing)
-          : null;
+      // SUP-25336 (RA F1): the authenticated final-delivery prefetch runs only
+      // after the done-tier source resolver below, so a dual-source conflict
+      // refuses with its 422 before this door spends any GitHub read.
+      let finalDeliveryPrefetch: Awaited<ReturnType<typeof prefetchFinalDelivery>> | null = null;
       // SUP-21910 (parent SUP-21901 audit F1): this door can land a card on
       // `done` — an owner restore after a manual landing (owner_completed) or an
       // agent's final-stage approval restore (SUP-17163), which then runs the
@@ -14401,6 +14756,7 @@ export function issueRoutes(
       let structuredDoneTierRendered = false;
       let recoveryOverrideAccepted = false;
       let pendingRecoveryCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
+      let finalizeRecoveryLandingDebt: ((tx: Db, locked: IssueRowForLandingDebt) => Promise<void>) | undefined;
       if (sourceIssueStatus === "done" && existing.status !== "done") {
         const preTxsRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           existing.companyId,
@@ -14418,11 +14774,17 @@ export function issueRoutes(
           );
         }
         if (doneTier !== undefined && doneTier !== null) {
-          doneTierResolutionNote = renderDoneTierDeclaration(
-            doneTierResolutionNote,
+          doneTierResolutionNote = await resolveDoneTierSourcesOrRefuse({
+            issue: existing,
+            commentBody: doneTierResolutionNote,
             doneTier,
-          );
+            door: "recovery_action_resolution",
+            runId: actor.runId ?? null,
+          });
           structuredDoneTierRendered = true;
+        }
+        if (existing.deliveryRequirement !== "record_only") {
+          finalDeliveryPrefetch = await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing);
         }
         const recoveryDonePolicy = normalizeIssueExecutionPolicy(
           existing.executionPolicy ?? null,
@@ -14464,6 +14826,7 @@ export function issueRoutes(
         // SUP-23925: close rows deferred by the guard evaluator; persisted on
         // the resolution's transaction below, only after the terminal write.
         pendingRecoveryCloseRowAudits = recoveryDoneOutcome.closeRowAudits;
+        finalizeRecoveryLandingDebt = recoveryDoneOutcome.finalizeLandingDebt;
       }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
@@ -14478,6 +14841,9 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        if (sourceIssueStatus === "done" && lockedIssue.status !== "done") {
+          if (!finalizeRecoveryLandingDebt) throw conflict("Issue reopened before close; retry.");
+        }
 
         let recoveryEscalationPayload: {
           escalation: ReviewEscalationSignal;
@@ -14606,7 +14972,7 @@ export function issueRoutes(
             !sourceOwner ||
             sourceOwner.companyId !== lockedIssue.companyId ||
             sourceOwner.status === "paused" ||
-            sourceOwner.status === "terminated"
+            (sourceOwner.status === "terminated" || sourceOwner.status === "deleted")
           ) {
             throw conflict(
               "The assigned agent is unavailable. Resume or review the agent before retrying.",
@@ -14926,6 +15292,7 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+          if (issue.status === "done") await finalizeRecoveryLandingDebt?.(tx as unknown as Db, issue);
           // SUP-23925: the deferred tier close rows commit on THIS
           // transaction, only after the terminal write landed, so a refused or
           // raced close cannot leave an orphan close row behind.
@@ -17717,7 +18084,11 @@ export function issueRoutes(
         projectId: createAssignmentScope.projectId,
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
-        originRunId: createBody.originRunId ?? actor.runId,
+        // originRunId is ownership proof: only an authenticated agent run
+        // (an agent JWT is minted for one run) may stamp it. A board request
+        // or an agent API key can only claim a run through an unauthenticated
+        // header, which is never copied into originRunId.
+        originRunId: createBody.originRunId ?? (actor.actorType === "agent" && actor.actorSource === "agent_jwt" ? actor.runId : null),
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
         ...(sourceTrust ? { sourceTrust } : {}),
@@ -17795,6 +18166,9 @@ export function issueRoutes(
         details: {
           title: issue.title,
           identifier: issue.identifier,
+          projectId: issue.projectId ?? null,
+          projectWorkspaceId: issue.projectWorkspaceId ?? null,
+          description: issue.description ?? null,
           ...(watchdogProductBugFollowUp
             ? {
                 watchdogDiscovery: {
@@ -19883,6 +20257,23 @@ export function issueRoutes(
       !(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "comment"))
     ) return;
 
+    // SUP-25336: a close that carries a structured doneTier resolves its comment
+    // and structured declaration sources after this request's authorization
+    // checks and before its first side effect (the board interrupt below). A
+    // dual-source conflict refuses here with a typed 422. The resolved body is
+    // rendered into the transition and the persisted comment below, only once
+    // the requested/effective status is known to be `done`.
+    const resolvedDoneTierCommentBody =
+      doneTier !== undefined && updateFields.status === "done"
+        ? await resolveDoneTierSourcesOrRefuse({
+          issue: existing,
+          commentBody,
+          doneTier,
+          door: "patch",
+          runId: actor.runId ?? null,
+        })
+        : undefined;
+
     if (interruptRequested) {
       if (!commentBody) {
         res.status(400).json({ error: "Interrupt is only supported when posting a comment" });
@@ -20273,7 +20664,13 @@ export function issueRoutes(
     const originalCommentBody = commentBody;
     const transitionCommentBody =
       doneTier !== undefined && requestedTransitionStatus === "done"
-        ? renderDoneTierDeclaration(originalCommentBody, doneTier)
+        ? resolvedDoneTierCommentBody ?? await resolveDoneTierSourcesOrRefuse({
+          issue: existing,
+          commentBody: originalCommentBody,
+          doneTier,
+          door: "patch",
+          runId: actor.runId ?? null,
+        })
         : originalCommentBody;
     // A summary-generation issue must always bounce back to the Summarizer
     // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). The
@@ -20843,24 +21240,53 @@ export function issueRoutes(
           });
           return;
         }
-        updateFields.executionState = {
-          ...currentExecState,
-          delivery: {
-            ...requestedDeliveryIdentity,
-            kind: "as05_bound_pr",
-            cardBranch: branchOwnership.branch,
-            sourceIssueId: existing.id,
-            recordedByRunId: actor.runId,
-            recordedAt: new Date().toISOString(),
-          },
-          // R20: the structured head of this review round, compared by the
-          // review-stall trigger against the head the last bounce rejected.
-          // Written only for a policy that names a stall arbiter, so a policy
-          // without one keeps its persisted state unchanged.
-          ...(nextExecutionPolicy?.stallEscalation
-            ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
-            : {}),
-        };
+        const carrierClass = exact.pr.headRefName
+          ? await classifyAncestorCarrierHead(db, existing.companyId, existing.id, exact.pr.headRefName)
+          : "absent";
+        if (carrierClass === "many") {
+          res.status(422).json({
+            error: "deliveryIdentity bound PR matches more than one ancestor carrier",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              reason: "multiple ancestor carrier candidates",
+            },
+          });
+          return;
+        }
+        if (carrierClass === "one") {
+          updateFields.executionState = {
+            ...currentExecState,
+            childCarrierClaim: {
+              prNumber: requestedDeliveryIdentity.prNumber,
+              prUrl: requestedDeliveryIdentity.prUrl,
+              headSha: requestedDeliveryIdentity.headSha,
+              claimedAt: new Date().toISOString(),
+            },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
+          };
+          delete updateFields.executionState.delivery;
+        } else {
+          const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+          delete withoutClaim.childCarrierClaim;
+          updateFields.executionState = {
+            ...withoutClaim,
+            delivery: {
+              ...requestedDeliveryIdentity,
+              kind: "as05_bound_pr",
+              cardBranch: branchOwnership.branch,
+              sourceIssueId: existing.id,
+              recordedByRunId: actor.runId,
+              recordedAt: new Date().toISOString(),
+            },
+            ...(nextExecutionPolicy?.stallEscalation
+              ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+              : {}),
+          };
+        }
         // deliveryIdentityWorkspaceBranchWrite stays false: a bound-PR record
         // names its card branch explicitly (cardBranch), so the generic
         // project-primary branch-write carve-out never applies.
@@ -20898,8 +21324,10 @@ export function issueRoutes(
           });
           return;
         }
+        const withoutClaim = { ...(currentExecState as Record<string, unknown>) };
+        delete withoutClaim.childCarrierClaim;
         updateFields.executionState = {
-          ...currentExecState,
+          ...withoutClaim,
           delivery: {
             ...requestedDeliveryIdentity,
             recordedByRunId: actor.runId,
@@ -21018,7 +21446,7 @@ export function issueRoutes(
         }
       } else {
         updateFields.executionState = {
-          ...existingExecutionState,
+          ...(updateFields.executionState ?? existingExecutionState),
           reviewRequest,
         };
       }
@@ -21095,7 +21523,13 @@ export function issueRoutes(
     const effectiveStatus =
       typeof transition.patch.status === "string" ? transition.patch.status : requestedStatus;
     if (doneTier !== undefined && effectiveStatus === "done") {
-      commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+      commentBody = resolvedDoneTierCommentBody ?? await resolveDoneTierSourcesOrRefuse({
+        issue: existing,
+        commentBody,
+        doneTier,
+        door: "patch",
+        runId: actor.runId ?? null,
+      });
     }
     if (commentAttachmentIds !== undefined && !commentBody) {
       res.status(400).json({ error: "Attachment ids require a comment" });
@@ -21181,9 +21615,13 @@ export function issueRoutes(
     // SUP-23925: close rows deferred by the guard evaluator; persisted on the
     // same transaction as the terminal write below.
     let pendingCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
+    let finalizePatchLandingDebt: ((tx: Db, locked: IssueRowForLandingDebt) => Promise<void>) | undefined;
     // SUP-22570: the closer of an accepted record_only no-repository close; the
     // same checks re-run inside the update transaction below.
     let noRepositoryLandingCloser: DoneTierClosingActor | null = null;
+    // SUP-24402: the measurement of an accepted zero-delta close; re-checked
+    // inside the update transaction below.
+    let zeroDeltaCloseMeasurement: ZeroDeltaCloseMeasurement | null = null;
     let recordDeferredGuardSkipDisposition: (() => void) | undefined;
     let originalDeliveryBinding: string | null = null;
     // Refuse before evaluateDoneTransitionGuards. That guard writes
@@ -21286,6 +21724,7 @@ export function issueRoutes(
         caller: refusalCaller,
         closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
+        zeroDeltaRecheckedAtWrite: true,
         storedDeliveryRequirement: existing.deliveryRequirement,
       });
       if (!outcome.ok) {
@@ -21294,8 +21733,13 @@ export function issueRoutes(
       }
       doneOverrideAccepted = outcome.overrideAccepted === true;
       pendingCloseRowAudits = outcome.closeRowAudits;
+      finalizePatchLandingDebt = outcome.finalizeLandingDebt;
       if (outcome.noRepositoryLanding === true) {
         noRepositoryLandingCloser = closingActor;
+        recordDeferredGuardSkipDisposition = outcome.recordGuardSkipDisposition;
+      }
+      if (outcome.zeroDeltaMeasurement) {
+        zeroDeltaCloseMeasurement = outcome.zeroDeltaMeasurement;
         recordDeferredGuardSkipDisposition = outcome.recordGuardSkipDisposition;
       }
       if (terminalApprovalNeedsClassificationCheck) {
@@ -21308,6 +21752,7 @@ export function issueRoutes(
       if (!deferFinalDeliveryPrefetch) {
         await preflightTerminalApproval(finalDeliveryIssue, updateFields, transition.decision, nextExecutionPolicy, {
           overrideAccepted: outcome.overrideAccepted === true,
+          zeroDeltaProven: outcome.zeroDeltaMeasurement != null,
           prefetched: finalDeliveryPrefetch,
         });
       }
@@ -21429,6 +21874,9 @@ export function issueRoutes(
       // a replacement run that takes ownership during the final delivery
       // preflight is not cancelled, and a checkout-only binding never
       // borrows cancellation authority.
+      // SUP-20121: an adopted issue-less author is never interrupted this
+      // way either: the recorded authorship proof spares it, mirroring
+      // resolveActiveIssueRun, with no exception here.
       const linkedRunIds = [existing.executionRunId].filter(
         (runId): runId is string => typeof runId === "string" && runId.length > 0,
       );
@@ -21452,7 +21900,10 @@ export function issueRoutes(
             actor.runId !== null &&
             linkedRun.id === actor.runId &&
             linkedIssueId === existing.id;
-          if (!isIssuingRunStageHandoff) {
+          const isAdoptedAuthor =
+            linkedIssueId !== existing.id &&
+            (await runIsIssueAuthor(db, existing.companyId, existing.id, linkedRun.id));
+          if (!isIssuingRunStageHandoff && !isAdoptedAuthor) {
             pendingReassignmentStopRunId = linkedRun.id;
           }
           break;
@@ -21547,7 +21998,7 @@ export function issueRoutes(
           updateFields,
           transition.decision,
           nextExecutionPolicy,
-          { overrideAccepted: doneOverrideAccepted, prefetched: finalDeliveryPrefetch },
+          { overrideAccepted: doneOverrideAccepted, zeroDeltaProven: zeroDeltaCloseMeasurement !== null, prefetched: finalDeliveryPrefetch },
         );
       } catch (err) {
         await rewakeSuppressedReassignmentRun();
@@ -21615,6 +22066,7 @@ export function issueRoutes(
       actorRunId: actor.agentId ? actor.runId : null,
       actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorAgentApiKeyId: actor.agentApiKeyId ?? null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       ...(expectedUpdatedAtRaw !== undefined
         ? { expectedUpdatedAt: new Date(expectedUpdatedAtRaw) }
@@ -21797,6 +22249,7 @@ export function issueRoutes(
       // tier close rows on the same transaction as the terminal write, so the
       // update is forced onto the transactional path whenever rows are pending.
       pendingCloseRowAudits.length > 0
+      || effectiveStatus === "done"
       || plainCommentJoinsUpdate
       || Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
       || Boolean(commentAttachmentIds?.length)
@@ -21822,6 +22275,8 @@ export function issueRoutes(
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
+      // SUP-24402: a zero-delta close re-checks its measured worktree inside the write.
+      || zeroDeltaCloseMeasurement !== null
       // SUP-24429: a record_only request reads the stored requirement under the
       // row lock (close re-check and reclassification audit).
       || recordOnlyRequested
@@ -21848,6 +22303,9 @@ export function issueRoutes(
       requestedDeliveryRequirement: updateFields.deliveryRequirement,
       requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
       requestedProjectWorkspaceId: updateFields.projectWorkspaceId,
+      requestedProjectId: updateFields.projectId,
+      requestedTitle: updateFields.title,
+      requestedDescription: updateFields.description,
     };
     const noRepositoryLandingRefusal = (reason: string) =>
       unprocessable(reason, {
@@ -21855,6 +22313,13 @@ export function issueRoutes(
         issueId: existing.id,
         identifier: existing.identifier ?? null,
         stage: "no_repository_landing_transition_recheck",
+      });
+    const zeroDeltaTransitionRefusal = (reason: string) =>
+      unprocessable(`Tier 2 declaration could not be verified at the close write (merge_commit_unrecorded): ${reason}`, {
+        code: "done_transition_missing_tier_declaration",
+        issueId: existing.id,
+        identifier: existing.identifier ?? null,
+        stage: "zero_delta_transition_recheck",
       });
     let noRepositoryMeasurement: NoRepositoryLandingMeasurement | null = null;
     try {
@@ -21894,6 +22359,13 @@ export function issueRoutes(
               deliveryRequirement: lockedForRequirement.deliveryRequirement,
               status: lockedForRequirement.status,
             };
+          }
+          // A close the guard never evaluated (the unlocked read saw `done`) must
+          // not land on a row that is open again under the lock.
+          if (effectiveStatus === "done" && !missingApprovalStageGap && !finalizePatchLandingDebt) {
+            const locked = await svc.getByIdForUpdate(id, tx);
+            if (!locked) return null;
+            if (locked.status !== "done") throw conflict("Issue reopened before close; retry.");
           }
           // ADR-103 M4: validate the re-parent edge inside the write
           // transaction. The gate takes an exclusive lock on the parent row so
@@ -22160,6 +22632,7 @@ export function issueRoutes(
               const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
               await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
                 overrideAccepted: doneOverrideAccepted,
+                zeroDeltaProven: zeroDeltaCloseMeasurement !== null,
                 locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
               });
             }
@@ -22167,10 +22640,10 @@ export function issueRoutes(
           }
 
           // SUP-22570: compare-and-set against the measurement taken before
-          // this transaction. It re-reads the database half of the proof,
+          // this transaction. It re-reads the database half of the proof and
           // re-checks the measured worktree with a Git status under one
-          // shared 15 s budget (no GitHub call), and refuses if anything moved,
-          // got dirty or ran out of budget since the measurement.
+          // shared 15 s budget. The record_only path makes no GitHub call.
+          // It refuses if anything moved, got dirty, or ran out of budget.
           if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
             const lockedForLanding = await svc.getByIdForUpdate(id, tx);
             if (!lockedForLanding) return null;
@@ -22199,9 +22672,36 @@ export function issueRoutes(
             });
           }
 
+          // SUP-24402: compare-and-set against the zero-delta measurement
+          // taken before this transaction. It re-reads the database half,
+          // re-checks the worktree, and re-reads the forge snapshot under a
+          // 20 s budget while the issue row is held. A changed digest refuses.
+          if (zeroDeltaCloseMeasurement !== null) {
+            const lockedForZeroDelta = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForZeroDelta) return null;
+            // The proof covers the measured workspace binding only, so the
+            // same request may not move the card's project, project
+            // workspace or execution workspace.
+            const rebound = (["projectId", "projectWorkspaceId", "executionWorkspaceId"] as const).find(
+              (field) => updateFields[field] !== undefined && updateFields[field] !== (lockedForZeroDelta[field] ?? null),
+            );
+            if (rebound) {
+              throw zeroDeltaTransitionRefusal(
+                `a zero-delta close cannot change the card's ${rebound} from the measured binding`,
+              );
+            }
+            const verdict = await verifyZeroDeltaCloseAtTransition(
+              tx as unknown as Db,
+              lockedForZeroDelta,
+              zeroDeltaCloseMeasurement,
+            );
+            if (!verdict.ok) throw zeroDeltaTransitionRefusal(verdict.reason);
+          }
+
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
+          if (updated.status === "done") await finalizePatchLandingDebt?.(tx as unknown as Db, updated);
           // SUP-23925: the tier1/tier2 close rows commit on THIS transaction,
           // only after the terminal write landed, so a refused or raced close
           // cannot leave an orphan close row behind.
@@ -22359,26 +22859,18 @@ export function issueRoutes(
             });
           }
 
-          // SUP-24429: a request that reclassifies a repository_delivery issue
-          // as record_only without closing it stays lawful, but a later close
-          // then takes the record-only skip. Record the reclassification as its
-          // own event, in the activity log and in the thread the next run reads,
-          // in this write transaction: the flip, the row and the comment commit
-          // together or not at all. (A close in the same request was refused
-          // above.) The stored side is the value this request read under the
-          // row lock, so a concurrent flip never attributes the change to an
-          // unrelated request.
+          // Reclassification records durable landing debt in this issue-locked
+          // transaction. Only a verified, accepted close may discharge the row.
           if (
             lockedRequirementRead !== null &&
             lockedRequirementRead.deliveryRequirement !== "record_only" &&
             updated.deliveryRequirement === "record_only"
           ) {
             const storedDeliveryRequirement = lockedRequirementRead.deliveryRequirement;
-            // A closed issue owes no later close; its landing check is not skipped by this change.
             const landingCheckOwed =
               storedDeliveryRequirement === "repository_delivery" &&
-              !isClosedIssueStatus(lockedRequirementRead.status);
-            await logActivityInTransaction(tx as unknown as Db, {
+              (!isClosedIssueStatus(lockedRequirementRead.status) || !isClosedIssueStatus(updated.status));
+            const reclassification = await logActivityInTransaction(tx as unknown as Db, {
               companyId: updated.companyId,
               actorType: actor.actorType,
               boardApiKeyId: actor.boardApiKeyId,
@@ -22398,18 +22890,32 @@ export function issueRoutes(
                 actorType: actor.actorType,
                 actorId: actor.actorId,
                 landingCheckOwed,
+                landingDebtDisposition: landingCheckOwed ? "outstanding" : "not_owed",
               },
             });
+            if (landingCheckOwed) {
+              // Independent of deletable actor/run links: loss of the source
+              // event cannot make an outstanding obligation look debt-free.
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId: updated.companyId, actorType: "system", actorId: "landing-debt",
+                action: "issue.repository_landing_debt", entityType: "issue",
+                entityId: updated.id, issueId: updated.id,
+                details: {
+                  reclassificationActivityId: reclassification.id,
+                  landingCheckOwed: true, landingDebtDisposition: "outstanding",
+                },
+              });
+            }
             await svc.addComment(
               updated.id,
               [
                 "**Delivery requirement reclassified** (`issue.delivery_requirement_reclassified`)",
                 "",
-                `The landing obligation of this issue was reclassified from \`${storedDeliveryRequirement}\` to ` +
-                  `\`record_only\` by ${actor.actorType} \`${actor.actorId}\`, in a request that did not close the issue.`,
+                `The delivery requirement changed from \`${storedDeliveryRequirement}\` to ` +
+                  `\`record_only\` by ${actor.actorType} \`${actor.actorId}\`.`,
                 landingCheckOwed
-                  ? "A later close of this issue takes the record-only skip: no repository landing check runs at that close."
-                  : "The issue was already closed; this reclassification skips no landing check.",
+                  ? "Repository landing remains owed until verified proof discharges it atomically with an accepted close."
+                  : "This closed-issue reclassification creates no new landing debt; any existing debt remains owed.",
               ].join("\n"),
               {},
               // The comment touches issues.updatedAt; the response carries that
@@ -22549,6 +23055,35 @@ export function issueRoutes(
           runId: actor.runId ?? null,
         });
       }
+      if (
+        zeroDeltaCloseMeasurement !== null
+        && err instanceof HttpError
+        && err.status === 422
+        && (err.details as Record<string, unknown> | null | undefined)?.stage
+          === "zero_delta_transition_recheck"
+      ) {
+        // SUP-24402 / SUP-17125: the transactional re-check refused and the
+        // update rolled back; leave the same thread-readable refusal record.
+        await writeDoneTransitionRefusedAuditLog(db, existing, {
+          code: "done_transition_missing_tier_declaration",
+          httpStatus: 422,
+          reason: err.message,
+          decisionCarried: !!transition.decision,
+          runId: actor.runId ?? null,
+          stage: "zero_delta_transition_recheck",
+        });
+        await postTerminalStatusRefusalComment(svc, existing.id, {
+          httpStatus: 422,
+          code: "done_transition_missing_tier_declaration",
+          error: err.message,
+          remedy: err.message.includes("timed out at the close write")
+            ? "The worktree re-check at the close write ran out of its time budget before it finished; that is " +
+              "not a dirty-worktree finding. Retry the close, or use the board close path."
+            : "Fix what the refusal names, or retry if it says the worktree could not be verified; " +
+              "keep the issue repository_delivery and close again; the board close path stays available.",
+          runId: actor.runId ?? null,
+        });
+      }
       throw err;
     }
     if (!issue) {
@@ -22650,6 +23185,19 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
     await flushIssuePostCommitActions(postCommitIssueActions);
+    // A transactional update that cleared the execution lock without the
+    // post-commit list (a comment-joined status change) still promotes the
+    // held wake here, once the route transaction has committed.
+    if (existing.executionRunId && !issue.executionRunId) {
+      try {
+        const clearedRun = await heartbeat.getRun(existing.executionRunId);
+        if (clearedRun) {
+          await heartbeat.releaseIssueExecutionAndPromote(clearedRun, { suppressImmediateRecovery: true }, issue.id);
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id, runId: existing.executionRunId }, "failed to promote wakes after a transactional lock clear");
+      }
+    }
 
     if (transition.droppedStageIds?.length) {
       void logActivity(db, {
@@ -23082,7 +23630,11 @@ export function issueRoutes(
           recoveryPolicy: nextMonitor.recoveryPolicy,
         },
       });
-    } else if (!nextMonitor.nextCheckAt && previousMonitor.nextCheckAt) {
+    } else if (
+      !nextMonitor.nextCheckAt &&
+      previousMonitor.nextCheckAt &&
+      !recordedLostFutureMonitorCheck(issue)
+    ) {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -24243,6 +24795,22 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!existing) return;
+    if (req.actor.type === "agent" && req.actor.source !== "agent_jwt") {
+      const heldRunId = existing.executionRunId ?? existing.checkoutRunId;
+      if (heldRunId) {
+        const holder = await heartbeat.getRun(heldRunId);
+        const holderIssueId = typeof holder?.contextSnapshot?.issueId === "string"
+          ? holder.contextSnapshot.issueId.trim()
+          : null;
+        if (
+          holder?.status === "running" &&
+          !holderIssueId &&
+          await runIsIssueAuthor(db, existing.companyId, existing.id, heldRunId)
+        ) {
+          throw forbidden("An authenticated author run is required to release an adopted hold");
+        }
+      }
+    }
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const actorRunId = await requireAgentRunId(req, res, { checkoutRunId: existing.checkoutRunId });
     if (req.actor.type === "agent" && !actorRunId) return;
@@ -25176,6 +25744,7 @@ export function issueRoutes(
           executionState: parseIssueExecutionState(issue.executionState),
         });
       let pendingInteractionCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
+      let finalizeInteractionLandingDebt: ((tx: Db, locked: IssueRowForLandingDebt) => Promise<void>) | undefined;
       let escalationApproval: {
         prefetch: FinalDeliveryPrefetch | null;
         patch: Record<string, unknown>;
@@ -25204,6 +25773,7 @@ export function issueRoutes(
         // the escalation decision's transaction below, only after the terminal
         // write.
         pendingInteractionCloseRowAudits = closeOutcome.closeRowAudits;
+        finalizeInteractionLandingDebt = closeOutcome.finalizeLandingDebt;
         const projected = applyIssueExecutionPolicyTransition({
           issue, policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
           requestedStatus: "done", requestedAssigneePatch: {},
@@ -25260,6 +25830,8 @@ export function issueRoutes(
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId ?? null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
         },
         // SUP-17552: a final-stage escalation approval closes the card (the
         // guard above already allowed it); a non-final stage still only advances
@@ -25274,6 +25846,9 @@ export function issueRoutes(
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
               acceptedEscalationDecision.value = await applyEscalationApproval(tx as unknown as Db);
+              if (acceptedEscalationDecision.value?.issue.status === "done") {
+                await finalizeInteractionLandingDebt?.(tx as unknown as Db, acceptedEscalationDecision.value.issue);
+              }
               // SUP-23925: the deferred tier close rows commit on THIS
               // transaction, only after the terminal write landed.
               if (
@@ -25736,6 +26311,9 @@ export function issueRoutes(
                       userId:
                         actor.actorType === "user" ? actor.actorId : null,
                       runId: actor.runId,
+                      agentApiKeyId: actor.agentApiKeyId ?? null,
+                      boardApiKeyId:
+                        actor.actorType === "user" ? actor.boardApiKeyId : null,
                     },
                     deferredPostCommit: rejectDeferredPostCommit,
                     skipStatusCompare: true,
@@ -26866,6 +27444,21 @@ export function issueRoutes(
       return;
     }
     if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment"))) return;
+    const issueExecutionStateBeforeComment = parseIssueExecutionState(issue.executionState);
+    const resolvedDoneTierCommentBody =
+      doneTier !== undefined &&
+      issue.status === "in_review" &&
+      issueExecutionStateBeforeComment?.status === "pending" &&
+      actorMatchesExecutionParticipant(actor, issueExecutionStateBeforeComment.currentParticipant ?? null) &&
+      isApprovalReviewComment(req.body.body)
+        ? await resolveDoneTierSourcesOrRefuse({
+          issue,
+          commentBody,
+          doneTier,
+          door: "comment_auto_approval",
+          runId: actor.runId ?? null,
+        })
+        : undefined;
     // Reopen the closed isolated workspace only after every access, resume-intent,
     // blocker, and run-cap gate passes. A rejected comment must not rebuild and
     // republish the workspace as active, because the issue stays terminal and the
@@ -27067,6 +27660,7 @@ export function issueRoutes(
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
     let pendingAutoApproveCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
+    let finalizeAutoApproveLandingDebt: ((tx: Db, locked: IssueRowForLandingDebt) => Promise<void>) | undefined;
     const shouldAutoApproveReviewComment =
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
@@ -27109,7 +27703,15 @@ export function issueRoutes(
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
       if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
-        commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+        commentBody = resolvedDoneTierCommentBody !== undefined
+          ? resolvedDoneTierCommentBody
+          : await resolveDoneTierSourcesOrRefuse({
+            issue: currentIssue,
+            commentBody,
+            doneTier,
+            door: "comment_auto_approval",
+            runId: actor.runId ?? null,
+          });
         if (transition.decision) transition.decision.body = commentBody;
       }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
@@ -27138,6 +27740,7 @@ export function issueRoutes(
         // SUP-23925: close rows deferred by the guard evaluator; persisted on
         // the auto-approval transaction below, only after the terminal write.
         pendingAutoApproveCloseRowAudits = outcome.closeRowAudits;
+        finalizeAutoApproveLandingDebt = outcome.finalizeLandingDebt;
       }
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -27173,7 +27776,9 @@ export function issueRoutes(
           ? { workflowControlledAssignment: true }
           : {}),
         actorAgentId: actor.agentId ?? null,
+        actorRunId: actor.agentId ? actor.runId ?? null : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        actorAgentApiKeyId: actor.agentApiKeyId ?? null,
         boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       };
 
@@ -27243,6 +27848,7 @@ export function issueRoutes(
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
+          if (updated.status === "done") await finalizeAutoApproveLandingDebt?.(tx as unknown as Db, updated);
           // SUP-23925: the deferred tier close rows commit on THIS
           // transaction, only after the terminal write landed.
           if (pendingAutoApproveCloseRowAudits.length > 0 && updated.status === "done") {

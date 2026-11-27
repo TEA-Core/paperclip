@@ -682,6 +682,7 @@ export async function reapStrandedSummaryGenerationIssues(
               lastActivityAt,
             }, { now: logRow!.databaseNow });
             if (continuation.ok) return false;
+            await guardVerdict.finalizeLandingDebt(tx as unknown as Db, issue, issue.statusVersion + 1);
 
             // SUP-21901 / SUP-21910: the audited system tier-bypass row (the
             // SUP-13939 census shape) lands in the SAME transaction as the
@@ -702,6 +703,7 @@ export async function reapStrandedSummaryGenerationIssues(
               postCommitActivityPublications,
               postCommitIssueActions,
             );
+            if (updated?.status !== "done") throw new Error("summary task vanished before its accepted close");
             // SUP-23925: the deferred tier close rows commit on THIS
             // transaction, only after the terminal write landed.
             if (updated?.status === "done" && guardVerdict.closeRowAudits.length > 0) {

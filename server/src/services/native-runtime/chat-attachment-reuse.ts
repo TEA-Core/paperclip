@@ -662,7 +662,7 @@ export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
     run.status !== "running" ||
     issue.assigneeAgentId !== binding.agentId ||
     issue.executionRunId !== binding.runId ||
-    ["paused", "terminated", "pending_approval", "error"].includes(
+    ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
       actor.status,
     )
   ) {
@@ -1028,7 +1028,7 @@ export async function listAuthorizedChatAttachments(input: {
       .limit(1);
     if (
       !current ||
-      ["paused", "terminated", "pending_approval", "error"].includes(
+      ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
         current.actorStatus,
       )
     ) {
