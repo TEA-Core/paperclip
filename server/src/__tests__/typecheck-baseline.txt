@@ -724,16 +724,6 @@ server/src/__tests__/issue-execution-policy.test.ts(228,43): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(248,43): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(259,43): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(322,43): TS2741
-server/src/__tests__/issue-monitor-scheduler.test.ts(243,39): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(243,74): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(244,39): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(244,74): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(245,37): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(245,70): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(246,39): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(246,74): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(247,42): TS2339
-server/src/__tests__/issue-monitor-scheduler.test.ts(247,80): TS2339
 server/src/__tests__/issue-queued-comments-routes.test.ts(357,7): TS2769
 server/src/__tests__/issue-recovery-actions.test.ts(1102,42): TS2493
 server/src/__tests__/issue-recovery-actions.test.ts(1102,46): TS2339
