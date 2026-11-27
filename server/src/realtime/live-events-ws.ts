@@ -321,6 +321,8 @@ export function setupLiveEventsWebSocketServer(
         }
         if (socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify(visible));
+      }).catch((err) => {
+        logger.warn({ err, companyId: context.companyId }, "live event delivery failed; event dropped");
       });
     });
 

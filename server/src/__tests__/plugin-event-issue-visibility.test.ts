@@ -96,6 +96,37 @@ describe("plugin issue event visibility", () => {
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
+  it("withholds the output of a run on an unreadable issue and keeps its status", () => {
+    const original = event({
+      eventType: "agent.run.failed",
+      entityType: "heartbeat_run",
+      entityId: "run-1",
+      payload: {
+        runId: "run-1",
+        agentId: "agent-1",
+        status: "failed",
+        error: "Restricted run error",
+        errorCode: "adapter_failed",
+        issueId: "issue-1",
+      },
+    });
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      runId: "run-1",
+      agentId: "agent-1",
+      status: "failed",
+      error: null,
+      errorCode: "adapter_failed",
+      issueId: "issue-1",
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
+    const issueless = event({
+      eventType: "agent.run.failed",
+      entityType: "heartbeat_run",
+      payload: { runId: "run-2", status: "failed", error: "Run error", issueId: null },
+    });
+    expect(pluginEventForRecipient(issueless, false)).toBe(issueless);
+  });
+
   it("leaves events about other entities unchanged", () => {
     const agentEvent = event({ eventType: "agent.updated", entityType: "agent", payload: { title: "Agent title" } });
     expect(pluginEventForRecipient(agentEvent, false)).toBe(agentEvent);
