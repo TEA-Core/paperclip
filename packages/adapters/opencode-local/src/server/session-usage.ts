@@ -6,8 +6,8 @@
  * a run spent: a `step_finish` record can be dropped from the stream entirely
  * (upstream anomalyco/opencode#53207), so stdout step sums alone can
  * under-report a turn. Only a run that started its session reports the
- * session totals; a run that resumed a session which already had usage reports
- * its own validated step sums, so overlapping runs on one session are never
+ * session totals; a run that resumed a session reports its own validated step
+ * sums, so overlapping runs on one session are never
  * charged for each other's work. Either way the result is per-run, which is
  * what the adapter's `usageBasis: "per_run"` result promises the server.
  */
@@ -346,9 +346,8 @@ export function subtractOpenCodeSessionTotals(
 /**
  * Reconcile this run's usage from the serve transport's durable session state.
  *
- * For a run that started its session (or resumed one with no usage yet) the
- * cumulative session totals minus the pre-run baseline (read from
- * `GET /api/session/{id}` before the prompt) are exactly what this run spent,
+ * For a run that started its session the cumulative session totals are
+ * exactly what this run spent,
  * so the result is scoped `per_run` and the server's legacy session-delta
  * heuristic steps aside. The totals are `complete` only when a final record
  * backs them: the post-turn session reading, or a last `session.usage.updated`
@@ -360,10 +359,10 @@ export function subtractOpenCodeSessionTotals(
  * Without a session reading — an older server that never emits usage events,
  * or a resume whose baseline payload lacked counters, where the cumulative
  * total would silently include prior runs — and for any run that resumed a
- * session which already had usage, the validated per-step sums stand in: a
- * sibling run on the same session can move the cumulative total, so only the
- * run's own steps are attributable to it. They cover only this run's steps, but a dropped `step_finish` can
- * under-report them, so they are never marked complete.
+ * session, the validated per-step sums stand in: a sibling run on the same
+ * session can move the cumulative total, so only the run's own steps are
+ * attributable to it. They cover only this run's steps, but a dropped
+ * `step_finish` can under-report them, so they are never marked complete.
  *
  * A zero cost with nonzero tokens means the model is unpriced, not free: the
  * cost is reported as null so the ledger marks it unpriced instead of $0.00.
@@ -384,13 +383,7 @@ export function reconcileOpenCodeRunUsage(input: {
   const finalRecord = input.sessionUsageFinal ?? null;
   const cumulative = mergeOpenCodeSessionTotals(input.sessionUsage, finalRecord);
   const baseline = input.sessionUsageBaseline;
-  const baselineHasUsage =
-    baseline !== null &&
-    (baseline.usage.inputTokens > 0 ||
-      baseline.usage.cachedInputTokens > 0 ||
-      baseline.usage.outputTokens > 0 ||
-      (baseline.costUsd ?? 0) > 0);
-  const startedSession = !input.resumedSession || (baseline !== null && !baselineHasUsage);
+  const startedSession = !input.resumedSession;
   const stepIssues = input.stepUsageIssues ?? [];
   if (cumulative && startedSession) {
     const delta = subtractOpenCodeSessionTotals(cumulative, baseline);
@@ -425,7 +418,7 @@ export function reconcileOpenCodeRunUsage(input: {
     ? "session reported no usage; step sums used"
     : baseline === null
       ? "resumed session has no pre-run usage baseline; step sums used"
-      : "resumed session already had usage; this run's own step sums used";
+      : "resumed session; this run's own step sums used";
   const stepTokens =
     input.stepUsage.inputTokens + input.stepUsage.cachedInputTokens + input.stepUsage.outputTokens;
   return {

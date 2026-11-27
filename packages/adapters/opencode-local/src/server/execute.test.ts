@@ -1150,7 +1150,7 @@ describe("execute — OpenCode V2 serve transport", () => {
     const { result, requests } = await runServe({}, { sessionId: "ses_known" });
 
     expect(requests.some((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toBe(true);
-    // The session already spent 500/60/40 before this run, so a sibling run
+    // The run resumed a session (500/60/40 already spent), so a sibling run
     // could move its cumulative total; only this run's own steps (5/2/1) are
     // charged, never the cumulative total or its delta.
     expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
@@ -1158,7 +1158,7 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(result.costUsd).toBeNull();
     const resultJson = result.resultJson as Record<string, unknown>;
     expect(resultJson.usageSource).toBe("step_finish");
-    expect(resultJson.usageIssues).toEqual(["resumed session already had usage; this run's own step sums used"]);
+    expect(resultJson.usageIssues).toEqual(["resumed session; this run's own step sums used"]);
   });
 
   it("reports the final session record when the last usage update was partial", async () => {

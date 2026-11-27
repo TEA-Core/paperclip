@@ -133,7 +133,7 @@ describe("reconcileOpenCodeRunUsage", () => {
       usageBasis: "per_run",
       source: "step_finish",
       complete: false,
-      issues: ["resumed session already had usage; this run's own step sums used"],
+      issues: ["resumed session; this run's own step sums used"],
     });
   });
 
@@ -178,23 +178,33 @@ describe("reconcileOpenCodeRunUsage", () => {
     });
     expect(reconciled.usage).toEqual(steps);
     expect(reconciled.issues).toEqual([
-      "resumed session already had usage; this run's own step sums used",
+      "resumed session; this run's own step sums used",
       "step_finish #1: tokens.input refused (-5)",
     ]);
   });
 
-  it("subtracts a zero baseline on a resumed session that had no usage yet", () => {
-    expect(
+  it("charges overlapping resumes of a zero-usage session their own steps", () => {
+    // A prior run created session S and failed before any model step, so S
+    // reads 0. Runs A and B both resume S at 0/0/0; A spends 50 and B 30, so S
+    // reads 80 when each finishes. Each is charged its own steps (80 in total),
+    // never the whole session total (160 in total).
+    const baseline = totals(0, 0, 0, 0);
+    const after = totals(80, 0, 0, 0.08);
+    const charged = [
+      { inputTokens: 50, cachedInputTokens: 0, outputTokens: 0 },
+      { inputTokens: 30, cachedInputTokens: 0, outputTokens: 0 },
+    ].map((stepUsage) =>
       reconcileOpenCodeRunUsage({
-        sessionUsage: totals(5, 1, 2, 0.01),
-        sessionUsageBaseline: totals(0, 0, 0, 0),
+        sessionUsage: after,
+        sessionUsageFinal: after,
+        sessionUsageBaseline: baseline,
         resumedSession: true,
-        stepUsage: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2 },
-        stepCostUsd: 0,
+        stepUsage,
+        stepCostUsd: stepUsage.inputTokens / 1000,
       }),
-    ).toEqual(
-      expect.objectContaining({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, source: "session_usage", complete: true, costUsd: 0.01 }),
     );
+    expect(charged.map((run) => run.usage.inputTokens)).toEqual([50, 30]);
+    expect(charged.every((run) => run.source === "step_finish")).toBe(true);
   });
 
   it("falls back to step sums when a resumed session has no baseline", () => {
@@ -281,8 +291,8 @@ describe("reconcileOpenCodeRunUsage", () => {
     expect(
       reconcileOpenCodeRunUsage({
         sessionUsage: totals(105, 20, 9, 0.5),
-        sessionUsageBaseline: totals(0, 0, 0, null),
-        resumedSession: true,
+        sessionUsageBaseline: totals(100, 20, 7, null),
+        resumedSession: false,
         stepUsage: steps,
         stepCostUsd: 0,
       }).costUsd,

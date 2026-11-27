@@ -428,10 +428,10 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       const existing = await request(`/api/session/${encodeURIComponent(sessionId)}`);
       if (existing.status === 404) throw new ServeTransportError(`OpenCode session ${sessionId} not found (unknown session)`);
       if (existing.status !== 200) throw new ServeTransportError(`OpenCode could not load session ${sessionId}: HTTP ${existing.status}`);
-      // Snapshot the session's cumulative usage before the prompt so the run's
-      // result can report only what this attempt spent (session-usage.ts). A
-      // payload without complete counters emits nothing, and the run falls
-      // back to the per-step stdout sums.
+      // Snapshot the session's cumulative usage before the prompt. A resumed
+      // run is charged its own per-step stdout sums either way
+      // (session-usage.ts); the snapshot only records whether the session had
+      // readable counters. A payload without complete counters emits nothing.
       await emitSessionUsage("session_usage_baseline", sessionId, existing.text);
       const switched = await request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: "POST",
