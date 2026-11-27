@@ -36,7 +36,7 @@ The recorded branch is always a local branch. The check compares full ref names 
 - HEAD is on another branch (`branch_mismatch`).
 - HEAD is detached at a commit other than the recorded branch tip (`detached_head_off_recorded_tip`). A detached HEAD at that tip starts.
 - The recorded branch has no local ref, for example a deleted branch, a tag, or a remote-only ref (`recorded_ref_missing`). Restore the local branch or reprovision the workspace.
-- A `git_worktree` workspace has no recorded branch (`recorded_branch_metadata_missing`). Reprovision the workspace to record its branch. Other execution workspace strategies never record a branch, so they have nothing to compare.
+- A `git_worktree` workspace has no recorded branch (`recorded_branch_metadata_missing`). Reprovision the workspace to record its branch. Other execution workspace strategies are compared only when they record a branch. They are not refused when the recorded branch is empty.
 
 The check does not apply to a project workspace start, because the project primary checkout has no recorded branch. Its default ref is not compared with the checkout, so the project primary checkout can be on any branch. The check also does not apply when an execution-workspace job runs.
 

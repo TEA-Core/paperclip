@@ -6759,9 +6759,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       "Cannot rebuild the git worktree: the base project checkout directory does not exist.",
     );
   }
-  // A linked worktree's own toplevel is not the disposable base. Resolve the
-  // owning repository so hygiene cannot force-checkout the bound source.
-  const repoRoot = await resolveGitOwnerRepoRoot(baseCwd);
+  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
     const reuseWorktreePath = realized.worktreePath ?? cwd;
