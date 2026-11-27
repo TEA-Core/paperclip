@@ -939,6 +939,8 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
+An issue event payload can carry issue content, such as the `title` and `description` of `issue.created`. The host delivers that content only to a plugin that can read issues, which is the `issues.read` capability that `issues.get` requires. A plugin without `issues.read` receives the event without `title` and `description` (also under `_previous`). The identifiers stay in the event.
+
 ### 16.1 Event Filtering
 
 Plugins may provide an optional filter when subscribing to events. The filter is evaluated by the host before dispatching to the worker, so filtered-out events never cross the process boundary.

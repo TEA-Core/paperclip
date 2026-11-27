@@ -610,6 +610,7 @@ Primary transport: websocket channel per company.
 
 - Endpoint: `GET /api/companies/:companyId/events/ws`
 - Auth: board session or agent API key (company-bound)
+- Issue visibility: an `activity.logged` event about an issue goes to a subscriber only when `GET /api/issues/:id` would let the same actor read that issue. If the issue row does not exist, the event goes out without its `details`.
 
 ## 11.2 Event envelope
 

@@ -45,6 +45,7 @@ import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
+import { pluginCanReadIssues, pluginEventForRecipient } from "./plugin-event-issue-visibility.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -1593,9 +1594,10 @@ export function buildHostServices(
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
       async subscribe(params: { eventPattern: string; filter?: Record<string, unknown> | null }) {
+        const canReadIssues = pluginCanReadIssues(options.manifest);
         const handler = async (event: import("@paperclipai/plugin-sdk").PluginEvent) => {
           if (notifyWorker) {
-            notifyWorker("onEvent", { event });
+            notifyWorker("onEvent", { event: pluginEventForRecipient(event, canReadIssues) });
           }
         };
         if (params.filter) {

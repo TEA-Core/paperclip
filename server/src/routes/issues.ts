@@ -555,6 +555,11 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import {
+  issueAccessDecisionInput,
+  type IssueAccessAction,
+  type IssueAccessTarget,
+} from "../services/issue-access-input.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 // Strip must be re-applied after `.extend()`: the handler below rest-spreads the parsed body into
@@ -8045,42 +8050,13 @@ export function issueRoutes(
 
   async function decideIssueAccess(
     req: Request,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-      status: string;
-      createdByAgentId: string | null;
-    },
-    action: "issue:comment" | "issue:read" | "issue:mutate",
+    issue: IssueAccessTarget,
+    action: IssueAccessAction,
     options: { allowCreatorDocumentWrite?: boolean } = {},
   ) {
     return access.decide({
       actor: req.actor,
-      action,
-      resource: {
-        type: "issue",
-        companyId: issue.companyId,
-        issueId: issue.id,
-        projectId: issue.projectId,
-        parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
-        status: issue.status,
-        createdByAgentId: issue.createdByAgentId,
-      },
-      scope: {
-        issueId: issue.id,
-        projectId: issue.projectId,
-        parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
-        createdByAgentId: issue.createdByAgentId,
-        ...(options.allowCreatorDocumentWrite ? { issueDocumentWrite: true } : {}),
-      },
+      ...issueAccessDecisionInput(issue, action, options),
     });
   }
 
