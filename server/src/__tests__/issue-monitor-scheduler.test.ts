@@ -882,6 +882,46 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
     });
 
+    it.each(["company", "agent"] as const)(
+      "a budget-stopped owner (%s paused for budget) defers the recovery with the monitor armed, then recovers once",
+      async (scope) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        if (scope === "company") {
+          await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, companyId));
+        } else {
+          await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, agentId));
+        }
+
+        await heartbeat.tickTimers(recoveryTickAt);
+        const deferred = await readIssue(issueId);
+        expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        expect(deferred.monitorWakeRequestedAt).toBeNull();
+        expect(deferred.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+        expect(await exhaustionRows(issueId)).toHaveLength(0);
+        expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(0);
+
+        if (scope === "company") {
+          await db.update(companies).set({ status: "active", pauseReason: null }).where(eq(companies.id, companyId));
+        } else {
+          await db.update(agents).set({ status: "active", pauseReason: null }).where(eq(agents.id, agentId));
+        }
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        // Recovered once. The outcome label depends on whether the owner's wake was
+        // admitted or parked behind an unrelated execution hold, so only the count is
+        // asserted here; the truthful-outcome cells cover the label.
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.details).toMatchObject({ recoveryPolicy: "wake_owner" });
+        expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped").length).toBeLessThanOrEqual(1);
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
     it("an owner that does not accept on-demand wakes gets a truthful outcome, not a queued claim", async () => {
       const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
       const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
