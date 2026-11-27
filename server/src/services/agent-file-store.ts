@@ -83,7 +83,7 @@ export async function adoptAgentFiles(tx: Tx, agent: Agent): Promise<string> {
     .from(agentInstructionHeads).innerJoin(agentInstructionRevisions, eq(agentInstructionHeads.revisionId, agentInstructionRevisions.id))
     .where(and(eq(agentInstructionHeads.companyId, agent.companyId), eq(agentInstructionHeads.agentId, agent.id)));
   for (const entry of legacy) await materializeInstructionBytes(root, entry.entryFile, Buffer.from(entry.contentBase64, "base64"));
-  await materializeInstructionBytes(markerRoot, marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })), 0o600);
+  await materializeInstructionBytes(markerRoot, marker, Buffer.from(JSON.stringify({ schema: AGENT_FILES_CONTRACT })), { privateFile: true });
   return root;
 }
 

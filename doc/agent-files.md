@@ -37,15 +37,31 @@ workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
 
-Editor saves, bundle initialization/import, and adoption of revision-backed files
-write instruction files as `0640` and create directories as `0750`, explicitly
-independent of umask. Group read is intentional; group write and world access
-are never granted. Existing files and directories are not bulk-migrated: files
-receive the new mode when written. The adoption marker remains private (`0600`).
+The runtime's agents group is resolved by name (`agents`). `PAPERCLIP_AGENTS_GID`
+may give it numerically where the name does not resolve. The server refuses an
+override that is not numeric, is gid `0`, is the server's own primary group, or
+differs from the named `agents` group. The group is used only when the server
+process may assign it (it is root or a member). Otherwise no group is used.
 
-When the runtime's agents group resolves (`PAPERCLIP_AGENTS_GID`, otherwise the
-named `agents` group) and the server process may assign it (it is root or a
-member), the fork stages live directories with modes derived from owner bits:
+Editor saves, bundle initialization/import, and adoption of revision-backed files
+write instruction files as `0640` and directories as `0750`, both owned by the
+agents group, explicitly independent of umask. Group read is intentional; group
+write and world access are never granted. When no agents group resolves, these
+writes stay owner-only (`0600` files, `0700` directories) and grant no group
+access. Each write replaces the file with a new inode in the final mode and
+group. It also sets every existing directory from the instruction root down to
+that file to the same layout, so a loose (for example `0777`) directory is
+tightened. Directories above the instruction root are not changed. If a loose
+directory cannot be tightened (for example, another user owns it), the write is
+refused with `INSTRUCTION_STORAGE_UNSAFE`. Files that are not written are not
+bulk-migrated. The adoption marker remains private (`0600`).
+
+Instruction files are readable by every member of the agents group. Do not put
+secrets (API keys, tokens, passwords, credentials) in instruction files or
+doctrine; give agents secrets through secret references in their environment
+variables instead.
+
+When the agents group resolves as described above, the fork stages live directories with modes derived from owner bits:
 at most `02750` (setgid, group read/traverse), owned by that group.
 The `file-sync/`, `runs/`, and run directories have at most `0750`, without
 setgid inheritance. Files retain their owner permissions and gain

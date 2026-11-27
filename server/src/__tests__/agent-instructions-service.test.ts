@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { agentInstructionsService } from "../services/agent-instructions.js";
+import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
+
+const agentsGid = assignableAgentsGid();
 
 type TestAgent = {
   id: string;
@@ -48,22 +51,25 @@ describe("agent instructions service", () => {
     }));
   });
 
-  it.each([0o077, 0o002])("writes supporting editor files group-readable regardless of umask (%s)", async (umask) => {
+  it.skipIf(agentsGid === undefined).each([0o077, 0o002])("writes supporting editor files group-readable in the agents group regardless of umask (%s)", async (umask) => {
     const root = await makeTempDir("editor-mode-");
     cleanupDirs.add(root);
     const previousUmask = process.umask(umask);
     try {
       const agent = makeAgent({ instructionsBundleMode: "external", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" });
       const service = agentInstructionsService();
-      await service.writeFile(agent, "doctrine/nested/mission.md", "first");
+      await withAgentsGid(agentsGid!, () => service.writeFile(agent, "doctrine/nested/mission.md", "first"));
       const filename = path.join(root, "doctrine/nested/mission.md");
       expect((await fs.stat(filename)).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(filename)).gid).toBe(agentsGid);
       await fs.chmod(filename, 0o600);
-      await service.writeFile(agent, "doctrine/nested/mission.md", "saved");
+      await withAgentsGid(agentsGid!, () => service.writeFile(agent, "doctrine/nested/mission.md", "saved"));
       expect(await fs.readFile(filename, "utf8")).toBe("saved");
       expect((await fs.stat(filename)).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(filename)).gid).toBe(agentsGid);
       for (const relative of ["doctrine", "doctrine/nested"]) {
         expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o750);
+        expect((await fs.stat(path.join(root, relative))).gid).toBe(agentsGid);
       }
     } finally {
       process.umask(previousUmask);

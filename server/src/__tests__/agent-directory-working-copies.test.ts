@@ -12,6 +12,11 @@ import { eq } from "drizzle-orm";
 import { adoptAgentFiles, agentFileStore, fileHash, inspectAgentFile, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
 import { agents, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
+
+// The agents group is never gid 0 or the server's primary group.
+const agentsGid = assignableAgentsGid();
+const sharing = agentsGid !== undefined;
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } from "../services/agent-instruction-working-copies.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
@@ -98,14 +103,6 @@ describe("persistent agent directories", () => {
     expect(await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId))).toHaveLength(0);
   });
 
-  async function withAgentsGid<T>(gid: number, fn: () => Promise<T>): Promise<T> {
-    const previous = process.env.PAPERCLIP_AGENTS_GID;
-    process.env.PAPERCLIP_AGENTS_GID = String(gid);
-    try { return await fn(); } finally {
-      if (previous === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
-      else process.env.PAPERCLIP_AGENTS_GID = previous;
-    }
-  }
   const sharedFiles = ["AGENTS.md", "doctrine/mission.md", "doctrine/nested/policy.md"];
   async function writeShared() {
     for (const relative of sharedFiles) {
@@ -115,24 +112,28 @@ describe("persistent agent directories", () => {
     }
   }
 
-  it.each([0o077, 0o002])("stages editor-written instructions and doctrine group-readable without group write (umask=%s)", async (umask) => {
+  it.skipIf(!sharing).each([0o077, 0o002])("stages editor-written instructions and doctrine group-readable without group write (umask=%s)", async (umask) => {
     const previousUmask = process.umask(umask);
     try {
       await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } }).where(eq(agents.id, agentId));
       const store = agentFileStore(db);
       for (const relative of sharedFiles) {
-        await store.write({ ...target(), path: relative, bytes: Buffer.from(relative), baseHash: null }, board());
-        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+        await withAgentsGid(agentsGid!, () => store.write({ ...target(), path: relative, bytes: Buffer.from(relative), baseHash: null }, board()));
+        const stat = await fs.stat(path.join(root, relative));
+        expect(stat.mode & 0o7777).toBe(0o640);
+        expect(stat.gid).toBe(agentsGid!);
       }
       for (const relative of ["doctrine", "doctrine/nested"]) {
-        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o750);
+        const stat = await fs.stat(path.join(root, relative));
+        expect(stat.mode & 0o7777).toBe(0o750);
+        expect(stat.gid).toBe(agentsGid!);
       }
-      const copy = await withAgentsGid(process.getegid!(), () => run());
+      const copy = await withAgentsGid(agentsGid!, () => run());
       expect(path.basename(copy.localRoot)).toBe("live");
       for (const relative of sharedFiles) {
         const stat = await fs.stat(path.join(copy.localRoot, relative));
         expect(stat.mode & 0o7777).toBe(0o640);
-        expect(stat.gid).toBe(process.getegid!());
+        expect(stat.gid).toBe(agentsGid!);
         expect(await fs.readFile(path.join(copy.localRoot, relative), "utf8")).toBe(relative);
       }
     } finally {
@@ -140,7 +141,7 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it.each([0o077, 0o002])("adopts revision files with explicit group-read modes (umask=%s)", async (umask) => {
+  it.skipIf(!sharing).each([0o077, 0o002])("adopts revision files with explicit group-read modes (umask=%s)", async (umask) => {
     const revisionId = randomUUID();
     await db.insert(agentInstructionRevisions).values({
       id: revisionId, companyId, agentId, entryFile, contentBase64: Buffer.from(initial).toString("base64"),
@@ -151,11 +152,13 @@ describe("persistent agent directories", () => {
     const previousUmask = process.umask(umask);
     try {
       const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-      await db.transaction(tx => adoptAgentFiles(tx, agent));
+      await withAgentsGid(agentsGid!, () => db.transaction(tx => adoptAgentFiles(tx, agent)));
       expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
       expect((await fs.stat(path.join(root, entryFile))).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(path.join(root, entryFile))).gid).toBe(agentsGid!);
       for (const directory of [root, path.join(root, "policy")]) {
         expect((await fs.stat(directory)).mode & 0o7777).toBe(0o750);
+        expect((await fs.stat(directory)).gid).toBe(agentsGid!);
       }
       expect((await fs.stat(path.join(path.dirname(root), "file-sync/adopted.json"))).mode & 0o7777).toBe(0o600);
     } finally {
@@ -163,8 +166,8 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
-    const gid = process.getegid!();
+  it.skipIf(!sharing)("stages private group-readable instructions and doctrine despite a restrictive umask", async () => {
+    const gid = agentsGid!;
     const previousUmask = process.umask();
     await writeShared();
     await fs.writeFile(path.join(root, "doctrine/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
@@ -201,7 +204,7 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it.each([0o077, 0o002])("keeps the run private until every writable canonical entry has its final mode and group (umask=%s)", async (umask) => {
+  it.skipIf(!sharing).each([0o077, 0o002])("keeps the run private until every writable canonical entry has its final mode and group (umask=%s)", async (umask) => {
     await writeShared();
     const modes = { "private.md": 0o600, "private.sh": 0o700, "world-read.md": 0o604, "writable.md": 0o666 };
     for (const [relative, mode] of Object.entries(modes)) {
@@ -226,14 +229,14 @@ describe("persistent agent directories", () => {
         const check = async (directory: string) => {
           const stat = await fs.stat(directory);
           expect(stat.mode & 0o022).toBe(0);
-          expect(stat.gid).toBe(process.getegid!());
+          expect(stat.gid).toBe(agentsGid!);
           for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
             const file = path.join(directory, entry.name);
             if (entry.isDirectory()) await check(file);
             else {
               const stat = await fs.stat(file);
               expect(stat.mode & 0o7777).toBe(expected[path.relative(path.join(name, "live"), file) as keyof typeof expected]);
-              expect(stat.gid).toBe(process.getegid!());
+              expect(stat.gid).toBe(agentsGid!);
             }
           }
         };
@@ -244,16 +247,16 @@ describe("persistent agent directories", () => {
     });
     try {
       process.umask(umask);
-      const copy = await withAgentsGid(process.getegid!(), () => run());
+      const copy = await withAgentsGid(agentsGid!, () => run());
       expect(published).toBe(true);
-      expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+      expect(copy.receipt?.stagedGid).toBe(agentsGid!);
     } finally {
       publishing.mockRestore();
       process.umask(previousUmask);
     }
   });
 
-  it.each([true, false])("protects staged files and controller metadata under umask 002 (shared=%s)", async (shared) => {
+  it.each(sharing ? [true, false] : [false])("protects staged files and controller metadata under umask 002 (shared=%s)", async (shared) => {
     const previousUmask = process.umask(0o002);
     try {
       await writeShared();
@@ -262,7 +265,7 @@ describe("persistent agent directories", () => {
       await fs.writeFile(path.join(root, "permissive/public.md"), "public");
       await fs.writeFile(path.join(root, "private.md"), "private", { mode: 0o600 });
       await fs.writeFile(path.join(root, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
-      const copy = await withAgentsGid(shared ? process.getegid!() : -1, () => run({ warm: true }));
+      const copy = await withAgentsGid(shared ? agentsGid! : -1, () => run({ warm: true }));
       const check = async (directory: string) => {
         const stat = await fs.stat(directory);
         expect(stat.mode & 0o027).toBe(0);
@@ -307,7 +310,7 @@ describe("persistent agent directories", () => {
     try {
       await writeShared();
       await fs.chmod(path.join(root, "doctrine"), 0o775);
-      const gid = process.getegid!();
+      const gid = agentsGid!;
       const copy = await withAgentsGid(gid, () => run({ warm: true }));
       await fs.writeFile(path.join(copy.localRoot, entryFile), `${initial}checkpoint`);
       expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.state).toBe("warm_saved");
@@ -348,7 +351,7 @@ describe("persistent agent directories", () => {
   });
 
   it.skipIf(process.getuid?.() !== 0)("lets a non-owner agents-group member read live/AGENTS.md and live/doctrine/* (needs root to switch uid)", async () => {
-    const gid = process.getegid!();
+    const gid = agentsGid!;
     await writeShared();
     const copy = await withAgentsGid(gid, () => run());
     // Only the disposable home fixture is opened for traversal; production
@@ -386,7 +389,7 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it.each([false, true])("writes edited files back with their canonical modes unless the run changed the mode (warm=%s)", async (warm) => {
+  it.skipIf(!sharing).each([false, true])("writes edited files back with their canonical modes unless the run changed the mode (warm=%s)", async (warm) => {
     const canonical = { "scripts/run.sh": 0o755, "scripts/private.sh": 0o700, "notes/private.md": 0o600, "notes/plain.md": 0o644, "notes/mode.md": 0o644 };
     for (const [relative, mode] of Object.entries(canonical)) {
       await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true });
@@ -399,8 +402,8 @@ describe("persistent agent directories", () => {
       await fs.chown(path.join(root, relative), -1, gids[index % gids.length]!);
       originalGroups.set(relative, (await fs.stat(path.join(root, relative))).gid);
     }
-    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
-    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+    const copy = await withAgentsGid(agentsGid!, () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(agentsGid!);
     expect((await fs.stat(path.join(copy.localRoot, "scripts/run.sh"))).mode & 0o7777).toBe(0o750);
     expect((await fs.stat(path.join(copy.localRoot, "notes/private.md"))).mode & 0o7777).toBe(0o600);
     expect((await fs.stat(path.join(copy.localRoot, "scripts/private.sh"))).mode & 0o7777).toBe(0o700);
@@ -417,11 +420,12 @@ describe("persistent agent directories", () => {
     if (warm) expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
 
-  const canonicalGroup = [...new Set(process.getgroups?.() ?? [])].find(gid => gid !== process.getegid?.());
-  it.skipIf(canonicalGroup === undefined).each([false, true])("saves run-created files and folders with the canonical parent group and no group write (warm=%s)", async (warm) => {
-    await fs.chown(root, -1, canonicalGroup!);
-    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
-    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+  it.skipIf(!sharing).each([false, true])("saves run-created files and folders with the canonical parent group and no group write (warm=%s)", async (warm) => {
+    // Preparing the run moves a canonical root left in the primary group into
+    // the agents group; run-created entries then inherit that parent group.
+    await fs.chown(root, -1, process.getegid!());
+    const copy = await withAgentsGid(agentsGid!, () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(agentsGid!);
     const created = { "created.md": 0o664, "newdir/inner.md": 0o666, "newdir/tool.sh": 0o775 };
     for (const [relative, mode] of Object.entries(created)) {
       await fs.mkdir(path.dirname(path.join(copy.localRoot, relative)), { recursive: true, mode: 0o775 });
@@ -429,13 +433,13 @@ describe("persistent agent directories", () => {
       await fs.chmod(path.join(copy.localRoot, relative), mode);
     }
     await fs.chmod(path.join(copy.localRoot, "newdir"), 0o2775);
-    expect((await fs.stat(path.join(copy.localRoot, "newdir"))).gid).toBe(process.getegid!());
+    expect((await fs.stat(path.join(copy.localRoot, "newdir"))).gid).toBe(agentsGid!);
     const saved = await copies[warm ? "checkpointWarm" : "collectStopped"]({ companyId, runId: copy.runId });
     expect(saved?.state).toBe(warm ? "warm_saved" : "saved");
     const expected = { "created.md": 0o640, "newdir/inner.md": 0o640, "newdir/tool.sh": 0o750, newdir: 0o750 };
     for (const [relative, mode] of Object.entries(expected)) {
       const stat = await fs.stat(path.join(root, relative));
-      expect(stat.gid).toBe(canonicalGroup);
+      expect(stat.gid).toBe(agentsGid!);
       expect(stat.mode & 0o7777).toBe(mode);
     }
     if (warm) {
@@ -444,15 +448,15 @@ describe("persistent agent directories", () => {
     }
   });
 
-  it.each([false, true])("maps legacy group-staged modes back to canonical owner-only modes (warm=%s)", async (warm) => {
+  it.skipIf(!sharing).each([false, true])("maps legacy group-staged modes back to canonical owner-only modes (warm=%s)", async (warm) => {
     const canonical = { "notes/private.md": 0o600, "scripts/private.sh": 0o700, "notes/plain.md": 0o644, "scripts/run.sh": 0o755 };
     for (const [relative, mode] of Object.entries(canonical)) {
       await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true });
       await fs.writeFile(path.join(root, relative), "before");
       await fs.chmod(path.join(root, relative), mode);
     }
-    const copy = await withAgentsGid(process.getegid!(), () => run({ warm }));
-    expect(copy.receipt?.stagedGid).toBe(process.getegid!());
+    const copy = await withAgentsGid(agentsGid!, () => run({ warm }));
+    expect(copy.receipt?.stagedGid).toBe(agentsGid!);
     const { stagedModeVersion: _version, ...legacyReceipt } = copy.receipt!;
     await db.update(agentInstructionWorkingCopies).set({ receipt: legacyReceipt }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
     const legacy = { "notes/private.md": 0o640, "scripts/private.sh": 0o750, "notes/plain.md": 0o640, "scripts/run.sh": 0o750 };
@@ -515,7 +519,7 @@ describe("persistent agent directories", () => {
     expect((await fs.lstat(manifest)).isDirectory()).toBe(true);
   });
 
-  it.each(["EPERM", "EACCES"])("falls back to an owner-only copy when the live tree cannot be shared (%s)", async (code) => {
+  it.skipIf(!sharing).each(["EPERM", "EACCES"])("falls back to an owner-only copy when the live tree cannot be shared (%s)", async (code) => {
     await writeShared();
     await fs.writeFile(path.join(root, "notes.md"), "before");
     await fs.chmod(path.join(root, "notes.md"), 0o644);
@@ -525,7 +529,7 @@ describe("persistent agent directories", () => {
       return chmod(filename, mode);
     });
     let copy;
-    try { copy = await withAgentsGid(process.getegid!(), () => run()); } finally { denied.mockRestore(); }
+    try { copy = await withAgentsGid(agentsGid!, () => run()); } finally { denied.mockRestore(); }
     expect(copy.receipt?.stagedGid).toBeUndefined();
     expect((await fs.stat(path.join(path.dirname(root), "file-sync/runs", copy.runId))).mode & 0o7777).toBe(0o700);
     for (const relative of sharedFiles) expect((await fs.stat(path.join(copy.localRoot, relative))).mode & 0o7777).toBe(0o600);
