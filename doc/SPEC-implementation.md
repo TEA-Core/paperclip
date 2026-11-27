@@ -469,9 +469,10 @@ against their containing directory, as Git does.
 
 Accepted filesystem residuals: tracked-file hardlinks can alias bytes outside
 the tree. A copied worktree directory or a hand-written `.git` file outside the
-registration mapping can share the submitting admin directory/index/HEAD without
-a path overlap or a changed provisioned identity. Entry does not discover these
-unregistered aliases. These limits do not provide an exclusion guarantee.
+registration mapping can share the submitting admin directory, index, HEAD or
+branch (through a hand-written admin directory whose `commondir` names the
+managed common directory) without a path overlap or a changed provisioned
+identity. Entry does not discover these unregistered aliases. These limits do not provide an exclusion guarantee.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
