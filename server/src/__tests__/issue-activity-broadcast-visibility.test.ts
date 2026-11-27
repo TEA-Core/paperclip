@@ -771,4 +771,96 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
       reader.services.dispose();
     }
   });
+
+  it("gives a plugin without issues.read only the title of an ordinary issue and keeps a restricted comment's title withheld from live-event non-readers", async () => {
+    const { company, userId } = await seedCompany(db);
+    const ordinaryIssue = await seedIssue(db, company.id, {
+      title: "Ordinary issue title",
+      description: "Ordinary issue description body",
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { nonReaderToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const bus = createPluginEventBus();
+    setPluginEventBus(bus);
+
+    async function subscribePlugin(pluginKey: string, capabilities: string[]) {
+      const received: PluginEvent[] = [];
+      const services = buildHostServices(
+        db,
+        randomUUID(),
+        pluginKey,
+        bus,
+        (method, params) => {
+          if (method === "onEvent") received.push((params as { event: PluginEvent }).event);
+        },
+        { manifest: pluginManifest(pluginKey, capabilities) },
+      );
+      await services.events.subscribe({ eventPattern: "issue.created" });
+      await services.events.subscribe({ eventPattern: "issue.comment.created" });
+      return { received, services };
+    }
+
+    const nonReader = await subscribePlugin("paperclip.ordinary-non-reader", ["events.subscribe"]);
+    const reader = await subscribePlugin("paperclip.ordinary-reader", ["events.subscribe", "issues.read"]);
+    const commentDetails = {
+      commentId: randomUUID(),
+      bodySnippet: "Ordinary comment body",
+      identifier: ordinaryIssue.identifier,
+      issueTitle: ordinaryIssue.title,
+    };
+
+    try {
+      await logIssueCreated(db, company.id, ordinaryIssue);
+      await logActivity(db, {
+        companyId: company.id,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: ordinaryIssue.id,
+        details: commentDetails,
+      });
+      await logIssueCreated(db, company.id, ownIssue);
+      const isComment = (event: PluginEvent) => event.eventType === "issue.comment.created";
+      await waitFor(() => nonReader.received.some(isComment) && reader.received.some(isComment));
+      await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
+
+      const nonReaderCreated = nonReader.received.find((event) => event.eventType === "issue.created");
+      expect(nonReaderCreated?.payload).toMatchObject({ title: ordinaryIssue.title, identifier: ordinaryIssue.identifier });
+      expect(nonReaderCreated?.payload).not.toHaveProperty("description");
+      const nonReaderComment = nonReader.received.find(isComment);
+      expect(nonReaderComment?.entityId).toBe(ordinaryIssue.id);
+      expect(nonReaderComment?.payload).toMatchObject({
+        commentId: commentDetails.commentId,
+        identifier: ordinaryIssue.identifier,
+        issueTitle: ordinaryIssue.title,
+      });
+      expect(nonReaderComment?.payload).not.toHaveProperty("bodySnippet");
+      expect(JSON.stringify(nonReader.received)).not.toContain("Ordinary issue description body");
+      expect(JSON.stringify(nonReader.received)).not.toContain(commentDetails.bodySnippet);
+
+      // A plugin with issues.read receives the ordinary issue's events unchanged.
+      expect(reader.received.find((event) => event.eventType === "issue.created")?.payload).toMatchObject({
+        title: ordinaryIssue.title,
+        description: ordinaryIssue.description,
+      });
+      expect(reader.received.find(isComment)?.payload).toMatchObject(commentDetails);
+
+      // A live-events subscriber that cannot read the issue keeps the earlier
+      // rule: the top-level title only, without the comment's issueTitle.
+      const nonReaderActivity = nonReaderEvents.filter(isActivityFor(ordinaryIssue.id));
+      expect(nonReaderActivity.map((event) => event.payload.details)).toEqual([
+        { title: ordinaryIssue.title, identifier: ordinaryIssue.identifier },
+        { commentId: commentDetails.commentId, identifier: ordinaryIssue.identifier },
+      ]);
+    } finally {
+      nonReader.services.dispose();
+      reader.services.dispose();
+    }
+  });
 });
