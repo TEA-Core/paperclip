@@ -27,6 +27,7 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.ts";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.ts";
+import { projectRoutes } from "../routes/projects.ts";
 import type { BrokerClient, BrokerListenerRequest } from "../services/runtime-exposure/broker-client.ts";
 import {
   ensurePersistedExecutionWorkspaceAvailable,
@@ -267,6 +268,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       next();
     });
     server.use("/api", executionWorkspaceRoutes(db));
+    server.use("/api", projectRoutes(db));
     server.use(errorHandler);
     return server;
   }
@@ -311,6 +313,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     serviceCommand?: string | null;
     runtimeOwned?: boolean;
     strategyType?: string;
+    workspaceRuntime?: Record<string, unknown>;
   }) {
     const issueId = randomUUID();
     const workspaceId = randomUUID();
@@ -355,7 +358,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
           : {}),
         config: {
           provisionCommand: input.provisionCommand ?? null,
-          workspaceRuntime: input.serviceCommand
+          workspaceRuntime: input.workspaceRuntime ?? (input.serviceCommand
             ? {
                 services: [{
                   name: "web",
@@ -372,7 +375,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
                   stopPolicy: { type: "manual" },
                 }],
               }
-            : { services: [{ name: "web", command: "true", port: { type: "auto" } }] },
+            : { services: [{ name: "web", command: "true", port: { type: "auto" } }] }),
         },
       },
       lastUsedAt: now,
@@ -717,6 +720,113 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     expect(evidence).toContain("Reprovision the execution workspace");
     expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
     await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  it.each([
+    {
+      label: "a checkout drifted to another branch",
+      branchName: "branch-a" as string | null,
+      strategyType: "project_primary",
+      prepare: async (f: LinkedSource) => {
+        await git(["switch", "-q", "--ignore-other-worktrees", "branch-b"], f.source);
+      },
+    },
+    {
+      label: "a legacy git_worktree row with no recorded branch",
+      branchName: null as string | null,
+      strategyType: "git_worktree",
+      prepare: async () => {},
+    },
+  ])("still runs a workspace job for $label", async ({ branchName, strategyType, prepare }) => {
+    const fixture = await makeLinkedSource();
+    await prepare(fixture);
+    const headRefBefore = await git(["symbolic-ref", "--quiet", "HEAD"], fixture.source);
+    const scope = await seedCompany();
+    const marker = path.join(fixture.root, "job-ran");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName,
+      baseRef: "branch-a",
+      projectCwd: null,
+      strategyType,
+      provisionCommand: "true",
+      workspaceRuntime: {
+        commands: [{ id: "mark", name: "mark", kind: "job", command: `touch ${quoteShell(marker)}` }],
+      },
+    });
+
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-commands/run`)
+      .send({ workspaceCommandId: "mark" });
+
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(marker)).resolves.toBeTruthy();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source)).resolves.toBe(headRefBefore);
+    const row = await db.select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.workspaceId))
+      .then((rows) => rows[0]);
+    expect(row?.branchName).toBe(branchName);
+    expect(await operationText(seeded.workspaceId)).not.toContain("checkoutBranchDrift");
+  }, 30_000);
+
+  it.each([
+    {
+      label: "a defaultRef of origin/main",
+      defaultRef: "origin/main",
+      prepare: async () => {},
+    },
+    {
+      label: "a primary checkout on a feature branch",
+      defaultRef: "branch-a",
+      prepare: async (f: LinkedSource) => {
+        await git(["switch", "-q", "--ignore-other-worktrees", "branch-b"], f.source);
+      },
+    },
+  ])("starts a project workspace service with $label", async ({ defaultRef, prepare }) => {
+    const fixture = await makeLinkedSource();
+    await prepare(fixture);
+    const headRefBefore = await git(["symbolic-ref", "--quiet", "HEAD"], fixture.source);
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    await db.insert(projectWorkspaces).values({
+      id: scope.projectWorkspaceId,
+      companyId: scope.companyId,
+      projectId: scope.projectId,
+      name: "Primary",
+      cwd: fixture.source,
+      isPrimary: true,
+      defaultRef,
+      metadata: {
+        runtimeConfig: {
+          workspaceRuntime: {
+            services: [{
+              name: "web",
+              command: httpCommand(started),
+              port: { type: "auto" },
+              readiness: {
+                type: "http",
+                urlTemplate: "http://127.0.0.1:{{port}}",
+                timeoutSec: 10,
+                intervalMs: 50,
+              },
+              lifecycle: "shared",
+              reuseScope: "project_workspace",
+              stopPolicy: { type: "manual" },
+            }],
+          },
+        },
+      },
+    });
+
+    const res = await request(app())
+      .post(`/api/projects/${scope.projectId}/workspaces/${scope.projectWorkspaceId}/runtime-services/start`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
+    await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source)).resolves.toBe(headRefBefore);
   }, 30_000);
 
   describe("a refusal immediately before spawn releases what the start reserved", () => {

@@ -541,7 +541,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         serviceIndex: selectedServiceIndex,
       },
       run: async (reportProgress) => {
-        const ensureWorkspaceAvailable = async () =>
+        const ensureWorkspaceAvailable = async (options: { preserveRecordedCheckoutBranch: boolean }) =>
           await ensurePersistedExecutionWorkspaceAvailable({
             db,
             base: {
@@ -585,14 +585,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               companyId: existing.companyId,
             },
             recorder,
-            preserveRecordedCheckoutBranch: true,
+            preserveRecordedCheckoutBranch: options.preserveRecordedCheckoutBranch,
           });
 
         if (action === "run") {
           if (!workspaceCommand || workspaceCommand.kind !== "job") {
             throw new Error("Workspace job selection is required");
           }
-          const availableWorkspace = await ensureWorkspaceAvailable();
+          const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: false });
           if (!availableWorkspace) {
             throw new Error("Execution workspace needs a local path before Paperclip can run workspace commands");
           }
@@ -824,7 +824,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             await reportRepairPhase("managed_restart", "started");
             let startedServices: Awaited<ReturnType<typeof startRuntimeServicesForWorkspaceControl>> = [];
             if (repairRestartsRuntimeServices) {
-              const availableWorkspace = await ensureWorkspaceAvailable();
+              const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: true });
               if (!availableWorkspace) {
                 throw new Error("Execution workspace needs a local path before Paperclip can restart it.");
               }
@@ -884,7 +884,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         }
 
         if (action === "start" || action === "restart") {
-          const availableWorkspace = await ensureWorkspaceAvailable();
+          const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: true });
           if (!availableWorkspace) {
             throw new Error("Execution workspace needs a local path before Paperclip can manage local runtime services");
           }

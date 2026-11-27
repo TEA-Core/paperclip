@@ -26,7 +26,6 @@ import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { accessService, projectService, logActivity, workspaceOperationService } from "../services/index.js";
 import { conflict, forbidden, unprocessable } from "../errors.js";
-import { checkoutBranchDriftAsHttpConflict } from "../services/checkout-branch-drift-conflict.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
@@ -791,7 +790,6 @@ export function projectRoutes(db: Db) {
             onLog,
             serviceIndex: selectedServiceIndex,
             runtimeServiceId: selectedRuntimeServiceId,
-            assertRecordedCheckoutBranch: true,
           });
           runtimeServiceCount = startedServices.length;
         } else {
@@ -845,8 +843,6 @@ export function projectRoutes(db: Db) {
           },
         };
       },
-    }).catch((error: unknown) => {
-      throw checkoutBranchDriftAsHttpConflict(error);
     });
 
     const updatedWorkspace = (await svc.listWorkspaces(project.id)).find((entry) => entry.id === workspace.id) ?? workspace;

@@ -236,6 +236,7 @@ function readThrownValidationEvidence(error: unknown): Record<string, unknown> |
   if (!workspaceValidation || typeof workspaceValidation !== "object" || Array.isArray(workspaceValidation)) {
     return null;
   }
+  if ((workspaceValidation as { reason?: unknown }).reason !== "checkout_branch_drift") return null;
   const evidence: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(workspaceValidation)) {
     evidence[key] = value;
