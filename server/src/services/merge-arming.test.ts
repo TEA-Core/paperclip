@@ -19,6 +19,7 @@ import {
   externalObjectMentions,
   externalObjects,
   issueComments,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issueThreadInteractions,
   issues,
@@ -868,7 +869,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       state?: string | null;
       draft?: boolean;
       number?: number;
-      headRefName?: string;
+      /** null omits the cached head branch anchor entirely. */
+      headRefName?: string | null;
       headSha?: string;
       baseRef?: string | null;
       owner?: string;
@@ -882,7 +884,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       state: overrides.state ?? "open",
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
-      head: { ref: overrides.headRefName ?? "SUP-42-branch" },
+      ...(overrides.headRefName === null ? {} : { head: { ref: overrides.headRefName ?? "SUP-42-branch" } }),
       ...(overrides.headSha === undefined ? {} : { headSha: overrides.headSha }),
       ...(overrides.baseRef === undefined ? {} : { baseRef: overrides.baseRef }),
       title: `Fix thing (SUP-${number})`,
@@ -2191,6 +2193,25 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     it("accepts a cached open draft mention when the live read proves it merged (SUP-24033)", async () => {
       const issueId = await insertIssue();
       await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    // SUP-25333: a cached open+draft mention captured without a head branch
+    // anchor must not be refused by cached delivery narrowing before the live
+    // read supplies the authoritative head branch.
+    it("accepts a stale cached open draft with no cached head branch when the live read proves it merged on the delivery branch (SUP-25333)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true, headRefName: null });
       installRoutes(mergedCarrierRoutes());
 
       const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
@@ -4800,6 +4821,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       // The prompt retries are timers; the tests that do not look at them keep them off.
       beforeEach(() => { disarmTiming.promptDelaysMs = []; });
       afterEach(async () => {
+        vi.useRealTimers();
         disarmTiming.promptDelaysMs = defaultPromptDelays;
         // Records are instance-wide (the sweep takes them all): none may outlive its test.
         await db.execute(sql`update issues set execution_state = execution_state #- '{approvalStatus,autoMergeDisarm}' where execution_state -> 'approvalStatus' -> 'autoMergeDisarm' is not null`);
@@ -4840,6 +4862,80 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const enables = () => graphqlQueries().filter((q) => q.includes("enablePullRequestAutoMerge"));
       const disables = () => graphqlQueries().filter((q) => q.includes("disablePullRequestAutoMerge"));
 
+      it.each(["node lookup", "retry", "accepted enable"])("refuses or compensates a new child attribution during %s", async (moment) => {
+        const { issueId } = await seedAuthorityCard();
+        const ancestorId = await insertIssue({ identifier: "SUP-900", branchName: "SUP-900-carrier" });
+        let installed = false;
+        const install = async () => {
+          if (installed) return;
+          installed = true;
+          await db.insert(issueChildCarrierAttributions).values({
+            companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+            owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: 125,
+            branchName: "SUP-42-branch", headSha: AUTH_HEAD, commitShas: [AUTH_HEAD],
+            writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+          });
+        };
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.endsWith("/pulls/125")) {
+            await install();
+            return { ok: true, status: 200, json: async () => ({ node_id: "PR_node_125" }) } as Response;
+          }
+          if (url !== GRAPHQL_URL) throw new Error(`Unexpected GitHub request: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("enablePullRequestAutoMerge")) {
+            await install();
+            if (moment === "retry") return { ok: false, status: 502, json: async () => ({}) } as Response;
+          }
+          return okBody();
+        });
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide,
+          { ...certifiedPr, ...(moment === "node lookup" ? { nodeId: null } : {}) },
+          { expectedHeadOid: AUTH_HEAD });
+        expect(outcome.kind).toBe(moment === "node lookup" ? "skipped" : "failed");
+        expect(enables()).toHaveLength(moment === "node lookup" ? 0 : 1);
+        expect(disables()).toHaveLength(moment === "accepted enable" ? 1 : 0);
+        if (moment === "retry") {
+          const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const state = stored!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+          expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight" });
+          expect(outcome.message).toContain("unconfirmed");
+          expect(outcome.message).not.toContain("nothing was armed");
+        }
+      });
+      it("refuses a direct-merge retry when a child-only attribution appears after a transient merge failure", async () => {
+        const { issueId } = await seedAuthorityCard();
+        const ancestorId = await insertIssue({ identifier: "SUP-900", branchName: "SUP-900-carrier" });
+        const mergeQueries: string[] = [];
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url === `https://api.github.com/repos/${OWNER}/${REPO}`) {
+            return { ok: true, status: 200, json: async () => ({ default_merge_method: "squash" }) } as Response;
+          }
+          if (url !== GRAPHQL_URL) throw new Error(`Unexpected GitHub request: ${url}`);
+          const query = String(JSON.parse(String(init?.body)).query);
+          if (query.includes("enablePullRequestAutoMerge")) {
+            return { ok: true, status: 200, json: async () => ({ errors: [{ message: "Pull request Pull request is in clean status" }] }) } as Response;
+          }
+          if (query.includes("mergePullRequest")) {
+            mergeQueries.push(query);
+            if (mergeQueries.length === 1) {
+              await db.insert(issueChildCarrierAttributions).values({
+                companyId, childIssueId: issueId, ancestorIssueId: ancestorId, provider: "github",
+                owner: OWNER.toLowerCase(), repo: REPO.toLowerCase(), pullRequestNumber: 125,
+                branchName: "SUP-42-branch", headSha: AUTH_HEAD, commitShas: [AUTH_HEAD],
+                writtenByActorType: "system", writtenByActorId: "system:child-carrier-attribution",
+              });
+              return { ok: false, status: 502, json: async () => ({}) } as Response;
+            }
+          }
+          return okBody();
+        });
+        const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
+        expect(outcome.kind).not.toBe("armed");
+        expect(mergeQueries).toHaveLength(1);
+        expect(mergeQueries[0]).toContain(`expectedHeadOid: "${AUTH_HEAD}"`);
+        expect(mergeQueries[0]).toContain("mergeMethod: SQUASH");
+      });
       it.each(revocations)("is refused before the first attempt when %s", async (_name, revoke) => {
         const { issueId, reviewerId } = await seedAuthorityCard();
         mockGhFetch.mockImplementation(async (url: string) => {
@@ -4867,8 +4963,11 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
         const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD });
 
-        expect(outcome.kind).toBe("skipped");
-        expect(outcome.message).toContain("skipped:authority-changed");
+        expect(outcome.kind).toBe("failed");
+        const [card] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        const state = card!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+        expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight", headSha: AUTH_HEAD, number: 125 });
+        expect(disables()).toHaveLength(0);
         expect(enables()).toHaveLength(1);
       });
 
@@ -4916,9 +5015,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certifiedPr, { expectedHeadOid: AUTH_HEAD, authorityGuard });
 
           if (timing === "before a transient retry") {
-            // Refused before the retry: no enable was ever accepted, nothing to take back.
-            expect(outcome.kind).toBe("skipped");
-            expect(outcome.message).toContain("skipped:authority-changed");
+            // The retry is refused, but the earlier 502 can hide an applied enable.
+            // Recovery must retain its exact target instead of closing the record.
+            expect(outcome.kind).toBe("failed");
+            const [card] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+            const state = card!.executionState as { approvalStatus?: { autoMergeDisarm?: unknown } };
+            expect(state.approvalStatus?.autoMergeDisarm).toMatchObject({ state: "in_flight", headSha: AUTH_HEAD, number: 125 });
             expect(disables()).toHaveLength(0);
           } else {
             // The revocation committed inside the accepted call: it is accepted, seen at the recheck and taken back. The window
@@ -5110,9 +5212,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
 
         for (const [label, result] of [
-          ["timed out", { success: false, error: "timeout after 10000ms", status: 0 }],
-          ["failed on the network", { success: false, error: "network_error", status: 0 }],
-          ["got a 502", { success: false, error: "HTTP 502", status: 502 }],
+          ["timed out", { success: false, error: "timeout after 10000ms", status: 0, mayHaveApplied: true }],
+          ["failed on the network", { success: false, error: "network_error", status: 0, mayHaveApplied: true }],
+          ["got a 502", { success: false, error: "HTTP 502", status: 502, mayHaveApplied: true }],
         ] as const) {
           it(`keeps the record when the enable call ${label}: the arm may be in force`, async () => {
             const { issueId } = await seedAuthorityCard();
@@ -5132,7 +5234,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           const opening = await openArmRecord(db, companyId, issueId, { owner: OWNER, repo: REPO, number: 125 }, "test", "PR_node_125", AUTH_HEAD, guard);
           if (!opening.ok) throw new Error(opening.message);
 
-          await opening.settleEnable({ success: false, error: "Resource not accessible", status: 403 });
+          await opening.settleEnable({ success: false, error: "Resource not accessible", status: 403, mayHaveApplied: false });
 
           expect(await disarmRecord(issueId)).toBeUndefined();
         });
@@ -5176,6 +5278,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
 
         it("holds the cap under concurrent admissions and a default sweep tries every record at it", async () => {
+          // This exercises admission/sweep limits, not wall-clock movement.
+          vi.useFakeTimers({ toFake: ["Date"] });
           disarmBacklog.cap = 7;
           const cards: string[] = [];
           for (let i = 0; i < 20; i++) cards.push((await seedAuthorityCard(`SUP-${1100 + i}`)).issueId);
@@ -7345,6 +7449,35 @@ describe("enableAutoMerge deadline (SUP-20772 round 14)", () => {
       await vi.advanceTimersByTimeAsync(ENABLE_ATTEMPT_TIMEOUT_MS + 1);
       await expect(pending).resolves.toMatchObject({ success: false, status: 0, error: `timeout after ${ENABLE_ATTEMPT_TIMEOUT_MS}ms` });
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires the authority check before arm grace and never enables after the check returns late", async () => {
+    vi.useFakeTimers();
+    // The repository's ES2023 Promise API requires the executor form.
+    let finishCheck!: () => void;
+    const check = new Promise<void>((resolve) => { finishCheck = resolve; });
+    let providerEnabled = false;
+    mockGhFetch.mockImplementation(async () => {
+      providerEnabled = true;
+      return Response.json({ data: { enablePullRequestAutoMerge: {} } });
+    });
+    try {
+      const pending = enableAutoMerge("t", "PR_node_1", {
+        attemptTimeoutMs: 10, maxAttempts: 1,
+        beforeAttempt: async () => { await check; return null; },
+      });
+      await vi.advanceTimersByTimeAsync(disarmTiming.inFlightGraceMs + 1);
+      const beforeLateCheck = await Promise.race([pending, Promise.resolve(null)]);
+      finishCheck();
+      const result = await pending;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(beforeLateCheck).toMatchObject({ success: false, status: 0 });
+      expect(result).toMatchObject({ success: false, status: 0 });
+      expect(providerEnabled).toBe(false);
+    } finally {
+      finishCheck();
       vi.useRealTimers();
     }
   });

@@ -249,5 +249,47 @@ describe("remote connector lifecycle", () => {
     await expect(call(allowed.id, "resume")).rejects.toThrow("not found");
     expect(calls).toHaveLength(3);
   });
+  it("shows a provider's one-time authorization link only to the run that started the handoff", async () => {
+    const org = await company();
+    const [agent] = await db.insert(agents).values({ companyId: org.id, name: "Linker", role: "engineer", adapterType: "process", adapterConfig: {}, runtimeConfig: {} }).returning();
+    let toolCalls = 0;
+    const send = async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      if (body.method === "initialize") return Response.json({ id: body.id, result: { protocolVersion: "2025-06-18" } }, { headers: { "Mcp-Session-Id": "link-session" } });
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") return Response.json({ id: body.id, result: { tools: [tool("execute")] } });
+      toolCalls += 1;
+      return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32042, message: "Authorization required", data: {
+        elicitations: [{ mode: "url", elicitationId: "link-1", url: "https://auth.example.com/authorize?code=one-time-code", message: "Authorize" }],
+      } } });
+    };
+    const service = toolAccessService(db, { deploymentMode: "local_trusted", deploymentExposure: "private", remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }], remoteHttpRequest: send });
+    const connection = await service.connectGalleryApp(org.id, { galleryKey: "executor", connectionMethodKey: "mcp", link: "https://executor.sh/test/mcp", authMode: "none" }, actor);
+    await service.finishGalleryAppConnection(org.id, connection.connectionId, { enabledCatalogEntryIds: connection.catalog.map((entry) => entry.id), askFirstCatalogEntryIds: [], access: { agentIds: [agent.id] } }, actor);
+    const gateway = createToolGatewayService(db, { deploymentMode: "local_trusted", deploymentExposure: "private", remoteHttpRequest: send, toolActionSigningSecret: "fixture-signing-key" });
+    const [issue] = await db.insert(issues).values({ companyId: org.id, title: "Provider link", status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const runs = await db.insert(heartbeatRuns).values([0, 1].map(() => ({ companyId: org.id, agentId: agent.id, invocationSource: "assignment", status: "running", contextSnapshot: { issueId: issue.id } }))).returning();
+    const callIn = async (runId: string) => {
+      const session = await gateway.createSession({ companyId: org.id, agentId: agent.id, runId });
+      const execute = (await gateway.listToolsForSession(session.token)).find((entry) => entry.upstreamToolName === "execute")!;
+      return gateway.executeTool({ sessionToken: session.token, tool: execute.name, parameters: {}, idempotencyKey: "handoff-explicit-key" }).then(
+        () => { throw new Error("Expected the provider handoff"); },
+        (error: { reasonCode?: string; details?: { upstreamPending?: { links?: Array<{ url: string }> } } }) => error,
+      );
+    };
+    const linkUrls = (error: Awaited<ReturnType<typeof callIn>>) => (error.details?.upstreamPending?.links ?? []).map((link) => link.url);
+
+    const started = await callIn(runs[0]!.id);
+    expect(started.reasonCode).toBe("provider_interaction_required");
+    expect(linkUrls(started)).toEqual(["https://auth.example.com/authorize?code=one-time-code"]);
+    expect(linkUrls(await callIn(runs[0]!.id))).toEqual(["https://auth.example.com/authorize?code=one-time-code"]);
+
+    const laterRun = await callIn(runs[1]!.id);
+    expect(laterRun.reasonCode).toBe("provider_interaction_required");
+    // The handoff itself still arrives, with its links removed.
+    expect(laterRun.details?.upstreamPending).toMatchObject({ kind: "authorization", elicitationId: "link-1" });
+    expect(laterRun.details?.upstreamPending?.links).toEqual([]);
+    expect(toolCalls).toBe(1);
+  });
 
 });

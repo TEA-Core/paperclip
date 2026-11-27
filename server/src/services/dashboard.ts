@@ -1,4 +1,4 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -41,7 +41,7 @@ export function dashboardService(db: Db) {
       const agentRows = await retryIdempotentDatabaseOperation(() => db
         .select({ status: agents.status, count: sql<number>`count(*)` })
         .from(agents)
-        .where(eq(agents.companyId, companyId))
+        .where(and(eq(agents.companyId, companyId), ne(agents.status, "deleted")))
         .groupBy(agents.status));
 
       const taskRows = await retryIdempotentDatabaseOperation(() => db

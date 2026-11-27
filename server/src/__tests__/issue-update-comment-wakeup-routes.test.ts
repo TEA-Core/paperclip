@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
@@ -935,5 +935,17 @@ describe("issue update comment wakeups", () => {
     const session = await request(await createApp())[method](path).send(body);
     expect(session.status).toBeLessThan(300);
     expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({ mirrorToSlack: true, boardApiKeyId: null });
+  });
+
+  // createApp imports the route module lazily, so without this warm-up the
+  // first test pays the one-time transform cost of `routes/issues.js` and its
+  // import graph inside its own 15s testTimeout, which the loaded serial shard
+  // can exceed. Hooks get 30s (see server/vitest.config.ts), so transform the
+  // graph here; vi.resetModules() in beforeEach re-evaluates but reuses the
+  // transforms. Kept at the end of the block so the line-keyed typecheck
+  // baseline entries above stay put; vitest runs beforeAll before any test.
+  beforeAll(async () => {
+    await import("../routes/issues.js");
+    await import("../middleware/index.js");
   });
 });

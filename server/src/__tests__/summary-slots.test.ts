@@ -1689,7 +1689,7 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(bounce.decision?.outcome).toBe("changes_requested");
       await issueService(db).update(
         generationIssueId,
-        bounce.patch as Partial<typeof issues.$inferInsert>,
+        bounce.patch,
       );
       const bouncedIssue = await db
         .select()

@@ -112,18 +112,16 @@ describeEmbeddedPostgres("agent service remove with billing events (SUP-14056)",
     expect(removed).toMatchObject({ id: agentId });
 
     const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agentRow).toBeUndefined();
-
+    expect(agentRow).toMatchObject({ id: agentId, status: "deleted", name: "Deleted agent" });
     const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(runRow).toBeUndefined();
+    expect(runRow?.id).toBe(runId);
 
     const [costRow] = await db.select().from(costEvents).where(eq(costEvents.id, costEvent.id));
     expect(costRow).toMatchObject({
       id: costEvent.id,
-      companyId,
       costCents: 42,
-      agentId: null,
-      heartbeatRunId: null,
+      agentId,
+      heartbeatRunId: runId,
     });
 
     const [financeRow] = await db
@@ -135,8 +133,8 @@ describeEmbeddedPostgres("agent service remove with billing events (SUP-14056)",
       companyId,
       amountCents: 42,
       costEventId: costEvent.id,
-      agentId: null,
-      heartbeatRunId: null,
+      agentId,
+      heartbeatRunId: runId,
     });
   });
 });

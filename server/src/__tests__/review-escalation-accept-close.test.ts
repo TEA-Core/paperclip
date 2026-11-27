@@ -8,6 +8,8 @@ import {
   agentWakeupRequests,
   agents,
   approvals,
+  authUsers,
+  boardApiKeys,
   companies,
   companyMemberships,
   createDb,
@@ -76,6 +78,8 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
+    await db.delete(boardApiKeys);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -345,5 +349,66 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
     // A closed card has no continuation wake target: the accept door must not wake
     // the return assignee back into a done card.
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("records the board key on a future verification lost by the accept close", async () => {
+    const seeded = await seedCompany("RECMON");
+    const { issueId, interactionId } = await seedRoundCapEscalation({
+      companyId: seeded.companyId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      returnAgentId: seeded.returnAgentId,
+      escalationUserId: seeded.escalationUserId,
+      identifier: "RECMON-1",
+      deliveryRequirement: "record_only",
+    });
+    const nextCheckAt = "2099-12-01T12:00:00.000Z";
+    const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db.update(issues).set({
+      executionPolicy: {
+        ...(seededIssue!.executionPolicy as Record<string, unknown>),
+        monitor: { nextCheckAt, recoveryPolicy: "wake_owner", notes: "Verify deployment tomorrow" },
+      },
+      monitorNextCheckAt: new Date(nextCheckAt),
+    }).where(eq(issues.id, issueId));
+    await db.insert(authUsers).values({
+      id: seeded.escalationUserId,
+      name: "Escalation User",
+      email: "escalation-user@example.com",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const keyId = randomUUID();
+    await db.insert(boardApiKeys).values({
+      id: keyId,
+      userId: seeded.escalationUserId,
+      name: "escalation-key",
+      keyHash: randomUUID(),
+      scope: "all_access",
+    });
+
+    const res = await request(app({
+      ...boardActor(seeded.companyId, seeded.escalationUserId),
+      source: "board_key",
+      keyId,
+    }))
+      .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [closed] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(closed).toMatchObject({ status: "done", monitorNextCheckAt: null });
+    const clears = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)))
+      .filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      actorType: "user",
+      actorId: seeded.escalationUserId,
+      boardApiKeyId: keyId,
+      details: {
+        previousNextCheckAt: nextCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+      },
+    });
   });
 });
