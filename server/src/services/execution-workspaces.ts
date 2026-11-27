@@ -4323,8 +4323,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const row = await db.transaction(async (tx) => {
         const publishesPath = patch.cwd !== undefined || patch.providerRef !== undefined
           || patch.providerType !== undefined
+          || patch.closedAt === null
           || (patch.status !== undefined && ["active", "idle", "in_review"].includes(patch.status));
         const waitedForCleanup = publishesPath && await acquireWorkspacePathPublicationLock(tx);
+        if (publishesPath) {
+          const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id)).for("update");
+          if (current) {
+            patch.cwd = await canonicalStoredPath(patch.cwd === undefined ? current.cwd : patch.cwd);
+            patch.providerRef = await canonicalStoredPath(patch.providerRef === undefined ? current.providerRef : patch.providerRef);
+          }
+        }
         if (waitedForCleanup) {
           const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
           if (current && ["active", "idle", "in_review"].includes(patch.status ?? current.status)) {

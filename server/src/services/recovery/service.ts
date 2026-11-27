@@ -1,3 +1,4 @@
+import { canonicalRunContextSnapshot } from "../stored-workspace-path.js";
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -4426,7 +4427,7 @@ export function recoveryService(
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: 1,
           scheduledRetryReason: "provider_quota_recovery",
-          contextSnapshot: withRecoveryContext(
+          contextSnapshot: await canonicalRunContextSnapshot(withRecoveryContext(
             {
               issueId: input.issue.id,
               taskId: input.issue.id,
@@ -4435,7 +4436,7 @@ export function recoveryService(
               providerQuotaRetryNotBefore: retryAt.toISOString(),
             },
             "normal_model",
-          ),
+          )),
           updatedAt: now,
         })
         .returning()
@@ -5182,7 +5183,7 @@ export function recoveryService(
                 scheduledRetryAttempt: input.attempt,
                 scheduledRetryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
                 responsibleUserId: sourceRun?.responsibleUserId ?? null,
-                contextSnapshot: context,
+                contextSnapshot: await canonicalRunContextSnapshot(context),
                 updatedAt: now,
               })
               .returning()

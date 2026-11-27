@@ -4,7 +4,7 @@ import { ZodError } from "zod";
 
 /** Upper bound on caller-supplied key names echoed back in a validation error. */
 const MAX_ECHOED_UNRECOGNIZED_KEYS = 10;
-import { HttpError } from "../errors.js";
+import { HttpError, reviewEntryFenceRefusalCode } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
@@ -131,6 +131,16 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  const fenceCode = reviewEntryFenceRefusalCode(err);
+  if (fenceCode) {
+    res.status(409).json({
+      error: fenceCode === "review_entry_writer_busy"
+        ? "A competing review-entry or writer transaction holds this path. Retry after it finishes."
+        : "A local workspace path cannot be normalized safely.",
+      code: fenceCode,
+    });
+    return;
+  }
   if (err instanceof HttpError) {
     const details =
       err.details &&

@@ -799,8 +799,34 @@ async function verifyCleanLinkedWorktree(
     const backlink = await readOptionalRegularFile(path.join(identity.gitDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
     const target = backlink?.endsWith("\n") ? backlink.slice(0, -1) : backlink;
     if (!target || /[\0\r\n]/.test(target) ||
-        await realpath(path.resolve(identity.gitDir, target)) !== path.join(worktreePath, ".git")) {
+        await realpath(path.isAbsolute(target) ? target : `${identity.gitDir}/${target}`) !== path.join(worktreePath, ".git")) {
       return { ok: false, reason: "has a linked-worktree Git directory registered to a different path" };
+    }
+    const ownAdmin = await lstat(identity.gitDir);
+    for (const name of (await readdir(path.join(identity.commonDir, "worktrees"))).sort()) {
+      if (options.deadline) remainingBudget(options.deadline);
+      const registeredDir = path.join(identity.commonDir, "worktrees", name);
+      const registered = await lstat(registeredDir);
+      if (!registered.isDirectory() || registered.isSymbolicLink()) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      const pointer = await readOptionalRegularFile(path.join(registeredDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
+      const linkedFile = pointer?.endsWith("\n") ? pointer.slice(0, -1) : pointer;
+      if (!linkedFile || /[\0\r\n]/.test(linkedFile)) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      const linkedPath = await realpath(path.isAbsolute(linkedFile) ? linkedFile : `${registeredDir}/${linkedFile}`);
+      const gitfile = await readOptionalRegularFile(linkedPath, MAX_GITDIR_FILE_BYTES);
+      const forward = gitfile?.endsWith("\n") ? gitfile.slice(0, -1) : gitfile;
+      if (!forward?.startsWith("gitdir: ") || /[\0\r\n]/.test(forward)) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      const targetDir = forward.slice("gitdir: ".length);
+      const actual = await lstat(await realpath(path.isAbsolute(targetDir) ? targetDir : `${path.dirname(linkedPath)}/${targetDir}`));
+      if (actual.dev !== registered.dev || actual.ino !== registered.ino ||
+          registeredDir !== identity.gitDir && registered.dev === ownAdmin.dev && registered.ino === ownAdmin.ino) {
+        return { ok: false, reason: "has ambiguous or shared linked-worktree Git directory registration" };
+      }
     }
   } catch {
     return { ok: false, reason: "has an unverifiable linked-worktree Git directory back-pointer" };

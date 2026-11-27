@@ -1,3 +1,4 @@
+import { canonicalRunContextSnapshot } from "./stored-workspace-path.js";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -167,7 +168,7 @@ export function selfDeclaredRunService(
           triggerDetail: "self_declared",
           status: "running",
           startedAt: now,
-          contextSnapshot,
+          contextSnapshot: await canonicalRunContextSnapshot(contextSnapshot),
           responsibleUserId: issue.responsibleUserId ?? null,
           issueCommentStatus: "not_applicable",
         })
@@ -196,10 +197,10 @@ export function selfDeclaredRunService(
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: {
+          contextSnapshot: await canonicalRunContextSnapshot({
             ...contextSnapshot,
             executionWorkspaceId: workspace.executionWorkspaceId,
-          },
+          }),
           updatedAt: now,
         })
         .where(eq(heartbeatRuns.id, run.id));

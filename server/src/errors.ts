@@ -52,3 +52,22 @@ export function reviewEntryReceiptRetained(subject: "Company" | "Issue" | "Docum
     { code: "review_entry_receipt_retained", receiptId },
   );
 }
+
+/** Integrity refusals are not optional diagnostic-write failures. */
+export function reviewEntryFenceRefusalCode(error: unknown):
+  "review_entry_writer_busy" | "review_entry_path_unverified" | null {
+  let current = error;
+  for (let depth = 0; depth < 8 && current !== null && typeof current === "object"; depth += 1) {
+    if ("code" in current && current.code === "55P03" &&
+        "message" in current && current.message === "review_entry_writer_busy") {
+      return "review_entry_writer_busy";
+    }
+    if (current instanceof HttpError && current.details !== null && typeof current.details === "object" &&
+        "code" in current.details) {
+      const code = current.details.code;
+      if (code === "review_entry_writer_busy" || code === "review_entry_path_unverified") return code;
+    }
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return null;
+}

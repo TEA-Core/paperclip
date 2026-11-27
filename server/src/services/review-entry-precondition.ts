@@ -1,5 +1,6 @@
+import { resolveStoredPath } from "./stored-workspace-path.js";
 import { createHash } from "node:crypto";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
@@ -193,38 +194,31 @@ export async function prepareReviewEntry(
   return { binding, record, snapshot, baseSha, defaultBranch, capturedAt: new Date(), issueBinding: issueProofBinding(issue) };
 }
 
-function claimedPaths(prepared: PreparedReviewEntry) {
-  const { cwd, providerRef } = prepared.binding.workspace;
-  return [...new Set([prepared.snapshot.worktreePath, cwd!, providerRef!]
-    .map((candidate) => `/${candidate.split("/").filter(Boolean).join("/")}`))].sort();
-}
 
-/** Taken before the issue row lock. Prefix keys fence descendants. Exact-path
- * keys are exclusive for claimed paths and shared for their ancestors below the
- * managed projects root, so admissions do not exclude each other while the
- * fence trigger's exclusive exact-path key still excludes ancestor writers.
+/** One sorted, nonblocking batch precedes the issue-row lock. Disjoint entries
+ * share ancestor authority. Broad ancestors are company-scoped; paths inside
+ * the managed projects root still exclude writers from every company.
  */
 export async function lockReviewEntryAuthority(tx: Db, issueId: string, prepared: PreparedReviewEntry) {
   await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
-  const paths = claimedPaths(prepared);
-  const textualRoot = path.resolve(resolvePaperclipInstanceRoot(), "projects");
-  const roots = [...new Set([textualRoot, await realpath(textualRoot).catch(() => textualRoot)])];
-  const ancestors = new Set<string>();
-  for (const candidate of paths) {
-    for (let ancestor = path.dirname(candidate); roots.some((root) => ancestor !== root && containsPath(root, ancestor));
-      ancestor = path.dirname(ancestor)) {
-      if (!paths.includes(ancestor)) ancestors.add(ancestor);
-    }
+  const own = prepared.snapshot.worktreePath;
+  const root = await realpath(path.join(resolvePaperclipInstanceRoot(), "projects")).catch(() =>
+    fail("workspace_unverified", "The managed projects root could not be verified."));
+  const shared: string[] = [];
+  for (let ancestor = path.dirname(own); ; ancestor = path.dirname(ancestor)) {
+    shared.push(ancestor !== root && containsPath(root, ancestor)
+      ? `path-exact:${ancestor}`
+      : `company-path-exact:${prepared.binding.workspace.companyId}:${ancestor}`);
+    if (ancestor === path.dirname(ancestor)) break;
   }
   const exclusive = [
-    `issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`,
-    ...paths.map((candidate) => `path:${candidate}`),
-    ...paths.map((candidate) => `path-exact:${candidate}`),
+    `issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`, `path:${own}`, `path-exact:${own}`,
   ];
-  for (const key of exclusive) await tx.execute(sql`SELECT pg_advisory_xact_lock(review_entry_lock_key(${key}))`);
-  for (const ancestor of [...ancestors].sort()) {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock_shared(review_entry_lock_key(${`path-exact:${ancestor}`}))`);
-  }
+  await tx.execute(sql`SELECT review_entry_acquire_locks(
+    ARRAY[${sql.join(shared.map((key) => sql`${key}`), sql`, `)}]::text[],
+    ARRAY[${sql.join(exclusive.map((key) => sql`${key}`), sql`, `)}]::text[],
+    'review_entry_workspace_busy'
+  )`);
 }
 
 async function physicalPath(candidate: string): Promise<PhysicalWorkspace> {
@@ -246,35 +240,25 @@ function containsPath(parent: string, candidate: string) {
   return candidate === parent || candidate.startsWith(parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`);
 }
 
-/** Missing suffixes can still claim the tree. Uncertainty is different: only a
- * deepest resolvable ancestor under the managed projects root can make an
- * unrelated dangling link prevent admission. Valid aliases remain global.
+/** Follow links before consuming dot-dot. Only verified broad ancestors are
+ * company-scoped; concrete managed-tree aliases remain global blockers.
  */
 async function worktreePathRelation(candidate: unknown, own: PhysicalWorkspace, managedRoot: string) {
   if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return null;
-  const overlaps = (other: string) => containsPath(own.path, other) || containsPath(other, own.path);
-  const absent = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "");
-  let uncertain = false;
-  try {
-    const otherPath = await realpath(candidate);
-    const info = await stat(otherPath);
-    return `${info.dev}:${info.ino}` === own.identity || overlaps(otherPath) ? "shared" : null;
-  } catch (error) {
-    uncertain = !absent(error);
+  const resolved = await resolveStoredPath(candidate, managedRoot);
+  if (resolved.uncertain || resolved.missing && resolved.followedSymlink) {
+    return resolved.scopeTouched ? "unverified" : null;
   }
-  const missing: string[] = [];
-  for (let ancestor = path.resolve(candidate); ; ancestor = path.dirname(ancestor)) {
+  if (!resolved.missing) {
     try {
-      const resolved = await realpath(ancestor);
-      if (uncertain) return containsPath(managedRoot, resolved) ? "unverified" : null;
-      return overlaps(path.join(resolved, ...missing)) ? "shared" : null;
-    } catch (error) {
-      if (!absent(error)) uncertain = true;
-      else if (await lstat(ancestor).then(() => true, (missingEntry) => !absent(missingEntry))) uncertain = true;
-      if (ancestor === path.dirname(ancestor)) return "unverified";
-      missing.unshift(path.basename(ancestor));
+      const info = await stat(resolved.path);
+      if (`${info.dev}:${info.ino}` === own.identity) return "shared";
+    } catch {
+      return resolved.scopeTouched ? "unverified" : null;
     }
   }
+  if (!containsPath(own.path, resolved.path) && !containsPath(resolved.path, own.path)) return null;
+  return containsPath(resolved.path, managedRoot) ? "company_ancestor" : "shared";
 }
 
 /** Admission consumes only the first blocker; the operator read enumerates
@@ -287,22 +271,24 @@ async function* reviewEntryBlockers(
   const managedRoot = await realpath(path.join(resolvePaperclipInstanceRoot(), "projects")).catch(() =>
     fail("workspace_unverified", "The managed projects root could not be verified."));
   const pathBlocker = async (
-    source: ReviewEntryBlocker["source"], id: string, candidates: unknown[],
+    source: ReviewEntryBlocker["source"], id: string, rowCompanyId: string, candidates: unknown[],
     code: ReviewEntryBlocker["code"], reason: string,
   ): Promise<ReviewEntryBlocker | null> => {
     for (const candidate of candidates) {
       const relation = await worktreePathRelation(candidate, own, managedRoot);
+      if (relation === "company_ancestor" && rowCompanyId !== issue.companyId) continue;
       if (relation) return {
         source, id, path: candidate as string,
         code: relation === "unverified" ? "review_entry_workspace_unverified" : code,
         reason: relation === "unverified"
-          ? "A live workspace path under the managed projects root could not be resolved. Inspect this company's review-entry-blockers read, retire the stale record or wait for it to finish."
+          ? "A live workspace path or symlink target reaches the managed projects root but could not be resolved. Inspect this company's review-entry-blockers read, retire the stale record or wait for it to finish."
           : reason,
       };
     }
     return null;
   };
-  const liveWorkspaces = await db.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
+  const liveWorkspaces = await db.select({ id: executionWorkspaces.id, companyId: executionWorkspaces.companyId,
+    cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef })
     .from(executionWorkspaces).where(and(
       ne(executionWorkspaces.id, workspace.id), isNull(executionWorkspaces.closedAt),
       inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
@@ -310,22 +296,23 @@ async function* reviewEntryBlockers(
       companyId ? eq(executionWorkspaces.companyId, companyId) : undefined,
     ));
   for (const candidate of liveWorkspaces) {
-    const blocker = await pathBlocker("execution_workspaces", candidate.id, [candidate.cwd, candidate.providerRef],
+    const blocker = await pathBlocker("execution_workspaces", candidate.id, candidate.companyId, [candidate.cwd, candidate.providerRef],
       "review_entry_workspace_shared", "Another execution workspace can write this physical tree. Provision a new isolated worktree for this card.");
     if (blocker) yield blocker;
   }
-  for (const project of await db.select({ id: projectWorkspaces.id, cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
+  for (const project of await db.select({ id: projectWorkspaces.id, companyId: projectWorkspaces.companyId, cwd: projectWorkspaces.cwd }).from(projectWorkspaces)
     .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
     .where(and(isNull(projects.archivedAt), ne(projectWorkspaces.sourceType, "remote_managed"),
       ne(projectWorkspaces.id, workspace.projectWorkspaceId!),
       companyId ? eq(projectWorkspaces.companyId, companyId) : undefined))) {
     // The card's own source binding is metadata, not an additional writer.
-    const blocker = await pathBlocker("project_workspaces", project.id, [project.cwd],
+    const blocker = await pathBlocker("project_workspaces", project.id, project.companyId, [project.cwd],
       "review_entry_workspace_shared", "Another project workspace can write this physical tree. Provision a separate isolated worktree.");
     if (blocker) yield blocker;
   }
   for (const service of await db.select({
-    id: workspaceRuntimeServices.id, executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
+    id: workspaceRuntimeServices.id, companyId: workspaceRuntimeServices.companyId,
+    executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId, cwd: workspaceRuntimeServices.cwd,
   }).from(workspaceRuntimeServices).where(and(
     isNull(workspaceRuntimeServices.stoppedAt), ne(workspaceRuntimeServices.provider, "adapter_managed"),
     companyId ? eq(workspaceRuntimeServices.companyId, companyId) : undefined,
@@ -333,17 +320,18 @@ async function* reviewEntryBlockers(
     const reason = "A runtime service can still write this worktree; wait for its confirmed stop.";
     const blocker = service.executionWorkspaceId === workspace.id
       ? { source: "workspace_runtime_services" as const, id: service.id, path: service.cwd, code: "review_entry_workspace_busy" as const, reason }
-      : await pathBlocker("workspace_runtime_services", service.id, [service.cwd], "review_entry_workspace_busy", reason);
+      : await pathBlocker("workspace_runtime_services", service.id, service.companyId, [service.cwd], "review_entry_workspace_busy", reason);
     if (blocker) yield blocker;
   }
   for (const operation of await db.select({
-    id: workspaceOperations.id, executionWorkspaceId: workspaceOperations.executionWorkspaceId, cwd: workspaceOperations.cwd,
+    id: workspaceOperations.id, companyId: workspaceOperations.companyId,
+    executionWorkspaceId: workspaceOperations.executionWorkspaceId, cwd: workspaceOperations.cwd,
   }).from(workspaceOperations).where(and(isNull(workspaceOperations.finishedAt),
     companyId ? eq(workspaceOperations.companyId, companyId) : undefined))) {
     const reason = "A workspace operation can still write this worktree; wait for it to finish.";
     const blocker = operation.executionWorkspaceId === workspace.id
       ? { source: "workspace_operations" as const, id: operation.id, path: operation.cwd, code: "review_entry_workspace_busy" as const, reason }
-      : await pathBlocker("workspace_operations", operation.id, [operation.cwd], "review_entry_workspace_busy", reason);
+      : await pathBlocker("workspace_operations", operation.id, operation.companyId, [operation.cwd], "review_entry_workspace_busy", reason);
     if (blocker) yield blocker;
   }
   const bindings = await db.select({ id: issues.id }).from(issues).where(and(
@@ -356,7 +344,7 @@ async function* reviewEntryBlockers(
   };
   const context = heartbeatRuns.contextSnapshot;
   const runs = await db.select({
-    id: heartbeatRuns.id,
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
     holdsCard: sql<boolean>`coalesce(${heartbeatRuns.nativeIssueId} = ${issue.id} OR ${context}->>'issueId' = ${issue.id}
       OR ${context}->>'taskId' = ${issue.id} OR ${context}->>'executionWorkspaceId' = ${workspace.id}, false)`,
     paths: sql<string[]>`review_entry_run_paths(${context})`,
@@ -372,7 +360,7 @@ async function* reviewEntryBlockers(
       reason: "Another run holds this card or workspace; wait for it to finish before first entry.",
     };
     else {
-      const blocker = await pathBlocker("heartbeat_runs", run.id, run.local ? run.paths : [],
+      const blocker = await pathBlocker("heartbeat_runs", run.id, run.companyId, run.local ? run.paths : [],
         "review_entry_workspace_busy", "Another run can write this physical tree; run this card alone in an isolated worktree.");
       if (blocker) yield blocker;
     }
@@ -397,7 +385,7 @@ async function assertExclusive(
   const own = await physicalPath(workspace.providerRef!).catch(() =>
     fail("workspace_unverified", "The isolated workspace path could not be verified."));
   if (own.path !== prepared.snapshot.worktreePath) fail("git_changed", "The physical worktree identity changed during proof.");
-  // Admission scans cross-company writers, but never returns their IDs/paths.
+  // Concrete managed-tree writers are global; broad root ancestors are company-scoped.
   for await (const blocker of reviewEntryBlockers(db, issue, workspace, own, actor.agentId ? actor.runId : null)) {
     throw conflict(blocker.reason, { code: blocker.code });
   }

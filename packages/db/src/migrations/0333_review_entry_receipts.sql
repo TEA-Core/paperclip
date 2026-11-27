@@ -57,10 +57,50 @@ CREATE FUNCTION "review_entry_lock_key"(name text) RETURNS bigint LANGUAGE sql I
   SELECT hashtextextended('paperclip.review-entry:' || name, 0)
 $$;
 --> statement-breakpoint
-CREATE FUNCTION "review_entry_normalize_path"(candidate text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
-  SELECT CASE WHEN left(candidate, 1) = '/'
-    THEN '/' || array_to_string(array_remove(string_to_array(candidate, '/'), ''), '/') END
-$$;
+CREATE FUNCTION "review_entry_normalize_path"(candidate text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  part text;
+  parts text[] := '{}'::text[];
+BEGIN
+  IF left(candidate, 1) IS DISTINCT FROM '/' THEN RETURN NULL; END IF;
+  FOREACH part IN ARRAY string_to_array(candidate, '/') LOOP
+    IF part = '' OR part = '.' THEN CONTINUE; END IF;
+    IF part = '..' THEN
+      parts := parts[1:greatest(coalesce(array_length(parts, 1), 0) - 1, 0)];
+    ELSE
+      parts := array_append(parts, part);
+    END IF;
+  END LOOP;
+  RETURN '/' || array_to_string(parts, '/');
+END $$;
+--> statement-breakpoint
+CREATE FUNCTION "review_entry_acquire_locks"(shared_names text[], exclusive_names text[], refusal text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  requested record;
+  acquired boolean;
+BEGIN
+  FOR requested IN
+    SELECT review_entry_lock_key(names.name) AS lock_key, bool_or(names.is_exclusive) AS is_exclusive
+    FROM (
+      SELECT unnest(shared_names) AS name, false AS is_exclusive
+      UNION ALL
+      SELECT unnest(exclusive_names) AS name, true AS is_exclusive
+    ) AS names
+    WHERE names.name IS NOT NULL
+    GROUP BY review_entry_lock_key(names.name)
+    ORDER BY lock_key
+  LOOP
+    IF requested.is_exclusive THEN
+      acquired := pg_try_advisory_xact_lock(requested.lock_key);
+    ELSE
+      acquired := pg_try_advisory_xact_lock_shared(requested.lock_key);
+    END IF;
+    IF NOT acquired THEN
+      RAISE EXCEPTION USING MESSAGE = refusal, ERRCODE = '55P03';
+    END IF;
+  END LOOP;
+END $$;
 --> statement-breakpoint
 CREATE FUNCTION "review_entry_run_paths"(context jsonb) RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
   SELECT array_remove(ARRAY[
@@ -78,35 +118,50 @@ DECLARE
   claim jsonb := to_jsonb(NEW);
   context jsonb := CASE WHEN jsonb_typeof(to_jsonb(NEW)->'context_snapshot') = 'object' THEN to_jsonb(NEW)->'context_snapshot' ELSE '{}'::jsonb END;
   candidate text;
+  normalized text;
   part text;
   prefix text;
+  candidates text[];
+  shared_names text[] := '{}'::text[];
+  exclusive_names text[] := '{}'::text[];
 BEGIN
   FOREACH candidate IN ARRAY array_remove(ARRAY[claim->>'native_issue_id', context->>'issueId', context->>'taskId'], NULL) LOOP
-    PERFORM pg_advisory_xact_lock_shared(review_entry_lock_key('issue:' || candidate));
+    shared_names := array_append(shared_names, 'issue:' || candidate);
   END LOOP;
   FOREACH candidate IN ARRAY array_remove(ARRAY[claim->>'execution_workspace_id', context->>'executionWorkspaceId'], NULL) LOOP
-    PERFORM pg_advisory_xact_lock_shared(review_entry_lock_key('workspace:' || candidate));
+    shared_names := array_append(shared_names, 'workspace:' || candidate);
   END LOOP;
-  FOREACH candidate IN ARRAY array_remove(ARRAY[claim->>'cwd', claim->>'provider_ref'], NULL) || review_entry_run_paths(context) LOOP
-    IF review_entry_normalize_path(candidate) IS NOT NULL THEN
-      PERFORM pg_advisory_xact_lock(review_entry_lock_key('path-exact:' || review_entry_normalize_path(candidate)));
+  IF TG_TABLE_NAME = 'projects' THEN
+    SELECT coalesce(array_agg(cwd), '{}'::text[]) INTO candidates
+      FROM project_workspaces WHERE project_id = NEW.id AND company_id = NEW.company_id
+        AND source_type <> 'remote_managed';
+  ELSE
+    candidates := array_remove(ARRAY[claim->>'cwd', claim->>'provider_ref'], NULL) || review_entry_run_paths(context);
+  END IF;
+  -- Physical aliases are normalized by trusted server producers, not by SQL.
+  FOREACH candidate IN ARRAY candidates LOOP
+    normalized := review_entry_normalize_path(candidate);
+    IF normalized IS NOT NULL THEN
+      exclusive_names := array_append(exclusive_names, 'path-exact:' || normalized);
+      exclusive_names := array_append(exclusive_names, 'company-path-exact:' || (claim->>'company_id') || ':' || normalized);
       prefix := '';
-      FOREACH part IN ARRAY array_remove(string_to_array(candidate, '/'), '') LOOP
+      FOREACH part IN ARRAY array_remove(string_to_array(normalized, '/'), '') LOOP
         prefix := prefix || '/' || part;
-        PERFORM pg_advisory_xact_lock_shared(review_entry_lock_key('path:' || prefix));
+        shared_names := array_append(shared_names, 'path:' || prefix);
       END LOOP;
     END IF;
   END LOOP;
+  PERFORM review_entry_acquire_locks(shared_names, exclusive_names, 'review_entry_writer_busy');
   RETURN NEW;
 END $$;
 --> statement-breakpoint
-CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "provider_ref" ON "execution_workspaces"
+CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "provider_ref", "provider_type", "status", "closed_at" ON "execution_workspaces"
 FOR EACH ROW EXECUTE FUNCTION "review_entry_fence_writer"();
 --> statement-breakpoint
-CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd" ON "project_workspaces"
+CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "source_type" ON "project_workspaces"
 FOR EACH ROW EXECUTE FUNCTION "review_entry_fence_writer"();
 --> statement-breakpoint
-CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "execution_workspace_id", "stopped_at" ON "workspace_runtime_services"
+CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "provider", "execution_workspace_id", "stopped_at" ON "workspace_runtime_services"
 FOR EACH ROW WHEN (NEW.stopped_at IS NULL) EXECUTE FUNCTION "review_entry_fence_writer"();
 --> statement-breakpoint
 CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "cwd", "execution_workspace_id", "finished_at" ON "workspace_operations"
@@ -114,3 +169,10 @@ FOR EACH ROW WHEN (NEW.finished_at IS NULL) EXECUTE FUNCTION "review_entry_fence
 --> statement-breakpoint
 CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "status", "context_snapshot", "native_issue_id" ON "heartbeat_runs"
 FOR EACH ROW WHEN (NEW.status IN ('queued', 'running')) EXECUTE FUNCTION "review_entry_fence_writer"();
+--> statement-breakpoint
+CREATE TRIGGER "review_entry_fence_writer" BEFORE UPDATE OF "archived_at" ON "projects"
+FOR EACH ROW WHEN (OLD.archived_at IS NOT NULL AND NEW.archived_at IS NULL)
+EXECUTE FUNCTION "review_entry_fence_writer"();
+--> statement-breakpoint
+CREATE TRIGGER "review_entry_fence_writer" BEFORE INSERT OR UPDATE OF "execution_workspace_id" ON "issues"
+FOR EACH ROW WHEN (NEW.execution_workspace_id IS NOT NULL) EXECUTE FUNCTION "review_entry_fence_writer"();

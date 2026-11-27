@@ -1,4 +1,4 @@
-import { canonicalStoredPath } from "./stored-workspace-path.js";
+import { canonicalRunContextSnapshot, canonicalStoredPath } from "./stored-workspace-path.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { isTransactionHandle } from "./db-handle.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
@@ -200,7 +200,7 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
-import { conflict, HttpError, notFound } from "../errors.js";
+import { conflict, HttpError, notFound, reviewEntryFenceRefusalCode } from "../errors.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -775,9 +775,9 @@ export function contextSnapshotWriteErrorClasses(
 }
 
 /**
- * Guard a single `heartbeat_runs.context_snapshot` write (SUP-15284): a driver-level failure is
- * recorded via `record` and the run continues instead of dying. The snapshot write is
- * diagnostic — losing it must never end the run. Never throws.
+ * Guard optional context diagnostics. Ordinary driver failures are recorded and
+ * degraded, but path-publication and review-entry fence refusals must stop the
+ * writer: swallowing those refusals could dispatch without a recorded claim.
  */
 export async function runContextSnapshotWriteGuarded<T>(input: {
   writeSite: string;
@@ -789,6 +789,7 @@ export async function runContextSnapshotWriteGuarded<T>(input: {
   try {
     return await input.write();
   } catch (error) {
+    if (reviewEntryFenceRefusalCode(error)) throw error;
     try {
       await input.record({ error, writeSite: input.writeSite, runId: input.runId });
     } catch {
@@ -15977,7 +15978,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: await canonicalRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -17882,7 +17883,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: "system",
             status: "scheduled_retry",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: retryContextSnapshot,
+            contextSnapshot: await canonicalRunContextSnapshot(retryContextSnapshot),
             ...(hasConversationContinuationPolicy(run.resultJson)
               ? { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } : {}),
             responsibleUserId,
@@ -18521,7 +18522,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           scheduledRetryAt: now,
-          contextSnapshot,
+          contextSnapshot: await canonicalRunContextSnapshot(contextSnapshot),
           updatedAt: now,
         })
         .where(
@@ -20442,7 +20443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ...legacyControllerClaim(run.runtimeMode),
                 responsibleUserId,
                 startedAt: lockedRun.startedAt ?? claimedAt,
-                contextSnapshot: claimedContextSnapshot,
+                contextSnapshot: await canonicalRunContextSnapshot(claimedContextSnapshot),
                 updatedAt: claimedAt,
               })
               .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
@@ -20778,10 +20779,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     // SUP-15580: every claim path stamps the host boot identity so a
                     // host-restart kill stays identifiable. Upstream's rewrite of this
                     // branch dropped the stamp; it is restored here.
-                    contextSnapshot: withHostBootIdInRunContext(
+                    contextSnapshot: await canonicalRunContextSnapshot(withHostBootIdInRunContext(
                       parseObject(lockedRun.contextSnapshot),
                       hostBootId,
-                    ),
+                    )),
                     updatedAt: claimedAt,
                   })
                   .where(
@@ -20887,13 +20888,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
-                  contextSnapshot: withHostBootIdInRunContext(
+                  contextSnapshot: await canonicalRunContextSnapshot(withHostBootIdInRunContext(
                     withQueuedCommentIdsInRunContext(
                       lockedRun.contextSnapshot,
                       liveIds,
                     ),
                     hostBootId,
-                  ),
+                  )),
                   updatedAt: claimedAt,
                 })
                 .where(
@@ -20969,10 +20970,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
-            contextSnapshot: withHostBootIdInRunContext(
+            contextSnapshot: await canonicalRunContextSnapshot(withHostBootIdInRunContext(
               parseObject(run.contextSnapshot),
               hostBootId,
-            ),
+            )),
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
@@ -27029,7 +27030,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: boundContextSnapshot(context),
+          contextSnapshot: await canonicalRunContextSnapshot(boundContextSnapshot(context)),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -27332,13 +27333,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: run.id,
         agentId: agent.id,
         companyId: agent.companyId,
-        write: () => db
+        write: async () => db
           .update(heartbeatRuns)
           .set({
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: boundContextSnapshot(context),
+            contextSnapshot: await canonicalRunContextSnapshot(boundContextSnapshot(context)),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))
@@ -27593,7 +27594,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: boundContextSnapshot(context),
+              contextSnapshot: await canonicalRunContextSnapshot(boundContextSnapshot(context)),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -29525,7 +29526,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: boundContextSnapshot(context),
+              contextSnapshot: await canonicalRunContextSnapshot(boundContextSnapshot(context)),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -32209,7 +32210,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: promotedTriggerDetail,
             status: "queued",
             wakeupRequestId: deferred.id,
-            contextSnapshot: promotedContextSnapshot,
+            contextSnapshot: await canonicalRunContextSnapshot(promotedContextSnapshot),
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
@@ -32493,7 +32494,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: "system",
             status: "queued",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: withRecoveryContext(
+            contextSnapshot: await canonicalRunContextSnapshot(withRecoveryContext(
               {
                 issueId: issue.id,
                 taskId: issue.id,
@@ -32507,7 +32508,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
               },
               "normal_model",
-            ),
+            )),
             sessionIdBefore: recoverySessionBefore,
             retryOfRunId: run.id,
             updatedAt: now,
@@ -32749,7 +32750,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: recoveryContextSnapshot,
+          contextSnapshot: await canonicalRunContextSnapshot(recoveryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
@@ -35167,12 +35168,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
-              contextSnapshot: adoptedComments.length
+              contextSnapshot: await canonicalRunContextSnapshot(adoptedComments.length
                 ? withQueuedCommentIdsInRunContext(
                     enrichedContextSnapshot,
                     adoptedCommentIds,
                   )
-                : enrichedContextSnapshot,
+                : enrichedContextSnapshot),
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
@@ -35334,10 +35335,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       let snapshotFailure: Parameters<typeof buildContextSnapshotWriteFailureEvent>[0] | undefined;
       const persistCoalescedWake = async (executor: Db) => {
-        const writeSnapshot = (runner: Db) => runner
+        const writeSnapshot = async (runner: Db) => runner
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+            contextSnapshot: await canonicalRunContextSnapshot(boundContextSnapshot(mergedContextSnapshot)),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
@@ -35514,7 +35515,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: await canonicalRunContextSnapshot(enrichedContextSnapshot),
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })

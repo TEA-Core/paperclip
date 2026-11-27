@@ -47,6 +47,7 @@ import {
   gt,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   sql,
@@ -17594,6 +17595,19 @@ export function issueRoutes(
     assertBoard(req);
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    if (req.actor.boardKeyScope === "read_only") {
+      throw forbidden("Review-entry blockers require a board operator, not a read-only key.");
+    }
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+      const [operator] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, issue.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, req.actor.userId ?? ""),
+        eq(companyMemberships.status, "active"),
+        ne(companyMemberships.membershipRole, "viewer"),
+      )).limit(1);
+      if (!operator) throw forbidden("Review-entry blockers require an active board company operator.");
+    }
     const blockers = await listReviewEntryBlockers(db, issue);
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, blockers));
   });

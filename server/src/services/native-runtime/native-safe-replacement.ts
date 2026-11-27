@@ -1,3 +1,4 @@
+import { canonicalRunContextSnapshot } from "../stored-workspace-path.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
@@ -411,7 +412,7 @@ export async function reconcileSafeNativeReplacements(
           executionStatusDeliveryId: randomUUID(),
           wakeupRequestId: wake!.id,
           responsibleUserId: run.responsibleUserId,
-          contextSnapshot: context,
+          contextSnapshot: await canonicalRunContextSnapshot(context),
           retryOfRunId: run.id,
           scheduledRetryAt: dueAt,
           scheduledRetryAttempt: current.attempt,

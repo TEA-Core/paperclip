@@ -1,3 +1,4 @@
+import { reviewEntryFenceRefusalCode } from "../errors.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -791,6 +792,21 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await noAcceptedEntry(fixture.issueId);
     });
 
+    it("refuses a shared sibling Git admin directory even when both back-pointers are rewritten", async () => {
+      const fixture = await reviewFixture();
+      const sibling = `${fixture.worktree}-sibling`;
+      git(fixture.repoRoot, "worktree", "add", "-q", "-b", `${fixture.identifier}-other`, sibling, "origin/main");
+      const siblingGitDir = git(sibling, "rev-parse", "--absolute-git-dir");
+      await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
+        status: "running", contextSnapshot: { cwd: sibling } });
+      writeFileSync(path.join(fixture.worktree, ".git"), `gitdir: ${siblingGitDir}\n`);
+      writeFileSync(path.join(siblingGitDir, "gitdir"), `${path.join(fixture.worktree, ".git")}\n`);
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.code).toBe("review_entry_git_refused");
+      await noAcceptedEntry(fixture.issueId);
+    });
+
     it("refuses a non-symlink physical alias with the same device and inode", async () => {
       const fixture = await reviewFixture();
       const alias = mkdtempSync(path.join(os.tmpdir(), "review-entry-physical-alias-"));
@@ -878,6 +894,17 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         const foreignRead = await request(app).get(url).set("x-test-actor", JSON.stringify({ ...board, companyIds: [foreignCompany] }));
         expect([403, 404]).toContain(foreignRead.status);
         expect((await request(app).get(url)).status).toBe(403);
+        const readOnly = await request(app).get(url).set("x-test-actor", JSON.stringify({
+          ...board, source: "board_key", boardKeyScope: "read_only",
+        }));
+        expect(readOnly.status).toBe(403);
+        await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(
+          eq(companyMemberships.companyId, fixture.companyId), eq(companyMemberships.principalId, "cloud-user-1"),
+        ));
+        expect((await request(app).get(url).set("x-test-actor", JSON.stringify(board))).status).toBe(403);
+        await db.update(companyMemberships).set({ membershipRole: "owner" }).where(and(
+          eq(companyMemberships.companyId, fixture.companyId), eq(companyMemberships.principalId, "cloud-user-1"),
+        ));
         await noAcceptedEntry(fixture.issueId);
         const refused = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
         expect(refused.status, JSON.stringify(refused.body)).toBe(409);
@@ -1067,6 +1094,17 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       const otherAgent = await insertAgent(otherCompany, "Phantom writer");
       const otherProject = randomUUID();
       await db.insert(projects).values({ id: otherProject, companyId: otherCompany, name: "Phantom source", status: "active" });
+      const [closedWorkspace] = await db.insert(executionWorkspaces).values({
+        companyId: fixture.companyId, projectId: fixture.projectId, name: "Dormant writer",
+        mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
+        cwd: fixture.worktree, providerRef: fixture.worktree, status: "closed", closedAt: new Date(),
+      }).returning();
+      const [archivedProject] = await db.insert(projects).values({
+        companyId: fixture.companyId, name: "Dormant source", status: "active", archivedAt: new Date(),
+      }).returning();
+      await db.insert(projectWorkspaces).values({
+        companyId: fixture.companyId, projectId: archivedProject!.id, name: "Dormant path", cwd: fixture.worktree,
+      });
       // The project's ES2022 type library has no Promise.withResolvers.
       let release!: () => void;
       let locked!: () => void;
@@ -1122,17 +1160,24 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           providerType: "local_fs", cwd: fixture.repoRoot, providerRef: fixture.repoRoot }),
         "project binding at an ancestor": (tx) => tx.insert(projectWorkspaces).values({
           companyId: fixture.companyId, projectId: fixture.projectId, name: "Ancestor source", cwd: fixture.repoRoot }),
+        "reactivated execution workspace": (tx) => tx.update(executionWorkspaces).set({ status: "active", closedAt: null })
+          .where(eq(executionWorkspaces.id, closedWorkspace!.id)),
+        "unarchived project source": (tx) => tx.update(projects).set({ archivedAt: null }).where(eq(projects.id, archivedProject!.id)),
+        "another card on the workspace": (tx) => tx.insert(issues).values({
+          companyId: fixture.companyId, title: "Competing workspace binding", executionWorkspaceId: fixture.executionWorkspaceId,
+        }),
       };
       const outcomes: Record<string, string> = {};
       const aliasPath = `${fixture.worktree}-symlinked`;
       symlinkSync(fixture.worktree, aliasPath);
-      let aliasCommitted = false;
-      let aliasWasBlocked = false;
+      let aliasRefusal: string | null = null;
       const aliasWrite = executionWorkspaceService(db).create({
         companyId: fixture.companyId, projectId: fixture.projectId, name: "Symlinked path claim",
         mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
         cwd: aliasPath, providerRef: aliasPath,
-      }).then((row) => { aliasCommitted = true; return row; });
+      }).then(() => { throw new Error("Alias writer escaped the admission fence"); }, (error: unknown) => {
+        aliasRefusal = reviewEntryFenceRefusalCode(error);
+      });
       const pendingWrites = Promise.allSettled([entry, aliasWrite]);
       try {
         await Promise.all(Object.entries(phantoms).map(async ([label, write]) => {
@@ -1152,18 +1197,104 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           await tx.insert(activityLog).values({ companyId: otherCompany, actorType: "system", actorId: "unrelated",
             entityType: "company", entityId: otherCompany, action: "company.unrelated_write" });
         });
-        aliasWasBlocked = !aliasCommitted;
       } finally {
         release();
         await pendingWrites;
       }
       expect(outcomes).toEqual(Object.fromEntries(Object.keys(phantoms).map((label) => [label, "excluded"])));
-      expect(aliasWasBlocked).toBe(true);
+      expect(aliasRefusal).toBe("review_entry_writer_busy");
       const response = await entry;
       expect(response.status, JSON.stringify(response.body)).toBe(200);
-      expect(await aliasWrite).toMatchObject({ cwd: fixture.worktree, providerRef: fixture.worktree });
       expect(await db.select().from(issueReviewEntryReceipts).where(eq(issueReviewEntryReceipts.issueId, fixture.issueId))).toHaveLength(1);
     }, 60_000);
+
+    it.each(["symlink alias", "dot form"])("fences a real project-workspace API writer using %s", async (kind) => {
+      const fixture = await reviewFixture();
+      const alias = path.join(home, `writer-api-alias-${randomUUID()}`);
+      symlinkSync(fixture.repoRoot, alias);
+      const cwd = kind === "symlink alias" ? alias : `${fixture.repoRoot}/.paperclip/../`;
+      let release!: () => void;
+      let locked!: () => void;
+      const reached = new Promise<void>((resolve) => { locked = resolve; });
+      const canCommit = new Promise<void>((resolve) => { release = resolve; });
+      mockRecheckReviewEntry.mockImplementationOnce(async (captured: Extract<ReviewEntryWorktreeSnapshot, { ok: true }>) => {
+        const result = await realRecheckReviewEntry.current!(captured);
+        locked();
+        await canCommit;
+        return result;
+      });
+      const entry = request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body).then((response) => response);
+      try {
+        await Promise.race([reached, entry.then((response) => {
+          throw new Error(`Entry ended before writer barrier: ${response.status} ${JSON.stringify(response.body)}`);
+        })]);
+        const writer = await request(app).post(`/api/projects/${fixture.projectId}/workspaces`)
+          .set("x-test-actor", JSON.stringify({ type: "board", source: "session", userId: "cloud-user-1", companyIds: [fixture.companyId] }))
+          .send({ name: "Competing API path", cwd, sourceType: "local_path" });
+        expect(writer.status, JSON.stringify(writer.body)).toBe(409);
+        expect(writer.body.code).toBe("review_entry_writer_busy");
+        expect(await db.select().from(projectWorkspaces).where(and(
+          eq(projectWorkspaces.projectId, fixture.projectId), eq(projectWorkspaces.name, "Competing API path"),
+        ))).toEqual([]);
+      } finally {
+        release();
+        await entry;
+        rmSync(alias, { force: true });
+      }
+      expect((await entry).status).toBe(200);
+    }, 60_000);
+
+    it("refuses opposite-order writer contention with named busy rather than deadlocking", async () => {
+      const fixture = await reviewFixture();
+      const first = fixture.worktree;
+      const second = `${fixture.worktree}-opposite`;
+      mkdirSync(second);
+      let release!: () => void;
+      const proceed = new Promise<void>((resolve) => { release = resolve; });
+      const ready: Promise<void>[] = [];
+      const writers = [[first, second], [second, first]].map(([a, b]) => {
+        let opened!: () => void;
+        ready.push(new Promise<void>((resolve) => { opened = resolve; }));
+        return db.transaction(async (tx) => {
+          await tx.execute(sql`SET LOCAL statement_timeout = '2s'`);
+          await tx.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
+            status: "queued", contextSnapshot: { cwd: a } });
+          opened();
+          await proceed;
+          await tx.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
+            status: "queued", contextSnapshot: { cwd: b } });
+          return "written";
+        }).catch((error: unknown) => reviewEntryFenceRefusalCode(error) ?? "unexpected refusal");
+      });
+      try {
+        await Promise.race([Promise.all(ready), Promise.race(writers).then((result) => {
+          throw new Error(`Writer ended before opposite-order barrier: ${result}`);
+        })]);
+      } finally {
+        release();
+      }
+      const outcomes = await Promise.all(writers);
+      expect(outcomes).toContain("review_entry_writer_busy");
+      expect(outcomes.every((outcome) => outcome === "written" || outcome === "review_entry_writer_busy")).toBe(true);
+    });
+
+    it.each(["own company", "another company"])("scopes a valid broad ancestor to %s", async (scope) => {
+      const fixture = await reviewFixture();
+      const companyId = scope === "own company" ? fixture.companyId : await insertCompany(`ROOT${seedSequence}`);
+      const agentId = scope === "own company" ? fixture.rulerAgentId : await insertAgent(companyId, "Root writer");
+      const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", contextSnapshot: { cwd: "/" } }).returning();
+      try {
+        const read = await request(app).get(`/api/issues/${fixture.identifier}/review-entry-blockers`)
+          .set("x-test-actor", JSON.stringify({ type: "board", source: "session", userId: "cloud-user-1", companyIds: [fixture.companyId] }));
+        expect(read.status, JSON.stringify(read.body)).toBe(200);
+        expect(read.body.some((row: { id: string }) => row.id === run!.id)).toBe(scope === "own company");
+        const entry = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(entry.status, JSON.stringify(entry.body)).toBe(scope === "own company" ? 409 : 200);
+        if (scope === "own company") await noAcceptedEntry(fixture.issueId);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run!.id));
+      }
+    });
 
     it("preserves revised-artifact resubmission and fresh record-only final evidence", async () => {
       const fixture = await reviewFixture();
@@ -1269,19 +1400,58 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       }
     });
 
-    it("ignores a cross-company dangling link outside the managed projects root", async () => {
+    it.each(["absolute", "relative", "two-hop"])("refuses an outside %s dangling link targeting the managed tree", async (kind) => {
       const fixture = await reviewFixture();
       const link = path.join(home, `unrelated-dangling-${randomUUID()}`);
-      symlinkSync(path.join(fixture.worktree, "absent"), link);
+      const next = `${link}-next`;
+      const target = path.join(fixture.worktree, "absent");
+      if (kind === "two-hop") symlinkSync(target, next);
+      symlinkSync(kind === "two-hop" ? next : kind === "relative" ? path.relative(path.dirname(link), target) : target, link);
       const otherCompany = await insertCompany(`OUTSIDE${seedSequence}`);
       await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Outside writer"),
         status: "queued", contextSnapshot: { cwd: path.join(link, "nested") } });
       try {
         const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
-        expect(response.status, JSON.stringify(response.body)).toBe(200);
-        expect(response.body.status).toBe("in_review");
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toBe("review_entry_workspace_unverified");
+        await noAcceptedEntry(fixture.issueId);
       } finally {
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, otherCompany));
+        rmSync(link, { force: true });
+        rmSync(next, { force: true });
+      }
+    });
+
+    it("ignores a genuinely outside dangling link and target", async () => {
+      const fixture = await reviewFixture();
+      const link = path.join(home, `outside-link-${randomUUID()}`);
+      symlinkSync(path.join(home, `outside-missing-${randomUUID()}`), link);
+      const companyId = await insertCompany(`OUTSAFE${seedSequence}`);
+      await db.insert(heartbeatRuns).values({ companyId, agentId: await insertAgent(companyId, "Outside writer"),
+        status: "queued", contextSnapshot: { cwd: `${link}/nested` } });
+      try {
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, companyId));
+        rmSync(link, { force: true });
+      }
+    });
+
+    it("follows a symlinked directory before a later dot-dot and missing suffix", async () => {
+      const fixture = await reviewFixture();
+      mkdirSync(path.join(fixture.worktree, "sub"));
+      const link = path.join(home, `directory-link-${randomUUID()}`);
+      symlinkSync(path.join(fixture.worktree, "sub"), link);
+      const companyId = await insertCompany(`DOTDOT${seedSequence}`);
+      await db.insert(heartbeatRuns).values({ companyId, agentId: await insertAgent(companyId, "Dot writer"),
+        status: "queued", contextSnapshot: { cwd: `${link}/../newdir` } });
+      try {
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        await noAcceptedEntry(fixture.issueId);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, companyId));
         rmSync(link, { force: true });
       }
     });

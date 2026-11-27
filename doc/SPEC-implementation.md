@@ -421,12 +421,15 @@ runs outside remote environments. It refuses another card, workspace or run
 sharing that directory, a directory inside it, or an ancestor directory from
 which it can write the tree. Only the card's own project-workspace binding is
 exempt metadata; a live run or another workspace at that primary checkout is
-still a writer. A path that does not exist (ENOENT/ENOTDIR) is judged by its
-nearest existing ancestor: it refuses when the reconstructed path overlaps the
-worktree and is ignored otherwise. A dangling symlink or other resolution error
-refuses with `review_entry_workspace_unverified` only when its deepest existing
-ancestor resolves under the instance managed projects root. Broken paths outside
-that root do not block unrelated companies; valid physical aliases still do.
+still a writer. Missing suffixes are resolved component by component, following
+each symlink target before consuming a later `..`. A missing path overlapping the
+worktree refuses. A dangling link or other resolution error refuses with
+`review_entry_workspace_unverified` when a resolved hop or target's deepest
+existing ancestor reaches the managed projects root. Outside links into that
+root are not an escape; genuinely outside links and targets do not block.
+Concrete managed-tree aliases remain cross-company blockers. Valid broad
+ancestors at or above the managed projects root constrain their own company only,
+so another company's `/` configuration is not an invisible instance-wide blocker.
 `review_entry_workspace_not_isolated` names the remedy: provision an isolated
 worktree for this card. A `project_primary` directory cannot qualify, even clean.
 Provision summary-routine cards with their own isolated-worktree workspace after
@@ -438,21 +441,31 @@ claim that database locks fence arbitrary host filesystem writers. Do not use it
 for shared folders or out-of-band writers. The transaction takes advisory locks
 keyed by the issue, its execution workspace and the worktree's paths before it
 locks the issue row, then row-locks the workspace binding, ruling, owning run,
-artifact and reviewer rows in one fixed order. Database triggers make any insert
-(or path re-point) of a workspace, project workspace, runtime service, operation
-or queued/running run on the same issue, workspace or overlapping path take
-conflicting keys, so such a phantom waits for the commit. Descendant writers
-share path-prefix keys. Ancestor writers take a separate exact-path key for
-their cwd exclusively, while admission holds its own exact keys exclusively and
-shares the exact keys of its ancestors below the managed projects root.
-Concurrent admissions on disjoint worktrees therefore do not exclude each
-other; concurrent writer inserts at one exact cwd briefly serialize.
-No table lock is taken; lock contention and unsupported paths fail closed.
+artifact and reviewer rows in one fixed order. Trusted server producers normalize
+local workspace and run-context paths before persistence, including missing
+symlink targets. Database triggers acquire the same issue, workspace and path
+keys for those claims. Admission and writer batches sort hashed keys in one
+order and use nonblocking advisory acquisition. A competing writer receives
+named `review_entry_writer_busy`, not an unbounded advisory wait. A run must not
+swallow that refusal as optional diagnostics. Descendant writers share prefix
+keys; writers own exact keys exclusively. Admission shares ancestor exact keys
+and owns its tree keys exclusively. Broad ancestor exact keys are company-scoped.
+Disjoint admissions, including different worktrees of one checkout, remain
+concurrent. Inverting the modes would reverse that contract; the chosen
+alternative is a named same-path writer refusal. No table lock is taken;
+ordinary row-lock contention still fails closed.
 
-The linked-worktree admin directory must also have a bounded, regular `gitdir`
-back-pointer resolving to this tree's own `.git` file; borrowing a sibling's
-Git directory cannot establish ownership. A relative back-pointer resolves
-against the admin directory, as Git does.
+Named residual: privileged raw-SQL physical-alias inserts are outside this
+server-write guarantee. PostgreSQL cannot resolve the application host's
+symlinks, and a database writer can bypass application normalization or alter
+the fence itself. This is not a raw-SQL or host-filesystem physical-alias fence.
+
+Each linked-worktree admin directory must have a bounded regular `gitdir`
+back-pointer and a consistent forward `.git` pointer to the same admin-directory
+device/inode. The common directory's registered mappings must be unambiguous;
+rewriting both pointers to borrow a sibling's index/HEAD is refused. Stale or
+inconsistent registrations also fail closed. Relative pointers resolve against
+their containing directory, as Git does.
 
 GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
@@ -502,14 +515,15 @@ changes requested, policy edits or reassignment. Revised-artifact resubmission
 uses the existing review workflow. Final closure still needs fresh, lawful Tier
 evidence and all existing landing checks; an entry receipt is not that evidence.
 
-`GET /api/issues/{id}/review-entry-blockers` is a board-only operator diagnostic
-for an active isolated-worktree binding. It lists blocking rows from the issue's
-company only, using the same liveness and physical-path predicates as admission:
-`source` table, row `id`, recorded `path` (null for an issue/workspace claim),
-`code` and `reason`. It never exposes another company's row IDs or paths.
-Admission still checks cross-company writers and returns a generic refusal.
-The diagnostic performs no Git/provider proof, locking or mutation; its result
-is not an admission token or a complete eligibility decision.
+`GET /api/issues/{id}/review-entry-blockers` is a board-operator diagnostic for an
+active isolated-worktree binding. Local/instance operators and active non-viewer
+company board members may read it; viewer sessions and read-only board keys may
+not. It lists this company's blockers using admission's liveness and physical-path
+predicates: source table, row id, recorded path (null for an issue/workspace claim),
+code and reason. Broad root ancestors are company-scoped; concrete managed-tree
+writers are still checked across companies without exposing foreign IDs or paths.
+The read performs no Git command/provider proof, locking or mutation and grants
+no admission token.
 
 
 For a stranded pending execution-policy review/approval stage whose recorded

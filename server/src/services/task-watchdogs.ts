@@ -1,3 +1,4 @@
+import { canonicalRunContextSnapshot } from "./stored-workspace-path.js";
 import { createHash } from "node:crypto";
 import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1860,7 +1861,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         context.stopFingerprint = classification.stopFingerprint;
         await db
           .update(heartbeatRuns)
-          .set({ contextSnapshot: context, updatedAt: new Date() })
+          .set({ contextSnapshot: await canonicalRunContextSnapshot(context), updatedAt: new Date() })
           .where(eq(heartbeatRuns.id, scope.runId));
         return { allowed: true as const, classification };
       }
@@ -1938,7 +1939,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     context.stopFingerprint = stopFingerprint;
     await db
       .update(heartbeatRuns)
-      .set({ contextSnapshot: context, updatedAt: new Date() })
+      .set({ contextSnapshot: await canonicalRunContextSnapshot(context), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, input.runId));
     return stopFingerprint;
   }

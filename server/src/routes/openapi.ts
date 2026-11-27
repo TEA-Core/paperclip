@@ -4526,7 +4526,7 @@ registry.registerPath({
   path: "/api/issues/{id}/review-entry-blockers",
   tags: ["issues"],
   summary: "Inspect company-scoped first-review entry blockers",
-  description: "Board-only diagnostic for an issue with an active isolated-worktree binding. Returns blocking rows from this issue's company only: source table, row id, recorded path (or null for an issue/workspace claim), review_entry_* code and reason. Admission still checks all companies and never exposes foreign row identities. Unresolvable paths block only when their deepest existing ancestor is under the instance managed projects root; valid physical aliases and ancestor/descendant writers remain blockers anywhere. This read performs no Git/provider proof, locks or mutation and grants no admission token.",
+  description: "Board-operator diagnostic for an active isolated-worktree binding; viewer sessions and read-only board keys are refused. Returns this company's blockers only: source table, row id, recorded path (or null), review_entry_* code and reason. Admission checks concrete managed-tree writers across companies without exposing foreign identities; valid broad ancestors at or above the managed projects root are company-scoped. Missing paths resolve symlink targets before dot-dot segments; uncertainty reaching the managed root refuses even when the link is outside it. This read performs no Git command/provider proof, locks or mutation and grants no admission token.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });

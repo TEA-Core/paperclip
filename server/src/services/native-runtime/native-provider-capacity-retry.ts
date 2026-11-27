@@ -1,3 +1,4 @@
+import { canonicalRunContextSnapshot } from "../stored-workspace-path.js";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
@@ -63,7 +64,7 @@ export async function materializeNativeProviderCapacityRetry(input: {
     retryOfRunId: run.id, scheduledRetryReason: NATIVE_PROVIDER_OVERLOADED_CODE,
     scheduledRetryAttempt: attempt, scheduledRetryAt: dueAt,
     error: NATIVE_PROVIDER_OVERLOADED_MESSAGE, errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
-    contextSnapshot,
+    contextSnapshot: await canonicalRunContextSnapshot(contextSnapshot),
   });
   return retryId;
 }
