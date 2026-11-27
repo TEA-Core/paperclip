@@ -262,6 +262,9 @@ row that has no branch, or to record a card with **no** execution workspace
 also record the exact branch of an ADR-083 carrier whose owner is already
 done/cancelled (a terminal carrier), provided the record binds a PR (`prNumber`
 and `prUrl`); approval later accepts it only as a merged delivery (see below).
+A board refresh naming a non-terminal ancestor carrier's branch records a
+child carrier claim under the same live proof as the executor's write (see
+[Delivery identity](delivery-identity.md)).
 Board attestation alone never turns an unanchored branch into the card's own
 branch. Workspace provisioning applies the same anchor when it carries the
 recorded branch onto a freshly minted or restored workspace row: the recorded
