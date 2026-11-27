@@ -11262,7 +11262,7 @@ registerCurrentRoute({
     "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
     "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
     "(it is linked to the card by a `pull_request` work product the attach did not create or by a linked external object, or its " +
-    "head or merge commit contains a delivery commit recorded on the card, or its head branch names the card; otherwise 422 " +
+    "head or merge commit contains a delivery commit recorded on the card; a head branch name is not a tie; otherwise 422 " +
     "`landing_proof_not_card_delivery`), and the " +
     "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
     "not contained). A missing credential, a network error, a non-OK GitHub answer or an unresolvable base branch is 422 " +

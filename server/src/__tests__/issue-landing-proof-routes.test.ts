@@ -1,11 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
+  agentApiKeys,
   agents,
+  authUsers,
+  boardApiKeys,
   companies,
   companyMemberships,
   createDb,
@@ -24,6 +29,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
+import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { issueRoutes } from "../routes/issues.js";
 import { evaluateDoneTransitionGuard, prepareLandingDebtClose } from "../services/done-transition-guard.js";
 
@@ -86,8 +94,6 @@ const github = {
   repo: { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` },
   /** `${commit}...${container}` pairs where the container commit contains the commit. */
   contains: new Set<string>(),
-  /** The card under test; a PR head ref of `{card}-...` names it. */
-  cardIdentifier: "",
 };
 
 function json(body: unknown, status = 200) {
@@ -104,8 +110,7 @@ async function fakeGitHub(url: string): Promise<Response> {
   if (pull) {
     const pr = github.prs.get(Number(pull[1]));
     if (!pr) return json({ message: "Not Found" }, 404);
-    const ref = pr.head.ref.replace("{card}", github.cardIdentifier);
-    return json({ number: Number(pull[1]), ...pr, head: { ...pr.head, ref } });
+    return json({ number: Number(pull[1]), ...pr });
   }
   const ref = /^\/git\/ref\/heads\/(.+)$/.exec(rest);
   if (ref) {
@@ -145,7 +150,7 @@ function resetGitHub() {
     state: "closed",
     merged: true,
     merge_commit_sha: MERGE_ON_BASE,
-    head: { sha: HEAD_OF_MERGED, ref: "{card}-deleted-after-merge", repo: { full_name: `${OWNER}/${REPO}` } },
+    head: { sha: HEAD_OF_MERGED, ref: "deleted-after-merge", repo: { full_name: `${OWNER}/${REPO}` } },
     base: { ref: BASE, repo: { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` } },
     draft: false,
     ...over,
@@ -163,6 +168,11 @@ function resetGitHub() {
   github.prs.set(506, pr({
     merge_commit_sha: LINKED_MERGE,
     head: { sha: sha("e7"), ref: "unrelated-branch", repo: { full_name: `${OWNER}/${REPO}` } },
+  }));
+  // An open draft PR, used to link a draft to the card after the attach.
+  github.prs.set(509, pr({
+    state: "open", merged: false, merge_commit_sha: null, draft: true,
+    head: { sha: sha("e9"), ref: "draft-follow-up", repo: { full_name: `${OWNER}/${REPO}` } },
   }));
   // The card's own PR, tied only by containing the card's recorded delivery commit.
   github.prs.set(507, pr({
@@ -183,6 +193,9 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let app!: express.Express;
+  let authApp!: express.Express;
+  let authServer: Server | null = null;
+  let authApiUrl = "";
   let currentActor!: Express.Request["actor"];
   let seq = 0;
   let previousSchedulingSuppression: string | undefined;
@@ -200,9 +213,22 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     });
     app.use("/api", issueRoutes(db, {} as any));
     app.use(errorHandler);
+
+    // The real bearer path: hashed API keys resolved by the auth middleware,
+    // served over HTTP so the MCP client reaches the route as a caller would.
+    authApp = express();
+    authApp.use(express.json());
+    authApp.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
+    authApp.use("/api", issueRoutes(db, {} as any));
+    authApp.use(errorHandler);
+    authServer = await new Promise<Server>((resolve) => {
+      const server = authApp.listen(0, "127.0.0.1", () => resolve(server));
+    });
+    authApiUrl = `http://127.0.0.1:${(authServer.address() as AddressInfo).port}/api`;
   }, 60_000);
 
   afterAll(async () => {
+    await new Promise<void>((resolve) => (authServer ? authServer.close(() => resolve()) : resolve()));
     await tempDb?.cleanup();
     if (previousSchedulingSuppression === undefined) delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
     else process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
@@ -230,10 +256,14 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     participant?: "user" | "agent";
     workflow?: "completed" | "pending";
     executionBranchAhead?: boolean;
+    /**
+     * The delivery commit the card recorded on entering review. It defaults to
+     * the head commit of PR #501, which ties that PR to the card. Null records none.
+     */
+    deliveredHeadSha?: string | null;
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
-    github.cardIdentifier = `${prefix}-1`;
     const companyId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -267,6 +297,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         lastUsedAt: now, openedAt: now, createdAt: now, updatedAt: now,
       });
     }
+    const deliveredHeadSha = options.deliveredHeadSha === undefined ? HEAD_OF_MERGED : options.deliveredHeadSha;
     const participant = options.participant === "agent"
       ? { type: "agent", agentId }
       : { type: "user", userId: "local-board" };
@@ -282,12 +313,12 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         ? {
           status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
           currentParticipant: participant, returnAssignee: null, completedStageIds: [], skippedStageIds: [],
-          lastDecisionId: null, lastDecisionOutcome: null,
+          lastDecisionId: null, lastDecisionOutcome: null, deliveredHeadSha,
         }
         : {
           status: "completed", currentStageId: null, currentStageIndex: null, currentStageType: null,
           currentParticipant: null, returnAssignee: null, completedStageIds: [stageId], skippedStageIds: [],
-          lastDecisionId: null, lastDecisionOutcome: "approved",
+          lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
         },
     });
     return { companyId, agentId, issueId, identifier };
@@ -566,8 +597,12 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       const { issueId } = await seedStuckCard();
       await reclassifyRecordOnly(issueId);
       expect((await attach(issueId, goodProof())).status).toBe(201);
-      // The PR stops naming the card; only the attach-created work product remains.
-      github.prs.get(501)!.head.ref = "renamed-branch";
+      // The card's recorded delivery commit is cleared; only the attach-created
+      // work product (with the PR's own commits) still names PR #501.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await db.update(issues).set({
+        executionState: { ...(row!.executionState as object), deliveredHeadSha: null },
+      }).where(eq(issues.id, issueId));
       const close = await patch(issueId, { status: "done" });
       expect(close.status, JSON.stringify(close.body)).toBe(409);
       expect(close.body.error).toContain("landing_proof_not_card_delivery");
@@ -612,6 +647,262 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       expect(close.status, JSON.stringify(close.body)).toBe(409);
       expect(close.body.error).toContain("landing_proof_repo_identity_mismatch");
       expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+    });
+  });
+  describe("a head branch name is not a tie to the card", () => {
+    it.each([
+      ["carries the exact card identifier", (identifier: string) => `attacker/${identifier}/unrelated`],
+      ["carries the identifier without its hyphen", (identifier: string) => `${identifier.replace("-", "").toLowerCase()}-fix`],
+      ["starts with the identifier in upper case", (identifier: string) => `${identifier.toUpperCase()}-delivery`],
+    ])("refuses an unrelated merged PR whose head branch %s, and the debt stays owed", async (_label, branchFor) => {
+      const { issueId, identifier } = await seedStuckCard({ deliveredHeadSha: null });
+      await reclassifyRecordOnly(issueId);
+      github.prs.get(505)!.head.ref = branchFor(identifier);
+      const refused = await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE }));
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+      expect(await statusOf(issueId)).toBe("in_progress");
+    });
+  });
+
+  describe("the debt discharge is atomic with the accepted close", () => {
+    it("rolls the discharge back when a later step of the same close fails", async () => {
+      const { issueId } = await seedStuckCard();
+      await reclassifyRecordOnly(issueId);
+      expect((await attach(issueId, goodProof())).status).toBe(201);
+      // The comment's attachment receipt is bound inside the close transaction,
+      // after the debt finalizer ran. An unknown receipt fails that step.
+      const failed = await patch(issueId, {
+        status: "done",
+        comment: "Closing on the attached landing proof.",
+        attachmentIds: [randomUUID()],
+      });
+      expect(failed.status, JSON.stringify(failed.body)).toBeGreaterThanOrEqual(400);
+      expect(failed.status).toBeLessThan(500);
+      expect(await statusOf(issueId)).toBe("in_progress");
+      const debt = await debtDispositions(issueId);
+      expect(debt.map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+      expect(debt[0]!.landingProof ?? null).toBeNull();
+      // The same card then closes cleanly and the discharge commits with it.
+      const closed = await patch(issueId, { status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["discharged"]);
+    });
+
+    it("serializes two concurrent board closes: the card closes once and the debt is discharged once", async () => {
+      const { issueId } = await seedStuckCard();
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status).toBe(201);
+      const responses = await Promise.all([patch(issueId, { status: "done" }), patch(issueId, { status: "done" })]);
+      for (const response of responses) expect(response.status, JSON.stringify(response.body)).toBeLessThan(500);
+      expect(responses.some((response) => response.status === 200)).toBe(true);
+      expect(await statusOf(issueId)).toBe("done");
+      const debt = await debtDispositions(issueId);
+      expect(debt).toHaveLength(1);
+      expect(debt[0]).toMatchObject({
+        landingDebtDisposition: "discharged",
+        landingProof: { source: "board_merged_pr", proofActivityId: attached.body.proofActivityId },
+      });
+    });
+
+    it("serializes two concurrent attaches of the same evidence: one record and one replay", async () => {
+      const { issueId } = await seedStuckCard();
+      await reclassifyRecordOnly(issueId);
+      const responses = await Promise.all([attach(issueId, goodProof()), attach(issueId, goodProof())]);
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 201]);
+      expect(responses.find((response) => response.status === 200)!.body.replayed).toBe(true);
+      expect(await proofRows(issueId)).toHaveLength(1);
+      expect(await workProducts(issueId)).toHaveLength(1);
+      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+    });
+  });
+
+  describe("an attached proof never overrides another close guard", () => {
+    // Each cell attaches a valid proof first, then adds one other close blocker.
+    // The board close must refuse with that blocker, the card must stay open, and
+    // the debt must stay owed. The stash and zero-delta close guards do not exist
+    // on this base, so they have no cell here.
+    const RECORD_ONLY_EVIDENCE =
+      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+    const cells: Array<{
+      name: string;
+      block: (card: { companyId: string; issueId: string; identifier: string; agentId: string }) => Promise<void>;
+      body?: object;
+      status: number;
+      code?: string;
+      error?: string;
+    }> = [
+      {
+        name: "an execution branch ahead of base with no merged PR (done tier 0)",
+        block: async ({ companyId, issueId, identifier }) => {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const workspaceId = randomUUID();
+          const now = new Date();
+          github.branches.set(`deliver/${identifier}`, FEATURE_HEAD);
+          await db.insert(executionWorkspaces).values({
+            id: workspaceId, companyId, projectId: row!.projectId!, projectWorkspaceId: row!.projectWorkspaceId!,
+            sourceIssueId: null, mode: "isolated_workspace", strategyType: "git_worktree", name: "late-ws",
+            status: "active", cwd: "/tmp/landing-proof-late-ws", repoUrl: `https://github.com/${OWNER}/${REPO}`,
+            baseRef: BASE, branchName: `deliver/${identifier}`, providerType: "git_worktree",
+            providerRef: "/tmp/landing-proof-late-ws", lastUsedAt: now, openedAt: now, createdAt: now, updatedAt: now,
+          });
+          await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+        },
+        status: 409,
+        code: "done_transition_missing_delivery",
+      },
+      {
+        name: "the card's own open draft PR linked to it (draft)",
+        block: async ({ companyId, issueId, identifier }) => {
+          // The draft guard counts only the card's own draft: its head branch starts with the card identifier.
+          const headRef = `${identifier.toLowerCase()}-follow-up`;
+          github.prs.get(509)!.head.ref = headRef;
+          const [object] = await db.insert(externalObjects).values({
+            companyId, providerKey: "github", objectType: "pull_request", externalId: `${OWNER}/${REPO}#pull/509`,
+            data: {
+              state: "open", draft: true, headRef, headRepoFullName: `${OWNER}/${REPO}`, title: `${identifier}: follow-up`,
+            },
+          }).returning();
+          await db.insert(externalObjectMentions).values({
+            companyId, sourceIssueId: issueId, sourceKind: "comment", objectId: object!.id,
+            providerKey: "github", objectType: "pull_request",
+          });
+        },
+        status: 409,
+        error: "head_draft",
+      },
+      {
+        name: "a conflicting dual-source done-tier declaration (done tier)",
+        block: async () => {},
+        body: {
+          comment: `Closing on live probe evidence.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`,
+          doneTier: { tier: "tier2", probeEvidence: "Re-ran the sweep probe and it passed." },
+        },
+        status: 422,
+        code: "done_tier_dual_source_conflict",
+      },
+      {
+        name: "two laddered children and no approval stage (approvals)",
+        block: async ({ companyId, issueId, identifier, agentId }) => {
+          const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+          for (const n of [2, 3]) {
+            await db.insert(issues).values({
+              id: randomUUID(), companyId, identifier: identifier.replace(/-1$/, `-${n}`), parentId: issueId,
+              title: `Laddered child ${n}`, status: "done", priority: "medium", assigneeAgentId: agentId,
+              createdByUserId: "local-board", projectId: row!.projectId, deliveryRequirement: "record_only",
+              executionPolicy: row!.executionPolicy, executionState: row!.executionState, completedAt: new Date(),
+            });
+          }
+        },
+        status: 409,
+        code: "done_transition_missing_approval_stage",
+      },
+    ];
+
+    it.each(cells)("refuses the close on $name", async (cell) => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const attached = await attach(card.issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      await cell.block(card);
+      const close = await patch(card.issueId, { status: "done", ...(cell.body ?? {}) });
+      expect(close.status, JSON.stringify(close.body)).toBe(cell.status);
+      if (cell.code) expect(close.body.code).toBe(cell.code);
+      if (cell.error) expect(close.body.error).toContain(cell.error);
+      expect(await statusOf(card.issueId)).toBe("in_progress");
+      const debt = await debtDispositions(card.issueId);
+      expect(debt.map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+      expect(debt[0]!.landingProof ?? null).toBeNull();
+    });
+  });
+
+  describe("the real bearer-token and MCP path", () => {
+    const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
+    let boardToken = "";
+    let foreignBoardToken = "";
+
+    beforeAll(async () => {
+      // The board API key belongs to the board user that the seeded companies list as owner.
+      await db.insert(authUsers).values({
+        id: "local-board", name: "Board", email: "board@example.com", createdAt: new Date(), updatedAt: new Date(),
+      }).onConflictDoNothing();
+      boardToken = `pcp_board_${randomUUID()}`;
+      await db.insert(boardApiKeys).values({
+        id: randomUUID(), userId: "local-board", name: "landing-proof-board", keyHash: hashToken(boardToken), scope: "all_access",
+      });
+      // A board user with no membership in any seeded company.
+      const foreignUserId = `foreign-${randomUUID()}`;
+      await db.insert(authUsers).values({
+        id: foreignUserId, name: "Foreign", email: `${foreignUserId}@example.com`, createdAt: new Date(), updatedAt: new Date(),
+      });
+      foreignBoardToken = `pcp_board_${randomUUID()}`;
+      await db.insert(boardApiKeys).values({
+        id: randomUUID(), userId: foreignUserId, name: "landing-proof-foreign", keyHash: hashToken(foreignBoardToken), scope: "all_access",
+      });
+    });
+
+    function mcpAttach(apiKey: string, card: { companyId: string; issueId: string; agentId?: string }, body: object) {
+      const client = new PaperclipApiClient({
+        apiUrl: authApiUrl, apiKey, companyId: card.companyId, agentId: card.agentId ?? null, runId: null,
+      });
+      const tool = createToolDefinitions(client).find((candidate) => candidate.name === "paperclipApiRequest")!;
+      return tool.execute({
+        method: "POST", path: `/api/issues/${card.issueId}/landing-proof`, jsonBody: JSON.stringify(body),
+      }).then((response) => JSON.parse(response.content[0]!.text) as Record<string, any>);
+    }
+
+    it("attaches through paperclipApiRequest with a board API key, and the audit carries no token", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const result = await mcpAttach(boardToken, card, goodProof());
+      expect(result.error, JSON.stringify(result)).toBeUndefined();
+      expect(result.proof).toMatchObject({ owner: OWNER, repo: REPO, pullRequestNumber: 501 });
+      const rows = await proofRows(card.issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ actorType: "user", actorId: "local-board" });
+      for (const text of [JSON.stringify(rows), JSON.stringify(result), JSON.stringify(await workProducts(card.issueId))]) {
+        expect(text).not.toContain(boardToken);
+        expect(text).not.toContain("test-token");
+      }
+    });
+
+    it("refuses an agent API key through paperclipApiRequest with 403 and records nothing", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const agentToken = `pcp_agent_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({
+        id: randomUUID(), agentId: card.agentId, companyId: card.companyId, name: "landing-proof-agent",
+        keyHash: hashToken(agentToken), responsibleUserId: "local-board",
+      });
+      const result = await mcpAttach(agentToken, card, goodProof());
+      expect(result.status, JSON.stringify(result)).toBe(403);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+      expect(await workProducts(card.issueId)).toHaveLength(0);
+    });
+
+    it("refuses a board API key from outside the card's company, and records nothing", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const result = await mcpAttach(foreignBoardToken, card, goodProof());
+      expect([403, 404], JSON.stringify(result)).toContain(result.status);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+    });
+
+    it("refuses a call with a missing or unknown bearer token, and records nothing", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const anonymous = await fetch(`${authApiUrl}/issues/${card.issueId}/landing-proof`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(goodProof()),
+      });
+      expect([401, 403]).toContain(anonymous.status);
+      const unknown = await mcpAttach(`pcp_board_${randomUUID()}`, card, goodProof());
+      expect([401, 403], JSON.stringify(unknown)).toContain(unknown.status);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
     });
   });
 });

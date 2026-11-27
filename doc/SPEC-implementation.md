@@ -339,8 +339,9 @@ repository id. The attach records that id, and the close re-checks it
 delivery. A `pull_request` work product on the card that the attach did not
 create, or a linked external object, can link the PR. A delivery commit recorded
 on the card can also tie it, when the PR head or merge commit contains that
-commit. A head branch that names the card can also tie it. Otherwise the call is
-refused `landing_proof_not_card_delivery`. The close re-checks this tie too.
+commit. A head branch name is not a tie, because any pull request can carry the
+card identifier in its branch name. Otherwise the call is refused
+`landing_proof_not_card_delivery`. The close re-checks this tie too.
 A failed check is a typed 4xx refusal. `landing_proof_not_on_base` means a
 readable compare showed the merge commit outside the base branch. A network
 error, a non-OK GitHub answer or an unresolvable base branch is

@@ -47,8 +47,7 @@ export interface BoardLandingProofEvidence {
 export type BoardLandingProofPossession =
   | { kind: "linked_work_product"; detail: string }
   | { kind: "linked_external_object"; detail: string }
-  | { kind: "recorded_delivery_commit"; detail: string }
-  | { kind: "head_branch_names_card"; detail: string };
+  | { kind: "recorded_delivery_commit"; detail: string };
 
 export interface VerifiedBoardLandingProof {
   owner: string;
@@ -221,7 +220,7 @@ export async function verifyBoardLandingProof(
     }
     const possession = await resolveCardDeliveryPossession(db, issue, {
       token, owner, repo, pullRequestNumber: evidence.pullRequestNumber,
-      headRef: pr.headRef, headSha, mergeCommitSha,
+      headSha, mergeCommitSha,
     });
     if (possession === "unverifiable") {
       lastFailure = "the recorded delivery commit containment check could not be read";
@@ -231,7 +230,7 @@ export async function verifyBoardLandingProof(
       return refuse(
         "landing_proof_not_card_delivery",
         `pull request #${evidence.pullRequestNumber} is not this card's delivery: it is not linked to the card, ` +
-          "it contains none of the card's recorded delivery commits, and its head branch does not name the card",
+          "and it contains none of the card's recorded delivery commits",
       );
     }
     const onBase = await verifyMergedPullRequestOnBaseBranch(token, owner, repo, baseRef, mergeCommitSha, {
@@ -297,26 +296,15 @@ async function fetchGitHubRepositoryIdentity(token: string, owner: string, repo:
 
 const MAX_RECORDED_DELIVERY_COMMITS = 10;
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** True when a branch name carries the card identifier as a delimited token (`SUP-1` or `sup1`). */
-export function headBranchNamesCard(headRef: string | null, identifier: string | null): boolean {
-  if (!headRef || !identifier) return false;
-  const forms = new Set([identifier, identifier.replace(/-/g, "")].map((form) => form.toLowerCase()).filter(Boolean));
-  const branch = headRef.toLowerCase();
-  return [...forms].some((form) => new RegExp(`(^|[/_.-])${escapeRegExp(form)}($|[/_.-])`).test(branch));
-}
-
 /**
- * The merged PR must be THIS card's own delivery. Accepted ties, cheapest first:
- *  - the head branch names the card;
+ * The merged PR must be THIS card's own delivery. Only two ties count:
  *  - the PR is linked to the card on record: a `pull_request` work product the
  *    attach route did not create, or a cached external-object link;
  *  - the PR head or merge commit contains a delivery commit recorded on the card
  *    (work-product head/merge commits, `executionState.deliveredHeadSha`),
  *    checked live with the GitHub compare API.
+ * A head branch name is not a tie: any merged PR can carry the card identifier
+ * in its branch name, so the name proves nothing about delivery.
  * Returns null when nothing ties the PR to the card, or "unverifiable" when a
  * needed live containment check could not be read.
  */
@@ -325,16 +313,13 @@ async function resolveCardDeliveryPossession(
   issue: { id: string; companyId: string },
   pr: {
     token: string; owner: string; repo: string; pullRequestNumber: number;
-    headRef: string | null; headSha: string; mergeCommitSha: string;
+    headSha: string; mergeCommitSha: string;
   },
 ): Promise<BoardLandingProofPossession | null | "unverifiable"> {
   const [card] = await db
-    .select({ identifier: issues.identifier, executionState: issues.executionState })
+    .select({ executionState: issues.executionState })
     .from(issues)
     .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
-  if (headBranchNamesCard(pr.headRef, card?.identifier ?? null)) {
-    return { kind: "head_branch_names_card", detail: `head branch ${pr.headRef} names ${card!.identifier}` };
-  }
   const prKey = `${pr.owner}/${pr.repo}#${pr.pullRequestNumber}`.toLowerCase();
   const products = await db
     .select({ externalId: issueWorkProducts.externalId, url: issueWorkProducts.url, metadata: issueWorkProducts.metadata })
