@@ -8,9 +8,10 @@ import {
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
-  redactSensitive,
+  redactHttpLogPayload,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
+import { redactSecretTokens } from "../log-redaction.js";
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -164,7 +165,9 @@ export function createHttpLogger(baseLogger: Logger) {
         err?.message ||
         (res as any).err?.message ||
         "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
+      // SUP-25336 (RA F2): a refusal reason can quote caller free text, such
+      // as an offending close-comment line; mask credential-shaped tokens.
+      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${redactSecretTokens(String(errMsg))}`;
     },
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.
@@ -203,22 +206,22 @@ export function createHttpLogger(baseLogger: Logger) {
             // for setup routes; the status, route, and redacted body remain.
             errorContext: secretSensitiveRoute
               ? { name: "Error" }
-              : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
-            reqParams: redactSensitive(ctx.reqParams),
+              : redactHttpLogPayload(ctx.error),
+            reqBody: redactHttpLogPayload(ctx.reqBody),
+            reqParams: redactHttpLogPayload(ctx.reqParams),
           };
         }
         const props: Record<string, unknown> = {};
         const { body, params } = req as any;
         if (body && typeof body === "object" && Object.keys(body).length > 0) {
-          props.reqBody = redactSensitive(body);
+          props.reqBody = redactHttpLogPayload(body);
         }
         if (
           params &&
           typeof params === "object" &&
           Object.keys(params).length > 0
         ) {
-          props.reqParams = redactSensitive(params);
+          props.reqParams = redactHttpLogPayload(params);
         }
         if ((req as any).route?.path) {
           props.routePath = (req as any).route.path;

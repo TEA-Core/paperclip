@@ -65,7 +65,13 @@ export async function applyReviewEscalationDecision(args: {
   issue: ReviewEscalationDecisionIssue;
   requestedStatus: "done" | "in_progress";
   decisionBody: string;
-  actor: { agentId: string | null; userId: string | null; runId: string | null };
+  actor: {
+    agentId: string | null;
+    userId: string | null;
+    runId: string | null;
+    agentApiKeyId?: string | null;
+    boardApiKeyId?: string | null;
+  };
   // SUP-17552: how a final-stage approval (the ladder completed) lands the card.
   // "handback" (default) keeps the return-assignee in_progress hand-back; "done"
   // renders the final-stage `done` close. The caller is responsible for running
@@ -157,7 +163,10 @@ export async function applyReviewEscalationDecision(args: {
     }
   }
   updateFields.actorAgentId = actor.agentId ?? null;
+  updateFields.actorRunId = actor.agentId ? actor.runId ?? null : null;
   updateFields.actorUserId = actor.userId ?? null;
+  updateFields.actorAgentApiKeyId = actor.agentId ? actor.agentApiKeyId ?? null : null;
+  updateFields.boardApiKeyId = actor.userId ? actor.boardApiKeyId ?? null : null;
   if (transition.workflowControlledAssignment) {
     updateFields.workflowControlledAssignment = true;
   }

@@ -944,6 +944,16 @@ letting the former assignee change the monitor.
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
+Closing an issue still clears a future-dated monitor, but the issue update that
+closes it (PATCH, a review-approval comment, a stage decision, or any other
+service caller), or the routine retirement that cancels a superseded routine
+execution sibling, writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
+`recoveryPolicy` (nullable), the existing actor/run attribution, and
+`reason: cleared_by_close_future_check`. This is a searchable cancellation record,
+not a transfer or a later wake. Past-due watchdogs retain their ordinary clear
+reason and require no disposition. The activity response contract is published
+in OpenAPI and the MCP `paperclipListIssueActivity` output schema.
+
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its
 retained `scheduledRetryAt` is historical and must not produce a waiting or overdue
@@ -955,6 +965,8 @@ Because `serviceName` and `notes` remain visible in issue activity and wake cont
 Monitor bounds are enforced. Paperclip rejects attempts to re-arm a monitor whose `timeoutAt` or `maxAttempts` is already exhausted. When a scheduled monitor reaches an exhausted bound at trigger time, Paperclip clears it and follows `recoveryPolicy`: `wake_owner` queues a bounded recovery wake for the assignee, `create_recovery_issue` opens visible issue-backed recovery work, and `escalate_to_board` records a board-visible escalation comment/activity.
 
 A due monitor on an issue with no assignee has no agent to wake. When its `recoveryPolicy` is `wake_owner` (the default), Paperclip clears the monitor with `clearReason: invalid_assignee` and raises one board-owned `no_live_path_unowned` recovery action for the issue, unless the issue already has an active recovery action. The monitor does not count as an attempt and does not set `lastTriggeredAt`. The clear is guarded by the claimed `monitorNextCheckAt`; if the monitor was re-armed concurrently, the new schedule is left untouched and the clear is skipped. Monitors with `create_recovery_issue` or `escalate_to_board` on an unassigned issue are not selected and stay armed.
+
+The scheduler selects a due monitor only on an `in_progress`, `in_review`, or `blocked` issue with no human assignee, and, when the issue has no agent assignee, only with the `wake_owner` policy. A due monitor outside that set cannot fire. Examples: an issue in `todo` or `backlog`, an agent release that moved the issue to `todo` and cleared the assignee but left the monitor scheduled, a human assignee, or an unassigned `create_recovery_issue` or `escalate_to_board` monitor. For each such schedule, Paperclip records one `issue.monitor_unfireable` activity row on the issue. The row has `details.reason` and `details.reasons` (`status_not_dispatchable`, `human_assignee`, `no_assignee_agent`), `nextCheckAt`, `status`, the assignee ids, and `recoveryPolicy`. This is detection only: the monitor stays armed, no wake is queued, and no recovery action is created. A due monitor that is eligible but has a wake claim from the last five minutes is an in-flight wake and gets no row. The scan runs under a transaction-scoped advisory lock, so an overlapping scheduler tick skips it and cannot write a second row for the same schedule. If the monitor is re-armed to a different `nextCheckAt` and that schedule also comes due without a dispatch, Paperclip records a new row. To find a lost scheduled wake, read `GET /api/issues/{id}/activity`: a past-due `monitorNextCheckAt` has an `issue.monitor_unfireable` row or an `issue.monitor_triggered`/`issue.monitor_skipped` row for that schedule.
 
 Use `blocked` instead of a monitor when no Paperclip assignee owns a responsible polling path. In that case, name the external owner/action or create first-class recovery/blocker work.
 
@@ -1019,7 +1031,7 @@ is skipped, while policy normalization writes `null`.
 
 The Wiki handoff guard is also skipped for a field-less write. In a field-less
 write, every present key is `undefined` or request attribution: `actorAgentId`,
-`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`actorAgentApiKeyId`, `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
 `expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
 write when the route adds no field to it and the request carries no
 `reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard

@@ -12,7 +12,7 @@ import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrig
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { adoptAgentFiles, agentFilePath, fileHash, readAgentFile, snapshotAgentFiles } from "./agent-file-store.js";
-import { assertInstructionPathSafe, instructionBytes, materializeInstructionBytes } from "./agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionBytes, materializeInstructionBytes, resolveAgentsGid } from "./agent-instruction-files.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
@@ -1019,7 +1019,8 @@ export function builtInAgentService(db: Db) {
           const nextHash = incoming[file] ? fileHash(incoming[file]) : null;
           if (hash !== baseHash && hash !== nextHash) return currentState;
         }
-        for (const [file, bytes] of Object.entries(incoming)) await materializeInstructionBytes(root, file, bytes);
+        const gid = await resolveAgentsGid();
+        for (const [file, bytes] of Object.entries(incoming)) await materializeInstructionBytes(root, file, bytes, { gid });
         for (const file of Object.keys(pending.baseHashes)) {
           if (!(file in incoming)) await fs.rm(await assertInstructionPathSafe(root, file), { force: true });
         }

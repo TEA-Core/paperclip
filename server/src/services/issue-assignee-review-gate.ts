@@ -243,6 +243,7 @@ export function isUnassignedWikiHandoffCancellation(input: {
 // Request attribution an issue write carries without setting an issue field.
 const ISSUE_WRITE_ATTRIBUTION_KEYS: ReadonlySet<string> = new Set([
   "actorAgentId",
+  "actorAgentApiKeyId",
   "actorRunId",
   "actorRunStopId",
   "actorUserId",
