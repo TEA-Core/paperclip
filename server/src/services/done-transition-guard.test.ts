@@ -267,6 +267,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue(rows.projectWorkspaces ?? []),
   };
+  const activityLogChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue([]),
+    then: vi.fn().mockResolvedValue([]),
+  };
   let issuesCallCount = 0;
   (mockDb.select as any).mockImplementation((_cols?: any) => {
     let callCount = 0;
@@ -283,6 +288,8 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
         if (table === issueWorkProductsTable) return workProductsChain;
+        // Landing-debt probe (prepareLandingDebtClose): an unseeded card owes none.
+        if (table === activityLogTable) return activityLogChain;
         if (table === heartbeatRunsTable) return heartbeatRunsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
