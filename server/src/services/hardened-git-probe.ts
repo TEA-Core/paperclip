@@ -801,7 +801,9 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * a registered sibling's branch, a project branch, an unregistered or deleted
  * branch naming no card of ours, `(no branch)`, any other subject, and any
  * evidence that cannot be read (garbage ref, non-commit, missing or corrupt
- * object, a reflog that is not a regular file).
+ * object, a missing reflog, or a directory or FIFO in the reflog's place). A
+ * reflog that is a symbolic link is not in that list: it refuses as unverified,
+ * including one swapped in after the first check.
  *
  * Subjects are read in one batched `git log`. When that read fails (a corrupt
  * object aborts it whole), each entry is read again on its own, so an
@@ -813,8 +815,10 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * The reflog file is read up to the same 16 MiB bound as git's own output. A
  * regular reflog file that is larger, or that cannot be read whole, refuses as
  * unverified: `git stash push -m` with long messages can grow it, so dropping
- * it would hide this card's entries below the tip. A missing reflog, a
- * directory or a FIFO in its place contributes no entries.
+ * it would hide this card's entries below the tip. A symbolic link in its
+ * place also refuses as unverified, because git reads the stash stack through
+ * it. A missing reflog, or a directory or FIFO in its place, contributes no
+ * entries.
  * The reflog subject, which `git stash store -m` sets freely, is never read, so
  * relabelling a stash changes no decision in either direction. Parents are
  * never read: a record_only card's own stash shares its first parent with every

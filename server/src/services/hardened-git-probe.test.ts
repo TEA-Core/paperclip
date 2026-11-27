@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HardenedGitError,
   IGNORED_ARTIFACT_DIRECTORY_NAMES,
@@ -14,6 +14,28 @@ import {
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
+
+/**
+ * Test seam for a mid-check swap: when `swapOnOpen` names a path, the first
+ * `open` of that path runs `swap` first, so the file the probe saw as regular
+ * at its `lstat` is something else by the time it opens it. Every other call
+ * goes straight to the real module.
+ */
+const fsControl = vi.hoisted(() => ({ swapOnOpen: null as null | { path: string; swap: () => void } }));
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    open: (...args: Parameters<typeof actual.open>) => {
+      const pending = fsControl.swapOnOpen;
+      if (pending && String(args[0]) === pending.path) {
+        fsControl.swapOnOpen = null;
+        pending.swap();
+      }
+      return actual.open(...args);
+    },
+  };
+});
 
 // Real repositories, real git: every planted program writes a marker file, so
 // "did not execute" is observed rather than assumed.
@@ -149,6 +171,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fsControl.swapOnOpen = null;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -1880,6 +1903,27 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       fixture.stash(fixture.y());
       symlinkReflog(fixture, "");
       await refusesUnverified(fixture);
+    });
+
+    it("ST-57 refuses a reflog that is regular at the first check and swapped to a symlink before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          symlinkReflog(fixture);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      // Git still reads this card's stash through the swapped-in link.
+      expect(stashList(fixture.m).split("\n")).toContain(own);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
     });
 
     it("ST-56 refuses a dangling reflog symlink", async () => {
