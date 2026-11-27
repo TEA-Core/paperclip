@@ -268,13 +268,26 @@ export interface IssueBlockerDiagnosticsResponse {
 
 /**
  * Read-only answer for GET /api/issues/{id}/publication-close-eligibility.
- * Every key is present. true means the accept path would refuse the card for
- * that binding. None of the values is null.
+ * Every key is present. A true boolean means the accept path would refuse the
+ * card for that binding. Only `cachedLinkedPullRequestFetchedAt` can be null.
  */
 export interface PublicationCloseEligibility {
   deliveryIdentity: boolean;
   deliveryReceipt: boolean;
-  linkedPullRequest: boolean;
+  /**
+   * Cached and advisory. True when the card has a cached GitHub pull-request
+   * mention whose cached state is open or unknown, drafts included. This is the
+   * cached read the accept path uses. The route does not call GitHub, so it does
+   * not refresh that state and does not discover unmentioned pull requests. The
+   * done-close guard does both and can decide differently.
+   */
+  cachedLinkedPullRequest: boolean;
+  /**
+   * ISO-8601 time of the oldest GitHub fetch among the card's cached
+   * pull-request rows that `cachedLinkedPullRequest` reads. Null when there is
+   * no such row or when one of them was never fetched.
+   */
+  cachedLinkedPullRequestFetchedAt: string | null;
 }
 
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";

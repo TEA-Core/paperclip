@@ -3,6 +3,8 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
+import * as schema from "@paperclipai/db";
 import {
   agents,
   companies,
@@ -17,6 +19,8 @@ import {
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "../services/issue-execution-policy.js";
+import { resolveLinkedPullRequests } from "../services/merge-arming.js";
+import { readPublicationCloseEligibility } from "../services/publication-close-eligibility.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -42,7 +46,8 @@ if (!embeddedPostgresSupport.supported) {
 const ALL_FALSE = {
   deliveryIdentity: false,
   deliveryReceipt: false,
-  linkedPullRequest: false,
+  cachedLinkedPullRequest: false,
+  cachedLinkedPullRequestFetchedAt: null,
 };
 
 function idleExecutionState(delivery?: unknown) {
@@ -187,12 +192,10 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
     companyId: string,
     issueId: string,
     data: { state: "open" | "closed"; draft: boolean },
+    options: { number?: number; lastResolvedAt?: Date | null } = {},
   ) {
-    const number = data.draft ? 704 : 705;
-    const [object] = await db.insert(externalObjects).values({
-      companyId,
-      providerKey: "github",
-      objectType: "pull_request",
+    const number = options.number ?? (data.draft ? 704 : 705);
+    await linkExternalObject(companyId, issueId, {
       externalId: `TEA-Core/paperclip#pull/${number}`,
       data: {
         state: data.state,
@@ -200,14 +203,38 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
         node_id: `eligibility-${issueId}-${number}`,
         title: "Eligibility fixture",
       },
+      lastResolvedAt: options.lastResolvedAt === undefined ? new Date() : options.lastResolvedAt,
+    });
+  }
+
+  async function linkExternalObject(
+    companyId: string,
+    issueId: string,
+    row: {
+      externalId: string;
+      data: Record<string, unknown>;
+      providerKey?: string;
+      objectType?: string;
+      lastResolvedAt?: Date | null;
+    },
+  ) {
+    const providerKey = row.providerKey ?? "github";
+    const objectType = row.objectType ?? "pull_request";
+    const [object] = await db.insert(externalObjects).values({
+      companyId,
+      providerKey,
+      objectType,
+      externalId: row.externalId,
+      data: row.data,
+      lastResolvedAt: row.lastResolvedAt ?? null,
     }).returning({ id: externalObjects.id });
     await db.insert(externalObjectMentions).values({
       companyId,
       sourceIssueId: issueId,
       sourceKind: "comment",
       objectId: object!.id,
-      objectType: "pull_request",
-      providerKey: "github",
+      objectType,
+      providerKey,
     });
   }
 
@@ -221,7 +248,10 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
     const res = await readEligibility(issue.id);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toEqual(ALL_FALSE);
-    expect(JSON.stringify(res.body)).not.toContain("null");
+    for (const key of ["deliveryIdentity", "deliveryReceipt", "cachedLinkedPullRequest"]) {
+      expect(typeof res.body[key]).toBe("boolean");
+    }
+    expect(res.body).not.toHaveProperty("linkedPullRequest");
   });
 
   it("sets only deliveryIdentity when a parsed delivery block is present", async () => {
@@ -265,22 +295,146 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
     expect(res.body).toEqual(ALL_FALSE);
   });
 
-  it("sets only linkedPullRequest for a draft pull request", async () => {
+  it("sets only cachedLinkedPullRequest for a cached draft pull request and reports its fetch time", async () => {
     const { companyId } = await seedCompany();
     const issue = await seedIssue(companyId, idleExecutionState());
-    await linkPullRequest(companyId, issue.id, { state: "open", draft: true });
+    const fetchedAt = new Date("2026-11-20T08:00:00.000Z");
+    await linkPullRequest(companyId, issue.id, { state: "open", draft: true }, { lastResolvedAt: fetchedAt });
     const res = await readEligibility(issue.id);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toEqual({ ...ALL_FALSE, linkedPullRequest: true });
+    expect(res.body).toEqual({
+      ...ALL_FALSE,
+      cachedLinkedPullRequest: true,
+      cachedLinkedPullRequestFetchedAt: fetchedAt.toISOString(),
+    });
   });
 
-  it("ignores a closed pull request mention", async () => {
+  it("ignores a cached closed pull request but still reports when that cache was fetched", async () => {
     const { companyId } = await seedCompany();
     const issue = await seedIssue(companyId, idleExecutionState());
-    await linkPullRequest(companyId, issue.id, { state: "closed", draft: false });
+    const fetchedAt = new Date("2026-11-21T09:30:00.000Z");
+    await linkPullRequest(companyId, issue.id, { state: "closed", draft: false }, { lastResolvedAt: fetchedAt });
     const res = await readEligibility(issue.id);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toEqual(ALL_FALSE);
+    expect(res.body).toEqual({ ...ALL_FALSE, cachedLinkedPullRequestFetchedAt: fetchedAt.toISOString() });
+  });
+
+  // RA F1: the done-close guard refreshes linked pull requests from GitHub and
+  // discovers pull requests that no comment mentions. This read route must not
+  // call GitHub, so it reports the cached value under a cached name, with the
+  // fetch time of the oldest cached row. A stale cached "open" row whose pull
+  // request has since merged reads true here, and the old fetch time shows the
+  // value is stale. A pull request that only live discovery can find reads false
+  // with a null fetch time, which means no cached evidence exists.
+  it("labels a stale cached open pull request as cached and exposes how old the cache is", async () => {
+    const { companyId } = await seedCompany();
+    const stale = await seedIssue(companyId, idleExecutionState());
+    const staleFetchedAt = new Date("2026-01-02T03:04:05.000Z");
+    await linkPullRequest(companyId, stale.id, { state: "open", draft: false }, { lastResolvedAt: staleFetchedAt });
+
+    const staleRes = await readEligibility(stale.id);
+    expect(staleRes.status, JSON.stringify(staleRes.body)).toBe(200);
+    expect(staleRes.body).toEqual({
+      ...ALL_FALSE,
+      cachedLinkedPullRequest: true,
+      cachedLinkedPullRequestFetchedAt: staleFetchedAt.toISOString(),
+    });
+    expect(staleRes.body).not.toHaveProperty("linkedPullRequest");
+
+    const unmentioned = await seedIssue(companyId, idleExecutionState());
+    const unmentionedRes = await readEligibility(unmentioned.id);
+    expect(unmentionedRes.status, JSON.stringify(unmentionedRes.body)).toBe(200);
+    expect(unmentionedRes.body).toEqual(ALL_FALSE);
+  });
+
+  it("reports the oldest fetch time across the card's cached pull requests, and null when one was never fetched", async () => {
+    const { companyId } = await seedCompany();
+    const issue = await seedIssue(companyId, idleExecutionState());
+    const older = new Date("2026-10-01T00:00:00.000Z");
+    const newer = new Date("2026-11-01T00:00:00.000Z");
+    await linkPullRequest(companyId, issue.id, { state: "open", draft: false }, { number: 801, lastResolvedAt: newer });
+    await linkPullRequest(companyId, issue.id, { state: "closed", draft: false }, { number: 802, lastResolvedAt: older });
+    const res = await readEligibility(issue.id);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual({
+      ...ALL_FALSE,
+      cachedLinkedPullRequest: true,
+      cachedLinkedPullRequestFetchedAt: older.toISOString(),
+    });
+
+    await linkPullRequest(companyId, issue.id, { state: "open", draft: false }, { number: 803, lastResolvedAt: null });
+    const unfetchedRes = await readEligibility(issue.id);
+    expect(unfetchedRes.status, JSON.stringify(unfetchedRes.body)).toBe(200);
+    expect(unfetchedRes.body).toEqual({ ...ALL_FALSE, cachedLinkedPullRequest: true });
+  });
+
+  // RA F2: the boolean comes from a scoped existence query, not from loading
+  // every linked pull-request row. The SQL predicate must keep the shared
+  // resolver's filter exactly, so the accept path and this read agree.
+  it("matches the shared cached resolver for every cached row shape", async () => {
+    const { companyId } = await seedCompany();
+    const otherCompany = await seedCompany();
+    const shapes: Array<{ name: string; rows: Array<Parameters<typeof linkExternalObject>[2]> }> = [
+      { name: "no rows", rows: [] },
+      { name: "open", rows: [{ externalId: "TEA-Core/paperclip#pull/1", data: { state: "open" } }] },
+      { name: "open draft", rows: [{ externalId: "TEA-Core/paperclip#pull/2", data: { state: "open", draft: true } }] },
+      { name: "state key missing", rows: [{ externalId: "TEA-Core/paperclip#pull/3", data: {} }] },
+      { name: "state null", rows: [{ externalId: "TEA-Core/paperclip#pull/4", data: { state: null } }] },
+      { name: "closed", rows: [{ externalId: "TEA-Core/paperclip#pull/5", data: { state: "closed" } }] },
+      { name: "merged", rows: [{ externalId: "TEA-Core/paperclip#pull/6", data: { state: "closed", merged: true } }] },
+      { name: "issues path", rows: [{ externalId: "TEA-Core/paperclip#issues/7", data: { state: "open" } }] },
+      { name: "bad external id", rows: [{ externalId: "TEA-Core/paperclip#pull/0", data: { state: "open" } }] },
+      { name: "extra path segment", rows: [{ externalId: "a/b/c#pull/8", data: { state: "open" } }] },
+      { name: "other provider", rows: [{ externalId: "TEA-Core/paperclip#pull/9", data: { state: "open" }, providerKey: "gitlab" }] },
+      { name: "other object type", rows: [{ externalId: "TEA-Core/paperclip#pull/10", data: { state: "open" }, objectType: "issue" }] },
+      {
+        name: "closed row before open row",
+        rows: [
+          { externalId: "TEA-Core/paperclip#pull/11", data: { state: "closed" } },
+          { externalId: "TEA-Core/paperclip#pull/12", data: { state: "open" } },
+        ],
+      },
+    ];
+    for (const shape of shapes) {
+      const issue = await seedIssue(companyId, idleExecutionState());
+      for (const row of shape.rows) await linkExternalObject(companyId, issue.id, row);
+      const expected = (await resolveLinkedPullRequests(db, companyId, issue.id, { includeDrafts: true })).length > 0;
+      const actual = await readPublicationCloseEligibility(db, { id: issue.id, companyId });
+      expect(actual.cachedLinkedPullRequest, shape.name).toBe(expected);
+    }
+
+    const foreign = await seedIssue(otherCompany.companyId, idleExecutionState());
+    await linkExternalObject(otherCompany.companyId, foreign.id, {
+      externalId: "TEA-Core/paperclip#pull/13",
+      data: { state: "open" },
+    });
+    const crossCompany = await readPublicationCloseEligibility(db, { id: foreign.id, companyId });
+    expect(crossCompany.cachedLinkedPullRequest).toBe(false);
+    expect(crossCompany.cachedLinkedPullRequestFetchedAt).toBeNull();
+  });
+
+  it("reads linked pull requests with bounded queries that never load cached payloads", async () => {
+    const { companyId } = await seedCompany();
+    const issue = await seedIssue(companyId, idleExecutionState());
+    for (let number = 900; number < 925; number += 1) {
+      await linkPullRequest(companyId, issue.id, { state: "closed", draft: false }, { number });
+    }
+    await linkPullRequest(companyId, issue.id, { state: "open", draft: false }, { number: 925 });
+
+    const logged: string[] = [];
+    const loggedDb = drizzle(db.$client, {
+      schema,
+      logger: { logQuery: (query) => { logged.push(query); } },
+    }) as unknown as Db;
+    const result = await readPublicationCloseEligibility(loggedDb, { id: issue.id, companyId });
+    expect(result.cachedLinkedPullRequest).toBe(true);
+
+    const pullRequestReads = logged.filter((query) => query.includes('"external_object_mentions"'));
+    expect(pullRequestReads.length).toBeGreaterThan(0);
+    for (const query of pullRequestReads) {
+      expect(query).toMatch(/limit \$\d+$|limit 1$/i);
+      expect(query).not.toMatch(/"external_objects"\."data"\s*(,|from)/i);
+    }
   });
 
   it("returns 404 for an unknown issue id", async () => {
@@ -365,10 +519,10 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
     try {
       const res = await readEligibility(issue.id);
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body).toEqual({
+      expect(res.body).toMatchObject({
         deliveryIdentity: true,
         deliveryReceipt: true,
-        linkedPullRequest: true,
+        cachedLinkedPullRequest: true,
       });
       const [after] = await db.select({ updatedAt: issues.updatedAt }).from(issues).where(sql`${issues.id} = ${issue.id}`);
       expect(after!.updatedAt).toEqual(before!.updatedAt);
@@ -392,21 +546,27 @@ describeEmbeddedPostgres("GET /api/issues/:id/publication-close-eligibility", ()
     }
   });
 
-  it("documents the read in OpenAPI as agent-callable with required booleans", () => {
+  it("documents the read in OpenAPI as agent-callable with required booleans and a cached fetch time", () => {
     const spec = buildOpenApiDocument();
     const operation = spec.paths?.["/api/issues/{id}/publication-close-eligibility"]?.get;
     expect(operation).toBeDefined();
     expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
-    const schema = operation.responses["200"].content["application/json"].schema;
-    const properties = schema.properties ?? schema;
-    expect(schema.required).toEqual(expect.arrayContaining([
+    expect(operation.description).toContain("cached");
+    expect(operation.description).toContain("advisory");
+    const responseSchema = operation.responses["200"].content["application/json"].schema;
+    const properties = responseSchema.properties ?? responseSchema;
+    expect(responseSchema.required).toEqual(expect.arrayContaining([
       "deliveryIdentity",
       "deliveryReceipt",
-      "linkedPullRequest",
+      "cachedLinkedPullRequest",
+      "cachedLinkedPullRequestFetchedAt",
     ]));
-    for (const name of ["deliveryIdentity", "deliveryReceipt", "linkedPullRequest"]) {
+    expect(properties).not.toHaveProperty("linkedPullRequest");
+    for (const name of ["deliveryIdentity", "deliveryReceipt", "cachedLinkedPullRequest"]) {
       expect(properties[name]).toMatchObject({ type: "boolean" });
       expect(properties[name].nullable).not.toBe(true);
     }
+    expect(properties.cachedLinkedPullRequestFetchedAt).toMatchObject({ type: "string", format: "date-time" });
+    expect(properties.cachedLinkedPullRequestFetchedAt.nullable).toBe(true);
   });
 });
