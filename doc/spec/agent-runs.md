@@ -610,7 +610,10 @@ Primary transport: websocket channel per company.
 
 - Endpoint: `GET /api/companies/:companyId/events/ws`
 - Auth: board session or agent API key (company-bound)
-- Issue visibility: an `activity.logged` event about an issue goes to a subscriber only when `GET /api/issues/:id` would let the same actor read that issue. If the issue row does not exist, the event goes out without its `details`.
+- Issue visibility: issue content goes to a subscriber only when `GET /api/issues/:id` would let the same actor read that issue. The read decision is made again for each event (reused for at most one second per subscriber and issue), so a lost grant or a removed instance-admin role takes effect without a reconnect.
+  - `activity.logged` about an issue: a subscriber that cannot read the issue gets the event without the `description` and comment `bodySnippet` (also under `_previous`). In the summary lists `addedReferencedIssues`, `removedReferencedIssues`, `currentReferencedIssues`, `blockedByIssues`, `addedBlockedByIssues` and `removedBlockedByIssues`, each entry loses its `title` when the subscriber cannot read that entry's issue. Identifiers and other metadata stay. If the issue row does not exist, the event goes out without its `details`.
+  - `heartbeat.run.*` events go only to a subscriber that can read the run's issue (`payload.issueId`, else the run's `contextSnapshot.issueId`). `agent.session.goal.changed` goes only to a subscriber that can read its `issueId`. Events of these types without an issue go to every subscriber.
+  - `agent.status`, `external_object.updated` and `plugin.*` events carry no issue content and go to every subscriber.
 
 ## 11.2 Event envelope
 

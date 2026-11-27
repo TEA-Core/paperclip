@@ -60,7 +60,7 @@ describe("plugin issue event visibility", () => {
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
-  it("strips referenced issue titles from an unreadable issue's document event", () => {
+  it("strips referenced and blocking issue titles from an unreadable issue's event", () => {
     const reference = { id: "issue-2", identifier: "PAP-2", title: "Referenced restricted title" };
     const original = event({
       eventType: "issue.document.updated",
@@ -69,6 +69,7 @@ describe("plugin issue event visibility", () => {
         addedReferencedIssues: [reference],
         removedReferencedIssues: [reference],
         currentReferencedIssues: [reference],
+        blockedByIssues: [reference],
       },
     });
     const stripped = { id: "issue-2", identifier: "PAP-2" };
@@ -77,6 +78,7 @@ describe("plugin issue event visibility", () => {
       addedReferencedIssues: [stripped],
       removedReferencedIssues: [stripped],
       currentReferencedIssues: [stripped],
+      blockedByIssues: [stripped],
     });
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });

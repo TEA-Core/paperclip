@@ -1,65 +1,174 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issues } from "@paperclipai/db";
-import { isUuidLike, type LiveEvent } from "@paperclipai/shared";
+import { heartbeatRuns, issues } from "@paperclipai/db";
+import { isUuidLike, type LiveEvent, type LiveEventType } from "@paperclipai/shared";
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
 import { issueAccessDecisionInput, type IssueAccessTarget } from "../services/issue-access-input.js";
+import {
+  isRecord,
+  summarizedIssueIds,
+  withoutUnreadableIssueContent,
+} from "../services/issue-event-content.js";
 
-/** The issue an `activity.logged` event describes, when it describes one. */
-function activityIssueId(event: LiveEvent): string | null {
-  if (event.type !== "activity.logged") return null;
-  const { entityType, entityId } = event.payload;
-  return entityType === "issue" && typeof entityId === "string" && entityId.length > 0 ? entityId : null;
+/**
+ * How each live event type relates to issue content. The record is exhaustive,
+ * so a new event type does not compile until it is classified here.
+ * - `none`: carries no issue content; every subscriber receives it.
+ * - `activity`: an activity entry; issue entries lose the content the
+ *   subscriber cannot read and keep their identifiers and metadata.
+ * - `run`: a heartbeat run event; it carries output of the run's issue and
+ *   goes only to a subscriber that can read that issue.
+ * - `issue`: names its issue in `payload.issueId`; it goes only to a
+ *   subscriber that can read that issue.
+ */
+const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "run" | "issue"> = {
+  "heartbeat.run.queued": "run",
+  "heartbeat.run.status": "run",
+  "heartbeat.run.progress": "run",
+  "heartbeat.run.event": "run",
+  "heartbeat.run.log": "run",
+  "agent.session.goal.changed": "issue",
+  "agent.status": "none",
+  "activity.logged": "activity",
+  "external_object.updated": "none",
+  "plugin.ui.updated": "none",
+  "plugin.worker.crashed": "none",
+  "plugin.worker.restarted": "none",
+};
+
+/**
+ * How long one subscriber's read decision for an issue is reused. It bounds
+ * the decision cost of bursts such as run log chunks; a lost grant, including
+ * a removed instance-admin role, takes effect within this window.
+ */
+const READ_DECISION_TTL_MS = 1_000;
+const READ_DECISION_CACHE_LIMIT = 512;
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /**
- * Per-recipient visibility for issue activity on the company live-events bus.
+ * Per-recipient issue visibility on the company live-events bus.
  *
- * An issue's activity details carry its content (an `issue.created` entry
- * holds the title and description). A subscriber receives such an event only
- * when `GET /issues/:id` would let the same actor read that issue; the check
- * is the route's own `issue:read` decision. When the issue row cannot be
- * found (for example after a delete) the event keeps its identifiers but loses
- * its details, so no reader decision is needed to deliver it.
+ * A subscriber receives issue content only when `GET /issues/:id` would let
+ * the same actor read that issue; the check is the route's own `issue:read`
+ * decision, made again for every event (see `READ_DECISION_TTL_MS`).
  */
 export function createLiveEventIssueVisibility(db: Db) {
   const access = authorizationService(db);
   // The bus hands every subscriber the same event object, so one lookup per
-  // event serves all sockets of the company.
-  const issueLoads = new WeakMap<LiveEvent, Promise<IssueAccessTarget | null>>();
+  // event and issue serves all sockets of the company.
+  const issueLoads = new WeakMap<LiveEvent, Map<string, Promise<IssueAccessTarget | null>>>();
+  const runIssueLoads = new WeakMap<LiveEvent, Promise<string | null>>();
 
   function loadIssue(event: LiveEvent, issueId: string) {
-    let load = issueLoads.get(event);
+    let loads = issueLoads.get(event);
+    if (!loads) {
+      loads = new Map();
+      issueLoads.set(event, loads);
+    }
+    let load = loads.get(issueId);
     if (!load) {
-      load = db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          projectId: issues.projectId,
-          parentId: issues.parentId,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-          status: issues.status,
-          createdByAgentId: issues.createdByAgentId,
-        })
-        .from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, event.companyId)))
-        .then((rows) => rows[0] ?? null);
-      issueLoads.set(event, load);
+      load = isUuidLike(issueId)
+        ? db
+            .select({
+              id: issues.id,
+              companyId: issues.companyId,
+              projectId: issues.projectId,
+              parentId: issues.parentId,
+              assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              status: issues.status,
+              createdByAgentId: issues.createdByAgentId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, event.companyId)))
+            .then((rows) => rows[0] ?? null)
+        : Promise.resolve(null);
+      loads.set(issueId, load);
     }
     return load;
   }
 
-  /** The event as `actor` may receive it, or `null` when it must be withheld. */
-  return async function visibleLiveEvent(actor: AuthorizationActor, event: LiveEvent): Promise<LiveEvent | null> {
-    const issueId = activityIssueId(event);
-    if (!issueId) return event;
-    // The HTTP actor middleware refuses an agent key that names no
-    // responsible user, so such a key can read no issue at all.
-    if (actor.type === "agent" && !actor.onBehalfOfUserId) return null;
-    const issue = isUuidLike(issueId) ? await loadIssue(event, issueId) : null;
-    if (!issue) return { ...event, payload: { ...event.payload, details: null } };
-    const decision = await access.decide({ actor, ...issueAccessDecisionInput(issue, "issue:read") });
-    return decision.allowed ? event : null;
+  /** The issue a run event concerns: its payload names it, or the run's context does. */
+  function loadRunIssueId(event: LiveEvent): Promise<string | null> {
+    const named = nonEmptyString(event.payload.issueId);
+    if (named) return Promise.resolve(named);
+    const runId = nonEmptyString(event.payload.runId);
+    if (!runId || !isUuidLike(runId)) return Promise.resolve(null);
+    let load = runIssueLoads.get(event);
+    if (!load) {
+      load = db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, event.companyId)))
+        .then((rows) => nonEmptyString(rows[0]?.contextSnapshot?.issueId));
+      runIssueLoads.set(event, load);
+    }
+    return load;
+  }
+
+  /** The visibility filter for one subscriber, which holds its short-lived read decisions. */
+  return function forRecipient(actor: AuthorizationActor) {
+    const decisions = new Map<string, { allowed: Promise<boolean>; expiresAt: number }>();
+
+    function canReadIssue(event: LiveEvent, issueId: string): Promise<boolean> {
+      // The HTTP actor middleware refuses an agent key that names no
+      // responsible user, so such a key can read no issue at all.
+      if (actor.type === "agent" && !actor.onBehalfOfUserId) return Promise.resolve(false);
+      const now = Date.now();
+      const cached = decisions.get(issueId);
+      if (cached && cached.expiresAt > now) return cached.allowed;
+      if (decisions.size >= READ_DECISION_CACHE_LIMIT) decisions.clear();
+      const allowed = loadIssue(event, issueId).then(async (issue) =>
+        issue
+          ? (await access.decide({ actor, ...issueAccessDecisionInput(issue, "issue:read") })).allowed
+          : false,
+      );
+      decisions.set(issueId, { allowed, expiresAt: now + READ_DECISION_TTL_MS });
+      allowed.catch(() => decisions.delete(issueId));
+      return allowed;
+    }
+
+    async function visibleActivity(event: LiveEvent): Promise<LiveEvent> {
+      const { entityType, entityId, details } = event.payload;
+      if (entityType !== "issue" || typeof entityId !== "string" || entityId.length === 0) return event;
+      // Without the issue row there is no reader to decide for, so the entry
+      // keeps its identifiers and loses its details.
+      if (!(await loadIssue(event, entityId))) return { ...event, payload: { ...event.payload, details: null } };
+      if (!isRecord(details)) return event;
+      const summarized = summarizedIssueIds(details);
+      const [ownIssue, summarizedReadable] = await Promise.all([
+        canReadIssue(event, entityId),
+        Promise.all(summarized.map((issueId) => canReadIssue(event, issueId))),
+      ]);
+      const readable = new Set(summarized.filter((_, index) => summarizedReadable[index]));
+      const visible = withoutUnreadableIssueContent(details, {
+        ownIssue,
+        summarizedIssue: (issueId) => typeof issueId === "string" && readable.has(issueId),
+      });
+      return visible === details ? event : { ...event, payload: { ...event.payload, details: visible } };
+    }
+
+    /** The event as this subscriber may receive it, or `null` when it must be withheld. */
+    return async function visibleLiveEvent(event: LiveEvent): Promise<LiveEvent | null> {
+      switch (LIVE_EVENT_ISSUE_SCOPE[event.type]) {
+        case "none":
+          return event;
+        case "activity":
+          return visibleActivity(event);
+        case "run": {
+          const issueId = await loadRunIssueId(event);
+          return !issueId || (await canReadIssue(event, issueId)) ? event : null;
+        }
+        case "issue": {
+          const issueId = nonEmptyString(event.payload.issueId);
+          return !issueId || (await canReadIssue(event, issueId)) ? event : null;
+        }
+        default:
+          return null;
+      }
+    };
   };
 }

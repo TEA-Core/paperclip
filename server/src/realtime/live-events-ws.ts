@@ -216,13 +216,15 @@ async function authorizeUpgrade(
       companyId,
       actorType: "board",
       actorId: userId,
+      // The instance-admin role is left out so every read decision looks it
+      // up again; the socket outlives this upgrade, and a removed role must
+      // stop granting content without a reconnect.
       actor: {
         type: "board",
         userId,
         sessionId: session?.session?.id ?? null,
         companyIds: memberships.map((row) => row.companyId),
         memberships,
-        isInstanceAdmin: Boolean(roleRow),
         source: "session",
       },
     };
@@ -280,7 +282,7 @@ export function setupLiveEventsWebSocketServer(
   },
 ) {
   const wss = new WebSocketServer({ noServer: true });
-  const visibleLiveEvent = createLiveEventIssueVisibility(db);
+  const liveEventVisibility = createLiveEventIssueVisibility(db);
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
 
@@ -305,13 +307,14 @@ export function setupLiveEventsWebSocketServer(
     // Each event is authorized for this subscriber before it is sent. The
     // chain keeps delivery in publish order while a decision is pending, and
     // a failed decision withholds the event rather than sending it.
+    const visibleLiveEvent = liveEventVisibility(context.actor);
     let delivery = Promise.resolve();
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       delivery = delivery.then(async () => {
         if (socket.readyState !== WebSocket.OPEN) return;
         let visible: LiveEvent | null;
         try {
-          visible = await visibleLiveEvent(context.actor, event);
+          visible = await visibleLiveEvent(event);
         } catch (err) {
           logger.warn({ err, companyId: context.companyId }, "live event authorization failed; event withheld");
           return;

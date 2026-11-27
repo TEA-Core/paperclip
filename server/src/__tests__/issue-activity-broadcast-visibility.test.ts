@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   activityLog,
   agentApiKeys,
@@ -11,12 +12,16 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
+  instanceUserRoles,
   issues,
 } from "@paperclipai/db";
 import type { LiveEvent, PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
+import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logActivity, setPluginEventBus } from "../services/activity-log.js";
+import { publishLiveEvent } from "../services/live-events.js";
 import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import {
@@ -183,9 +188,11 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     }
     await db.delete(activityLog);
     await db.delete(agentApiKeys);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(instanceUserRoles);
     await db.delete(authUsers);
     await db.delete(companies);
   });
@@ -194,17 +201,20 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     await tempDb?.cleanup();
   });
 
-  async function startLiveEventsServer() {
+  async function startLiveEventsServer(
+    options: { resolveSessionFromHeaders?: () => Promise<BetterAuthSessionResult | null> } = {},
+  ) {
     const httpServer = createServer();
-    setupLiveEventsWebSocketServer(httpServer, db, { deploymentMode: "authenticated" });
+    setupLiveEventsWebSocketServer(httpServer, db, { deploymentMode: "authenticated", ...options });
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
     server = httpServer;
     return (httpServer.address() as AddressInfo).port;
   }
 
-  async function connect(port: number, companyId: string, token: string) {
+  /** Connects with an agent key, or with the stubbed board session when `token` is null. */
+  async function connect(port: number, companyId: string, token: string | null) {
     const socket = new WebSocket(`ws://127.0.0.1:${port}/api/companies/${companyId}/events/ws`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: token ? { authorization: `Bearer ${token}` } : {},
     });
     sockets.push(socket);
     const received: LiveEvent[] = [];
@@ -219,7 +229,30 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     return received;
   }
 
-  it("withholds a restricted issue's created activity from a live-events subscriber that cannot read it", async () => {
+  const isActivityFor = (issueId: string) => (event: LiveEvent) =>
+    event.type === "activity.logged" && event.payload.entityId === issueId;
+
+  async function seedScopedAndReaderKeys(companyId: string, userId: string, ownIssueId: string) {
+    const scopedAgent = await seedAgent(db, companyId);
+    const readerAgent = await seedAgent(db, companyId);
+    // A skill-test key may read only its own harness issue, so GET on any
+    // other issue answers 403 for it.
+    const nonReaderToken = await seedAgentKey(db, {
+      companyId,
+      agentId: scopedAgent.id,
+      responsibleUserId: userId,
+      scopeConfig: { kind: "skill_test", issueId: ownIssueId },
+    });
+    const readerToken = await seedAgentKey(db, {
+      companyId,
+      agentId: readerAgent.id,
+      responsibleUserId: userId,
+      scopeConfig: null,
+    });
+    return { scopedAgent, nonReaderToken, readerToken };
+  }
+
+  it("withholds a restricted issue's content from a live-events subscriber that cannot read it", async () => {
     const { company, userId } = await seedCompany(db);
     const restrictedIssue = await seedIssue(db, company.id, {
       title: RESTRICTED_TITLE,
@@ -229,22 +262,7 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
       title: "Skill-test harness issue",
       description: "Visible to the scoped key",
     });
-    const scopedAgent = await seedAgent(db, company.id);
-    const readerAgent = await seedAgent(db, company.id);
-    // A skill-test key may read only its own harness issue, so GET on the
-    // restricted issue answers 403 for it.
-    const nonReaderToken = await seedAgentKey(db, {
-      companyId: company.id,
-      agentId: scopedAgent.id,
-      responsibleUserId: userId,
-      scopeConfig: { kind: "skill_test", issueId: ownIssue.id },
-    });
-    const readerToken = await seedAgentKey(db, {
-      companyId: company.id,
-      agentId: readerAgent.id,
-      responsibleUserId: userId,
-      scopeConfig: null,
-    });
+    const { nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
 
     const port = await startLiveEventsServer();
     const nonReaderEvents = await connect(port, company.id, nonReaderToken);
@@ -255,15 +273,19 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     // processed for that socket rather than still in flight.
     await logIssueCreated(db, company.id, ownIssue);
 
-    const isActivityFor = (issueId: string) => (event: LiveEvent) =>
-      event.type === "activity.logged" && event.payload.entityId === issueId;
     await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
     await waitFor(() => readerEvents.some(isActivityFor(ownIssue.id)));
 
-    const nonReaderWire = JSON.stringify(nonReaderEvents);
-    expect(nonReaderWire).not.toContain(RESTRICTED_DESCRIPTION);
-    expect(nonReaderWire).not.toContain(RESTRICTED_TITLE);
-    expect(nonReaderEvents.some(isActivityFor(restrictedIssue.id))).toBe(false);
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    // Only the content is withheld: the entry keeps its identifiers and metadata.
+    const nonReaderRestricted = nonReaderEvents.find(isActivityFor(restrictedIssue.id));
+    expect(nonReaderRestricted?.payload).toMatchObject({
+      action: "issue.created",
+      entityType: "issue",
+      entityId: restrictedIssue.id,
+      details: { title: RESTRICTED_TITLE, identifier: restrictedIssue.identifier },
+    });
+    expect(nonReaderRestricted?.payload.details).not.toHaveProperty("description");
 
     // A subscriber that can read the issue still receives the full payload.
     const readerRestricted = readerEvents.find(isActivityFor(restrictedIssue.id));
@@ -273,7 +295,168 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     });
   });
 
-  it("withholds issue activity from a key without a responsible user and strips details of a missing issue", async () => {
+  it("strips the titles of unreadable referenced issues from activity the subscriber can read", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    const restrictedSummary = { id: restrictedIssue.id, identifier: restrictedIssue.identifier, title: RESTRICTED_TITLE };
+    const ownSummary = { id: ownIssue.id, identifier: ownIssue.identifier, title: ownIssue.title };
+    const details = {
+      key: "plan",
+      addedReferencedIssues: [restrictedSummary, ownSummary],
+      currentReferencedIssues: [restrictedSummary, ownSummary],
+      blockedByIssues: [restrictedSummary],
+    };
+    await logActivity(db, {
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.document_updated",
+      entityType: "issue",
+      entityId: ownIssue.id,
+      details,
+    });
+
+    await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
+    await waitFor(() => readerEvents.some(isActivityFor(ownIssue.id)));
+
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_TITLE);
+    const strippedSummary = { id: restrictedIssue.id, identifier: restrictedIssue.identifier };
+    expect(nonReaderEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual({
+      key: "plan",
+      addedReferencedIssues: [strippedSummary, ownSummary],
+      currentReferencedIssues: [strippedSummary, ownSummary],
+      blockedByIssues: [strippedSummary],
+    });
+    expect(readerEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual(details);
+  });
+
+  it("withholds run and goal events about an issue from a subscriber that cannot read that issue", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { scopedAgent, nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+    const run = await db
+      .insert(heartbeatRuns)
+      .values({ companyId: company.id, agentId: scopedAgent.id, status: "running", contextSnapshot: { issueId: restrictedIssue.id } })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    publishLiveEvent({
+      companyId: company.id,
+      type: "heartbeat.run.progress",
+      payload: {
+        runId: run.id,
+        agentId: scopedAgent.id,
+        issueId: restrictedIssue.id,
+        message: RESTRICTED_DESCRIPTION,
+        lastAssistantSnippet: RESTRICTED_DESCRIPTION,
+      },
+    });
+    // A run event that does not name its issue still concerns the run's issue.
+    publishLiveEvent({
+      companyId: company.id,
+      type: "heartbeat.run.status",
+      payload: { runId: run.id, agentId: scopedAgent.id, issueId: null, status: "failed", error: RESTRICTED_DESCRIPTION },
+    });
+    publishLiveEvent({
+      companyId: company.id,
+      type: "agent.session.goal.changed",
+      payload: { issueId: restrictedIssue.id, goal: { objective: RESTRICTED_DESCRIPTION } },
+    });
+    // An event without issue content reaches every subscriber and marks the end of the batch.
+    publishLiveEvent({
+      companyId: company.id,
+      type: "agent.status",
+      payload: { agentId: scopedAgent.id, status: "idle" },
+    });
+
+    const isAgentStatus = (event: LiveEvent) => event.type === "agent.status";
+    await waitFor(() => nonReaderEvents.some(isAgentStatus));
+    await waitFor(() => readerEvents.some(isAgentStatus));
+
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    expect(nonReaderEvents.map((event) => event.type)).toEqual(["agent.status"]);
+    // A subscriber that can read the issue still receives every event in full.
+    expect(readerEvents.map((event) => event.type)).toEqual([
+      "heartbeat.run.progress",
+      "heartbeat.run.status",
+      "agent.session.goal.changed",
+      "agent.status",
+    ]);
+    expect(readerEvents[0]!.payload).toMatchObject({ message: RESTRICTED_DESCRIPTION });
+    expect(readerEvents[1]!.payload).toMatchObject({ error: RESTRICTED_DESCRIPTION });
+  });
+
+  it("stops sending issue content to a session once its instance-admin role is removed", async () => {
+    const { company } = await seedCompany(db);
+    const firstIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const secondIssue = await seedIssue(db, company.id, {
+      title: "Second restricted title",
+      description: RESTRICTED_DESCRIPTION,
+    });
+    // An instance admin with no company membership reads issues only through the role.
+    const adminUserId = `admin-${randomUUID()}`;
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: adminUserId,
+      name: "Instance admin",
+      email: `${adminUserId}@example.test`,
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(instanceUserRoles).values({ userId: adminUserId, role: "instance_admin" });
+
+    const port = await startLiveEventsServer({
+      resolveSessionFromHeaders: async () => ({
+        session: { id: `session-${randomUUID()}`, userId: adminUserId },
+        user: { id: adminUserId },
+      }),
+    });
+    const events = await connect(port, company.id, null);
+
+    await logIssueCreated(db, company.id, firstIssue);
+    await waitFor(() => events.some(isActivityFor(firstIssue.id)));
+    expect(events.find(isActivityFor(firstIssue.id))?.payload.details).toMatchObject({
+      description: RESTRICTED_DESCRIPTION,
+    });
+
+    await db.delete(instanceUserRoles).where(eq(instanceUserRoles.userId, adminUserId));
+    await logIssueCreated(db, company.id, secondIssue);
+    await waitFor(() => events.some(isActivityFor(secondIssue.id)));
+
+    const afterRemoval = events.find(isActivityFor(secondIssue.id));
+    expect(afterRemoval?.payload.details).toMatchObject({ title: "Second restricted title" });
+    expect(afterRemoval?.payload.details).not.toHaveProperty("description");
+  });
+
+  it("withholds issue content from a key without a responsible user and strips details of a missing issue", async () => {
     const { company, userId } = await seedCompany(db);
     const issue = await seedIssue(db, company.id, {
       title: RESTRICTED_TITLE,
@@ -326,7 +509,8 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     await waitFor(() => readerEvents.some(isAgentActivity));
 
     expect(JSON.stringify(orphanEvents)).not.toContain(RESTRICTED_DESCRIPTION);
-    expect(orphanEvents.some((event) => event.payload.entityType === "issue")).toBe(false);
+    expect(orphanEvents.find((event) => event.payload.entityId === issue.id)?.payload.details)
+      .toMatchObject({ title: RESTRICTED_TITLE });
 
     const missing = readerEvents.find((event) => event.payload.entityId === missingIssueId);
     expect(missing?.payload).toMatchObject({ action: "issue.deleted", details: null });
