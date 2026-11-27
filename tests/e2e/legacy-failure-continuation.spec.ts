@@ -41,6 +41,23 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
     const url = `postgres://paperclip:paperclip@127.0.0.1:${pid.split("\n")[3]}/paperclip`;
     const db = createDb(url);
     const company = await json(await request.post("/api/companies", { data: { name: `Legacy recovery ${action} ${Date.now()}` } }));
+    // queued_interrupt seeds a stranded queue: a terminal legacy run, an unlocked task, and a
+    // deferred user comment. That is the shape the periodic recovery sweep repairs by delivering
+    // the saved comment (resumeQueuedRuns stranded-queue promotion), so a tick landing between
+    // the seed and the Interrupt click completes the continuation first and the button never
+    // renders (measured: 2/20 and 8/40 failures with a 10s scheduler interval). Holding the task
+    // execution lock does not help, because sweepStaleIssueLocks clears a lock held by a
+    // terminal run and promotes the queue the same way. The sweeps cannot be scoped per spec,
+    // so engage the runtime dispatch quiesce (the gate that suppresses dispatch without
+    // cancelling anything) from before the seed until immediately before the click. The
+    // quiesce carries a short TTL so an aborted test self-releases instead of parking the
+    // shared server.
+    let dispatchQuiesced = false;
+    const releaseDispatchQuiesce = async () => {
+      if (!dispatchQuiesced) return;
+      dispatchQuiesced = false;
+      await json(await request.delete("/api/instance/dispatch-quiesce"));
+    };
     try {
       await writeFile(path.join(root, "continued"), "ready");
       const agent = await json(await request.post(`/api/companies/${company.id}/agents`, { data: {
@@ -67,6 +84,12 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       } }));
       await recordTier2MergedDelivery(request, issue.id);
       const sourceRunId = randomUUID();
+      if (action === "queued_interrupt") {
+        await json(await request.post("/api/instance/dispatch-quiesce", {
+          data: { reason: "legacy-failure-continuation queued_interrupt seed", ttlSeconds: 120 },
+        }));
+        dispatchQuiesced = true;
+      }
       // Seed the historical incident, then exercise all recovery through the UI.
       // No adapter.invoke or new dispatch identity exists on this pre-upgrade run.
       await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: company.id, agentId: agent.id,
@@ -129,6 +152,9 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         // the wait is widened, to the same 45s this spec already allows for its reply assertion.
         await expect(interrupt).toBeEnabled({ timeout: 45_000 });
         await db.update(heartbeatRuns).set({ processPid: 999999999 }).where(eq(heartbeatRuns.id, sourceRunId));
+        // Recovery must run now: lift the quiesce only after the provider is recorded stopped,
+        // so no sweep can promote the queue before the click while the button is verified.
+        await releaseDispatchQuiesce();
         await interrupt.click();
       } else if (action === "automatic_message") {
         // No Retry, duplicate message, or status change: the saved input runs.
@@ -350,6 +376,7 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         throw failed;
       }
     } finally {
+      await releaseDispatchQuiesce().catch(() => {});
       // SUP-17651: teardown must never mask the primary failure. When the test times
       // out Playwright has already torn down the page/context, and the archive PATCH
       // then rejects ("Target page, context or browser has been closed"), replacing
