@@ -1,4 +1,3 @@
-import { canonicalRunContextSnapshot } from "./stored-workspace-path.js";
 import {
   persistActivity,
   publishActivity,
@@ -295,7 +294,7 @@ export async function prepareConversationTurn(
     };
     await tx
       .update(heartbeatRuns)
-      .set({ contextSnapshot: await canonicalRunContextSnapshot(next) })
+      .set({ contextSnapshot: next })
       .where(eq(heartbeatRuns.id, run.id));
     return { context: next, reset, duplicateReset: false, conversation: true };
   });

@@ -1,4 +1,3 @@
-import { canonicalRunContextSnapshot } from "../../../services/stored-workspace-path.js";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
@@ -81,7 +80,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
     async updateQueueRunCommentIds({ queueRunId, contextSnapshot, ids, updatedAt }) {
       const row = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: await canonicalRunContextSnapshot(withQueuedCommentIdsInRunContext(contextSnapshot, ids)), updatedAt })
+        .set({ contextSnapshot: withQueuedCommentIdsInRunContext(contextSnapshot, ids), updatedAt })
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);

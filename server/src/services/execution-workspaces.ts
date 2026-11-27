@@ -1,4 +1,3 @@
-import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -1760,7 +1759,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       "companyId" | "projectWorkspaceId" | "strategyType" | "cwd" | "sourceIssueId"
     >,
     dbOrTx: Db = db,
-    requestedCwd: string | null | undefined = data.cwd,
   ) {
     if (data.strategyType !== "git_worktree" || !data.projectWorkspaceId || !data.cwd) return;
     const holders = await dbOrTx
@@ -1773,7 +1771,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         and(
           eq(executionWorkspaces.companyId, data.companyId),
           eq(executionWorkspaces.projectWorkspaceId, data.projectWorkspaceId),
-          inArray(executionWorkspaces.cwd, [...new Set([data.cwd, requestedCwd ?? data.cwd])]),
+          eq(executionWorkspaces.cwd, data.cwd),
           inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
         ),
       );
@@ -2999,12 +2997,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       liveBranchName: string | null;
       excludingExecutionWorkspaceId?: string | null;
     }): Promise<ExecutionWorkspaceGitWorktreeContention> => {
-      const worktreePaths = [...new Set([
-        path.resolve(input.worktreePath), await canonicalStoredPath(path.resolve(input.worktreePath)),
-      ])];
+      const resolvedWorktreePath = path.resolve(input.worktreePath);
       const pathOrBranchConditions = [
-        inArray(executionWorkspaces.providerRef, [input.worktreePath, ...worktreePaths]),
-        inArray(executionWorkspaces.cwd, [input.worktreePath, ...worktreePaths]),
+        eq(executionWorkspaces.providerRef, input.worktreePath),
+        eq(executionWorkspaces.cwd, input.worktreePath),
       ];
       if (input.liveBranchName) {
         pathOrBranchConditions.push(eq(executionWorkspaces.branchName, input.liveBranchName));
@@ -3043,7 +3039,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       let liveMatch: ExecutionWorkspaceGitWorktreeContention = null;
       for (const candidate of candidates) {
         const candidatePath = readNullableString(candidate.providerRef) ?? readNullableString(candidate.cwd);
-        const matchesPath = candidatePath ? worktreePaths.includes(path.resolve(candidatePath)) : false;
+        const matchesPath = candidatePath ? path.resolve(candidatePath) === resolvedWorktreePath : false;
         const matchesBranch = Boolean(input.liveBranchName && candidate.branchName === input.liveBranchName);
         if (!matchesPath && !matchesBranch) continue;
 
@@ -4282,10 +4278,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     escalateStrandedTerminalCleanups,
 
-    create: async (input: typeof executionWorkspaces.$inferInsert) => {
-      const data = {
-        ...input, cwd: await canonicalStoredPath(input.cwd), providerRef: await canonicalStoredPath(input.providerRef),
-      };
+    create: async (data: typeof executionWorkspaces.$inferInsert) => {
       // The path-exclusivity check is a read; the insert that follows is a write.
       // Without serialization two concurrent allocations both pass the read and
       // both insert — the exact "two active rows over one directory" shape this
@@ -4306,7 +4299,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (pathGuardKey) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
         }
-        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db, input.cwd);
+        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
         return tx
           .insert(executionWorkspaces)
           .values(data)
@@ -4316,23 +4309,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return row ? toExecutionWorkspace(row) : null;
     },
 
-    update: async (id: string, input: Partial<typeof executionWorkspaces.$inferInsert>) => {
-      const patch = { ...input };
-      if (patch.cwd !== undefined) patch.cwd = await canonicalStoredPath(patch.cwd);
-      if (patch.providerRef !== undefined) patch.providerRef = await canonicalStoredPath(patch.providerRef);
+    update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
       const row = await db.transaction(async (tx) => {
         const publishesPath = patch.cwd !== undefined || patch.providerRef !== undefined
           || patch.providerType !== undefined
-          || patch.closedAt === null
           || (patch.status !== undefined && ["active", "idle", "in_review"].includes(patch.status));
         const waitedForCleanup = publishesPath && await acquireWorkspacePathPublicationLock(tx);
-        if (publishesPath) {
-          const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id)).for("update");
-          if (current) {
-            patch.cwd = await canonicalStoredPath(patch.cwd === undefined ? current.cwd : patch.cwd);
-            patch.providerRef = await canonicalStoredPath(patch.providerRef === undefined ? current.providerRef : patch.providerRef);
-          }
-        }
         if (waitedForCleanup) {
           const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
           if (current && ["active", "idle", "in_review"].includes(patch.status ?? current.status)) {

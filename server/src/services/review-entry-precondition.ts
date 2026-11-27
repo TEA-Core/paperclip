@@ -195,32 +195,6 @@ export async function prepareReviewEntry(
 }
 
 
-/** One sorted, nonblocking batch precedes the issue-row lock. Disjoint entries
- * share ancestor authority. Broad ancestors are company-scoped; paths inside
- * the managed projects root still exclude writers from every company.
- */
-export async function lockReviewEntryAuthority(tx: Db, issueId: string, prepared: PreparedReviewEntry) {
-  await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
-  const own = prepared.snapshot.worktreePath;
-  const root = await realpath(path.join(resolvePaperclipInstanceRoot(), "projects")).catch(() =>
-    fail("workspace_unverified", "The managed projects root could not be verified."));
-  const shared: string[] = [];
-  for (let ancestor = path.dirname(own); ; ancestor = path.dirname(ancestor)) {
-    shared.push(ancestor !== root && containsPath(root, ancestor)
-      ? `path-exact:${ancestor}`
-      : `company-path-exact:${prepared.binding.workspace.companyId}:${ancestor}`);
-    if (ancestor === path.dirname(ancestor)) break;
-  }
-  const exclusive = [
-    `issue:${issueId}`, `workspace:${prepared.binding.workspace.id}`, `path:${own}`, `path-exact:${own}`,
-  ];
-  await tx.execute(sql`SELECT review_entry_acquire_locks(
-    ARRAY[${sql.join(shared.map((key) => sql`${key}`), sql`, `)}]::text[],
-    ARRAY[${sql.join(exclusive.map((key) => sql`${key}`), sql`, `)}]::text[],
-    'review_entry_workspace_busy'
-  )`);
-}
-
 async function physicalPath(candidate: string): Promise<PhysicalWorkspace> {
   const resolved = await realpath(candidate);
   const info = await stat(resolved);
@@ -418,13 +392,13 @@ async function pinnedRevision(db: Db, issue: Subject, key: string, revisionId: s
   return { documentId: revision.documentId, revisionId: revision.id, revisionNumber: revision.revisionNumber, bodyDigest: digest(revision.body) };
 }
 
-/** Called after lockReviewEntryAuthority and with the issue FOR UPDATE, before
- * any handoff/comment write. Rows are locked in one order: workspace binding,
- * ruling, owning run, artifact, then ruling authors and reviewer. Rows that
- * reference the issue or workspace by foreign key wait on those row locks; the
- * advisory keys exclude path and run-context phantoms. This local-worktree mode
- * is not a host filesystem freeze: provisioning gives this card/run sole use of
- * the working directory, and the submitting owner must yield while PATCH runs.
+/** Called with the issue FOR UPDATE, before any handoff/comment write. Rows are
+ * locked in one order: workspace binding, ruling, owning run, artifact, then
+ * ruling authors and reviewer. Entry is checked optimistically: live writers
+ * and the final Git fingerprint are rechecked inside this transaction, but
+ * nothing fences ordinary writers, so a writer on the card-owned isolated
+ * worktree can still act after the final check and before commit. The receipt
+ * records what was observed; it is not an exclusion guarantee.
  */
 export async function verifyReviewEntryAtTransition(
   tx: Db, issue: Subject, expected: ReviewEntryPrecondition, actor: ReviewEntryActor,

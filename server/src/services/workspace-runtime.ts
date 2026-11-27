@@ -1,4 +1,3 @@
-import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -8852,8 +8851,7 @@ function toPersistedWorkspaceRuntimeService(record: RuntimeServiceRecord): typeo
 
 async function persistRuntimeServiceRecord(db: Db | undefined, record: RuntimeServiceRecord) {
   if (!db) return;
-  const persisted = toPersistedWorkspaceRuntimeService(record);
-  const values = { ...persisted, cwd: await canonicalStoredPath(persisted.cwd) };
+  const values = toPersistedWorkspaceRuntimeService(record);
   await db
     .insert(workspaceRuntimeServices)
     .values(values)
@@ -12220,7 +12218,7 @@ export async function persistAdapterManagedRuntimeServices(input: {
         lifecycle: ref.lifecycle,
         reuseKey: ref.reuseKey,
         command: ref.command,
-        cwd: await canonicalStoredPath(ref.cwd),
+        cwd: ref.cwd,
         port: ref.port,
         url: ref.url,
         provider: ref.provider,

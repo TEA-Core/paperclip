@@ -1,4 +1,3 @@
-import { canonicalStoredPath } from "./stored-workspace-path.js";
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -897,20 +896,11 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
       const { goalIds: inputGoalIds, ...projectData } = data;
       const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
       const existingProject = await db
-        .select({ id: projects.id, companyId: projects.companyId, name: projects.name, archivedAt: projects.archivedAt })
+        .select({ id: projects.id, companyId: projects.companyId, name: projects.name })
         .from(projects)
         .where(eq(projects.id, id)).for("update")
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
-      if (projectData.archivedAt === null && existingProject.archivedAt !== null) {
-        const sources = await db.select().from(projectWorkspaces).where(eq(projectWorkspaces.projectId, id))
-          .orderBy(asc(projectWorkspaces.id)).for("update");
-        for (const source of sources) {
-          if (source.sourceType === "remote_managed") continue;
-          const cwd = await canonicalStoredPath(source.cwd);
-          if (cwd !== source.cwd) await db.update(projectWorkspaces).set({ cwd }).where(eq(projectWorkspaces.id, source.id));
-        }
-      }
       if (ids && ids.length > 0) {
         await assertGoalsBelongToCompany(db, existingProject.companyId, ids);
       }
@@ -1025,7 +1015,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
         .then((rows) => rows[0] ?? null);
       if (!project) return null;
 
-      const cwd = await canonicalStoredPath(normalizeWorkspaceCwd(data.cwd));
+      const cwd = normalizeWorkspaceCwd(data.cwd);
       const repoUrl = readNonEmptyString(data.repoUrl);
       const sourceType = readNonEmptyString(data.sourceType) ?? (repoUrl ? "git_repo" : cwd ? "local_path" : "remote_managed");
       const remoteWorkspaceRef = readNonEmptyString(data.remoteWorkspaceRef);
@@ -1119,7 +1109,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
 
       const nextCwd =
         data.cwd !== undefined
-          ? await canonicalStoredPath(normalizeWorkspaceCwd(data.cwd))
+          ? normalizeWorkspaceCwd(data.cwd)
           : normalizeWorkspaceCwd(existing.cwd);
       const nextRepoUrl =
         data.repoUrl !== undefined

@@ -411,9 +411,9 @@ The current `entry-ruling` revision must be substantive and independently author
 The current reviewed document revision must be separate from that ruling.
 
 Only the card's own active, managed isolated Git worktree is supported.
-Workspace, runtime-service, operation and run-context paths are stored
-canonically (symlinks resolved) when written. Inside the locked transaction the
-server re-resolves the physical path (realpath and device:inode, including
+Entry is checked, optimistic admission: the server observes the tree and its
+possible writers and refuses what it sees, but it does not exclude writers.
+Inside the locked transaction the server resolves the physical path (realpath and device:inode, including
 aliases) of every possible local writer across companies: live local execution
 workspaces, project workspaces of non-archived projects (not remote-managed),
 live non-adapter-managed runtime services, live operations and queued/running
@@ -437,28 +437,19 @@ deployment; this change does not edit or migrate live routines.
 
 The owner yields its isolated directory while its conditional PATCH runs.
 This is a sole-owner local-worktree contract, not a privileged host freeze or a
-claim that database locks fence arbitrary host filesystem writers. Do not use it
-for shared folders or out-of-band writers. The transaction takes advisory locks
-keyed by the issue, its execution workspace and the worktree's paths before it
-locks the issue row, then row-locks the workspace binding, ruling, owning run,
-artifact and reviewer rows in one fixed order. Trusted server producers normalize
-local workspace and run-context paths before persistence, including missing
-symlink targets. Database triggers acquire the same issue, workspace and path
-keys for those claims. Admission and writer batches sort hashed keys in one
-order and use nonblocking advisory acquisition. A competing writer receives
-named `review_entry_writer_busy`, not an unbounded advisory wait. A run must not
-swallow that refusal as optional diagnostics. Descendant writers share prefix
-keys; writers own exact keys exclusively. Admission shares ancestor exact keys
-and owns its tree keys exclusively. Broad ancestor exact keys are company-scoped.
-Disjoint admissions, including different worktrees of one checkout, remain
-concurrent. Inverting the modes would reverse that contract; the chosen
-alternative is a named same-path writer refusal. No table lock is taken;
-ordinary row-lock contention still fails closed.
+claim that database locks fence host filesystem writers or other database
+writers. Do not use it for shared folders or out-of-band writers. The
+transaction bounds lock waits, locks the issue row, then row-locks the workspace
+binding, ruling, owning run, artifact and reviewer rows in one fixed order.
+Ordinary workspace, runtime-service, operation and run writers take no
+review-entry lock and never refuse one another; row-lock contention on the
+entry's own rows fails closed as `review_entry_workspace_busy`. Disjoint
+admissions, including different worktrees of one checkout, remain concurrent.
 
-Named residual: privileged raw-SQL physical-alias inserts are outside this
-server-write guarantee. PostgreSQL cannot resolve the application host's
-symlinks, and a database writer can bypass application normalization or alter
-the fence itself. This is not a raw-SQL or host-filesystem physical-alias fence.
+Accepted residual: a writer can start on, or write to, the card-owned isolated
+worktree after the final in-transaction check and before commit. The receipt
+records the state observed at that check; it is neither an exclusion guarantee
+nor close evidence.
 
 Each linked-worktree admin directory must have a bounded regular `gitdir`
 back-pointer and a consistent forward `.git` pointer to the same admin-directory
@@ -474,7 +465,7 @@ GitHub credentialed reads pin the project's published base to a commit before
 the transaction. Every checked tip must be positively covered by that base;
 local default refs, equal trees and synthetic merge histories are not authority.
 The issue-locked transaction rechecks classification, debt, policy/state, owning
-run, repository binding, pinned revisions and physical exclusivity and recomputes
+run, repository binding, pinned revisions and observed writers and recomputes
 the ordinary stage transition. The full hardened clean/index/ignored-file,
 branch-attribution and `git fsck --strict` proof runs before the transaction;
 inside it a cheap recheck requires the same HEAD, branch, index digest, refs digest

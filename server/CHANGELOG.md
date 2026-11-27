@@ -4,9 +4,9 @@
 
 ### Patch Changes
 
-- Add conditional first-review entry for recorded deliverables in exclusively owned isolated Git worktrees. The transaction retains immutable document revisions and an append-only receipt without creating close-tier evidence or discharging repository landing debt.
+- Add conditional first-review entry for recorded deliverables in card-owned isolated Git worktrees, using entry-checked, optimistic admission. The transaction retains immutable document revisions and an append-only receipt without creating close-tier evidence or discharging repository landing debt.
 - Harden isolated first-review admission against ancestor writers and borrowed sibling Git metadata. Scope uncertain-link refusals to managed project paths and add a company-scoped board diagnostic at `GET /api/issues/{id}/review-entry-blockers`.
-- Follow missing symlink targets and dot segments in OS order before publishing local writer paths. Validate linked-worktree registration identities, use sorted nonblocking fence locks with named busy refusals, and restrict blocker diagnostics to board operators. Broad root ancestors are company-scoped; privileged raw-SQL physical aliases remain outside the server-write guarantee.
+- Follow missing symlink targets and dot segments in OS order when resolving possible writers. Validate linked-worktree registration identities, skip prunable sibling registrations, and restrict blocker diagnostics to board operators. Broad root ancestors are company-scoped. Ordinary writers are not fenced: a writer can act on the card-owned worktree after the final check and before commit, and the receipt records only what was observed.
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 

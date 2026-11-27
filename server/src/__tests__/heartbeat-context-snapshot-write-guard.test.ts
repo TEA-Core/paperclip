@@ -65,7 +65,7 @@ describe("runContextSnapshotWriteGuarded", () => {
     expect(record).not.toHaveBeenCalled();
   });
 
-  it("degrades an ordinary write failure and records failure with runId/site", async () => {
+  it("never throws on a write failure: returns the fallback and records failure with runId/site", async () => {
     const record = vi.fn();
     const failure = new Error("Failed query: update heartbeat_runs ...");
     const result = await runContextSnapshotWriteGuarded({
@@ -173,16 +173,6 @@ describe("runContextSnapshotWriteGuarded", () => {
     // The run survives: the guarded write degrades to the prior/fallback value.
     expect(result).toEqual({ id: "existing-scope-run" });
     expect(recordCalls).toBe(1);
-  });
-  it("propagates a named writer fence refusal instead of dispatching with a fallback", async () => {
-    const driver = Object.assign(new Error("review_entry_writer_busy"), { code: "55P03" });
-    const error = new Error("Wrapped database write", { cause: driver });
-    const record = vi.fn();
-    await expect(runContextSnapshotWriteGuarded({
-      writeSite: "executeRun:dispatch-start", runId: "fenced-run",
-      write: async () => { throw error; }, fallback: "unsafe continuation", record,
-    })).rejects.toBe(error);
-    expect(record).not.toHaveBeenCalled();
   });
 });
 

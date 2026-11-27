@@ -1,4 +1,3 @@
-import { canonicalRunContextSnapshot } from "./stored-workspace-path.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { eq, sql } from "drizzle-orm";
@@ -1165,7 +1164,7 @@ export async function provisionIssueExecutionWorkspace(
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: await canonicalRunContextSnapshot(input.context),
+        contextSnapshot: input.context,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));

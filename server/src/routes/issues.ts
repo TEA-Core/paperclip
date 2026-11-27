@@ -3,7 +3,6 @@ import { setIssueTitle } from "../services/issue-title.js";
 import {
   assertReviewEntryRequest,
   listReviewEntryBlockers,
-  lockReviewEntryAuthority,
   prepareReviewEntry,
   verifyReviewEntryAtTransition,
 } from "../services/review-entry-precondition.js";
@@ -22356,7 +22355,7 @@ export function issueRoutes(
         issue = await db.transaction(async (tx) => {
           let entryProof;
           if (preparedReviewEntry && reviewEntryPrecondition) {
-            await lockReviewEntryAuthority(tx as unknown as Db, existing.id, preparedReviewEntry);
+            await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
             const locked = await svc.getByIdForUpdate(existing.id, tx);
             if (!locked) return null;
             entryProof = await verifyReviewEntryAtTransition(

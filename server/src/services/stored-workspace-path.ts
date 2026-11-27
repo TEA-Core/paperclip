@@ -1,6 +1,5 @@
 import { lstat, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
-import { conflict } from "../errors.js";
 
 interface StoredPathResolution {
   path: string;
@@ -67,71 +66,3 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
   return { path: resolved, missing, uncertain, followedSymlink, scopeTouched };
 }
 
-/** Store the physical spelling, including future descendants of a symlink. */
-export async function canonicalStoredPath<T extends string | null | undefined>(value: T): Promise<T> {
-  if (typeof value !== "string" || !path.isAbsolute(value)) return value;
-  const resolved = await resolveStoredPath(value);
-  if (resolved.uncertain) {
-    throw conflict("A local workspace path cannot be normalized safely.", { code: "review_entry_path_unverified" });
-  }
-  return resolved.path as T;
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown> : null;
-}
-
-const workspacePathKeys = ["cwd", "worktreePath"] as const;
-const contextPathKeys = ["cwd", "workspaceCwd"] as const;
-
-async function canonicalPathFields(source: Record<string, unknown>, keys: readonly string[]) {
-  let result = source;
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value !== "string") continue;
-    const normalized = await canonicalStoredPath(value);
-    if (normalized !== value) {
-      if (result === source) result = { ...source };
-      result[key] = normalized;
-    }
-  }
-  return result;
-}
-
-/** Normalize every local run-context producer before persistence. Atomic
- * metadata-only JSONB patches preserve these fields; remote paths stay remote.
- */
-export async function canonicalRunContextSnapshot<T>(value: T): Promise<T> {
-  const source = record(value);
-  if (!source) return value;
-  const driver = record(source.paperclipEnvironment)?.driver;
-  if (driver != null && driver !== "local") return value;
-  let result = await canonicalPathFields(source, contextPathKeys);
-  const workspace = record(source.paperclipWorkspace);
-  if (workspace) {
-    const normalized = await canonicalPathFields(workspace, workspacePathKeys);
-    if (normalized !== workspace) {
-      if (result === source) result = { ...source };
-      result.paperclipWorkspace = normalized;
-    }
-  }
-  if (Array.isArray(source.paperclipWorkspaces)) {
-    const original = source.paperclipWorkspaces;
-    let hints = original;
-    for (let index = 0; index < original.length; index += 1) {
-      const hint = record(original[index]);
-      if (!hint) continue;
-      const normalized = await canonicalPathFields(hint, workspacePathKeys);
-      if (normalized !== hint) {
-        if (hints === original) hints = [...original];
-        hints[index] = normalized;
-      }
-    }
-    if (hints !== original) {
-      if (result === source) result = { ...source };
-      result.paperclipWorkspaces = hints;
-    }
-  }
-  return result as T;
-}

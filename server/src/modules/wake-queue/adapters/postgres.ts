@@ -1,4 +1,3 @@
-import { canonicalRunContextSnapshot } from "../../../services/stored-workspace-path.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -459,7 +458,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,
-          contextSnapshot: await canonicalRunContextSnapshot(input.contextSnapshot),
+          contextSnapshot: input.contextSnapshot,
           responsibleUserId: input.responsibleUserId,
           sessionIdBefore: input.sessionBefore,
           continuationAttempt: readContinuationAttempt(input.contextSnapshot.livenessContinuationAttempt),
@@ -612,7 +611,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: await canonicalRunContextSnapshot(withRecoveryContext(
+          contextSnapshot: withRecoveryContext(
             {
               issueId: issue.id,
               taskId: issue.id,
@@ -626,7 +625,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
             },
             "normal_model",
-          )),
+          ),
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
           updatedAt: now,
@@ -689,7 +688,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: await canonicalRunContextSnapshot(contextSnapshot),
+          contextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
@@ -920,7 +919,7 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
       const now = new Date();
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: await canonicalRunContextSnapshot(input.mergedContextSnapshot), updatedAt: now })
+        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),
