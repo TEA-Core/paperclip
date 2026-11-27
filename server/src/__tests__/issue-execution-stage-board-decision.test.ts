@@ -1110,6 +1110,64 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(decisions).toHaveLength(2);
   });
 
+  it("completes a pending stage from its durable approved row instead of refusing no_undecided_stage", async () => {
+    const { companyId, issueId, returnAssigneeAgentId } = await seedIssue();
+    currentActor = boardActor(companyId);
+    // The drift shape: the stage's latest durable verdict is `approved`, but a
+    // later write re-pended it (pending, lastDecisionId null). A board approval
+    // reconciles the projection from that row and writes no second row.
+    const durableDecisionId = "c1000000-0000-4000-8000-000000000001";
+    await db.insert(issueExecutionDecisions).values({
+      id: durableDecisionId,
+      companyId,
+      issueId,
+      stageId: STAGE_ID,
+      stageType: "review",
+      actorAgentId: null,
+      actorUserId: USER_ID,
+      outcome: "approved",
+      body: "prior board approval",
+      createdByRunId: null,
+      createdAt: new Date("2026-09-01T00:00:00Z"),
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: reconcile the recorded approval" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(STAGE_ID);
+    expect(res.body.decisionId).toBe(durableDecisionId);
+    expect(res.body.reconciled).toBe(true);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect(row!.assigneeAgentId).toBe(returnAssigneeAgentId);
+    expect(row!.executionState).toMatchObject({
+      status: "completed",
+      currentStageId: null,
+      completedStageIds: [STAGE_ID],
+      lastDecisionId: durableDecisionId,
+      lastDecisionOutcome: "approved",
+    });
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions.map((decision) => decision.id)).toEqual([durableDecisionId]);
+
+    const reconciledActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_reconciled")));
+    expect(reconciledActivity).toHaveLength(1);
+    expect(reconciledActivity[0]!.details).toMatchObject({
+      stageId: STAGE_ID,
+      reconciledDecisionId: durableDecisionId,
+    });
+  });
+
   it("wakes the return assignee when a board decision requests changes", async () => {
     const { companyId, issueId, returnAssigneeAgentId } = await seedIssue();
     currentActor = boardActor(companyId);

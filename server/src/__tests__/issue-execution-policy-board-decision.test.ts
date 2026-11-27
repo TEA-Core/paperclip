@@ -412,6 +412,55 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     });
   });
 
+  it("reconciles a pending stage from its durable approved row when no undecided stage remains", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+    const durableDecisionId = "d1000000-0000-4000-8000-000000000001";
+    const makeInput = (decision: "approved" | "changes_requested") => ({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision,
+      commentBody: "board: reconcile",
+      decidedStageIds: [reviewStage.id],
+      durableApprovalIds: new Map([[reviewStage.id, durableDecisionId]]),
+    });
+
+    const result = applyBoardStageDecision(makeInput("approved"));
+
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.reconciledDecisionId).toBe(durableDecisionId);
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [reviewStage.id],
+    });
+
+    // A bounce is a new verdict, not the recorded approval: nothing to reconcile.
+    expect(() => applyBoardStageDecision(makeInput("changes_requested"))).toThrowError(
+      BoardStageNoUndecidedStageError,
+    );
+  });
+
   it("clears a workflow-controlled assignee when the final stage has no return assignee", () => {
     const policy = reviewOnlyPolicy();
     const reviewStage = policy.stages[0];

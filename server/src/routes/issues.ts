@@ -281,6 +281,7 @@ import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../servi
 import {
   evaluateStageIntegrity,
   resolveSelfApprovalPrincipals,
+  latestDecisionPerStage,
   listDurablyApprovedStageIds,
   readApprovalHeadDelta,
   readApprovalPullRequest,
@@ -13109,6 +13110,7 @@ export function issueRoutes(
       updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
       result: ReturnType<typeof applyBoardStageDecision>;
       commentRow: Awaited<ReturnType<typeof svc.addComment>>;
+      recordedDecisionId: string;
       previousState: ReturnType<typeof parseIssueExecutionState>;
       nextExecutionState: Record<string, unknown>;
       previousAssigneeAgentId: string | null;
@@ -13192,6 +13194,13 @@ export function issueRoutes(
             ),
           );
         const decidedStageIds = listDurablyApprovedStageIds(decidedRows, policyStageIdSet);
+        // SUP-25518: the row behind each durably approved stage, so an approval
+        // that finds its current stage still pending on that row reconciles the
+        // projection from it instead of writing a second row.
+        const latestDecisionByStage = latestDecisionPerStage(decidedRows);
+        const durableApprovalIds = new Map(
+          decidedStageIds.map((stageId) => [stageId, latestDecisionByStage.get(stageId)!.id]),
+        );
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -13201,6 +13210,7 @@ export function issueRoutes(
             decision,
             commentBody: comment,
             decidedStageIds,
+            durableApprovalIds,
             actorUserId: boardUserId,
           });
         } catch (err) {
@@ -13213,13 +13223,14 @@ export function issueRoutes(
           throw err;
         }
 
+        const recordedDecisionId = result.reconciledDecisionId ?? decisionId;
         const rawExecutionState = result.patch.executionState;
         if (!rawExecutionState || typeof rawExecutionState !== "object") {
           throw new Error("Board stage decision patch is missing executionState");
         }
         result.patch.executionState = {
           ...(rawExecutionState as Record<string, unknown>),
-          lastDecisionId: decisionId,
+          lastDecisionId: recordedDecisionId,
         };
         await preflightTerminalApproval(
           lockedIssue,
@@ -13270,18 +13281,22 @@ export function issueRoutes(
         );
         if (!updated) return null;
 
-        await tx.insert(issueExecutionDecisions).values({
-          id: decisionId,
-          companyId: updated.companyId,
-          issueId: updated.id,
-          stageId: result.decision.stageId,
-          stageType: result.decision.stageType,
-          actorAgentId: null,
-          actorUserId: boardUserId,
-          outcome: result.decision.outcome,
-          body: result.decision.body,
-          createdByRunId: actor.runId ?? null,
-        });
+        // SUP-25518: a reconciled approval records the existing durable row as
+        // `lastDecisionId`; the decision itself is already on the table.
+        if (!result.reconciledDecisionId) {
+          await tx.insert(issueExecutionDecisions).values({
+            id: decisionId,
+            companyId: updated.companyId,
+            issueId: updated.id,
+            stageId: result.decision.stageId,
+            stageType: result.decision.stageType,
+            actorAgentId: null,
+            actorUserId: boardUserId,
+            outcome: result.decision.outcome,
+            body: result.decision.body,
+            createdByRunId: actor.runId ?? null,
+          });
+        }
 
         // SUP-15805 CR-2: the visible comment shares the decision's transaction —
         // a comment referencing a decision that then rolls back (or a decision
@@ -13308,7 +13323,7 @@ export function issueRoutes(
             actorType: actor.actorType,
             boardApiKeyId: actor.boardApiKeyId,
             actorId: boardUserId,
-            action: "issue.board_stage_override",
+            action: result.reconciledDecisionId ? "issue.board_stage_reconciled" : "issue.board_stage_override",
             entityType: "issue",
             entityId: updated.id,
             agentId: null,
@@ -13319,6 +13334,7 @@ export function issueRoutes(
               decision: result.decision.outcome,
               displacedParticipant: result.displacedParticipant,
               commentId: commentRow.id,
+              ...(result.reconciledDecisionId ? { reconciledDecisionId: result.reconciledDecisionId } : {}),
             },
           },
           postCommitActivityPublications,
@@ -13328,6 +13344,7 @@ export function issueRoutes(
           updated,
           result,
           commentRow,
+          recordedDecisionId,
           previousState,
           nextExecutionState,
           previousAssigneeAgentId,
@@ -13428,7 +13445,8 @@ export function issueRoutes(
       outcome: outcome.result.decision.outcome,
       stageId: outcome.result.targetStage.id,
       stageType: outcome.result.targetStage.type,
-      decisionId,
+      decisionId: outcome.recordedDecisionId,
+      reconciled: outcome.result.reconciledDecisionId !== null,
       commentId: outcome.commentRow.id,
       executionState: outcome.nextExecutionState,
     });

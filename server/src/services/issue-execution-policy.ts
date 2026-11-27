@@ -2890,6 +2890,13 @@ export interface BoardStageDecisionInput {
    * (SUP-15805 addendum item 4).
    */
   actorUserId?: string | null;
+  /**
+   * SUP-25518: the id of the latest durable `approved` row for each stage in
+   * `decidedStageIds`. An approval that finds no undecided stage while the
+   * current stage is still pending reconciles the projection from this row
+   * instead of refusing, and writes no second decision row.
+   */
+  durableApprovalIds?: ReadonlyMap<string, string>;
 }
 
 export interface BoardStageDecisionResult {
@@ -2902,6 +2909,12 @@ export interface BoardStageDecisionResult {
    */
   displacedParticipant: IssueExecutionStagePrincipal | null;
   workflowControlledAssignment: boolean;
+  /**
+   * SUP-25518: the existing durable decision the patch reconciles the
+   * projection from. When set, the caller records this id as `lastDecisionId`
+   * and inserts no decision row.
+   */
+  reconciledDecisionId: string | null;
 }
 
 /**
@@ -2967,6 +2980,24 @@ function resolveBoardTargetStage(
 }
 
 /**
+ * SUP-25518: the pending current stage whose latest durable verdict is already
+ * `approved`. This is the drift shape left when a write re-pends a stage after
+ * its approval committed (a non-terminal status write dissolves the completed
+ * projection, then an `in_review` write re-arms the ladder). The target
+ * selector treats the stage as decided, so without this the board cannot act.
+ */
+function resolveDurablyApprovedPendingStage(
+  policy: IssueExecutionPolicy,
+  previous: IssueExecutionState | null,
+  durableApprovalIds?: ReadonlyMap<string, string>,
+): { stage: IssueExecutionStage; decisionId: string } | null {
+  if (previous?.status !== PENDING_STATUS || !previous.currentStageId) return null;
+  const stage = findStageById(policy, previous.currentStageId);
+  const decisionId = stage ? durableApprovalIds?.get(stage.id) : undefined;
+  return stage && decisionId ? { stage, decisionId } : null;
+}
+
+/**
  * SUP-15805: a board user approves or requests changes on an execution stage on
  * behalf of an (unresponsive or absent) agent participant. Unlike the PATCH
  * decision path this function is NOT bound to `principalsEqual(participant,
@@ -2998,7 +3029,18 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     input.policy.stages.map((stage) => stage.id),
   ).state;
   const currentAssignee = assigneePrincipal(input.issue);
-  const targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  let targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  let reconciledDecisionId: string | null = null;
+  if (!targetStage && input.decision === "approved") {
+    // SUP-25518: no undecided stage remains, but the current stage is still
+    // pending on a durable approval. Apply that approval exactly as it would
+    // have applied when it was recorded; the caller writes no new row.
+    const durablyApproved = resolveDurablyApprovedPendingStage(input.policy, previous, input.durableApprovalIds);
+    if (durablyApproved) {
+      targetStage = durablyApproved.stage;
+      reconciledDecisionId = durablyApproved.decisionId;
+    }
+  }
   if (!targetStage) throw new BoardStageNoUndecidedStageError();
 
   const returnAssignee = resolveReturnAssignee({
@@ -3070,6 +3112,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
       targetStage,
       displacedParticipant,
       workflowControlledAssignment: true,
+      reconciledDecisionId,
     };
   }
 
@@ -3091,6 +3134,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     targetStage,
     displacedParticipant,
     workflowControlledAssignment: true,
+    reconciledDecisionId: null,
   };
 }
 
