@@ -1805,6 +1805,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
   contentionExcludeExecutionWorkspaceId?: string | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<GitWorktreeBranchIncoherenceEvidence> {
   // SUP-11169: a populated directory with no git metadata of its own resolves
   // UPWARD to the enclosing repository, so every `git` call below would answer
@@ -1923,11 +1924,16 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const plainLanguageReason = inProgressOperation
     ? `${basePlainLanguageReason} An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is still in progress in this worktree.`
     : basePlainLanguageReason;
-  // Same-tip and contained-head repairs also move HEAD. A live claimant on
-  // this checkout must keep that HEAD; without a database there is still no
-  // claimant to find.
+  // On managed start, restart, and repair, same-tip and contained-head
+  // repairs also move HEAD, so a live claimant on this checkout keeps that
+  // HEAD. Heartbeat dispatch keeps its earlier repair behaviour.
+  const blockingLiveContention = input.preserveRecordedCheckoutBranch === true ? liveContention : null;
   const canCheckoutRecordedBranch =
-    cleanliness === "clean" && expectedBranchExists && sameHead && registeredBranchMatchesHead && !liveContention;
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    sameHead &&
+    registeredBranchMatchesHead &&
+    !blockingLiveContention;
   const canAdoptForwardActualBranch =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1961,7 +1967,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     input.actualBranchName !== null &&
     ancestryVerdict !== "ancestor" &&
     actualHeadContainedInExpectedBranch &&
-    !liveContention;
+    !blockingLiveContention;
   // SUP-11207: the containment proof above is only *needed* when the commits on HEAD would
   // otherwise become unreachable — a detached HEAD, or a branch ref that no longer exists. When
   // HEAD is on a live named branch that git still resolves, checking out the recorded branch
@@ -2708,6 +2714,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   persistForwardReconcile?: boolean;
   reconcileOperationPhase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<GitWorktreeBranchCoherenceResult> {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
@@ -2729,6 +2736,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     executionWorkspaceId: input.executionWorkspaceId ?? null,
     contentionExcludeExecutionWorkspaceId:
       input.contentionExcludeExecutionWorkspaceId ?? input.executionWorkspaceId ?? null,
+    preserveRecordedCheckoutBranch: input.preserveRecordedCheckoutBranch === true,
   });
 
   if (evidence.reason === WORKTREE_METADATA_MISSING_REASON) {
@@ -6788,6 +6796,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         persistForwardReconcile: false,
         reconcileOperationPhase: "worktree_prepare",
         recorder: input.recorder ?? null,
+        preserveRecordedCheckoutBranch: input.preserveRecordedCheckoutBranch === true,
       });
       if (coherence.branchName) {
         realized.branchName = coherence.branchName;
@@ -10574,7 +10583,7 @@ async function startLocalRuntimeService(
       !started
       && provisioningRecord
       && provisioningRecord.status === "starting"
-      && !(await runtimeServiceRowWasFinalized(input.db, provisioningRecord.id))
+      && !(await driftRefusalStoppedRuntimeServiceRow(input.db, provisioningRecord.id, error))
     ) {
       const nowIso = new Date().toISOString();
       provisioningRecord.status = "failed";
@@ -10588,18 +10597,22 @@ async function startLocalRuntimeService(
 }
 
 /**
- * A refused start that shares the provisioning row id (HTTPS exposure) already
- * saved that row as stopped, with its exposure state and broker handle. The
- * stale in-memory provisioning object must not overwrite it.
+ * A checkout-drift refusal before spawn that shares the provisioning row id
+ * (HTTPS exposure) already saved that row as stopped, with its exposure state
+ * and broker handle. The stale in-memory provisioning object must not
+ * overwrite it. Every other failed start is still recorded as failed.
  */
-async function runtimeServiceRowWasFinalized(db: Db | undefined, id: string) {
+async function driftRefusalStoppedRuntimeServiceRow(db: Db | undefined, id: string, error: unknown) {
   if (!db) return false;
+  if (!(error instanceof WorkspaceRuntimeValidationFailure)) return false;
+  const validation = error.resultJson.workspaceValidation as { reason?: unknown } | undefined;
+  if (validation?.reason !== "checkout_branch_drift") return false;
   const [row] = await db
     .select({ status: workspaceRuntimeServices.status })
     .from(workspaceRuntimeServices)
     .where(eq(workspaceRuntimeServices.id, id))
     .catch(() => []);
-  return row?.status === "stopped" || row?.status === "failed";
+  return row?.status === "stopped";
 }
 
 function scheduleIdleStop(record: RuntimeServiceRecord) {

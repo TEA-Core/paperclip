@@ -1486,4 +1486,72 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       await expect(git(["symbolic-ref", "--short", "HEAD"], protectedFixture.source)).resolves.toBe("branch-b");
     }
   }, 30_000);
+
+  it("keeps heartbeat same-tip repair on a claimed checkout while a managed start still refuses", async () => {
+    async function sameTipClaimedCheckout() {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup24747-heartbeat-claim-"));
+      tempRoots.push(root);
+      const owner = path.join(root, "owner");
+      await git(["init", "-q", "-b", "branch-a", owner], root);
+      await commitFile(owner, "a.txt");
+      await git(["branch", "branch-b"], owner);
+      await git(["checkout", "-q", "-b", "parking"], owner);
+      const source = path.join(root, "source");
+      await git(["worktree", "add", "-q", source, "branch-b"], owner);
+      const scope = await seedCompany();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: scope.companyId,
+        projectId: scope.projectId,
+        title: "Recorded",
+        status: "in_progress",
+        priority: "medium",
+        identifier: `H${issueId.replace(/-/g, "").slice(0, 8).toUpperCase()}`,
+      });
+      await seedCompetitor({ scope, cwd: source, branchName: "branch-b", runStatus: "running" });
+      return { owner, source, issueId };
+    }
+
+    function restore(
+      fixture: { owner: string; source: string; issueId: string },
+      preserveRecordedCheckoutBranch: boolean,
+    ) {
+      return ensurePersistedExecutionWorkspaceAvailable({
+        db,
+        preserveRecordedCheckoutBranch,
+        base: {
+          baseCwd: fixture.owner,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "branch-a",
+        },
+        workspace: {
+          id: randomUUID(),
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: fixture.source,
+          providerRef: fixture.source,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "branch-a",
+          branchName: "branch-a",
+          metadata: { createdByRuntime: true, gitBranchOwnershipVersion: 1 },
+        },
+        issue: { id: fixture.issueId, identifier: null, title: "Recorded" },
+        agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      });
+    }
+
+    const heartbeat = await sameTipClaimedCheckout();
+    await restore(heartbeat, false);
+    await expect(git(["symbolic-ref", "--short", "HEAD"], heartbeat.source)).resolves.toBe("branch-a");
+
+    const managed = await sameTipClaimedCheckout();
+    await expect(restore(managed, true)).rejects.toThrow(/claims the live branch/i);
+    await expect(git(["symbolic-ref", "--short", "HEAD"], managed.source)).resolves.toBe("branch-b");
+  }, 30_000);
 });
