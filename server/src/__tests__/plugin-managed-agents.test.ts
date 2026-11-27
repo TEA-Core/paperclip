@@ -574,6 +574,44 @@ describeEmbeddedPostgres("plugin-managed agents", () => {
     },
   );
 
+  // Fork (two-fleet routing): `runtimeConfig.workDelivery` exempts an agent's
+  // parked cards from recovery sweeps, so a plugin may not set or clear it.
+  function externalPullManifest(): PaperclipPluginManifestV1 {
+    const base = manifest();
+    return {
+      ...base,
+      agents: base.agents!.map((agent) => ({
+        ...agent,
+        runtimeConfig: { ...(agent.runtimeConfig ?? {}), workDelivery: "external_pull" },
+      })),
+    };
+  }
+
+  it("refuses a managed agent declaration that sets external_pull work delivery", async () => {
+    const { companyId, services } = await seedCompanyAndPlugin({ manifest: externalPullManifest() });
+
+    await expect(services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "agent_work_delivery_board_only" },
+    });
+    expect(await db.select().from(agents)).toHaveLength(0);
+  });
+
+  it("keeps a board-set work delivery mode when the plugin resets its managed agent", async () => {
+    const { companyId, services } = await seedCompanyAndPlugin();
+    const created = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: false }, workDelivery: "external_pull" } })
+      .where(eq(agents.id, created.agentId!));
+
+    const reset = await services.agents.managedReset({ companyId, agentKey: "wiki-maintainer" });
+
+    expect(reset.status).toBe("reset");
+    const [row] = await db.select().from(agents).where(eq(agents.id, created.agentId!));
+    expect((row?.runtimeConfig as Record<string, unknown>).workDelivery).toBe("external_pull");
+  });
+
   it("respects board approval policy for new managed agents", async () => {
     const { companyId, services } = await seedCompanyAndPlugin({ requireApproval: true });
 

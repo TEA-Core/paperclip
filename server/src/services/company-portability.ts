@@ -75,6 +75,7 @@ import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/serv
 import { findServerAdapter } from "../adapters/index.js";
 import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
+import { agentWorkDeliveryBoardOnlyError, declaresExternalPullWorkDelivery } from "./agent-work-delivery.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
 import { accessService } from "./access.js";
@@ -758,6 +759,13 @@ type ImportBehaviorOptions = {
   mode?: ImportMode;
   sourceCompanyId?: string | null;
   pauseAutomations?: boolean;
+  /**
+   * Fork (two-fleet routing): true only when a board actor runs the import.
+   * Without it, an import that declares `external_pull` work delivery on an
+   * agent is refused, because that declaration exempts the agent's parked
+   * cards from recovery sweeps.
+   */
+  allowExternalPullWorkDelivery?: boolean;
 };
 
 type AgentLike = {
@@ -5304,6 +5312,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           .filter((entry) => entry.action !== "skip")
           .map((entry) => entry.slug),
       );
+      if (
+        options?.allowExternalPullWorkDelivery !== true
+        && sourceManifest.agents.some((agent) =>
+          importedAgentSlugs.has(agent.slug) && declaresExternalPullWorkDelivery(agent.runtimeConfig))
+      ) {
+        throw agentWorkDeliveryBoardOnlyError();
+      }
       const selectsNativeRunner = sourceManifest.agents.some((agent) =>
         importedAgentSlugs.has(agent.slug)
         && (input.adapterOverrides?.[agent.slug]?.adapterType ?? agent.adapterType)

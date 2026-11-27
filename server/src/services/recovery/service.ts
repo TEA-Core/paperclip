@@ -192,6 +192,13 @@ import {
 import { hydrateSuccessfulRunHandoffLiveness, SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES } from "../successful-run-handoff-state.js";
 import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
+  decideExternalPullRecoveryExemption,
+  EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
+  EXTERNAL_PULL_RECOVERY_NOTICE_REASONS,
+  type ExternalPullRecoveryBoardOnlyReason,
+  type ExternalPullRecoveryExemption,
+} from "./external-pull-exemption.js";
+import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
   TIMER_DISPATCH_PARK_RECOVERY_CAUSE,
@@ -1623,6 +1630,7 @@ export function recoveryService(
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let undispatchableAssignedScanCursor: string | null = null;
+  let stillbornAssignedBacklogScanCursor: string | null = null;
   // Two-cycle confirmation counter (SUP-14565): issueId -> number of sweep
   // cycles the card has been observed with the undispatchable-assigned
   // condition true. Per service instance, so a control-plane restart counts
@@ -1646,6 +1654,135 @@ export function recoveryService(
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  // Fork (two-fleet routing): see external-pull-exemption.ts for the rule. The
+  // owner is keyed on the agent's own declaration (agent-work-delivery.ts), not
+  // on agent ids, and an agent cannot set that declaration itself.
+  async function getExternalPullAgent(
+    companyId: string,
+    agentId: string | null | undefined,
+    runner: Db = db,
+  ) {
+    if (!agentId) return null;
+    const agent = await getAgent(agentId, runner);
+    return agent && agent.companyId === companyId && isExternalPullAgent(agent) ? agent : null;
+  }
+
+  async function isExternalPullRecoveryExemptionBoardCleared(
+    companyId: string,
+    issueId: string,
+    runner: Db = db,
+  ) {
+    const rows = await runner
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  // The exemption clock starts at the card's creation and moves only on
+  // activity by someone other than the owner: a board user, a plugin or
+  // another agent. The owner's own writes (comments, status flips) and
+  // system rows written by recovery itself do not move it, so an owner
+  // cannot keep a parked card exempt by touching it.
+  async function externalPullExemptionClockAt(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "createdAt">,
+    ownerAgentId: string,
+    runner: Db = db,
+  ): Promise<Date> {
+    const [row] = await runner
+      .select({ at: sql<Date | string | null>`max(${activityLog.createdAt})` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          sql`${activityLog.actorType} <> 'system'`,
+          sql`not (${activityLog.actorType} = 'agent' and ${activityLog.agentId} is not distinct from ${ownerAgentId})`,
+        ),
+      );
+    const latest = row?.at ? new Date(row.at) : null;
+    return latest && latest.getTime() > issue.createdAt.getTime() ? latest : issue.createdAt;
+  }
+
+  async function evaluateExternalPullRecoveryExemption(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "createdAt">,
+    ownerAgentId: string | null | undefined,
+    now: Date = new Date(),
+    runner: Db = db,
+  ): Promise<ExternalPullRecoveryExemption> {
+    const owner = await getExternalPullAgent(issue.companyId, ownerAgentId, runner);
+    if (!owner) return { kind: "none" };
+    return decideExternalPullRecoveryExemption({
+      ownerIsExternalPull: true,
+      ownerStatusInvokable: isAgentStatusInvokable(owner.status),
+      issueStatus: issue.status,
+      lastActivityAt: await externalPullExemptionClockAt(issue, owner.id, runner),
+      boardCleared: await isExternalPullRecoveryExemptionBoardCleared(issue.companyId, issue.id, runner),
+      now,
+    });
+  }
+
+  async function postExternalPullRecoveryNotice(
+    input: {
+      issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId">;
+      assignee: Pick<typeof agents.$inferSelect, "id" | "name">;
+      reason: ExternalPullRecoveryBoardOnlyReason | "recovery_exhausted";
+      episodeId: string;
+    },
+    runner: Db = db,
+  ) {
+    const reasonPrefix = `external_pull_recovery_notice:${input.reason}:`;
+    const episodePrefix = `${reasonPrefix}${input.issue.status}:${input.issue.assigneeAgentId ?? "none"}:`;
+    const [latestNotice] = await runner
+      .select({ body: issueComments.body, createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, input.issue.companyId),
+        eq(issueComments.issueId, input.issue.id),
+        eq(issueComments.authorType, "system"),
+        sql`strpos(${issueComments.body}, ${reasonPrefix}) > 0`,
+      ))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(1);
+    if (latestNotice?.body.includes(episodePrefix)) {
+      const [transitionSinceNotice] = await runner
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, input.issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issue.id),
+          gt(activityLog.createdAt, latestNotice.createdAt),
+          sql`(
+            ${activityLog.details}->'_previous'->'status' is not null or
+            ${activityLog.details}->'_previous'->'assigneeAgentId' is not null or
+            ${activityLog.details}->'_previous'->'assigneeUserId' is not null
+          )`,
+        ))
+        .limit(1);
+      if (!transitionSinceNotice) return;
+    }
+    const marker = `${episodePrefix}${input.episodeId}`;
+    await issueService(runner).addComment(
+      input.issue.id,
+      `Recovery notice for ${input.assignee.name}: ${EXTERNAL_PULL_RECOVERY_NOTICE_REASONS[input.reason]} ` +
+        `The card stays assigned to ${input.assignee.name}; no other agent was assigned or woken, and the board owns ` +
+        `the recovery decision. (\`${marker}\`)`,
+      {},
+      { authorType: "system" },
+      runner,
+    );
   }
 
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db): Promise<AgentInvokability> {
@@ -6877,6 +7014,20 @@ export function recoveryService(
         return;
       }
 
+      // Fork (two-fleet routing): a parked card of a live `external_pull` owner
+      // is not stranded. Any other card of such an owner reaches only the
+      // board-owned hold below, never the manager ladder. A dead owner, the age
+      // bound and a board override divert at once; a live owner's active card
+      // first passes the normal live-path guards.
+      const externalPullExemption = await evaluateExternalPullRecoveryExemption(issue, agentId, now);
+      if (externalPullExemption.kind === "exempt") {
+        result.skipped += 1;
+        return;
+      }
+      const externalPullBoardOnly = externalPullExemption.kind === "board_only";
+      const externalPullActiveCard =
+        externalPullExemption.kind === "board_only" && externalPullExemption.reason === "active_card";
+
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       // A native chat can finish between the earlier settlement read and this
       // fresh run read, before its response is materialized. Its trusted
@@ -6964,6 +7115,7 @@ export function recoveryService(
       // at all -- stays on SUP-11085's arm below, grace window and no-status-write
       // guarantee intact.
       if (
+        !externalPullBoardOnly &&
         issue.status !== "in_review" &&
         !agentInvokable &&
         (await hasNativePassiveWaitReceipt(issue, latestRun))
@@ -7000,7 +7152,7 @@ export function recoveryService(
         return;
       }
 
-      if (issue.status !== "in_review" && !agentInvokable) {
+      const openOwnerUnavailableHold = async () => {
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
@@ -7025,10 +7177,15 @@ export function recoveryService(
             agentId,
             msSinceUpdate,
             agentInvokable: agentInvokable,
-            agentInvokabilityReason: agentInvokability.reason,
-            agentInvokabilityMessage: agentInvokability.message,
+            agentInvokabilityReason: agentInvokability.invokable ? null : agentInvokability.reason,
+            agentInvokabilityMessage: agentInvokability.invokable ? null : agentInvokability.message,
+            ...(externalPullExemption.kind === "board_only"
+              ? { externalPullExemptionLapsed: externalPullExemption.reason }
+              : {}),
           },
-          nextAction: "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
+          nextAction: externalPullActiveCard
+            ? "The external-pull assignee still owns this card. Confirm its progress with the assignee, or record an intentional manual resolution."
+            : "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
           wakePolicy: null,
           monitorPolicy: null,
           maxAttempts: null,
@@ -7053,6 +7210,18 @@ export function recoveryService(
             fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
           },
         });
+        if (externalPullExemption.kind === "board_only" && agent) {
+          await postExternalPullRecoveryNotice({
+            issue,
+            assignee: agent,
+            reason: externalPullExemption.reason,
+            episodeId: upserted.id,
+          });
+        }
+      };
+
+      if ((issue.status !== "in_review" && !agentInvokable) || (externalPullBoardOnly && !externalPullActiveCard)) {
+        await openOwnerUnavailableHold();
         return;
       }
 
@@ -7189,6 +7358,11 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
+        return;
+      }
+
+      if (externalPullActiveCard) {
+        await openOwnerUnavailableHold();
         return;
       }
 
@@ -10368,6 +10542,20 @@ export function recoveryService(
       return { kind: "carrier", issueId: reusableRecoveryIssue.id };
     }
 
+    // Fork (two-fleet routing): never mint a ladder-owned recovery card for a
+    // source owned by an `external_pull` agent, whatever its status, age, owner
+    // status or board override; the board action stays the decision item and
+    // the card stays with its owner.
+    const externalPullAssignee = await getExternalPullAgent(input.issue.companyId, input.issue.assigneeAgentId, db);
+    if (externalPullAssignee) {
+      await postExternalPullRecoveryNotice({
+        issue: input.issue,
+        assignee: externalPullAssignee,
+        reason: "recovery_exhausted",
+        episodeId: input.recoveryActionId,
+      }, db);
+      return EXHAUSTED_RECOVERY_UNAVAILABLE;
+    }
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);
     if (!ownerAgentId) return EXHAUSTED_RECOVERY_UNAVAILABLE;
 
@@ -12192,10 +12380,19 @@ export function recoveryService(
       // instead of the action waiting on a human indefinitely.
       let rerouteOwnerAgentId: string | null = null;
       if (wakePolicyType === "board_escalation") {
-        rerouteOwnerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
-          sourceIssue,
-          candidate.previousOwnerAgentId,
+        // Fork (two-fleet routing): an external-pull assignee's card is never
+        // re-homed onto another Paperclip agent, so its board escalation stays
+        // with the board and only walks toward its ceiling.
+        const externalPullAssignee = await getExternalPullAgent(
+          sourceIssue.companyId,
+          sourceIssue.assigneeAgentId,
         );
+        rerouteOwnerAgentId = externalPullAssignee
+          ? null
+          : await resolveStrandedIssueRecoveryOwnerAgentId(
+            sourceIssue,
+            candidate.previousOwnerAgentId,
+          );
         if (!rerouteOwnerAgentId) {
           // Still no invokable owner: burn the attempt so the action walks
           // toward its ceiling instead of re-resolving on every sweep.
@@ -12984,23 +13181,41 @@ export function recoveryService(
     // does not fire against cards still being filed (create → assign → promote).
     const graceCutoff = new Date(Date.now() - STILLBORN_ASSIGNED_BACKLOG_GRACE_MS);
 
-    const candidates = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.status, "backlog"),
-          sql`${issues.assigneeAgentId} is not null`,
-          visibleIssueCondition(),
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-          lt(issues.createdAt, graceCutoff),
-        ),
-      )
-      .orderBy(asc(issues.id))
-      .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
+    const queryCandidates = (afterIssueId: string | null) =>
+      db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "backlog"),
+            sql`${issues.assigneeAgentId} is not null`,
+            visibleIssueCondition(),
+            opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+            lt(issues.createdAt, graceCutoff),
+            afterIssueId ? gt(issues.id, afterIssueId) : undefined,
+          ),
+        )
+        .orderBy(asc(issues.id))
+        .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
+
+    let candidates = await queryCandidates(stillbornAssignedBacklogScanCursor);
+    if (candidates.length === 0 && stillbornAssignedBacklogScanCursor) {
+      stillbornAssignedBacklogScanCursor = null;
+      candidates = await queryCandidates(null);
+    }
+    stillbornAssignedBacklogScanCursor =
+      candidates.length === STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT
+        ? candidates[candidates.length - 1]!.id
+        : null;
 
     for (const candidate of candidates) {
       const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_stillborn_assigned_backlog", async () => {
+      const externalPullExemption = await evaluateExternalPullRecoveryExemption(candidate, candidate.assigneeAgentId);
+      if (externalPullExemption.kind === "exempt") {
+        result.skipped += 1;
+        return;
+      }
+
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
         return;
@@ -13021,6 +13236,7 @@ export function recoveryService(
         previousStatus: "backlog",
         latestRun: null,
         recoveryCause: "stillborn_assigned_backlog",
+        boardEscalation: externalPullExemption.kind === "board_only",
         comment:
           "Paperclip found this issue parked in `backlog` with an assignee but no live execution path, no pending " +
           "wake interaction, and no recorded recovery. Moving it to `blocked` so a human or the assignee rules on it " +

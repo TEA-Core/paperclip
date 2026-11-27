@@ -7203,6 +7203,13 @@ export function issueRoutes(
       if (assignee && DIRECT_NON_INVOKABLE_STATUSES.has(assignee.status)) {
         return null;
       }
+      if (
+        input.trigger === "read_projection" &&
+        input.activeRecoveryAction?.kind === "no_live_path_owner_unavailable" &&
+        input.activeRecoveryAction.evidence?.externalPullExemptionLapsed === "active_card"
+      ) {
+        return null;
+      }
       return `Recovery action became stale because the source issue is ${issue.status} with an agent owner.`;
     }
 

@@ -23,6 +23,10 @@ import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
+import {
+  agentWorkDeliveryBoardOnlyError,
+  hireApprovalPayloadDeclaresExternalPull,
+} from "../services/agent-work-delivery.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -312,6 +316,13 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    if (
+      approvalInput.type === "hire_agent" &&
+      req.actor.type !== "board" &&
+      hireApprovalPayloadDeclaresExternalPull(approvalInput.payload)
+    ) {
+      throw agentWorkDeliveryBoardOnlyError();
+    }
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -538,6 +549,14 @@ export function approvalRoutes(
     if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
       res.status(403).json({ error: "Only requesting agent can resubmit this approval" });
       return;
+    }
+
+    if (
+      existing.type === "hire_agent" &&
+      req.actor.type !== "board" &&
+      hireApprovalPayloadDeclaresExternalPull(req.body.payload)
+    ) {
+      throw agentWorkDeliveryBoardOnlyError();
     }
 
     const normalizedPayload = req.body.payload

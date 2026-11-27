@@ -1001,6 +1001,114 @@ describe("agent permission routes", () => {
     expect(mockAgentService.update).toHaveBeenCalledOnce();
   });
 
+  // Fork (two-fleet routing): `runtimeConfig.workDelivery` exempts an agent's
+  // parked cards from recovery sweeps, so an agent may not change it.
+  describe("work delivery declaration is board-only", () => {
+    const agentActor = { type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" };
+
+    it("refuses an agent that declares external_pull on its own record", async () => {
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { workDelivery: "external_pull" } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("agent_work_delivery_board_only");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses an agent that removes its own external_pull declaration", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { workDelivery: "external_pull" } });
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { heartbeat: { enabled: false } } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("agent_work_delivery_board_only");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses an agent that declares external_pull on a peer", async () => {
+      const app = await createApp({ ...agentActor, agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { workDelivery: "pull" } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("agent_work_delivery_board_only");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("lets an agent change other runtime settings when the declaration stays the same", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, runtimeConfig: { workDelivery: "external_pull" } });
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { workDelivery: "external_pull", heartbeat: { enabled: false } } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledOnce();
+    });
+
+    it("lets the board declare external_pull", async () => {
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { workDelivery: "external_pull" } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledWith(
+        agentId,
+        expect.objectContaining({ runtimeConfig: { workDelivery: "external_pull" } }),
+        expect.anything(),
+      );
+    });
+
+    it("refuses an agent that rolls its own record back to an external_pull revision", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      mockAgentService.getConfigRevision.mockResolvedValue({
+        id: "revision-1",
+        agentId,
+        afterConfig: { adapterType: "claude_local", adapterConfig: {}, runtimeConfig: { workDelivery: "external_pull" } },
+      });
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/config-revisions/revision-1/rollback`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("agent_work_delivery_board_only");
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["direct creation", `/api/companies/${companyId}/agents`],
+      ["hire creation", `/api/companies/${companyId}/agent-hires`],
+    ])("refuses an agent that declares external_pull during %s", async (_label, path) => {
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(path)
+        .send({
+          name: "Pull agent",
+          role: "engineer",
+          adapterType: "claude_local",
+          adapterConfig: {},
+          runtimeConfig: { workDelivery: "external_pull" },
+        }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("agent_work_delivery_board_only");
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    });
+  });
+
   it("allows a provider credential reference without allowing arbitrary environment variables", async () => {
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
     const app = await createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId, source: "agent_key", runId: "run-1" });

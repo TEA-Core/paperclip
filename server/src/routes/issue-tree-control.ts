@@ -8,6 +8,7 @@ import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { conflict } from "../errors.js";
 import { recoveryCarrierParkService } from "../services/recovery-carrier-park.js";
+import { EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION } from "../services/recovery/external-pull-exemption.js";
 import {
   createIssueTreeHoldSchema,
   isUuidLike,
@@ -64,6 +65,34 @@ export function issueTreeControlRoutes(
     const root = await issuesSvc.getById(rootIssueId);
     return root;
   }
+
+  // Fork (two-fleet routing): a board override that clears the external-pull
+  // recovery exemption for one card. The recovery sweeps then surface that
+  // card to the board; they still never re-home it onto another agent. The
+  // activity row is the durable record the sweeps read.
+  router.post("/issues/:id/recovery/external-pull-exemption/clear", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, resolveRootIssue(req), "Issue not found");
+    if (!issue) return;
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      boardApiKeyId: actor.boardApiKeyId,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier,
+        assigneeAgentId: issue.assigneeAgentId,
+      },
+    });
+    res.status(201).json({ issueId: issue.id, exemptionCleared: true });
+  });
 
   router.get("/issues/:id/recovery-carrier-park/candidate", async (req, res) => {
     assertBoard(req);
