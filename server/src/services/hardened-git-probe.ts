@@ -815,7 +815,12 @@ async function verifyCleanLinkedWorktree(
       if (!linkedFile || /[\0\r\n]/.test(linkedFile)) {
         return { ok: false, reason: "has unverifiable linked-worktree registration" };
       }
-      const linkedPath = await realpath(path.isAbsolute(linkedFile) ? linkedFile : `${registeredDir}/${linkedFile}`);
+      const linkedPath = await realpath(path.isAbsolute(linkedFile) ? linkedFile : `${registeredDir}/${linkedFile}`)
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT" && registeredDir !== identity.gitDir) return null;
+          throw error;
+        });
+      if (linkedPath === null) continue;
       const gitfile = await readOptionalRegularFile(linkedPath, MAX_GITDIR_FILE_BYTES);
       const forward = gitfile?.endsWith("\n") ? gitfile.slice(0, -1) : gitfile;
       if (!forward?.startsWith("gitdir: ") || /[\0\r\n]/.test(forward)) {

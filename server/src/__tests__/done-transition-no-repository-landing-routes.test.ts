@@ -780,6 +780,27 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       expect(response.status, JSON.stringify(response.body)).toBe(200);
     });
 
+    it("admits entry beside a deleted, unpruned sibling worktree registration", async () => {
+      const fixture = await reviewFixture();
+      const sibling = `${fixture.worktree}-deleted`;
+      git(fixture.repoRoot, "worktree", "add", "-q", "-b", `${fixture.identifier}-deleted`, sibling, "origin/main");
+      rmSync(sibling, { recursive: true, force: true });
+      expect(git(fixture.repoRoot, "worktree", "list", "--porcelain")).toContain("prunable");
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(await statusOf(fixture.issueId)).toBe("in_review");
+    });
+
+    it("still refuses entry when the submitting tree's own back-pointer target is missing", async () => {
+      const fixture = await reviewFixture();
+      const adminDir = git(fixture.worktree, "rev-parse", "--absolute-git-dir");
+      writeFileSync(path.join(adminDir, "gitdir"), `${path.join(`${fixture.worktree}-missing`, ".git")}\n`);
+      const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.code).toBe("review_entry_git_refused");
+      await noAcceptedEntry(fixture.issueId);
+    });
+
     it("refuses a sibling worktree Git directory borrowed by the submitting tree", async () => {
       const fixture = await reviewFixture();
       const sibling = `${fixture.worktree}-sibling`;
@@ -1565,6 +1586,23 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       .where(eq(issueComments.issueId, fixture.issueId))
       .then((rows) => rows.map((row) => row.body));
     expect(bodies.some((body) => body.includes("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing"))).toBe(true);
+  });
+
+  it("closes a record_only worktree beside a deleted, unpruned sibling worktree registration", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const sibling = `${fixture.worktree}-deleted`;
+    git(fixture.repoRoot, "worktree", "add", "-q", "-b", `${fixture.identifier}-deleted`, sibling, "origin/main");
+    rmSync(sibling, { recursive: true, force: true });
+    expect(git(fixture.repoRoot, "worktree", "list", "--porcelain")).toContain("prunable");
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+    expect(mockRecheckRecordedWorktree).toHaveBeenCalled();
+    expect(await Promise.all(mockRecheckRecordedWorktree.mock.results.map((result) => result.value)))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ ok: true })]));
   });
 
   // SUP-23925: the close measurement runs AFTER the guard evaluator deferred

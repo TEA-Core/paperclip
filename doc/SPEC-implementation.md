@@ -463,8 +463,11 @@ the fence itself. This is not a raw-SQL or host-filesystem physical-alias fence.
 Each linked-worktree admin directory must have a bounded regular `gitdir`
 back-pointer and a consistent forward `.git` pointer to the same admin-directory
 device/inode. The common directory's registered mappings must be unambiguous;
-rewriting both pointers to borrow a sibling's index/HEAD is refused. Stale or
-inconsistent registrations also fail closed. Relative pointers resolve against
+rewriting both pointers to borrow a sibling's index/HEAD is refused. A sibling
+registration whose linked `.git` target is missing (ENOENT, which Git reports as
+prunable) is skipped, because it holds no gitfile that could borrow an admin
+directory. Every other unreadable or inconsistent registration fails closed, and
+the submitting tree always needs its own valid back-pointer. Relative pointers resolve against
 their containing directory, as Git does.
 
 GitHub credentialed reads pin the project's published base to a commit before
