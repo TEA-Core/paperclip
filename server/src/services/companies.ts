@@ -10,6 +10,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   issues,
+  issueReviewEntryReceipts,
   issueComments,
   projects,
   goals,
@@ -35,7 +36,7 @@ import {
   routines,
 } from "@paperclipai/db";
 import { isForeignKeyViolation } from "../db-errors.js";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, reviewEntryReceiptRetained, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { notifyCloudOfPrimaryCompanyLifecycleChange } from "./cloud-lifecycle-sync.js";
 import {
@@ -546,6 +547,9 @@ export function companyService(db: Db) {
       // delete policy) and blocks this delete; answer 409, not a bare 500. Any other
       // foreign-key failure keeps its existing behavior.
       db.transaction(async (tx) => {
+        const [receipt] = await tx.select({ id: issueReviewEntryReceipts.id }).from(issueReviewEntryReceipts)
+          .where(eq(issueReviewEntryReceipts.companyId, id)).limit(1);
+        if (receipt) throw reviewEntryReceiptRetained("Company", receipt.id);
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
@@ -597,6 +601,7 @@ export function companyService(db: Db) {
         if (isForeignKeyViolation(err, "release_assurance_events_")) {
           throw conflict("Company cannot be deleted because release-assurance records still reference it.");
         }
+        if (isForeignKeyViolation(err, "issue_review_entry_receipts_")) throw reviewEntryReceiptRetained("Company", null);
         throw err;
       }),
 

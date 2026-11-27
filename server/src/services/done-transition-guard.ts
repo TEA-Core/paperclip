@@ -3715,7 +3715,7 @@ function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandi
 }
 
 /** Everything the close rests on that the database holds; `probe` aside, the measurement. */
-type NoRepositoryLandingRecord = Omit<
+export type NoRepositoryLandingRecord = Omit<
   NoRepositoryLandingWorktreeMeasurement,
   "proof" | "probe" | "recoverySourceIssueId" | "permittedSourceCard"
 > & {
@@ -4367,7 +4367,7 @@ async function readNoRepositoryLandingRecord(
     return noRepositoryRefusal("requires the project workspace to name its default branch.");
   }
 
-  const ruling = await readEntryRuling(db, issue, closingActor);
+  const ruling = await readEntryRuling(db, issue, closingActor, { lock: options.lockRuling });
   if (!ruling.ok) return ruling;
   const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
   if (linkedWork) return linkedWork;
@@ -4420,6 +4420,16 @@ async function readNoRepositoryLandingRecord(
       ruling: ruling.ruling,
     },
   };
+}
+
+/** Shared database predicates only; review admission does not evaluate a Tier
+ * declaration and cannot create a terminal-close fact. */
+export async function readNoRepositoryReviewEntryRecord(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+  actor: DoneTierClosingActor,
+): Promise<NoRepositoryLandingRead> {
+  return readNoRepositoryLandingRecord(db, issue, actor, { lockRuling: true });
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import { forbidden } from "../errors.js";
+import { PROVISIONED_GIT_ADMIN_IDENTITY_KEY } from "../services/worktree-git-admin-identity.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -91,7 +92,11 @@ export function assertNoAgentProjectWorkspaceSourceMutation(req: Request, paths:
 }
 
 export function collectExecutionWorkspaceIdentityPaths(workspacePatch: unknown, prefix = ""): string[] {
-  return collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName", "baseRef"], prefix);
+  const paths = collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName", "baseRef"], prefix);
+  if (isRecord(workspacePatch)) {
+    paths.push(...collectOwnKeyPaths(workspacePatch.metadata, [PROVISIONED_GIT_ADMIN_IDENTITY_KEY], prefixPath(prefix, "metadata")));
+  }
+  return paths;
 }
 
 export function assertNoAgentExecutionWorkspaceIdentityMutation(req: Request, paths: string[]) {
