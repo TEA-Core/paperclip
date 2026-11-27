@@ -12777,10 +12777,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (input.recoveryPolicy === "create_recovery_issue") {
+      const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}`;
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(
         input.claimed,
       );
-      const reusedRecoveryIssue = recoveryIssue !== null;
+      const reusedRecoveryIssue =
+        recoveryIssue !== null && recoveryIssue.originFingerprint !== recoveryFingerprint;
       if (!recoveryIssue) {
         recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
           title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
@@ -12798,7 +12800,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           assigneeAgentId: input.claimed.assigneeAgentId,
           originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
           originId: input.claimed.id,
-          originFingerprint: `issue_monitor:${input.clearReason}`,
+          originFingerprint: recoveryFingerprint,
           billingCode: input.claimed.billingCode,
         });
       }

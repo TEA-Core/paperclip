@@ -994,6 +994,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         expect(effects.comments).toBe(recoveryPolicy === "escalate_to_board" ? 1 : 0);
         expect(effects.recoveryIssues).toBe(recoveryPolicy === "create_recovery_issue" ? 1 : 0);
         expect(await queuedRecoveryWakeups()).toBe(recoveryPolicy === "escalate_to_board" ? 0 : 1);
+        if (recoveryPolicy === "create_recovery_issue") {
+          expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+          const created = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).find(
+            (row) => row.action === effectAction,
+          );
+          expect(created?.details).toMatchObject({ recoveryIssueReused: false });
+        }
         expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
       },
     );
