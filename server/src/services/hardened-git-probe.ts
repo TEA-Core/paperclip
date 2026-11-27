@@ -788,6 +788,27 @@ type StashScope = Pick<NoRepositoryWorktreeProbeInput, "issueIdentifier" | "attr
 /** `WIP on <branch>: …` or `On <branch>: …`. A branch name holds no space and no colon; `(no branch)` does not match. */
 const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
 
+const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
+
+/**
+ * The stash reflog's text; null when there is none or it is a directory or FIFO
+ * (unreadable evidence, nobody's). `UNVERIFIED_STASH_REFLOG` when it is a
+ * symbolic link (git reads through the link, so its entries are real to git but
+ * are never read here), or a regular file that is over the bound or cannot be
+ * read whole.
+ */
+async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
+  const info = await lstat(file).catch(() => null);
+  if (info?.isSymbolicLink()) return UNVERIFIED_STASH_REFLOG;
+  if (!info?.isFile()) return null;
+  try {
+    return await readOptionalRegularFile(file, MAX_BUFFER);
+  } catch {
+    const unverified = await lstat(file).then((entry) => entry.isFile() || entry.isSymbolicLink(), () => false);
+    return unverified ? UNVERIFIED_STASH_REFLOG : null;
+  }
+}
+
 /**
  * Record-only: why the shared stash holds work stashed on one of this card's
  * branches; null when it holds none.
@@ -831,27 +852,6 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
  * another subject, all record a branch that is not this card's, so they do not
  * refuse. A detached-HEAD stash of this card cannot be told from a sibling's.
  */
-const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
-
-/**
- * The stash reflog's text; null when there is none or it is a directory or FIFO
- * (unreadable evidence, nobody's). `UNVERIFIED_STASH_REFLOG` when it is a
- * symbolic link (git reads through the link, so its entries are real to git but
- * are never read here), or a regular file that is over the bound or cannot be
- * read whole.
- */
-async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
-  const info = await lstat(file).catch(() => null);
-  if (info?.isSymbolicLink()) return UNVERIFIED_STASH_REFLOG;
-  if (!info?.isFile()) return null;
-  try {
-    return await readOptionalRegularFile(file, MAX_BUFFER);
-  } catch {
-    const unverified = await lstat(file).then((entry) => entry.isFile() || entry.isSymbolicLink(), () => false);
-    return unverified ? UNVERIFIED_STASH_REFLOG : null;
-  }
-}
-
 async function cardStashRefusal(
   repoRoot: string,
   commonDir: string,
