@@ -22,8 +22,9 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
  * SUP-25193 (option a): a board-attached landing proof.
  *
  * Some delivered cards cannot reach `done` with any landing proof. Their review
- * stage names only a user (the board seat) and is already completed, and no
- * deliveryIdentity is recorded. Repository landing debt left by a record_only
+ * stage names only a user (the board seat) and is already completed, or the card
+ * was reclassified `record_only` after an agent-reviewed review workflow
+ * completed. No deliveryIdentity is recorded. Repository landing debt left by a record_only
  * reclassification can be discharged only by a proof that `prepareLandingDebtClose`
  * re-measures at the close, and every existing proof needs a live
  * execution-workspace branch. A merged PR's head branch is usually deleted.
@@ -496,12 +497,16 @@ async function listPullRequestCommits(
 }
 
 /**
- * The stuck shape this proof exists for. The workflow is completed, at least one
- * completed review stage names only users, no deliveryIdentity is recorded, and
- * the card is not closed. Returns null when eligible, else the refusal reason.
+ * The stuck shape this proof exists for. The workflow is completed, no
+ * deliveryIdentity is recorded, and the card is not closed. Either at least one
+ * completed review stage names only users, or the card is `record_only` and has
+ * at least one completed review stage with every stage completed or skipped,
+ * whoever its participants are (an agent-reviewed card). Returns null when
+ * eligible, else the refusal reason.
  */
 export function boardLandingProofIneligibility(issue: {
   status: string;
+  deliveryRequirement?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
 }): string | null {
@@ -519,22 +524,31 @@ export function boardLandingProofIneligibility(issue: {
     return "the card's execution workflow is not completed; it still has a live review path";
   }
   const completed = new Set(state.completedStageIds ?? []);
+  const skipped = new Set(state.skippedStageIds ?? []);
   const policy = issue.executionPolicy && typeof issue.executionPolicy === "object"
     ? (issue.executionPolicy as { stages?: unknown })
     : null;
   const stages = Array.isArray(policy?.stages) ? policy.stages : [];
-  const userOnlyCompletedReview = stages.some((stage) => {
-    if (!stage || typeof stage !== "object") return false;
+  const completedReviewStages = stages.flatMap((stage) => {
+    if (!stage || typeof stage !== "object") return [];
     const { id, type, participants } = stage as { id?: unknown; type?: unknown; participants?: unknown };
-    if (type !== "review" || typeof id !== "string" || !completed.has(id)) return false;
-    return Array.isArray(participants) && participants.length > 0 &&
-      participants.every((participant) =>
-        !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "user");
+    if (type !== "review" || typeof id !== "string" || !completed.has(id)) return [];
+    return [{ participants }];
   });
-  if (!userOnlyCompletedReview) {
-    return "the card has no completed review stage that names only a user";
+  const userOnlyCompletedReview = completedReviewStages.some(({ participants }) =>
+    Array.isArray(participants) && participants.length > 0 &&
+    participants.every((participant) =>
+      !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "user"));
+  if (userOnlyCompletedReview) return null;
+  if (issue.deliveryRequirement === "record_only" && completedReviewStages.length > 0) {
+    const everyStageSettled = stages.every((stage) => {
+      const id = stage && typeof stage === "object" ? (stage as { id?: unknown }).id : null;
+      return typeof id === "string" && (completed.has(id) || skipped.has(id));
+    });
+    if (everyStageSettled) return null;
+    return "the card's review workflow still has a stage that is neither approved nor skipped";
   }
-  return null;
+  return "the card has no completed review stage that names only a user, and is not a record_only card with a completed review workflow";
 }
 
 export interface AttachedBoardLandingProof {

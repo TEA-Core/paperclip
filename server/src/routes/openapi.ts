@@ -11303,7 +11303,9 @@ registerCurrentRoute({
   summary: "Attach a GitHub-verified merged-PR landing proof to a delivered card (board only)",
   description:
     "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
-    "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
+    "execution workflow is completed and either has at least one completed review stage naming only users, or is `record_only` " +
+    "with at least one completed review stage whose every stage is approved or skipped, agent participants included, " +
+    "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
     "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +

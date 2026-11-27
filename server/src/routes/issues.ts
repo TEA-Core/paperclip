@@ -14400,7 +14400,8 @@ export function issueRoutes(
   });
 
   // SUP-25193: board-only landing proof. A delivered card whose completed review
-  // stage names only a user, and which records no deliveryIdentity, has no other
+  // stage names only a user (or a record_only card whose review workflow completed
+  // with agent participants), and which records no deliveryIdentity, has no other
   // way to prove its landing, so landing debt from an earlier record_only
   // reclassification blocks `done` for good. The board names the merged PR; the
   // server verifies it against GitHub and records it. Attaching discharges

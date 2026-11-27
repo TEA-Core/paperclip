@@ -562,7 +562,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   });
 
   it.each([
-    ["an agent review stage", { participant: "agent" as const }],
+    ["an agent review stage on a repository_delivery card", { participant: "agent" as const }],
     ["a live (pending) review workflow", { workflow: "pending" as const }],
   ])("refuses a card with %s as not applicable", async (_label, options) => {
     const { issueId } = await seedStuckCard(options);
@@ -570,6 +570,59 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     expect(refused.status, JSON.stringify(refused.body)).toBe(409);
     expect(refused.body.code).toBe("landing_proof_not_applicable");
     expect(await proofRows(issueId)).toHaveLength(0);
+  });
+
+  describe("an agent-reviewed record_only card whose review stage is completed", () => {
+    it("accepts a live-verified merged PR, and the board close then discharges the debt", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(attached.body).toMatchObject({ landingDebtOwed: true, landingDebtDischarged: false, replayed: false });
+      const [proof] = await proofRows(issueId);
+      expect(proof).toMatchObject({ actorType: "user", actorId: "local-board" });
+      const closed = await patch(issueId, { status: "done", comment: "Landing proven by the board-attached PR." });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const [debt] = await debtDispositions(issueId);
+      expect(debt).toMatchObject({
+        landingDebtDisposition: "discharged",
+        landingProof: { head: MERGE_ON_BASE, source: "board_merged_pr", pullRequestNumber: 501 },
+      });
+    });
+
+    it("refuses while the review workflow is not completed", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent", workflow: "pending" });
+      await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it("refuses an agent key, including the assignee holding a live run", async () => {
+      const card = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(card.issueId);
+      await actAsAssigneeRun(card);
+      const refused = await attach(card.issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(403);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+      expect(await workProducts(card.issueId)).toHaveLength(0);
+    });
+
+    it.each([
+      ["an unmerged (open) PR", goodProof({ pullRequestNumber: 502 }), "landing_proof_pr_not_merged", 502],
+      ["a wrong repository", goodProof({ owner: "someone-else" }), "landing_proof_wrong_repo", 501],
+      ["a merge commit not on base", goodProof({ pullRequestNumber: 504, mergeCommitSha: MERGE_OFF_BASE }), "landing_proof_not_on_base", 504],
+    ] as const)("still refuses %s and records nothing", async (_label, body, code, linkedPr) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", boardLinkedPr: linkedPr });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, body);
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe(code);
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+    });
   });
 
   it("refuses a card that already records a deliveryIdentity or is closed", async () => {
