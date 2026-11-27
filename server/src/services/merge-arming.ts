@@ -4040,22 +4040,23 @@ async function resolveMergedBeforeVerdictLanding(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
   if (!issue) return refusal;
-  const reviewedHeadSha = readRecordedReviewedHead(issue.executionState);
-  if (!reviewedHeadSha) {
+  const reviewed = readRecordedReviewedHead(issue.executionState);
+  if (!reviewed) {
     return {
       ...refusal,
       landingProofRefusal: {
         code: "merged_first_reviewed_head_unrecorded",
-        reason: "the control plane recorded no reviewed head (executionState.approvalStatus.approvedHeadSha) for this card",
+        reason: "the control plane recorded no reviewed head with its approval time (executionState.approvalStatus.approvedHeadSha and approvedAt) for this card",
       },
       remedy:
         "every linked pull_request work product is MERGED, but the control plane recorded no reviewed head for this " +
-        "card: executionState.approvalStatus.approvedHeadSha is missing. It is written only when a review stage is " +
-        "approved over a live, certified PR head; work-product metadata.headSha is agent-writable and is not used. " +
-        "This path cannot admit the verdict; close the card with an accepted doneTransitionOverride (disposition " +
-        "merged-elsewhere) instead. Do not open a replacement PR.",
+        "card: executionState.approvalStatus.approvedHeadSha or its approvedAt is missing. It is written only when a " +
+        "review stage is approved over a live, certified PR head; work-product metadata.headSha is agent-writable and " +
+        "is not used. This path cannot admit the verdict; close the card with an accepted doneTransitionOverride " +
+        "(disposition merged-elsewhere) instead. Do not open a replacement PR.",
     };
   }
+  const reviewedHeadSha = reviewed.sha;
   const liveRefusal = (claimLabel: string, pr: { owner: string; repo: string; pullRequestNumber: number }, code: string, reason: string): DecisionHeadResolution => ({
     ...refusal,
     landingProofRefusal: { code, reason },
@@ -4106,6 +4107,13 @@ async function resolveMergedBeforeVerdictLanding(
       return liveRefusal(claim.label, pr, "merged_first_head_not_reviewed",
         `the pull request merged at head ${live.headSha}, not the reviewed head ${reviewedHeadSha} the control plane recorded`);
     }
+    // The reviewed-head record must predate the merge: an attestation written after the merge
+    // did not review the head before it landed. GitHub's merged_at is second-granular, so the
+    // record is compared at second precision and the same second is accepted.
+    if (key === primaryKey && Math.floor(reviewed.approvedAtMs / 1000) * 1000 > mergedAt) {
+      return liveRefusal(claim.label, pr, "merged_first_reviewed_head_after_merge",
+        `the reviewed head ${reviewedHeadSha} was recorded at ${reviewed.approvedAt}, after the pull request merged at ${live.mergedAt}`);
+    }
   }
   if (!latestMergedAt) return refusal;
   // Dynamic: board-landing-proof.ts statically imports this module, so a static import would be circular.
@@ -4136,23 +4144,30 @@ async function resolveMergedBeforeVerdictLanding(
 }
 
 /**
- * SUP-25478: the reviewed head of a merged-first landing, taken only from a
- * record agents cannot write. `executionState` is not part of any issue update
- * validator, so no agent PATCH sets it; the server alone writes it, and
- * `approvalStatus.approvedHeadSha` only from a head it resolved live on GitHub
- * (the final-delivery preflight, the merge-arming anchor, the approval-status
- * reconciler, the board head-approval route). A review-entry delivery record
- * is not used: a branch-only record carries a head the agent asserted, and a
- * live-verified bound-PR record routes the decision-head resolver to the
- * bound PR, so this `no-pr` path never sees it. Work-product
- * `metadata.headSha` is agent-writable and is never used.
+ * SUP-25478: the reviewed head of a merged-first landing and the time it was
+ * recorded, taken only from a record agents cannot write. `executionState` is
+ * not part of any issue update validator, so no agent PATCH sets it; the
+ * server alone writes it, and `approvalStatus.approvedHeadSha` only from a
+ * head it resolved live on GitHub (the final-delivery preflight, the
+ * merge-arming anchor, which also stamps `approvedAt`, the approval-status
+ * reconciler, the board head-approval route). A
+ * review-entry delivery record is not used: a branch-only record carries a
+ * head the agent asserted, and a live-verified bound-PR record routes the
+ * decision-head resolver to the bound PR, so this `no-pr` path never sees it.
+ * Work-product `metadata.headSha` is agent-writable and is never used. A head
+ * without a readable `approvedAt` is not a usable record.
  */
-function readRecordedReviewedHead(executionState: unknown): string | null {
+function readRecordedReviewedHead(
+  executionState: unknown,
+): { sha: string; approvedAt: string; approvedAtMs: number } | null {
   const state = executionState && typeof executionState === "object" ? executionState as Record<string, unknown> : {};
   const approval = state.approvalStatus && typeof state.approvalStatus === "object"
     ? state.approvalStatus as Record<string, unknown>
     : {};
-  return readFullSha(approval.approvedHeadSha);
+  const sha = readFullSha(approval.approvedHeadSha);
+  const approvedAt = typeof approval.approvedAt === "string" ? approval.approvedAt : null;
+  const approvedAtMs = approvedAt ? Date.parse(approvedAt) : Number.NaN;
+  return sha && approvedAt && Number.isFinite(approvedAtMs) ? { sha, approvedAt, approvedAtMs } : null;
 }
 
 /** A full 40-hex SHA, lower-cased, or null. */

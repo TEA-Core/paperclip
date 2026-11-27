@@ -874,6 +874,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     type Product = { number: number; status: string; isPrimary: boolean; metadata: Record<string, unknown>; externalId?: string };
     const REPO_ID = 4242;
     const MERGED_AT = "2026-11-27T16:16:00Z";
+    // The control plane recorded the reviewed head before the merge.
+    const REVIEWED_AT = "2026-11-27T16:10:00.000Z";
     // GitHub's live view of the delivery PRs: each one merged from TEA-Core/paperclip
     // into its main branch, before the verdict, with the merge commit its work product records.
     const livePull = (number: number, mergeCommit: string) => ({
@@ -887,7 +889,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     async function mergedFirstReview(
       fixture: Awaited<ReturnType<typeof pendingDelivery>>,
       products: Product[],
-      { pulls = {}, boardWritten = true, reviewedHeadSha = HEAD_SHA }: {
+      { pulls = {}, boardWritten = true, reviewedHeadSha = HEAD_SHA, reviewedAt = REVIEWED_AT }: {
         /**
          * Live GitHub answers per PR number; a PR absent here reads as merged with its recorded
          * merge commit. An Error is thrown by the fetch (a network failure or timeout).
@@ -897,6 +899,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         boardWritten?: boolean;
         /** The reviewed head the control plane certified (executionState.approvalStatus.approvedHeadSha); null records none. */
         reviewedHeadSha?: string | null;
+        /** When the control plane recorded that head (approvalStatus.approvedAt); null records none. */
+        reviewedAt?: string | null;
       } = {},
     ) {
       const reviewer = await seedAgent(db, fixture.company.id);
@@ -916,7 +920,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           ...initial.executionState,
           currentParticipant: participant,
           ...(reviewedHeadSha
-            ? { approvalStatus: { ...(initial.executionState as Record<string, any>)?.approvalStatus, approvedHeadSha: reviewedHeadSha } }
+            ? {
+                approvalStatus: {
+                  ...(initial.executionState as Record<string, any>)?.approvalStatus,
+                  approvedHeadSha: reviewedHeadSha,
+                  ...(reviewedAt ? { approvedAt: reviewedAt } : {}),
+                },
+              }
             : {}),
         },
       }).where(eq(issues.id, fixture.issue.id));
@@ -1120,6 +1130,46 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         landingProofRefusal: { code: "merged_first_reviewed_head_unrecorded" },
         remedy: expect.stringContaining("approvalStatus.approvedHeadSha"),
       });
+    });
+
+    it("refuses when the reviewed head was recorded after the primary pull request merged", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        reviewedAt: "2026-11-27T16:17:00.000Z",
+      });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: {
+          code: "merged_first_reviewed_head_after_merge",
+          reason: expect.stringContaining("2026-11-27T16:17:00.000Z"),
+        },
+      });
+    });
+
+    it("refuses a recorded reviewed head that carries no approval time", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        reviewedAt: null,
+      });
+
+      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+        landingProofRefusal: { code: "merged_first_reviewed_head_unrecorded", reason: expect.stringContaining("approvedAt") },
+      });
+    });
+
+    // GitHub's merged_at is second-granular, so a record in the same second as the merge is accepted.
+    it.each([
+      ["in the same second as the merge", "2026-11-27T16:16:00.400Z"],
+      ["exactly at the merge", "2026-11-27T16:16:00.000Z"],
+      ["before the merge", "2026-11-27T16:15:59.000Z"],
+    ])("accepts a reviewed head recorded %s", async (_label, reviewedAt) => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], { reviewedAt });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect((await fixture.read()).status).toBe("done");
     });
 
     it.each([
