@@ -11261,7 +11261,7 @@ registerCurrentRoute({
     "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
     "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
     "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
-    "(it is linked to the card by a `pull_request` work product the attach did not create or by a linked external object, or its " +
+    "(it is linked to the card by a `pull_request` work product the attach did not create or by a linked external object, or " +
     "a delivery commit recorded on the card is its head or merge commit or one of the PR's own commits; a head branch name is not a tie; otherwise 422 " +
     "`landing_proof_not_card_delivery`), and the " +
     "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
