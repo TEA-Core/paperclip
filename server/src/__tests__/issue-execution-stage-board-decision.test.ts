@@ -1077,14 +1077,17 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(calls[0]!.issueId).toBe(issueId);
   });
 
-  it("skips a stage that already has a durable approved decision row", async () => {
+  it("reconciles a drifted first stage from its durable approved row and re-pends the second stage", async () => {
     const { companyId, issueId } = await seedIssue({ twoStages: true });
     currentActor = boardActor(companyId);
-    // The projection can lose completedStageIds (a board `done` PATCH clears it)
-    // while the durable approved row survives. The target selector must consult
-    // the row and never re-decide the stage.
+    const secondStageAgentId = "66666666-6666-4666-8666-666666666666";
+    // The drift shape: stage 1 carries a durable approved row while the
+    // projection is still pending on it (lastDecisionId null). The board
+    // approval applies that recorded approval to stage 1 only and hands
+    // stage 2 to its own participant.
+    const durableDecisionId = "77777777-7777-4777-8777-777777777777";
     await db.insert(issueExecutionDecisions).values({
-      id: "77777777-7777-4777-8777-777777777777",
+      id: durableDecisionId,
       companyId,
       issueId,
       stageId: STAGE_ID,
@@ -1098,16 +1101,29 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: reconcile the recorded approval" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.stageId).toBe(SECOND_STAGE_ID);
+    expect(res.body.stageId).toBe(STAGE_ID);
+    expect(res.body.decisionId).toBe(durableDecisionId);
+    expect(res.body.reconciled).toBe(true);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    expect(row!.assigneeAgentId).toBe(secondStageAgentId);
+    expect(row!.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: SECOND_STAGE_ID,
+      currentParticipant: { type: "agent", agentId: secondStageAgentId },
+      completedStageIds: [STAGE_ID],
+      lastDecisionId: durableDecisionId,
+    });
 
     const decisions = await db
       .select()
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
-    expect(decisions).toHaveLength(2);
+    expect(decisions.map((decision) => decision.id)).toEqual([durableDecisionId]);
   });
 
   it("completes a pending stage from its durable approved row instead of refusing no_undecided_stage", async () => {

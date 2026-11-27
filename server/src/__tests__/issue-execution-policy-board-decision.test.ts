@@ -461,6 +461,55 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     );
   });
 
+  it("reconciles a drifted non-final stage and re-pends the next stage for its own participant", () => {
+    const policy = twoStagePolicy();
+    const reviewStage = policy.stages[0];
+    const approvalStage = policy.stages[1];
+    const durableDecisionId = "d1000000-0000-4000-8000-000000000002";
+
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: reconcile stage 1",
+      decidedStageIds: [reviewStage.id],
+      durableApprovalIds: new Map([[reviewStage.id, durableDecisionId]]),
+    });
+
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.decision.stageId).toBe(reviewStage.id);
+    expect(result.reconciledDecisionId).toBe(durableDecisionId);
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeUserId).toBe(ctoUserId);
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStage.id,
+      currentStageType: "approval",
+      currentParticipant: { type: "user", userId: ctoUserId, agentId: null },
+      completedStageIds: [reviewStage.id],
+    });
+  });
+
   it("clears a workflow-controlled assignee when the final stage has no return assignee", () => {
     const policy = reviewOnlyPolicy();
     const reviewStage = policy.stages[0];

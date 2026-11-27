@@ -2892,9 +2892,9 @@ export interface BoardStageDecisionInput {
   actorUserId?: string | null;
   /**
    * SUP-25518: the id of the latest durable `approved` row for each stage in
-   * `decidedStageIds`. An approval that finds no undecided stage while the
-   * current stage is still pending reconciles the projection from this row
-   * instead of refusing, and writes no second decision row.
+   * `decidedStageIds`. An approval whose current stage is still pending on
+   * such a row reconciles that stage from this row before any later stage is
+   * targeted, and writes no second decision row.
    */
   durableApprovalIds?: ReadonlyMap<string, string>;
 }
@@ -3029,18 +3029,17 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     input.policy.stages.map((stage) => stage.id),
   ).state;
   const currentAssignee = assigneePrincipal(input.issue);
-  let targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
-  let reconciledDecisionId: string | null = null;
-  if (!targetStage && input.decision === "approved") {
-    // SUP-25518: no undecided stage remains, but the current stage is still
-    // pending on a durable approval. Apply that approval exactly as it would
-    // have applied when it was recorded; the caller writes no new row.
-    const durablyApproved = resolveDurablyApprovedPendingStage(input.policy, previous, input.durableApprovalIds);
-    if (durablyApproved) {
-      targetStage = durablyApproved.stage;
-      reconciledDecisionId = durablyApproved.decisionId;
-    }
-  }
+  // SUP-25518: an approval on a current stage still pending on a durable
+  // approval applies that recorded approval exactly as it would have applied
+  // when it was recorded, before any later stage is targeted, so a later
+  // stage's own approver is never skipped; the caller writes no new row.
+  const durablyApproved =
+    input.decision === "approved"
+      ? resolveDurablyApprovedPendingStage(input.policy, previous, input.durableApprovalIds)
+      : null;
+  const targetStage =
+    durablyApproved?.stage ?? resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  const reconciledDecisionId = durablyApproved?.decisionId ?? null;
   if (!targetStage) throw new BoardStageNoUndecidedStageError();
 
   const returnAssignee = resolveReturnAssignee({
