@@ -178,6 +178,41 @@ describe("same-source hygiene leaves the bound checkout alone", () => {
     await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(fixture.commitX);
   }, 30_000);
 
+  it("does not force-checkout the bound checkout when the workspace runs from a subdirectory of it", async () => {
+    const fixture = await makeLinkedSource();
+    const app = path.join(fixture.source, "app");
+    await fs.mkdir(app);
+    await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: fixture.source,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "branch-b",
+      },
+      workspace: {
+        id: "execution-workspace-1",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: app,
+        providerRef: fixture.source,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "branch-b",
+        branchName: "branch-a",
+        metadata: { createdByRuntime: true, gitBranchOwnershipVersion: 1 },
+      },
+      issue: { id: "issue-1", identifier: null, title: "Bound source" },
+      agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      preserveRecordedCheckoutBranch: true,
+    }).catch(() => null);
+
+    await expect(git(["symbolic-ref", "--short", "HEAD"], fixture.source)).resolves.toBe("branch-a");
+    await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(fixture.commitX);
+  }, 30_000);
+
   it("does not require git for an ordinary non-git project directory", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sup24747-nongit-"));
     tempRoots.push(dir);
@@ -310,6 +345,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     baseRef: string;
     projectCwd?: string | null;
     provisionCommand?: string | null;
+    runtimeProvisionCommand?: string | null;
     serviceCommand?: string | null;
     runtimeOwned?: boolean;
     strategyType?: string;
@@ -358,6 +394,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
           : {}),
         config: {
           provisionCommand: input.provisionCommand ?? null,
+          runtimeProvisionCommand: input.runtimeProvisionCommand ?? null,
           workspaceRuntime: input.workspaceRuntime ?? (input.serviceCommand
             ? {
                 services: [{
@@ -467,10 +504,12 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     return `${quoteShell(process.execPath)} -e ${quoteShell(script)}`;
   }
 
-  /** A refusal is a client error with a message, never an unhandled 500. */
-  function expectCleanRefusal(res: { status: number; body: unknown }) {
-    expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
-    expect(res.status, JSON.stringify(res.body)).toBeLessThan(500);
+  /** A drift refusal is a 409 that carries its reason code, never a 500 or another 4xx. */
+  function expectDriftRefusal(res: { status: number; body: unknown }, reasonCode: string) {
+    const body = res.body as { details?: { code?: unknown; reasonCode?: unknown } };
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(body.details?.code, JSON.stringify(res.body)).toBe("checkout_branch_drift");
+    expect(body.details?.reasonCode, JSON.stringify(res.body)).toBe(reasonCode);
   }
 
   async function expectNoStartingRuntimeRows() {
@@ -510,7 +549,8 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     expect(row?.branchName).toBe("branch-a");
     expect(branch, `start status ${res.status} left the checkout on ${branch}@${sha}`).toBe("branch-a");
     expect(sha).toBe(fixture.commitX);
-    if (res.status < 300) expect(branch).toBe("branch-a");
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
   }, 30_000);
 
   it("fails before spawn when provisioning moves the checkout, and an unchanged checkout still starts", async () => {
@@ -532,7 +572,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
       .send({});
 
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expectDriftRefusal(res, "branch_mismatch");
     await expect(fs.stat(started)).rejects.toThrow();
     const row = await db.select({ branchName: executionWorkspaces.branchName })
       .from(executionWorkspaces)
@@ -657,11 +697,30 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         await git(["tag", "v1-tag", "branch-a"], f.owner);
       },
     },
+    {
+      label: "a deleted branch shadowed by a tag named like its full ref, with HEAD detached at that tag",
+      recordedRef: "gone-topic",
+      reasonCode: "recorded_ref_missing",
+      prepare: async (f: LinkedSource) => {
+        // `refs/tags/refs/heads/gone-topic`: revision parsing of
+        // `refs/heads/gone-topic` falls back to it when the branch is gone.
+        await git(["tag", "refs/heads/gone-topic", "branch-a"], f.owner);
+        await git(["checkout", "-q", "--detach", "branch-a"], f.source);
+      },
+    },
+    {
+      label: "an unborn branch that HEAD names but no ref holds",
+      recordedRef: "unborn-topic",
+      reasonCode: "recorded_ref_missing",
+      prepare: async (f: LinkedSource) => {
+        await git(["checkout", "-q", "--orphan", "unborn-topic"], f.source);
+      },
+    },
   ])("refuses a start when the recorded ref is $label", async ({ recordedRef, reasonCode, prepare }) => {
     const fixture = await makeLinkedSource();
     await prepare(fixture);
     const headRefBefore = await git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null);
-    const headBefore = await git(["rev-parse", "HEAD"], fixture.source);
+    const headBefore = await git(["rev-parse", "--verify", "--quiet", "HEAD"], fixture.source).catch(() => null);
     const scope = await seedCompany();
     const started = path.join(fixture.root, "started");
     const seeded = await seedWorkspace({
@@ -678,11 +737,12 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
       .send({});
 
-    expectCleanRefusal(res);
+    expectDriftRefusal(res, reasonCode);
     await expect(fs.stat(started)).rejects.toThrow();
     await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null))
       .resolves.toBe(headRefBefore);
-    await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(headBefore);
+    await expect(git(["rev-parse", "--verify", "--quiet", "HEAD"], fixture.source).catch(() => null))
+      .resolves.toBe(headBefore);
     const row = await db.select({ branchName: executionWorkspaces.branchName })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.workspaceId))
@@ -693,6 +753,76 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     expect(evidence).toContain(seeded.workspaceId);
     expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
     await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  it("returns the pre-spawn refusal while the start transaction holds the workspace row lock", async () => {
+    const fixture = await makeLinkedSource();
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    // Runtime provisioning runs after restore and before the start
+    // transaction, so only the pre-spawn check inside that transaction sees it.
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: "branch-a",
+      baseRef: "branch-a",
+      projectCwd: null,
+      strategyType: "project_primary",
+      provisionCommand: "true",
+      runtimeProvisionCommand: "git checkout -q branch-b",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .timeout({ response: 20_000 })
+      .send({});
+
+    expectDriftRefusal(res, "branch_mismatch");
+    await expect(fs.stat(started)).rejects.toThrow();
+    const evidence = await operationText(seeded.workspaceId);
+    expect(evidence).toContain("checkoutBranchDrift");
+    expect(evidence).toContain(fixture.commitY);
+    expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+    await expectNoStartingRuntimeRows();
+  }, 30_000);
+
+  it("does not rebind the recorded branch to the default branch during a managed start", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup24747-rebind-"));
+    tempRoots.push(root);
+    const owner = path.join(root, "owner");
+    await git(["init", "-q", "-b", "main", owner], root);
+    await commitFile(owner, "a.txt");
+    await git(["branch", "topic"], owner);
+    await git(["checkout", "-q", "-b", "parking"], owner);
+    const source = path.join(root, "source");
+    await git(["worktree", "add", "-q", source, "topic"], owner);
+    // The runtime-owned branch is deleted and the clean worktree sits on the
+    // default branch: the shape the default-branch rebind repairs.
+    await git(["switch", "-q", "main"], source);
+    await git(["branch", "-D", "topic"], owner);
+    const scope = await seedCompany();
+    const started = path.join(root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: source,
+      branchName: "topic",
+      baseRef: "main",
+      projectCwd: owner,
+      runtimeOwned: true,
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+    await expect(fs.stat(started)).rejects.toThrow();
+    const row = await db.select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.workspaceId))
+      .then((rows) => rows[0]);
+    expect(row?.branchName).toBe("topic");
   }, 30_000);
 
   it("refuses a legacy git_worktree row with no recorded branch and names the reprovision remedy", async () => {
@@ -712,7 +842,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
       .send({});
 
-    expectCleanRefusal(res);
+    expectDriftRefusal(res, "recorded_branch_metadata_missing");
     await expect(fs.stat(started)).rejects.toThrow();
     await expect(git(["symbolic-ref", "--short", "HEAD"], fixture.source)).resolves.toBe("branch-a");
     const evidence = await operationText(seeded.workspaceId);
@@ -879,6 +1009,194 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       return { fixture, scope, seeded };
     }
 
+    function installFakeBroker(input: { appPort: number; includeHmr: boolean; removeFails?: boolean }) {
+      const brokerCalls: string[] = [];
+      const reserved = new Map<string, BrokerListenerRequest[]>();
+      const broker: BrokerClient = {
+        async reserve(runtimeId, requested) {
+          brokerCalls.push("reserve");
+          const handle = `handle-${runtimeId}`;
+          reserved.set(handle, requested);
+          return { handle, reservedPorts: requested.map((listener) => listener.port) };
+        },
+        async expose(_runtimeId, handle) {
+          brokerCalls.push("expose");
+          return { handle, publicPorts: (reserved.get(handle) ?? []).map((listener) => listener.port) };
+        },
+        async remove(_runtimeId, handle) {
+          brokerCalls.push("remove");
+          if (input.removeFails) throw new Error("broker unavailable");
+          const listeners = reserved.get(handle) ?? [];
+          reserved.delete(handle);
+          return { removedPorts: listeners.map((listener) => listener.port) };
+        },
+        async list() {
+          return [];
+        },
+      };
+      setWorkspaceRuntimeExposureDepsForTests({
+        broker,
+        isPortAvailable: async (port) =>
+          port === input.appPort || (input.includeHmr && port === deriveViteHmrPort(input.appPort)),
+        isBrokerAvailable: async () => true,
+        resolveHostname: async () => "runner.tail123.ts.net",
+        probeHealth: async () => true,
+        now: () => new Date().toISOString(),
+        diagnoseListenerBinds: async () => null,
+      });
+      return { brokerCalls, reserved };
+    }
+
+    async function withHttpsMode<T>(run: () => Promise<T>) {
+      const previousHttpsMode = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "auto";
+      try {
+        return await run();
+      } finally {
+        if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+        else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
+      }
+    }
+
+    async function freeExposureAppPort(offset: number) {
+      for (let port = RUNTIME_EXPOSURE_APP_PORT_MIN + offset; port < RUNTIME_EXPOSURE_APP_PORT_MIN + offset + 200; port += 1) {
+        const free = await new Promise<boolean>((resolve) => {
+          const probe = net.createServer();
+          probe.once("error", () => resolve(false));
+          probe.listen(port, "127.0.0.1", () => probe.close(() => resolve(true)));
+        });
+        if (free) return port;
+      }
+      throw new Error("no free exposure app port");
+    }
+
+    const exposeConfig = {
+      type: "tailscale_https",
+      hostname: "auto",
+      publicPort: "same",
+      includePaperclipViteHmr: false,
+      failurePolicy: "fail_closed",
+    } as const;
+
+    it("keeps the HTTPS rollback record when runtime provisioning shares its row and removal is pending", async () => {
+      await withHttpsMode(async () => {
+        const appPort = RUNTIME_EXPOSURE_APP_PORT_MIN + 720;
+        const broker = installFakeBroker({ appPort, includeHmr: true, removeFails: true });
+        const { fixture, scope, seeded } = await driftedWorkspace();
+        const started = path.join(fixture.root, "started");
+        const input = controlInput({
+          scope,
+          fixture,
+          executionWorkspaceId: seeded.workspaceId,
+          service: {
+            name: "preview",
+            command: httpCommand(started),
+            port: { type: "auto", envKey: "PORT" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            expose: exposeConfig,
+          },
+        });
+
+        await expect(startRuntimeServicesForWorkspaceControl({
+          ...input,
+          config: { ...input.config, runtimeProvisionCommand: "true" },
+        })).rejects.toThrow(/Managed checkout branch drift/);
+
+        expect(broker.brokerCalls).toContain("remove");
+        const rows = await db.select().from(workspaceRuntimeServices)
+          .where(eq(workspaceRuntimeServices.executionWorkspaceId, seeded.workspaceId));
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.status).toBe("stopped");
+        // The broker still holds the reservation, so its handle must survive.
+        expect((rows[0]?.exposure as { state?: string } | null)?.state).toBe("cleanup_pending");
+        expect(rows[0]?.exposureHandle).toBeTruthy();
+      });
+    }, 30_000);
+
+    it("refuses readiness-time drift before the broker publishes the backend", async () => {
+      await withHttpsMode(async () => {
+        const appPort = await freeExposureAppPort(800);
+        const broker = installFakeBroker({ appPort, includeHmr: true });
+        const fixture = await makeLinkedSource();
+        const scope = await seedCompany();
+        const seeded = await seedWorkspace({
+          scope,
+          cwd: fixture.source,
+          branchName: "branch-a",
+          baseRef: "branch-a",
+          projectCwd: null,
+          strategyType: "project_primary",
+        });
+        const barrierServer = net.createServer();
+        await new Promise<void>((resolve) => barrierServer.listen(0, "127.0.0.1", () => resolve()));
+        const barrierAddress = barrierServer.address();
+        if (!barrierAddress || typeof barrierAddress === "string") throw new Error("barrier port missing");
+        const connected = new Promise<net.Socket>((resolve) => barrierServer.once("connection", resolve));
+        try {
+          const pending = startRuntimeServicesForWorkspaceControl(controlInput({
+            scope,
+            fixture,
+            executionWorkspaceId: seeded.workspaceId,
+            service: {
+              name: "preview",
+              command: barrierCommand({ barrierPort: barrierAddress.port, exitAfterRelease: false }),
+              port: { type: "auto", envKey: "PORT" },
+              readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 15, intervalMs: 50 },
+              expose: exposeConfig,
+            },
+          }));
+          pending.catch(() => undefined);
+          const socket = await Promise.race([
+            connected,
+            pending.then(() => {
+              throw new Error("start finished before the service reached the barrier");
+            }),
+          ]);
+          await git(["checkout", "-q", "branch-b"], fixture.source);
+          socket.write("x");
+          await expect(pending).rejects.toThrow(/Managed checkout branch drift/);
+          socket.destroy();
+        } finally {
+          barrierServer.close();
+        }
+        expect(broker.brokerCalls).toContain("reserve");
+        expect(broker.brokerCalls).not.toContain("expose");
+      });
+    }, 45_000);
+
+    it("keeps the original startup error when the drift recheck cannot read the checkout", async () => {
+      const fixture = await makeLinkedSource();
+      const scope = await seedCompany();
+      const seeded = await seedWorkspace({
+        scope,
+        cwd: fixture.source,
+        branchName: "branch-a",
+        baseRef: "branch-a",
+        projectCwd: null,
+        strategyType: "project_primary",
+      });
+      try {
+        // The service locks the checkout's parent directory and exits before
+        // readiness, so the recheck in the failure path gets EACCES.
+        await expect(startRuntimeServicesForWorkspaceControl(controlInput({
+          scope,
+          fixture,
+          executionWorkspaceId: seeded.workspaceId,
+          service: {
+            name: "web",
+            command: `chmod 000 ${quoteShell(fixture.root)}; exit 2`,
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            lifecycle: "shared",
+            reuseScope: "execution_workspace",
+            stopPolicy: { type: "manual" },
+          },
+        }))).rejects.toThrow(/exited before readiness/);
+      } finally {
+        await fs.chmod(fixture.root, 0o755);
+      }
+    }, 30_000);
+
     it("releases the in-process port claim", async () => {
       const { fixture, scope, seeded } = await driftedWorkspace();
       const started = path.join(fixture.root, "started");
@@ -1033,22 +1351,27 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
           exitAfterRelease,
         }),
       });
-      const pending = request(app())
-        .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
-        .send({});
-      const pid = await Promise.race([
-        barrier.pid,
-        pending.then(async (early) => {
-          throw new Error(
-            `service never reached the barrier: ${early.status} ${JSON.stringify(early.body)} ${await operationText(seeded.workspaceId)}`,
-          );
-        }),
-      ]);
-      await git(["checkout", "-q", "branch-b"], fixture.source);
-      barrier.release();
-      const res = await pending;
-      barrier.close();
-      expect(res.status).toBeGreaterThanOrEqual(400);
+      let pid!: number;
+      let res!: request.Response;
+      try {
+        const pending = request(app())
+          .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+          .send({});
+        pid = await Promise.race([
+          barrier.pid,
+          pending.then(async (early) => {
+            throw new Error(
+              `service never reached the barrier: ${early.status} ${JSON.stringify(early.body)} ${await operationText(seeded.workspaceId)}`,
+            );
+          }),
+        ]);
+        await git(["checkout", "-q", "branch-b"], fixture.source);
+        barrier.release();
+        res = await pending;
+      } finally {
+        barrier.close();
+      }
+      expectDriftRefusal(res, "branch_mismatch");
       expect(() => process.kill(pid, 0)).toThrow();
 
       const row = await db.select({ branchName: executionWorkspaces.branchName })

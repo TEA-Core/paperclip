@@ -3870,24 +3870,23 @@ async function assertRecordedCheckoutBranchIdentity(input: {
 
   const expectedRef = expectedRaw ? recordedBranchFullRef(expectedRaw) : null;
   let reasonCode: CheckoutBranchDriftReasonCode;
-  let expectedTipSha: string | null = null;
+  // `show-ref --verify` reads only the exact ref. Revision parsing would fall
+  // back to a tag such as `refs/tags/refs/heads/<name>` when the branch is gone,
+  // and an unborn HEAD can name a branch that has no ref at all.
+  const expectedTipSha = expectedRef
+    ? await runGit(["show-ref", "--verify", "--hash", expectedRef], identity.canonicalCwd).catch(() => null)
+    : null;
   if (!expectedRef) {
     reasonCode = "recorded_branch_metadata_missing";
+  } else if (!expectedTipSha) {
+    reasonCode = "recorded_ref_missing";
   } else if (identity.headRef === expectedRef) {
     return;
+  } else if (identity.headRef === null) {
+    if (identity.headSha === expectedTipSha) return;
+    reasonCode = "detached_head_off_recorded_tip";
   } else {
-    expectedTipSha = await runGit(
-      ["rev-parse", "--verify", "--quiet", `${expectedRef}^{commit}`],
-      identity.canonicalCwd,
-    ).catch(() => null);
-    if (!expectedTipSha) {
-      reasonCode = "recorded_ref_missing";
-    } else if (identity.headRef === null) {
-      if (identity.headSha === expectedTipSha) return;
-      reasonCode = "detached_head_off_recorded_tip";
-    } else {
-      reasonCode = "branch_mismatch";
-    }
+    reasonCode = "branch_mismatch";
   }
 
   const evidence: CheckoutBranchDriftEvidence = {
@@ -5722,9 +5721,14 @@ function sameSourceCheckoutRestoreGuard(input: {
   hygieneRoot: string;
 }): BaseRepoRestoreGuard {
   return async () => {
-    const source = await resolvePathForWorktreeComparison(input.sourceCwd);
     const root = await resolvePathForWorktreeComparison(input.hygieneRoot);
-    if (source === root) {
+    const source = await resolvePathForWorktreeComparison(input.sourceCwd);
+    // A workspace can run from a subdirectory of its checkout. The checkout
+    // root is what hygiene would force-checkout, so compare that too.
+    const sourceTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.sourceCwd)
+      .then((value) => resolvePathForWorktreeComparison(value))
+      .catch(() => null);
+    if (source === root || sourceTopLevel === root) {
       return "it is the bound source checkout, not a disposable base repository";
     }
     return null;
@@ -9595,6 +9599,11 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
+  // These checks run while the start transaction holds the execution
+  // workspace row `FOR UPDATE`. A recorder insert on its own connection needs a
+  // key-share lock on that row and would wait on this transaction forever, so
+  // the refusal carries its evidence on the thrown error instead; the outer
+  // workspace operation records it when it fails.
   const assertSpawnCheckoutBranch = async () => {
     if (input.assertRecordedCheckoutBranch !== true) return;
     await assertRecordedCheckoutBranchIdentity({
@@ -9602,7 +9611,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       expectedBranch: input.workspace.branchName,
       strategy: input.workspace.strategy,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
-      recorder: input.recorder ?? null,
+      recorder: null,
     });
   };
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
@@ -10212,6 +10221,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   ]).then(async () => {
     releasePortReservation(reservedPort);
     releasePortReservation(claimedIdentityPort);
+    // Drift during readiness must be refused before the broker publishes the
+    // backend. The check after publication still catches drift during it.
+    if (record.exposureConfig) await assertSpawnCheckoutBranch();
     if (record.exposureConfig && record.exposureHandle && record.port) {
       const provisioned = await provisionExposure(workspaceRuntimeExposureDeps, {
         runtimeId: record.id,
@@ -10390,7 +10402,12 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
         throw wrapped;
       }
-      throw drift;
+      // The recheck could not read the checkout, so it did not establish drift.
+      // Keep the original startup failure and its classification below.
+      await input.onLog?.(
+        "stderr",
+        `[service:${serviceName}] checkout branch recheck failed: ${drift instanceof Error ? drift.message : String(drift)}\n`,
+      ).catch(() => undefined);
     }
 
     if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);
@@ -10553,7 +10570,12 @@ async function startLocalRuntimeService(
       remediation: "Retry the start or configure a different runtime service port.",
     });
   } catch (error) {
-    if (!started && provisioningRecord && provisioningRecord.status === "starting") {
+    if (
+      !started
+      && provisioningRecord
+      && provisioningRecord.status === "starting"
+      && !(await runtimeServiceRowWasFinalized(input.db, provisioningRecord.id))
+    ) {
       const nowIso = new Date().toISOString();
       provisioningRecord.status = "failed";
       provisioningRecord.healthStatus = "unhealthy";
@@ -10563,6 +10585,21 @@ async function startLocalRuntimeService(
     }
     throw error;
   }
+}
+
+/**
+ * A refused start that shares the provisioning row id (HTTPS exposure) already
+ * saved that row as stopped, with its exposure state and broker handle. The
+ * stale in-memory provisioning object must not overwrite it.
+ */
+async function runtimeServiceRowWasFinalized(db: Db | undefined, id: string) {
+  if (!db) return false;
+  const [row] = await db
+    .select({ status: workspaceRuntimeServices.status })
+    .from(workspaceRuntimeServices)
+    .where(eq(workspaceRuntimeServices.id, id))
+    .catch(() => []);
+  return row?.status === "stopped" || row?.status === "failed";
 }
 
 function scheduleIdleStop(record: RuntimeServiceRecord) {
