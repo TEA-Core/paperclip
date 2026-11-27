@@ -20507,32 +20507,29 @@ export function issueRoutes(
     // Board ruling 2026-11-27: the creator and the assignee never hold a
     // reviewer or approver seat. Judged on the client's own fields, before the
     // stage transition below moves the assignee onto a seated participant.
-    {
-      const assigneeAgentWritten = normalizedAssigneeAgentId !== undefined;
-      const assigneeUserWritten = req.body.assigneeUserId !== undefined;
-      if (updateFields.executionPolicy !== undefined || assigneeAgentWritten || assigneeUserWritten) {
-        assertExecutionPolicySeatsLawful({
-          executionPolicy: nextExecutionPolicy,
-          creator: { agentId: existing.createdByAgentId, userId: existing.createdByUserId },
-          assignee: {
-            agentId: assigneeAgentWritten ? normalizedAssigneeAgentId : existing.assigneeAgentId,
-            userId: assigneeUserWritten
-              ? (req.body.assigneeUserId as string | null)
-              : existing.assigneeUserId,
-          },
-          // The creator never changes: it is judged only when the seats do.
-          judgeCreator:
-            updateFields.executionPolicy !== undefined
-            && executionPolicySeatsChanged(previousExecutionPolicy, nextExecutionPolicy),
-          // While a stage holds the card its seated participant is the
-          // assignee by design (in_review, or blocked mid-review).
-          judgeAssignee:
-            assigneeAgentWritten || assigneeUserWritten || !stageHoldsAssignee(existing),
-          // A reassign within the active stage hands it to another participant.
-          assigneeMayHoldStageId: activeExecutionStageId(existing),
-        });
-      }
-    }
+    const seatAssigneeWritten = normalizedAssigneeAgentId !== undefined;
+    const seatRulesJudged = updateFields.executionPolicy !== undefined || seatAssigneeWritten;
+    const assertPatchSeatsLawful = (
+      row: { createdByAgentId: string | null; assigneeAgentId: string | null; status: string; executionState: unknown },
+      rowPolicy: unknown,
+    ) => {
+      const resultingPolicy = updateFields.executionPolicy !== undefined ? updateFields.executionPolicy : rowPolicy;
+      assertExecutionPolicySeatsLawful({
+        executionPolicy: resultingPolicy,
+        creator: { agentId: row.createdByAgentId },
+        assignee: { agentId: seatAssigneeWritten ? normalizedAssigneeAgentId : row.assigneeAgentId },
+        // The creator never changes: it is judged only when the seats do.
+        judgeCreator:
+          updateFields.executionPolicy !== undefined
+          && executionPolicySeatsChanged(rowPolicy, resultingPolicy),
+        // While a stage holds the card its seated participant is the
+        // assignee by design (in_review, or blocked mid-review).
+        judgeAssignee: seatAssigneeWritten || !stageHoldsAssignee(row),
+        // A reassign within the active stage hands it to another participant.
+        assigneeMayHoldStageId: activeExecutionStageId(row),
+      });
+    };
+    if (seatRulesJudged) assertPatchSeatsLawful(existing, previousExecutionPolicy);
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -22312,6 +22309,8 @@ export function issueRoutes(
       // SUP-16525 / SUP-24000: a policy write is re-checked against the
       // locked row, so it has to run on the transactional path.
       || executionPolicyNeedsLockedRevalidation
+      // The seat rules are re-judged against the locked row.
+      || seatRulesJudged
       // Both monitor spellings must recheck policy and ownership under the lock.
       || monitorKeyExplicit
       || monitorChanged
@@ -22622,6 +22621,12 @@ export function issueRoutes(
                 executionState: parseIssueExecutionState(lockedForInvariant.executionState),
               });
             }
+          }
+
+          if (seatRulesJudged) {
+            const lockedForSeats = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForSeats) return null;
+            assertPatchSeatsLawful(lockedForSeats, lockedForSeats.executionPolicy ?? null);
           }
 
           if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {
@@ -24671,8 +24676,8 @@ export function issueRoutes(
         // unchanged, so only the new assignee is judged.
         assertExecutionPolicySeatsLawful({
           executionPolicy: issue.executionPolicy ?? null,
-          creator: { agentId: issue.createdByAgentId, userId: issue.createdByUserId },
-          assignee: { agentId: req.body.agentId, userId: null },
+          creator: { agentId: issue.createdByAgentId },
+          assignee: { agentId: req.body.agentId },
           judgeCreator: false,
           judgeAssignee: true,
           assigneeMayHoldStageId: activeExecutionStageId(issue),

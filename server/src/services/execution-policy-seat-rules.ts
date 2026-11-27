@@ -8,13 +8,14 @@
  * tools, so the server enforces the rule itself on every write path that can
  * seat a participant or move the assignee: issue create, child create,
  * accepted-plan decomposition, PATCH (policy, assignee, or both, including a
- * whole-policy replace and a monitor-alias write) and checkout.
+ * whole-policy replace and a monitor-alias write) and checkout. Routine
+ * create, update and revision restore apply it to the routine's policy and
+ * assignee, since every issue the routine dispatches carries them.
  *
- * The rule compares principal ids only, never names:
- *   - every `review` or `approval` stage participant of type `agent` must
- *     differ from `createdByAgentId` and `assigneeAgentId`;
- *   - every participant of type `user` must differ from `createdByUserId` and
- *     `assigneeUserId`.
+ * The rule compares agent ids only, never names: every `review` or
+ * `approval` stage participant of type `agent` must differ from
+ * `createdByAgentId` and `assigneeAgentId`. User participants are not judged,
+ * matching the tool-side rule.
  *
  * It is evaluated against the issue AS IT WILL BE after the write. Two
  * scoping rules keep it the same as the tool-side rule, and keep stored cards
@@ -42,7 +43,6 @@ export type ExecutionPolicySeatConflictingRole = "creator" | "assignee";
 
 export interface ExecutionPolicySeatPrincipals {
   agentId?: string | null;
-  userId?: string | null;
 }
 
 export interface ExecutionPolicySeatConflict {
@@ -50,7 +50,7 @@ export interface ExecutionPolicySeatConflict {
   stageId: string | null;
   stageType: "review" | "approval";
   seat: ExecutionPolicySeat;
-  participantType: "agent" | "user";
+  participantType: "agent";
   participantId: string;
   conflictingRole: ExecutionPolicySeatConflictingRole;
 }
@@ -100,20 +100,12 @@ export function findExecutionPolicySeatConflicts(
   const policy = input.executionPolicy;
   if (!isRecord(policy) || !Array.isArray(policy.stages)) return [];
 
-  const roles: Array<{ role: ExecutionPolicySeatConflictingRole; agentId: string | null; userId: string | null }> = [];
+  const roles: Array<{ role: ExecutionPolicySeatConflictingRole; agentId: string | null }> = [];
   if (input.judgeCreator) {
-    roles.push({
-      role: "creator",
-      agentId: nonEmptyId(input.creator.agentId),
-      userId: nonEmptyId(input.creator.userId),
-    });
+    roles.push({ role: "creator", agentId: nonEmptyId(input.creator.agentId) });
   }
   if (input.judgeAssignee) {
-    roles.push({
-      role: "assignee",
-      agentId: nonEmptyId(input.assignee.agentId),
-      userId: nonEmptyId(input.assignee.userId),
-    });
+    roles.push({ role: "assignee", agentId: nonEmptyId(input.assignee.agentId) });
   }
 
   const conflicts: ExecutionPolicySeatConflict[] = [];
@@ -124,15 +116,11 @@ export function findExecutionPolicySeatConflicts(
     const participants = Array.isArray(rawStage.participants) ? rawStage.participants : [];
     for (const rawParticipant of participants) {
       if (!isRecord(rawParticipant)) continue;
-      const participantType = rawParticipant.type;
-      if (participantType !== "agent" && participantType !== "user") continue;
-      const participantId = nonEmptyId(
-        participantType === "agent" ? rawParticipant.agentId : rawParticipant.userId,
-      );
+      if (rawParticipant.type !== "agent") continue;
+      const participantId = nonEmptyId(rawParticipant.agentId);
       if (!participantId) continue;
       for (const principal of roles) {
-        const principalId = participantType === "agent" ? principal.agentId : principal.userId;
-        if (!sameId(participantId, principalId)) continue;
+        if (!sameId(participantId, principal.agentId)) continue;
         if (
           principal.role === "assignee"
           && sameId(nonEmptyId(rawStage.id), nonEmptyId(input.assigneeMayHoldStageId))
@@ -142,7 +130,7 @@ export function findExecutionPolicySeatConflicts(
           stageId: nonEmptyId(rawStage.id),
           stageType,
           seat: stageType === "review" ? "reviewer" : "approver",
-          participantType,
+          participantType: "agent",
           participantId,
           conflictingRole: principal.role,
         });
@@ -234,18 +222,11 @@ export function stageHoldsAssignee(issue: {
   status?: string | null;
   executionState?: unknown;
   assigneeAgentId?: string | null;
-  assigneeUserId?: string | null;
 }): boolean {
   if (issue.status === "in_review") return true;
   const state = issue.executionState;
   if (!isRecord(state) || state.status !== "pending" || !nonEmptyId(state.currentStageId)) return false;
   const participant = state.currentParticipant;
-  if (!isRecord(participant)) return false;
-  if (participant.type === "agent") {
-    return sameId(nonEmptyId(participant.agentId), nonEmptyId(issue.assigneeAgentId));
-  }
-  if (participant.type === "user") {
-    return sameId(nonEmptyId(participant.userId), nonEmptyId(issue.assigneeUserId));
-  }
-  return false;
+  if (!isRecord(participant) || participant.type !== "agent") return false;
+  return sameId(nonEmptyId(participant.agentId), nonEmptyId(issue.assigneeAgentId));
 }

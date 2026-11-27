@@ -239,6 +239,27 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     return { companyId, agentId, projectId, userId };
   }
 
+  async function insertAgent(companyId: string, name: string) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name,
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return id;
+  }
+
+  const selfReviewPolicy = (agentId: string) => ({
+    mode: "normal",
+    stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+  });
+
   function routineResourceRequests(app: express.Express, routineId: string, triggerId = routineId) {
     const path = `/api/routines/${encodeURIComponent(routineId)}`;
     const triggerPath = `/api/routine-triggers/${encodeURIComponent(triggerId)}`;
@@ -631,9 +652,21 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
 
   it("carries a routine executionPolicy onto the materialised issue", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
+    const firstReviewerId = randomUUID();
     const secondReviewerId = randomUUID();
     const approverId = randomUUID();
     await db.insert(agents).values([
+      {
+        id: firstReviewerId,
+        companyId,
+        name: "FirstReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
       {
         id: secondReviewerId,
         companyId,
@@ -668,7 +701,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const executionPolicy = {
       mode: "auto",
       returnAssigneeAgentId: agentId,
-      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: firstReviewerId }] }],
     };
 
     const createRes = await request(app)
@@ -705,7 +738,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const ladder = {
       mode: "normal",
       stages: [
-        { type: "review", participants: [{ type: "agent", agentId }] },
+        { type: "review", participants: [{ type: "agent", agentId: firstReviewerId }] },
         { type: "review", participants: [{ type: "agent", agentId: secondReviewerId }] },
         { type: "approval", participants: [{ type: "agent", agentId: approverId }] },
       ],
@@ -773,7 +806,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
         {
           type: "review",
           approvalsNeeded: 1,
-          participants: [{ type: "agent", agentId, userId: null }],
+          participants: [{ type: "agent", agentId: firstReviewerId, userId: null }],
         },
         {
           type: "review",
@@ -788,6 +821,100 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       ],
     });
     expect(policy?.returnAssigneeAgentId ?? null).toBeNull();
+  }, 15_000);
+
+  it("refuses an agent creating a routine that seats itself as reviewer", async () => {
+    const { companyId, agentId, projectId } = await seedFixture();
+    const app = await createApp({ type: "agent", agentId, companyId });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Self-reviewed routine",
+        assigneeAgentId: agentId,
+        executionPolicy: selfReviewPolicy(agentId),
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "execution_policy_seat_conflict",
+      seat: "reviewer",
+      participantId: agentId,
+    });
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toHaveLength(0);
+  });
+
+  it("refuses an agent updating its routine to seat itself as reviewer", async () => {
+    const { companyId, agentId, projectId } = await seedFixture();
+    const reviewerId = await insertAgent(companyId, "Reviewer");
+    const app = await createApp({ type: "agent", agentId, companyId });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Reviewed routine",
+        assigneeAgentId: agentId,
+        executionPolicy: selfReviewPolicy(reviewerId),
+      });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    const routineId = createRes.body.id as string;
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ executionPolicy: selfReviewPolicy(agentId) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "execution_policy_seat_conflict",
+      seat: "reviewer",
+      participantId: agentId,
+    });
+    const [stored] = await db.select().from(routines).where(eq(routines.id, routineId));
+    expect((stored.executionPolicy as { stages: Array<{ participants: Array<{ agentId: string }> }> })
+      .stages[0].participants[0].agentId).toBe(reviewerId);
+  });
+
+  it("still dispatches a stored routine that seats its assignee, and logs a warning naming it", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      projectId,
+      title: "Legacy self-reviewed routine",
+      assigneeAgentId: agentId,
+      createdByAgentId: agentId,
+      responsibleUserId: userId,
+      executionPolicy: selfReviewPolicy(agentId),
+    });
+    const app = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const { logger } = await import("../middleware/logger.js");
+    const warn = vi.spyOn(logger, "warn");
+
+    try {
+      const runRes = await postRoutineRun(app, routineId, { source: "manual" });
+      expect(runRes.status, JSON.stringify(runRes.body)).toBe(202);
+      expect(runRes.body.status).toBe("issue_created");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, runRes.body.linkedIssueId));
+      expect(issue.assigneeAgentId).toBe(agentId);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          routineId,
+          conflicts: [expect.objectContaining({ participantId: agentId, conflictingRole: "assignee" })],
+        }),
+        expect.stringContaining("seats the dispatched issue's creator or assignee"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   }, 15_000);
 
   it("dispatches a routine without executionPolicy with the default issue policy", async () => {
@@ -882,6 +1009,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
 
   it("inherits the project default when a routine executionPolicy is PATCHed back to null (SUP-17459)", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
+    const reviewerId = await insertAgent(companyId, "Reviewer");
 
     await db
       .update(projects)
@@ -909,7 +1037,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
         assigneeAgentId: agentId,
         executionPolicy: {
           mode: "normal",
-          stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
         },
       });
     expect([200, 201]).toContain(createRes.status);

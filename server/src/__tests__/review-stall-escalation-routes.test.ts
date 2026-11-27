@@ -568,10 +568,6 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       twoStage: true,
       reviewers: [seeded.reviewerId, seeded.secondReviewerId],
     });
-    // The fixture's board user is both creator and approver; a board policy
-    // edit that changes the seats may not keep the creator in a seat, so file
-    // this card as another user's.
-    await db.update(issues).set({ createdByUserId: "another-board-user" }).where(eq(issues.id, issueId));
 
     const boardEdit = await request(app(boardActor(seeded)))
       .patch(`/api/issues/${issueId}`)

@@ -23,6 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -214,19 +215,19 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
 
   // ---------------------------------------------------------------- create
 
-  it("create: refuses the creating user as a user approver", async () => {
+  it("create: does not judge user seats, so the creating board user may approve", async () => {
     const { companyId, executorId } = await seed();
     const res = await request(app())
       .post(`/api/companies/${companyId}/issues`)
       .send({
-        title: "Board approves its own card",
+        title: "Board approves the card it filed",
         status: "todo",
         assigneeAgentId: executorId,
         deliveryRequirement: "record_only",
         executionPolicy: policy(userStage("approval", BOARD_USER)),
       });
-    expectSeatConflict(res, { seat: "approver", participantId: BOARD_USER, conflictingRole: "creator" });
-    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
   });
 
   it("create: refuses the assignee as an approver even beside another approver", async () => {
@@ -354,20 +355,20 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
 
   // ----------------------------------------------------------- child create
 
-  it("child create: refuses the creator as reviewer", async () => {
+  it("child create: does not judge user seats, so the creating board user may review", async () => {
     const { companyId, executorId, reviewerId } = await seed();
     const parent = await insertIssue({ companyId, createdByUserId: BOARD_USER });
     const res = await request(app())
       .post(`/api/issues/${parent.id}/children`)
       .send({
-        title: "Child reviewed by its creator",
+        title: "Child reviewed by the board user who filed it",
         status: "todo",
         assigneeAgentId: executorId,
         deliveryRequirement: "record_only",
         executionPolicy: policy(agentStage("review", reviewerId), userStage("review", BOARD_USER)),
       });
-    expectSeatConflict(res, { seat: "reviewer", participantId: BOARD_USER, conflictingRole: "creator" });
-    expect(await db.select().from(issues).where(eq(issues.parentId, parent.id))).toHaveLength(0);
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    expect(await db.select().from(issues).where(eq(issues.parentId, parent.id))).toHaveLength(1);
   });
 
   it("child create: an agent key that names another creator is still judged as the creator", async () => {
@@ -497,25 +498,26 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
       .toHaveLength(0);
   });
 
-  it("decomposition: refuses an explicit child policy that seats the creator, and accepts a lawful batch", async () => {
+  it("decomposition: refuses an explicit child policy that seats the creating agent, and accepts a lawful batch", async () => {
     const { companyId, executorId, reviewerId } = await seed();
     const source = await insertIssue({ companyId, assigneeAgentId: executorId, createdByUserId: BOARD_USER, status: "in_progress" });
     await db.update(issues).set({ workMode: "planning" }).where(eq(issues.id, source.id));
     const acceptedPlanRevisionId = await seedAcceptedPlan(companyId, source.id);
 
+    currentActor = agentKeyActor(companyId, executorId, await seedRun(companyId, executorId, source.id));
     const refused = await request(app())
       .post(`/api/issues/${source.id}/accepted-plan-decompositions`)
       .send({
         acceptedPlanRevisionId,
         children: [{
-          title: "Board approves its own child",
-          assigneeAgentId: executorId,
+          title: "Creating agent approves its own child",
           deliveryRequirement: "record_only",
-          executionPolicy: policy(userStage("approval", BOARD_USER)),
+          executionPolicy: policy(agentStage("approval", executorId)),
         }],
       });
-    expectSeatConflict(refused, { seat: "approver", participantId: BOARD_USER, conflictingRole: "creator" });
+    expectSeatConflict(refused, { seat: "approver", participantId: executorId, conflictingRole: "creator" });
     expect(await db.select().from(issues).where(eq(issues.parentId, source.id))).toHaveLength(0);
+    currentActor = boardActor(companyId);
 
     const accepted = await request(app())
       .post(`/api/issues/${source.id}/accepted-plan-decompositions`)
@@ -530,6 +532,49 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
       });
     expect(accepted.status, JSON.stringify(accepted.body)).toBeLessThan(300);
     expect(await db.select().from(issues).where(eq(issues.parentId, source.id))).toHaveLength(1);
+  });
+
+  it("decomposition: an explicitly empty child policy is judged against the default it will inherit", async () => {
+    const { companyId, executorId, reviewerId } = await seed();
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Default ladder",
+      status: "in_progress",
+      defaultExecutionPolicy: policy(agentStage("review", reviewerId)) as unknown as Record<string, unknown>,
+    });
+    const source = await insertIssue({ companyId, assigneeAgentId: executorId, createdByUserId: BOARD_USER, status: "in_progress" });
+    await db.update(issues).set({ workMode: "planning", projectId }).where(eq(issues.id, source.id));
+    const acceptedPlanRevisionId = await seedAcceptedPlan(companyId, source.id);
+    const childInput = (title: string, assigneeAgentId: string, executionPolicy?: Record<string, unknown>) => ({
+      title,
+      assigneeAgentId,
+      deliveryRequirement: "record_only" as const,
+      createdByUserId: BOARD_USER,
+      enforceExecutionPolicySeatRules: true,
+      ...(executionPolicy ? { executionPolicy } : {}),
+    });
+
+    let error: unknown = null;
+    try {
+      await issueService(db).decomposeAcceptedPlan(source.id, {
+        acceptedPlanRevisionId,
+        actorUserId: BOARD_USER,
+        children: [
+          childInput("Lawful child", executorId),
+          // Normalized to no policy, so create() inherits the default that seats this assignee.
+          childInput("Reviewer works under its own ladder", reviewerId, { mode: "normal", stages: [] }),
+        ],
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", participantId: reviewerId, conflictingRole: "assignee" },
+    });
+    expect(await db.select().from(issues).where(eq(issues.parentId, source.id))).toHaveLength(0);
   });
 
   // ------------------------------------------------------------------ PATCH

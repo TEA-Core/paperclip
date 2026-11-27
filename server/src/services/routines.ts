@@ -70,6 +70,11 @@ import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { assertIssueExecutionWorkspaceOverrideAllowed, issueService, logLostFutureMonitorCheck } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  assertExecutionPolicySeatsLawful,
+  executionPolicySeatsChanged,
+  findExecutionPolicySeatConflicts,
+} from "./execution-policy-seat-rules.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -469,6 +474,29 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
 
 function statusRequiresDefaultAgent(status: string) {
   return status === "active";
+}
+
+/**
+ * The issues a routine dispatches carry its policy and assignee, so the
+ * routine itself may not seat its creator or its assignee as reviewer or
+ * approver. The creator is judged only when the seats change, and the
+ * assignee when the seats or the assignee change, so a stored routine stays
+ * repairable.
+ */
+function assertRoutineExecutionPolicySeatsLawful(
+  next: { executionPolicy: unknown; assigneeAgentId: string | null; createdByAgentId: string | null },
+  previous: { executionPolicy: unknown; assigneeAgentId: string | null } | null,
+) {
+  const seatsChanged = previous === null
+    || executionPolicySeatsChanged(previous.executionPolicy ?? null, next.executionPolicy ?? null);
+  const assigneeChanged = previous === null || previous.assigneeAgentId !== next.assigneeAgentId;
+  assertExecutionPolicySeatsLawful({
+    executionPolicy: next.executionPolicy ?? null,
+    creator: { agentId: next.createdByAgentId },
+    assignee: { agentId: next.assigneeAgentId },
+    judgeCreator: seatsChanged,
+    judgeAssignee: seatsChanged || assigneeChanged,
+  });
 }
 
 function normalizeDraftRoutineStatus(status: string, assigneeAgentId: string | null | undefined) {
@@ -2339,6 +2367,20 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        const createdByAgentId = input.source === "manual" ? input.actor?.agentId ?? null : null;
+        const seatConflicts = findExecutionPolicySeatConflicts({
+          executionPolicy: input.routine.executionPolicy ?? null,
+          creator: { agentId: createdByAgentId },
+          assignee: { agentId: assigneeAgentId },
+          judgeCreator: true,
+          judgeAssignee: true,
+        });
+        if (seatConflicts.length > 0) {
+          logger.warn(
+            { routineId: input.routine.id, runId: createdRun.id, conflicts: seatConflicts },
+            "routine execution policy seats the dispatched issue's creator or assignee as reviewer or approver; dispatching anyway",
+          );
+        }
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2350,7 +2392,7 @@ export function routineService(
             status: "todo",
             priority: input.routine.priority,
             assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
+            createdByAgentId,
             createdByUserId: manualRunnerUserId,
             responsibleUserId,
             trustExplicitResponsibleUserId: true,
@@ -2667,6 +2709,14 @@ export function routineService(
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
+      assertRoutineExecutionPolicySeatsLawful(
+        {
+          executionPolicy: input.executionPolicy ?? null,
+          assigneeAgentId: input.assigneeAgentId ?? null,
+          createdByAgentId: actor.agentId ?? null,
+        },
+        null,
+      );
       const env = input.env === undefined || input.env === null
         ? null
         : await secretsSvc.normalizeEnvBindingsForPersistence(companyId, input.env, {
@@ -2864,6 +2914,8 @@ export function routineService(
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
+
+        assertRoutineExecutionPolicySeatsLawful(candidate, locked);
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
@@ -3241,6 +3293,14 @@ export function routineService(
             currentRevisionId: locked.latestRevisionId,
           });
         }
+        assertRoutineExecutionPolicySeatsLawful(
+          {
+            executionPolicy: routineSnapshot.executionPolicy ?? null,
+            assigneeAgentId: routineSnapshot.assigneeAgentId ?? null,
+            createdByAgentId: locked.createdByAgentId,
+          },
+          locked,
+        );
 
         const currentTriggers = await txDb
           .select({ id: routineTriggers.id })

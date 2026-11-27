@@ -10538,7 +10538,10 @@ export function issueService(
       // a refusal in create() for child N would leave children 1..N-1 behind.
       for (const child of data.children) {
         if (child.enforceExecutionPolicySeatRules !== true) continue;
-        const childPolicy = child.executionPolicy
+        const childPolicy = normalizeIssueExecutionPolicy(
+          child.executionPolicy ?? null,
+          { preserveEmptyPolicy: child.trustExplicitExecutionPolicy === true },
+        )
           ?? await resolveDefaultIssueExecutionPolicy(
             db,
             sourceIssue.companyId,
@@ -10546,8 +10549,8 @@ export function issueService(
           );
         assertExecutionPolicySeatsLawful({
           executionPolicy: childPolicy ?? null,
-          creator: { agentId: child.createdByAgentId, userId: child.createdByUserId },
-          assignee: { agentId: child.assigneeAgentId, userId: child.assigneeUserId },
+          creator: { agentId: child.createdByAgentId },
+          assignee: { agentId: child.assigneeAgentId },
           judgeCreator: true,
           judgeAssignee: true,
         });
@@ -11372,8 +11375,8 @@ export function issueService(
         if (enforceExecutionPolicySeatRules === true) {
           assertExecutionPolicySeatsLawful({
             executionPolicy: issueData.executionPolicy ?? null,
-            creator: { agentId: issueData.createdByAgentId, userId: issueData.createdByUserId },
-            assignee: { agentId: issueData.assigneeAgentId, userId: issueData.assigneeUserId },
+            creator: { agentId: issueData.createdByAgentId },
+            assignee: { agentId: issueData.assigneeAgentId },
             judgeCreator: true,
             judgeAssignee: true,
           });

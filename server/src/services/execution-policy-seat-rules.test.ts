@@ -55,16 +55,19 @@ describe("execution policy seat rules", () => {
     ]);
   });
 
-  it("compares user participants with the creating and assigned user ids", () => {
-    const conflicts = findExecutionPolicySeatConflicts({
-      executionPolicy: policy({ type: "approval", participants: [{ type: "user", userId: "board-user" }] }),
-      creator: { userId: "board-user" },
+  it("does not judge user seats, matching the tool-side rule", () => {
+    const boardPolicy = policy({ type: "approval", participants: [{ type: "user", userId: "board-user" }] });
+    expect(findExecutionPolicySeatConflicts({
+      executionPolicy: boardPolicy,
+      creator: { agentId: CREATOR },
       assignee: { agentId: ASSIGNEE },
       ...all,
-    });
-    expect(conflicts).toEqual([
-      expect.objectContaining({ seat: "approver", participantType: "user", participantId: "board-user", conflictingRole: "creator" }),
-    ]);
+    })).toEqual([]);
+    expect(stageHoldsAssignee({
+      status: "blocked",
+      executionState: { status: "pending", currentStageId: "s", currentParticipant: { type: "user", userId: "board-user" } },
+      assigneeAgentId: ASSIGNEE,
+    })).toBe(false);
   });
 
   it("compares ids, never names, and ignores id case", () => {

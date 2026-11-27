@@ -99,10 +99,13 @@ Every API write that sets the policy or the assignee is judged against the
 issue as it will be after the write: issue create (including a policy inherited
 from the project or company default), child create, accepted-plan
 decomposition, `PATCH /api/issues/{id}` (assignee, policy, both, the `monitor`
-alias, and a whole-policy replace) and checkout. The server compares principal
-ids, never names: an agent participant against `createdByAgentId` and
-`assigneeAgentId`, a user participant against `createdByUserId` and
-`assigneeUserId`. A violation is refused with `422` and the code
+alias, and a whole-policy replace) and checkout. The server compares agent ids,
+never names: an agent participant against `createdByAgentId` and
+`assigneeAgentId`. User participants are not judged, matching the agent tools'
+rule. Routine create, update and revision restore apply the same rule to the
+routine's policy, its assignee and the agent that created it; a routine stored
+before the rule still dispatches, and the server logs a warning naming the
+routine. A violation is refused with `422` and the code
 `execution_policy_seat_conflict`; `details` names the seat (`reviewer` or
 `approver`), the stage, the participant id and the conflicting role (`creator`
 or `assignee`). The rule applies to agent and board callers alike, and the
