@@ -231,6 +231,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
+  attachIssueLandingProofSchema,
   cancelIssueThreadInteractionSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
@@ -1356,6 +1357,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1374,6 +1376,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -1734,6 +1737,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/recovery-actions/resolve",
   "POST /api/issues/{id}/recovery-actions/retry-workspace-export",
+  "POST /api/issues/{id}/landing-proof",
   "GET /api/companies/{companyId}/chats",
   "POST /api/issues/{id}/scheduled-retry/retry-now",
   "POST /api/issues/{id}/stalled-review-decision",
@@ -11237,6 +11241,47 @@ registerCurrentRoute({
   summary: "Retry only workspace export for a repaired accepted native result",
   body: retryWorkspaceExportSchema,
   responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/landing-proof",
+  tags: ["issues"],
+  summary: "Attach a GitHub-verified merged-PR landing proof to a delivered card (board only)",
+  description:
+    "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
+    "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
+    "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
+    "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
+    "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
+    "reason, the call is 409 `landing_proof_cannot_close` before the submitted proof is verified and nothing is recorded. The body names one pull request in the card's " +
+    "project repository (`owner`, `repo`, `pullRequestNumber`), at least one of `mergeCommitSha` / `headSha` (full shas), and a " +
+    "`reason`. The server verifies the proof live against GitHub: the repository is the card's project repository " +
+    "(422 `landing_proof_wrong_repo`), the card resolves a control-plane base branch (422 `landing_proof_no_base`), the PR exists " +
+    "(422 `landing_proof_pr_not_found`), it is merged (422 `landing_proof_pr_not_merged`, or `landing_proof_pr_closed_unmerged` " +
+    "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), " +
+    "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
+    "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
+    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
+    "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
+    "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
+    "or a board user's comment on the card naming the PR, or a head or merge " +
+    "commit recorded on such a work product that is the PR head or merge commit or one of the PR's own commits; links, comments " +
+    "and delivery identities an agent wrote do not count, and a head branch name is not a tie; otherwise 422 " +
+    "`landing_proof_not_card_delivery`), and the " +
+    "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
+    "not contained). A missing credential, a network error, a non-OK GitHub answer or an unresolvable base branch is 422 " +
+    "`landing_proof_unverifiable`, which may succeed on retry. A refusal records nothing. On success (201) the server records an " +
+    "`issue.landing_proof_attached` activity row naming the actor and the evidence, plus a `pull_request` work product with the " +
+    "merge and head commits. The call is idempotent for retries: replaying the same evidence returns 200 with `replayed: true` " +
+    "and the recorded proof, and writes nothing. Attaching discharges no landing debt. A later board `PATCH /api/issues/{id}` with " +
+    "`status: done` re-verifies the latest attached proof and discharges the repository landing debt (for example from a " +
+    "`record_only` reclassification) atomically with that accepted close. Non-board close doors do not accept the proof.",
+  body: attachIssueLandingProofSchema,
+  responses: {
+    200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: r.conflict, 422: r.unprocessable,
+  },
 });
 
 registerCurrentRoute({
