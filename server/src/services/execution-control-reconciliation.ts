@@ -341,7 +341,9 @@ async function reapUnboundSummaryGenerationIssues(
  *
  * Blocked cards stay in this population: `blocked` is non-terminal, and the
  * SUP-17698 contract terminalizes a blocked strand whose continuation paths
- * have all died.
+ * have all died. A card that becomes blocked between the scan and the row
+ * lock is skipped for that tick, keeping its slot binding, and left to
+ * whoever blocked it; only a card already blocked at scan time is reaped.
  *
  * A previously refused card defers only while its current evaluated ladder
  * key matches the latest refusal's durable cursor. The key includes the
