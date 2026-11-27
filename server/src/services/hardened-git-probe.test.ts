@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1670,11 +1671,6 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       git(f.m, "pack-refs", "--all");
       rmSync(f.stashLog);
     }],
-    ["ST-05c the tip is read when the reflog cannot be", OWN, (f) => {
-      f.stash(f.x);
-      rmSync(f.stashLog);
-      mkdirSync(f.stashLog);
-    }],
     ["ST-06 this card's entry below a packed tip", OWN, (f) => {
       f.stash(f.x);
       f.stash(f.y());
@@ -1812,15 +1808,9 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       chmodSync(object, 0o644);
       truncateSync(object, 20);
     }],
-    ["ST-50a a reflog that is a directory", (f) => mkdirSync(f.stashLog, { recursive: true })],
     ["ST-51 only a registered sibling's stashes in a reflog over 1 MiB", (f) => {
       longMessagePushes(f, f.y());
       expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
-    }],
-    ["ST-50b a reflog that is a FIFO", (f) => {
-      f.stash(f.y());
-      rmSync(f.stashLog);
-      execFileSync("mkfifo", [f.stashLog]);
     }],
     // Admitted by design: each is the same repository state as an admit row
     // above up to file contents, or a state record_only never inspects. They
@@ -1863,7 +1853,10 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
     expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
   });
 
-  describe("a stash reflog that is a symbolic link", () => {
+  // Captain rulings Q43 (symbolic link) and the FIFO ruling (option a): any
+  // stash reflog path that holds something other than a regular file refuses
+  // as unverified. Only a missing reflog contributes nothing.
+  describe("a stash reflog that is not a regular file", () => {
     /** Move the reflog out of the repository and leave a symlink to it in its place. */
     function symlinkReflog(fixture: StashFixture, contents?: string): string {
       const target = path.join(mkdtempSync(path.join(root, "stash-reflog-target-")), "stash");
@@ -1877,8 +1870,141 @@ describe("record_only stash provenance rule (frozen matrix)", () => {
       const result = await probeNoRepositoryWorktree(fixture.input());
       expect(result.ok).toBe(false);
       expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
-      expect((result as { reason: string }).reason).toContain("a symbolic link");
+      expect((result as { reason: string }).reason).toContain("not a regular file");
     }
+
+    /** Replace the reflog with a FIFO. */
+    function fifoReflog(fixture: StashFixture) {
+      rmSync(fixture.stashLog);
+      execFileSync("mkfifo", [fixture.stashLog]);
+    }
+
+    /**
+     * Keep writing `contents` into the FIFO at `fifo`, so every reader (git
+     * included) sees the real reflog through it. Returns a stopper that kills
+     * the writer's whole process group.
+     */
+    function feedFifo(fifo: string, contents: string): () => void {
+      const source = path.join(mkdtempSync(path.join(root, "stash-reflog-feed-")), "stash");
+      writeFileSync(source, contents);
+      const writer = spawn("sh", ["-c", 'while :; do cat "$1" > "$2"; done', "feed", source, fifo], {
+        detached: true,
+        stdio: "ignore",
+      });
+      return () => {
+        try {
+          process.kill(-writer.pid!, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      };
+    }
+
+    /** Bind a Unix socket at a short path, then move it into the reflog's place. */
+    async function socketReflog(fixture: StashFixture) {
+      const bound = path.join(root, "s.sock");
+      const server = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(bound, resolve);
+      });
+      rmSync(fixture.stashLog);
+      renameSync(bound, fixture.stashLog);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      expect(lstatSync(fixture.stashLog).isSocket()).toBe(true);
+    }
+
+    // ST-05c keeps its setup (this card's stash at the tip, a directory as the
+    // reflog) and its refusal; the reason is now the unverified reflog, which
+    // is decided before the tip is attributed.
+    it("ST-05c refuses this card's tip when the reflog is a directory", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      rmSync(fixture.stashLog);
+      mkdirSync(fixture.stashLog);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-50a refuses a reflog that is a directory", async () => {
+      const fixture = stashFixture();
+      mkdirSync(fixture.stashLog, { recursive: true });
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-50b refuses a reflog that is a FIFO", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      fifoReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-58 refuses a FIFO fed with the real reflog that holds this card's stash below a sibling's top", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      const contents = readFileSync(fixture.stashLog, "utf8");
+      fifoReflog(fixture);
+      const stop = feedFifo(fixture.stashLog, contents);
+      try {
+        // Git reads the stack through the FIFO: this card's stash is on it.
+        expect(stashList(fixture.m).split("\n")).toContain(own);
+        await refusesUnverified(fixture);
+      } finally {
+        stop();
+      }
+    });
+
+    it("ST-59 refuses a reflog that is regular at the first check and swapped to a FIFO before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          fifoReflog(fixture);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+    });
+
+    it("ST-60 refuses a reflog that is a Unix socket", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      await socketReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-61 refuses a reflog that is regular at the first check and swapped to a directory before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          rmSync(fixture.stashLog);
+          mkdirSync(fixture.stashLog);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+    });
+
+    it("ST-62 still admits when the reflog file is missing and the tip is a registered sibling's", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      rmSync(fixture.stashLog);
+      expect(await probeNoRepositoryWorktree(fixture.input())).toMatchObject({ ok: true, branch: OWN });
+    });
 
     it("ST-53 refuses a symlinked reflog that holds this card's stash below a sibling's top", async () => {
       const fixture = stashFixture();

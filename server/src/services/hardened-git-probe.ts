@@ -790,22 +790,36 @@ const STASH_COMMIT_BRANCH_RE = /^(?:WIP on|On) ([^ :]+): /;
 
 const UNVERIFIED_STASH_REFLOG = Symbol("unverified stash reflog");
 
+/** Whether an `lstat` failure means nothing is at the path (git then has no reflog either). */
+function isAbsentPathError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
 /**
- * The stash reflog's text; null when there is none or it is a directory or FIFO
- * (unreadable evidence, nobody's). `UNVERIFIED_STASH_REFLOG` when it is a
- * symbolic link (git reads through the link, so its entries are real to git but
- * are never read here), or a regular file that is over the bound or cannot be
- * read whole.
+ * The stash reflog's text; null only when nothing is at the path.
+ * `UNVERIFIED_STASH_REFLOG` when anything other than a regular file is there (a
+ * symbolic link, which git reads through; a FIFO, which git reads from; a
+ * socket, a device or a directory), when a regular file is over the bound or
+ * cannot be read whole, when the path cannot be examined, and when the path is
+ * swapped for any of those between the first check and the read.
  */
 async function readStashReflog(file: string): Promise<string | null | typeof UNVERIFIED_STASH_REFLOG> {
-  const info = await lstat(file).catch(() => null);
-  if (info?.isSymbolicLink()) return UNVERIFIED_STASH_REFLOG;
-  if (!info?.isFile()) return null;
+  const present = () =>
+    lstat(file).then(
+      () => true,
+      (error: unknown) => !isAbsentPathError(error),
+    );
+  let regular: boolean;
+  try {
+    regular = (await lstat(file)).isFile();
+  } catch (error) {
+    return isAbsentPathError(error) ? null : UNVERIFIED_STASH_REFLOG;
+  }
+  if (!regular) return UNVERIFIED_STASH_REFLOG;
   try {
     return await readOptionalRegularFile(file, MAX_BUFFER);
   } catch {
-    const unverified = await lstat(file).then((entry) => entry.isFile() || entry.isSymbolicLink(), () => false);
-    return unverified ? UNVERIFIED_STASH_REFLOG : null;
+    return (await present()) ? UNVERIFIED_STASH_REFLOG : null;
   }
 }
 
@@ -822,9 +836,8 @@ async function readStashReflog(file: string): Promise<string | null | typeof UNV
  * a registered sibling's branch, a project branch, an unregistered or deleted
  * branch naming no card of ours, `(no branch)`, any other subject, and any
  * evidence that cannot be read (garbage ref, non-commit, missing or corrupt
- * object, a missing reflog, or a directory or FIFO in the reflog's place). A
- * reflog that is a symbolic link is not in that list: it refuses as unverified,
- * including one swapped in after the first check.
+ * object, a missing reflog). A reflog path that holds anything other than a
+ * regular file is not in that list: it refuses as unverified (below).
  *
  * Subjects are read in one batched `git log`. When that read fails (a corrupt
  * object aborts it whole), each entry is read again on its own, so an
@@ -836,10 +849,11 @@ async function readStashReflog(file: string): Promise<string | null | typeof UNV
  * The reflog file is read up to the same 16 MiB bound as git's own output. A
  * regular reflog file that is larger, or that cannot be read whole, refuses as
  * unverified: `git stash push -m` with long messages can grow it, so dropping
- * it would hide this card's entries below the tip. A symbolic link in its
- * place also refuses as unverified, because git reads the stash stack through
- * it. A missing reflog, or a directory or FIFO in its place, contributes no
- * entries.
+ * it would hide this card's entries below the tip. Anything other than a
+ * regular file in its place (a symbolic link or a FIFO, which git reads the
+ * stash stack through; a socket, a device or a directory) also refuses as
+ * unverified, including one swapped in after the first check. Only a missing
+ * reflog contributes no entries.
  * The reflog subject, which `git stash store -m` sets freely, is never read, so
  * relabelling a stash changes no decision in either direction. Parents are
  * never read: a record_only card's own stash shares its first parent with every
@@ -866,7 +880,7 @@ async function cardStashRefusal(
   if (SHA_RE.test(tip)) ids.add(tip);
   const log = await readStashReflog(path.join(commonDir, "logs", "refs", "stash"));
   if (log === UNVERIFIED_STASH_REFLOG) {
-    return `holds a stash reflog that could not be verified (a symbolic link, a regular file larger than ${MAX_BUFFER} bytes, or unreadable)`;
+    return `holds a stash reflog that could not be verified (not a regular file, a regular file larger than ${MAX_BUFFER} bytes, or unreadable)`;
   }
   for (const line of log?.split("\n") ?? []) {
     const id = line.split(" ", 2)[1] ?? "";
