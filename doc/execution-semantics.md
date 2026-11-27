@@ -944,6 +944,16 @@ letting the former assignee change the monitor.
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
+Closing an issue still clears a future-dated monitor, but the issue update that
+closes it (PATCH, a review-approval comment, a stage decision, or any other
+service caller), or the routine retirement that cancels a superseded routine
+execution sibling, writes one `issue.monitor_cleared` activity that records `previousNextCheckAt`, the prior
+`recoveryPolicy` (nullable), the existing actor/run attribution, and
+`reason: cleared_by_close_future_check`. This is a searchable cancellation record,
+not a transfer or a later wake. Past-due watchdogs retain their ordinary clear
+reason and require no disposition. The activity response contract is published
+in OpenAPI and the MCP `paperclipListIssueActivity` output schema.
+
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its
 retained `scheduledRetryAt` is historical and must not produce a waiting or overdue
@@ -1021,7 +1031,7 @@ is skipped, while policy normalization writes `null`.
 
 The Wiki handoff guard is also skipped for a field-less write. In a field-less
 write, every present key is `undefined` or request attribution: `actorAgentId`,
-`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`actorAgentApiKeyId`, `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
 `expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
 write when the route adds no field to it and the request carries no
 `reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
