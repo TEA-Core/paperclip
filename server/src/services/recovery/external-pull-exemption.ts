@@ -8,12 +8,14 @@
 //   holds in `todo` or `in_progress` is still detected, but goes to the board.
 // - Only a live owner is exempt. A paused, terminated or pending-approval owner
 //   pulls nothing.
-// - The exemption expires. A parked card with no activity for
-//   EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS is surfaced again.
+// - The exemption expires. A parked card with no activity by anyone but the
+//   owner for EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS is surfaced again.
+//   The owner's own comments do not reset the clock.
 // - The board can clear the exemption for one card.
 // When the exemption does not hold for one of those reasons, the card goes to
-// the board only. Recovery never re-homes a pull agent's card onto another
-// agent.
+// the board only. This board-owned hold is the intended design: recovery
+// never re-homes a pull agent's card onto another agent, and it does not
+// resume automatic recovery for it.
 
 export const EXTERNAL_PULL_RECOVERY_EXEMPT_STATUSES: ReadonlySet<string> = new Set([
   "backlog",
@@ -54,7 +56,7 @@ export interface ExternalPullRecoveryExemptionFacts {
   /** The owner's status lets it work (`isAgentStatusInvokable`). */
   ownerStatusInvokable: boolean;
   issueStatus: string;
-  /** The card's last activity (`issues.updatedAt`). */
+  /** The latest activity by anyone but the owner, or the card's creation. */
   lastActivityAt: Date;
   /** A board override cleared the exemption for this card. */
   boardCleared: boolean;

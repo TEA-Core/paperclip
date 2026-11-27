@@ -3607,6 +3607,57 @@ describe("company portability", () => {
     expect(createdRuntimeConfig?.debug).not.toHaveProperty("providerTrace");
   });
 
+  // Fork (two-fleet routing): `runtimeConfig.workDelivery` exempts an agent's
+  // parked cards from recovery sweeps, so only a board import may carry it.
+  async function exportExternalPullBundle(portability: ReturnType<typeof companyPortabilityService>) {
+    companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.name).toLowerCase()}`,
+      name: input.name,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    }));
+    const sourceAgents = (await agentSvc.list()) as Array<Record<string, unknown>>;
+    agentSvc.list.mockResolvedValue(sourceAgents.map((agent) => ({
+      ...agent,
+      runtimeConfig: { ...((agent.runtimeConfig ?? {}) as Record<string, unknown>), workDelivery: "external_pull" },
+    })));
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: false, issues: false },
+    });
+    agentSvc.list.mockResolvedValue([]);
+    agentSvc.create.mockClear();
+    return {
+      source: { type: "inline" as const, rootPath: exported.rootPath, files: exported.files },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company" as const, newCompanyName: "Imported Paperclip" },
+      agents: "all" as const,
+      collisionStrategy: "rename" as const,
+    };
+  }
+
+  it("refuses an import that declares external_pull work delivery unless a board actor allows it", async () => {
+    const portability = companyPortabilityService({} as any);
+    const input = await exportExternalPullBundle(portability);
+
+    // Fail closed: an import that a board actor did not allow refuses the mode.
+    await expect(portability.importBundle(input, null)).rejects.toMatchObject({
+      status: 403,
+      details: { code: "agent_work_delivery_board_only" },
+    });
+    expect(agentSvc.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps external_pull work delivery on a board import", async () => {
+    const portability = companyPortabilityService({} as any);
+    const input = await exportExternalPullBundle(portability);
+
+    await portability.importBundle(input, "user-1", { allowExternalPullWorkDelivery: true });
+
+    const createdClaude = agentSvc.create.mock.calls.find(([, created]) => created.name === "ClaudeCoder");
+    expect((createdClaude?.[1].runtimeConfig as Record<string, unknown>).workDelivery).toBe("external_pull");
+  });
+
   /**
    * `heartbeat.wakeOnDemand` parses back as `true` when absent, so dropping a
    * `false` here does not preserve behaviour — it inverts it. An operator who

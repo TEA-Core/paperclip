@@ -20,6 +20,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.ts";
+import { issueService } from "../services/issues.ts";
+import { logActivity } from "../services/activity-log.ts";
 import {
   EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
   EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS,
@@ -171,11 +173,31 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
   }
 
   // Moves the card's last activity past the exemption age bound.
+  // Moves the card's start (and last write) past the exemption age bound. The
+  // clock counts only activity by someone other than the assignee.
   async function ageCardPastExemption(issueId: string) {
-    await db
-      .update(issues)
-      .set({ updatedAt: new Date(Date.now() - EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS - 60 * 60_000) })
-      .where(eq(issues.id, issueId));
+    const old = new Date(Date.now() - EXTERNAL_PULL_RECOVERY_EXEMPTION_MAX_AGE_MS - 60 * 60_000);
+    await db.update(issues).set({ createdAt: old, updatedAt: old }).where(eq(issues.id, issueId));
+  }
+
+  // A comment as the comment route writes it: the issue row's updatedAt moves
+  // and an `issue.comment_added` activity row names the actor.
+  async function commentOnCard(
+    companyId: string,
+    issueId: string,
+    actor: { agentId: string } | { userId: string },
+  ) {
+    await issueService(db).addComment(issueId, "Still on it.", actor);
+    await logActivity(db, {
+      companyId,
+      actorType: "agentId" in actor ? "agent" : "user",
+      actorId: "agentId" in actor ? actor.agentId : actor.userId,
+      agentId: "agentId" in actor ? actor.agentId : null,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      details: {},
+    });
   }
 
   async function createRouteApp(actor: Record<string, unknown>) {
@@ -301,6 +323,36 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
       expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
+
+  it("stillborn backlog: the assignee's own comment does not reset the exemption clock", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+    await ageCardPastExemption(issueId);
+    await commentOnCard(fleet.companyId, issueId, { agentId: fleet.externalAgentId });
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(1);
+    expect((await issueRow(issueId))?.status).toBe("blocked");
+    await expectNotReassigned(fleet, issueId);
+    await expectBoardOnlyAction(await recoveryActionRows(issueId));
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stillborn backlog: a board comment restarts the exemption clock", async () => {
+    const fleet = await seedFleet();
+    const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+    await ageCardPastExemption(issueId);
+    await commentOnCard(fleet.companyId, issueId, { userId: "board-user" });
+    const { svc } = makeSweep();
+
+    const result = await svc.reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(0);
+    expect((await issueRow(issueId))?.status).toBe("backlog");
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+  });
 
   it("stillborn backlog: surfaces a live external-pull assignee's card to the board once it is older than the exemption bound", async () => {
     const fleet = await seedFleet();

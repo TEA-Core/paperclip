@@ -96,7 +96,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
-import { parseAgentWorkDelivery } from "../services/agent-work-delivery.js";
+import { agentWorkDeliveryBoardOnlyError, parseAgentWorkDelivery } from "../services/agent-work-delivery.js";
 import { resolveLiveExecutionLeases } from "../services/issue-execution-lease.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -2300,9 +2300,7 @@ export function agentRoutes(
     const next = parseAgentWorkDelivery({ runtimeConfig: asRecord(nextRuntimeConfig) ?? {} });
     const previous = parseAgentWorkDelivery({ runtimeConfig: asRecord(previousRuntimeConfig) ?? {} });
     if (next === previous) return;
-    throw forbidden("Only the board can change an agent's work delivery mode.", {
-      code: "agent_work_delivery_board_only",
-    });
+    throw agentWorkDeliveryBoardOnlyError();
   }
 
   async function assertAgentDefaultEnvironmentSelection(

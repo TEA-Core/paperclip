@@ -1,5 +1,6 @@
 import type { agents } from "@paperclipai/db";
 import { asString, parseObject } from "../adapters/utils.js";
+import { forbidden } from "../errors.js";
 
 /**
  * How an agent's work reaches Paperclip.
@@ -44,4 +45,23 @@ export function parseAgentWorkDelivery(agent: AgentWorkDeliveryInput): AgentWork
 
 export function isExternalPullAgent(agent: AgentWorkDeliveryInput) {
   return parseAgentWorkDelivery(agent) === "external_pull";
+}
+
+/**
+ * Fork (two-fleet routing): the `external_pull` declaration exempts an agent's
+ * parked cards from recovery sweeps, so only a board actor may set or clear
+ * it. Every write path that is reachable by an agent, a plugin or an import
+ * that the board did not allow refuses a change with this error.
+ */
+export const AGENT_WORK_DELIVERY_BOARD_ONLY_CODE = "agent_work_delivery_board_only";
+
+export function agentWorkDeliveryBoardOnlyError() {
+  return forbidden("Only the board can change an agent's work delivery mode.", {
+    code: AGENT_WORK_DELIVERY_BOARD_ONLY_CODE,
+  });
+}
+
+/** The runtime config declares `external_pull` work delivery. */
+export function declaresExternalPullWorkDelivery(runtimeConfig: unknown): boolean {
+  return parseAgentWorkDelivery({ runtimeConfig: parseObject(runtimeConfig) }) === "external_pull";
 }

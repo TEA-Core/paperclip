@@ -17,6 +17,11 @@ import type {
 import { isUuidLike } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { agentService } from "./agents.js";
+import {
+  AGENT_WORK_DELIVERY_RUNTIME_CONFIG_KEY,
+  agentWorkDeliveryBoardOnlyError,
+  declaresExternalPullWorkDelivery,
+} from "./agent-work-delivery.js";
 import { approvalService } from "./approvals.js";
 import { logActivity } from "./activity-log.js";
 import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
@@ -109,6 +114,9 @@ function selectPreferredAdapterType(
 }
 
 function declarationPatch(declaration: PluginManagedAgentDeclaration, input: { adapterType?: string } = {}) {
+  // Fork (two-fleet routing): a plugin is not a board actor, so it may not
+  // declare `external_pull` work delivery for the agents it manages.
+  if (declaresExternalPullWorkDelivery(declaration.runtimeConfig)) throw agentWorkDeliveryBoardOnlyError();
   return {
     name: declaration.displayName,
     role: declaration.role ?? "general",
@@ -664,9 +672,18 @@ export function pluginManagedAgentService(
           if (withInstructions.adapterConfig[key] !== undefined) adapterConfig[key] = withInstructions.adapterConfig[key];
         }
       }
+      // Fork (two-fleet routing): a reset must not clear a work delivery mode
+      // that the board set, so the current declaration carries over.
+      const currentRuntimeConfig = (reconciled.agent.runtimeConfig ?? {}) as Record<string, unknown>;
+      const runtimeConfig = { ...defaults.runtimeConfig } as Record<string, unknown>;
+      delete runtimeConfig[AGENT_WORK_DELIVERY_RUNTIME_CONFIG_KEY];
+      if (currentRuntimeConfig[AGENT_WORK_DELIVERY_RUNTIME_CONFIG_KEY] !== undefined) {
+        runtimeConfig[AGENT_WORK_DELIVERY_RUNTIME_CONFIG_KEY] = currentRuntimeConfig[AGENT_WORK_DELIVERY_RUNTIME_CONFIG_KEY];
+      }
       const updated = await agentSvc.update(reconciled.agent.id, {
         ...defaults,
         adapterConfig,
+        runtimeConfig,
         metadata: managedMetadata(options.pluginId, options.pluginKey, declaration, currentMetadata),
       }, {
         recordRevision: {

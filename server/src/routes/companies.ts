@@ -624,6 +624,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
         const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
         const result = await portability.importBundle(importBody, boardUserId, {
           pauseAutomations: importBody.pauseAutomations === true,
+          allowExternalPullWorkDelivery: req.actor.type === "board",
         });
         // The import is committed. Settlement (hooks) runs before the
         // best-effort audit entry so a logging failure cannot make a
@@ -1168,6 +1169,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       mode: "agent_safe",
       sourceCompanyId: companyId,
       pauseAutomations: body.pauseAutomations === true,
+      allowExternalPullWorkDelivery: req.actor.type === "board",
     });
     await logActivity(db, {
       companyId: result.company.id,

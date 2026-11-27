@@ -1688,8 +1688,34 @@ export function recoveryService(
     return rows.length > 0;
   }
 
+  // The exemption clock starts at the card's creation and moves only on
+  // activity by someone other than the owner: a board user, a plugin or
+  // another agent. The owner's own writes (comments, status flips) and
+  // system rows written by recovery itself do not move it, so an owner
+  // cannot keep a parked card exempt by touching it.
+  async function externalPullExemptionClockAt(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "createdAt">,
+    ownerAgentId: string,
+    runner: Db = db,
+  ): Promise<Date> {
+    const [row] = await runner
+      .select({ at: sql<Date | string | null>`max(${activityLog.createdAt})` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          sql`${activityLog.actorType} <> 'system'`,
+          sql`not (${activityLog.actorType} = 'agent' and ${activityLog.agentId} is not distinct from ${ownerAgentId})`,
+        ),
+      );
+    const latest = row?.at ? new Date(row.at) : null;
+    return latest && latest.getTime() > issue.createdAt.getTime() ? latest : issue.createdAt;
+  }
+
   async function evaluateExternalPullRecoveryExemption(
-    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "updatedAt">,
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "createdAt">,
     ownerAgentId: string | null | undefined,
     now: Date = new Date(),
     runner: Db = db,
@@ -1700,7 +1726,7 @@ export function recoveryService(
       ownerIsExternalPull: true,
       ownerStatusInvokable: isAgentStatusInvokable(owner.status),
       issueStatus: issue.status,
-      lastActivityAt: issue.updatedAt,
+      lastActivityAt: await externalPullExemptionClockAt(issue, owner.id, runner),
       boardCleared: await isExternalPullRecoveryExemptionBoardCleared(issue.companyId, issue.id, runner),
       now,
     });
