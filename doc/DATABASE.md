@@ -199,6 +199,52 @@ completed lookups and the separate liveness backfill are not replayed. Projectio
 callers that use a transaction retain single-attempt reads. The opt-in is only
 for a pooled database handle outside a transaction.
 
+### Tool invocation replay compatibility
+
+The tool gateway hashes full arguments for derived side-effect replay keys.
+New invocations reserve the unversioned legacy key when it is free and store
+their full, principal-scoped identity in the server-owned
+`arguments_summary.sideEffectReplayKey` JSONB field. The actual invocation,
+including its approval, dispatch and outcome state, lives at that key; there
+is no separate outcome copy to synchronize. If another call owns the legacy
+key, a distinct call uses its full `side_effect:v2:` key.
+
+Run UUIDs use one strict parser before run lookup, gateway context creation,
+derived replay-key construction and legacy receipt ownership checks. Hex case,
+omitted hyphens, hyphens after four-digit groups, matching braces and the
+`urn:uuid:` prefix all map to lowercase `8-4-4-4-12` form. Invalid provided
+run IDs (including arrays, objects, numbers and malformed strings) fail with
+HTTP 400 and code `invalid_run_id` before any database query, replay key or
+dispatch. Null or omitted optional policy/actor context stays unbound.
+Required null run context retains its existing service 403 / HTTP 400 refusal.
+
+Caller-supplied keys have a different contract: within a company, the same
+principal replays its stored outcome even with changed arguments or from a
+later run. They are not argument- or run-scoped. Another principal gets HTTP
+409 `idempotency_key_conflict`; another company has a separate key namespace.
+
+Recording holds a transaction-scoped advisory lock for the full identity
+across both possible storage keys. Releasing a legacy key cannot let two
+retries of one full identity dispatch through different keys.
+
+This needs no column or migration. During mixed-version operation or rollback,
+the pre-change binary finds the legacy row instead of dispatching again.
+It retains its old truncated-argument replay behavior, including null failure
+replays. The new binary checks the marker and principal before replay and
+reports in-progress calls as HTTP 409. An unmarked earlier-build row belonging
+to the same caller and run remains ambiguous: the new binary returns HTTP 409
+without replay or dispatch. Distinct full arguments remain distinct on new
+binaries even when their legacy hashes collide.
+
+If a pre-dispatch denial expires, its legacy row remains in place while a
+successful retry can be recorded at the v2 key. After rollback, the old
+binary can return that stale denial even for identical arguments. This
+response does not prove that the successful retry did not execute.
+
+Failures can expire after five minutes only before dispatch, without a human
+approval decision. A call that might have reached its tool, including a landed
+effect followed by a failure, never expires into automatic dispatch.
+
 ## Execution identity row locks
 
 Identity initialization, credential acquisition, and steering reconciliation lock

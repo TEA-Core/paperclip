@@ -3277,6 +3277,7 @@ export function issueThreadInteractionService(
                 "addressee_deleted",
                 "Cancelled because the addressed agent was deleted",
               ),
+              addresseeAgentId: null,
               resolvedByAgentId: null,
               resolvedByRunId: null,
               resolvedByUserId: null,

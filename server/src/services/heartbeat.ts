@@ -1,4 +1,5 @@
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { isTransactionHandle } from "./db-handle.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
@@ -457,7 +458,7 @@ import {
   DEFAULT_SELF_DECLARED_RUN_TTL_MS,
 } from "./run-stillborn.js";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
-import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishActivity, publishPluginDomainEvent, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -740,6 +741,7 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import { isRecoveryActionBoardParked, RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED } from "./recovery-carrier-park-state.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -1083,6 +1085,11 @@ function countConsecutivePreAdapterSetupFailures(
 const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
+// Statuses the scheduled monitor dispatcher selects (tickDueIssueMonitors).
+const ISSUE_MONITOR_DISPATCH_STATUSES = ["in_progress", "in_review", "blocked"] as const;
+const ISSUE_MONITOR_UNFIREABLE_ACTION = "issue.monitor_unfireable";
+// Transaction-scoped advisory lock key that serializes the unfireable scan.
+const ISSUE_MONITOR_UNFIREABLE_SCAN_LOCK_KEY = "paperclip:issue-monitor-unfireable-scan";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 // A reviewer that runs to completion and comments without deciding is deliberately
 // deferring, not dead, so its stage keeps getting re-armed instead of escalating.
@@ -13441,30 +13448,155 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  // Dispatch eligibility for a scheduled monitor, independent of time and of
+  // an in-flight claim: no human assignee, an agent assignee or the default
+  // `wake_owner` policy, and a dispatchable status. `tickDueIssueMonitors` and
+  // the unfireable scan both derive from this one predicate so the two stay
+  // exact complements.
+  function issueMonitorEligibleSql() {
+    return and(
+      isNull(issues.assigneeUserId),
+      or(
+        sql`${issues.assigneeAgentId} is not null`,
+        sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
+      ),
+      inArray(issues.status, [...ISSUE_MONITOR_DISPATCH_STATUSES]),
+    )!;
+  }
+
+  // A claim older than five minutes is treated as abandoned and can be taken
+  // again. A fresh claim is an in-flight wake, not an unfireable monitor.
+  function issueMonitorClaimableSql(now: Date) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
-    const hasDispatchTarget = or(
-      sql`${issues.assigneeAgentId} is not null`,
-      sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
-    );
+    return or(
+      isNull(issues.monitorWakeRequestedAt),
+      lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+    )!;
+  }
+
+  // The scheduler fires a monitor only when it is due, eligible and claimable.
+  function issueMonitorFireableSql(now: Date) {
+    return and(
+      sql`${issues.monitorNextCheckAt} is not null`,
+      lte(issues.monitorNextCheckAt, now),
+      issueMonitorEligibleSql(),
+      issueMonitorClaimableSql(now),
+    )!;
+  }
+
+  // A due monitor that is not eligible (an issue in `todo`/`backlog`/a closed
+  // status, a human assignee, or no assignee with a non-`wake_owner` policy)
+  // can never fire, and would otherwise stay armed with no activity row at all
+  // (SUP-25400: an agent release moves the issue to `todo` and drops the
+  // assignee but leaves the monitor scheduled). Record one
+  // `issue.monitor_unfireable` row per due schedule so the loss is visible in
+  // the issue activity API. Detection only: the monitor stays armed and no wake
+  // is routed. A due, eligible monitor that only fails the claim check is an
+  // in-flight wake and is not reported.
+  //
+  // A row whose `details.nextCheckAt` equals the current `monitorNextCheckAt`
+  // marks that schedule as reported; a re-arm to another time is reported again
+  // when it comes due. The scan and its inserts run in one transaction that
+  // holds a transaction-scoped advisory lock on a fixed key, so an overlapping
+  // tick (the scheduler interval has no in-flight guard) skips the scan instead
+  // of racing the NOT EXISTS check and writing a duplicate row.
+  async function reportUnfireableDueIssueMonitors(now: Date) {
+    const publications: ActivityPublication[] = [];
+    const reported = await db.transaction(async (tx) => {
+      const [lock] = await tx.execute<{ acquired: boolean }>(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${ISSUE_MONITOR_UNFIREABLE_SCAN_LOCK_KEY}, 0)) as acquired`,
+      );
+      if (!lock?.acquired) return 0;
+
+      const rows = await tx
+        .select(issueMonitorDispatchColumns)
+        .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(
+          and(
+            eq(companies.status, "active"),
+            sql`${issues.monitorNextCheckAt} is not null`,
+            lte(issues.monitorNextCheckAt, now),
+            sql`not (${issueMonitorEligibleSql()})`,
+            sql`not exists (
+              select 1 from ${activityLog}
+              where ${activityLog.companyId} = ${issues.companyId}
+                and ${activityLog.entityType} = 'issue'
+                and ${activityLog.entityId} = ${issues.id}::text
+                and ${activityLog.action} = ${ISSUE_MONITOR_UNFIREABLE_ACTION}
+                and ${activityLog.details}->>'nextCheckAt' = to_char(
+                  date_trunc('milliseconds', ${issues.monitorNextCheckAt}) at time zone 'UTC',
+                  'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                )
+            )`,
+          ),
+        )
+        .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+        .limit(50);
+
+      let count = 0;
+      for (const row of rows as IssueMonitorDispatchRow[]) {
+        if (!row.monitorNextCheckAt) continue;
+        const monitor =
+          normalizeIssueExecutionPolicy(row.executionPolicy ?? null)?.monitor ??
+          null;
+        const recoveryPolicy = monitorRecoveryPolicy(monitor);
+        const reasons: string[] = [];
+        if (
+          !(ISSUE_MONITOR_DISPATCH_STATUSES as readonly string[]).includes(
+            row.status,
+          )
+        ) {
+          reasons.push("status_not_dispatchable");
+        }
+        if (row.assigneeUserId) reasons.push("human_assignee");
+        else if (!row.assigneeAgentId && recoveryPolicy !== "wake_owner") {
+          reasons.push("no_assignee_agent");
+        }
+        await logActivityInTransaction(
+          tx as unknown as Db,
+          {
+            companyId: row.companyId,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            agentId: null,
+            runId: null,
+            action: ISSUE_MONITOR_UNFIREABLE_ACTION,
+            entityType: "issue",
+            entityId: row.id,
+            details: {
+              identifier: row.identifier,
+              status: row.status,
+              assigneeAgentId: row.assigneeAgentId,
+              assigneeUserId: row.assigneeUserId,
+              nextCheckAt: row.monitorNextCheckAt.toISOString(),
+              attemptCount: row.monitorAttemptCount ?? 0,
+              notes: row.monitorNotes ?? null,
+              serviceName: monitor?.serviceName ?? null,
+              recoveryPolicy,
+              reason: reasons[0] ?? "not_dispatchable",
+              reasons,
+              source: "scheduled",
+            },
+          },
+          publications,
+        );
+        count += 1;
+      }
+      return count;
+    });
+    // Publish only after the rows are committed.
+    for (const publication of publications) publishActivity(publication);
+    return reported;
+  }
+
+  async function tickDueIssueMonitors(now = new Date()) {
+    const fireable = issueMonitorFireableSql(now);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
       .innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(
-        and(
-          eq(companies.status, "active"),
-          sql`${issues.monitorNextCheckAt} is not null`,
-          lte(issues.monitorNextCheckAt, now),
-          isNull(issues.assigneeUserId),
-          hasDispatchTarget,
-          inArray(issues.status, ["in_progress", "in_review", "blocked"]),
-          or(
-            isNull(issues.monitorWakeRequestedAt),
-            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-          ),
-        ),
-      )
+      .where(and(eq(companies.status, "active"), fireable))
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
       .limit(50);
 
@@ -13479,20 +13611,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             monitorWakeRequestedAt: now,
             updatedAt: now,
           })
-          .where(
-            and(
-              eq(issues.id, due.id),
-              sql`${issues.monitorNextCheckAt} is not null`,
-              lte(issues.monitorNextCheckAt, now),
-              isNull(issues.assigneeUserId),
-              hasDispatchTarget,
-              inArray(issues.status, ["in_progress", "in_review", "blocked"]),
-              or(
-                isNull(issues.monitorWakeRequestedAt),
-                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
-              ),
-            ),
-          )
+          .where(and(eq(issues.id, due.id), issueMonitorFireableSql(now)))
           .returning();
         return (updated ?? null) as IssueMonitorDispatchRow | null;
       });
@@ -13522,10 +13641,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    let unfireable = 0;
+    try {
+      unfireable = await reportUnfireableDueIssueMonitors(now);
+    } catch (err) {
+      logger.error({ err }, "issue monitor unfireable scan failed");
+    }
+
     return {
       checked: dueMonitors.length,
       triggered,
       skipped,
+      unfireable,
     };
   }
 
@@ -15484,6 +15611,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // diagnostic persistence: a driver-level failure must be recorded (with its error class chain,
   // since drizzle/postgres.js keep the real Postgres error and SQLSTATE on `.cause`) and the run
   // must continue (SUP-15284). The guard never throws.
+  async function recordHeartbeatRunContextSnapshotFailure(
+    failure: Parameters<typeof buildContextSnapshotWriteFailureEvent>[0],
+    agentId?: string | null,
+    companyId?: string | null,
+  ) {
+    try {
+      logger.error(
+        {
+          err: failure.error,
+          runId: failure.runId,
+          agentId: agentId ?? null,
+          companyId: companyId ?? null,
+          writeSite: failure.writeSite,
+          errorClasses: contextSnapshotWriteErrorClasses(failure.error),
+        },
+        `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
+      );
+      // Retain one agent-readable run-log event on failure only. Callers owning
+      // a transaction record after it settles, never through a second pool
+      // connection while that transaction still holds the first one.
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, failure.runId))
+        .then((rows) => rows[0] ?? null);
+      if (run) await appendRunEvent(run, buildContextSnapshotWriteFailureEvent(failure));
+    } catch {
+      // A diagnostic failure must not abort the original wake or guarded write.
+    }
+  }
+
   async function guardHeartbeatRunContextSnapshotWrite<T>(input: {
     writeSite: string;
     runId: string;
@@ -15497,33 +15655,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runId: input.runId,
       write: input.write,
       fallback: input.fallback,
-      record: async (failure) => {
-        logger.error(
-          {
-            err: failure.error,
-            runId: failure.runId,
-            agentId: input.agentId ?? null,
-            companyId: input.companyId ?? null,
-            writeSite: failure.writeSite,
-            errorClasses: contextSnapshotWriteErrorClasses(failure.error),
-          },
-          `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
-        );
-        // Also retain the failure where an agent can read it (SUP-15431): append one
-        // heartbeat_run_events row so a future guarded failure is diagnosable from
-        // GET /api/heartbeat-runs/{runId}/events, not only container logs. Load the
-        // full run row here (failure path only — no happy-path cost) so appendRunEvent
-        // gets a complete row; skip the append if the row is already gone. A failure
-        // in this append is swallowed by the guard's outer catch, so it can never
-        // re-enter the guarded write path.
-        const run = await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, failure.runId))
-          .then((rows) => rows[0] ?? null);
-        if (!run) return;
-        await appendRunEvent(run, buildContextSnapshotWriteFailureEvent(failure));
-      },
+      record: failure => recordHeartbeatRunContextSnapshotFailure(failure, input.agentId, input.companyId),
     });
   }
 
@@ -21814,7 +21946,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const existing = await getAgent(agentId);
     if (!existing) return;
 
-    if (existing.status === "paused" || existing.status === "terminated") {
+    if (existing.status === "paused" || existing.status === "terminated" || existing.status === "deleted") {
       return;
     }
 
@@ -21843,7 +21975,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), ne(agents.status, "deleted")))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -31079,6 +31211,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
+      recoveryAgent.status !== "deleted" &&
       recoveryAgent.status !== "pending_approval";
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))
@@ -31628,7 +31761,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issue.id,
         );
         const treeHoldInteractionWake =
-          activePauseHold &&
+          activePauseHold && !activePauseHold.recoveryCarrierPark &&
           (await isVerifiedIssueTreeControlInteractionWake(tx, {
             companyId: issue.companyId,
             issueId: issue.id,
@@ -32778,6 +32911,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  async function suppressParkedNativeStatusWakeIntent(runner: Db, companyId: string, agentId: string, opts: WakeupOptions) {
+    const intentId = readNonEmptyString(opts.contextSnapshot?.nativeStatusWakeIntentId);
+    if (!intentId || !isUuidLike(intentId) || opts.requestedByActorType !== "system" ||
+        opts.requestedByActorId !== `native-status-wake-dispatch:${intentId}`) return;
+    const now = new Date();
+    await runner.update(agentWakeupRequests).set({
+      status: "skipped", finishedAt: now, updatedAt: now, error: RECOVERY_CARRIER_PARK_WAKE_SUPPRESSED,
+    }).where(and(
+      eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.requestedByActorType, "system"),
+      eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+      eq(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, readNonEmptyString(opts.contextSnapshot?.issueId) ?? ""),
+      inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
+    ));
+  }
+
+  /** Caller retains these locks through either queue insertion or run coalescing. */
+  async function lockRecoveryActionWakeGate(runner: Db, companyId: string, actionId: string) {
+    const [action] = await runner.select({
+      sourceIssueId: issueRecoveryActions.sourceIssueId, recoveryIssueId: issueRecoveryActions.recoveryIssueId,
+    }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.id, actionId), eq(issueRecoveryActions.companyId, companyId),
+    )).limit(1);
+    if (action) {
+      await runner.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, action.sourceIssueId), eq(issues.companyId, companyId),
+      )).for("update");
+      if (action.recoveryIssueId && action.recoveryIssueId !== action.sourceIssueId) {
+        await runner.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, action.recoveryIssueId), eq(issues.companyId, companyId),
+        )).for("update");
+      }
+    }
+    return await isRecoveryActionBoardParked(runner, companyId, actionId) ||
+      Boolean(action?.recoveryIssueId && (await issueTreeControlService(runner)
+        .getActivePauseHoldGate(companyId, action.recoveryIssueId))?.recoveryCarrierPark);
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -32823,6 +32994,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const recoveryActionId = readNonEmptyString(enrichedContextSnapshot.recoveryActionId) ?? readNonEmptyString(payload?.recoveryActionId);
+    if (recoveryActionId && await isRecoveryActionBoardParked(db, agent.companyId, recoveryActionId)) {
+      await suppressParkedNativeStatusWakeIntent(db, agent.companyId, agentId, opts);
+      return null;
+    }
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
@@ -32965,7 +33141,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
       executor: WakeupWriteExecutor = db,
-    ) => {
+    ): Promise<{ created: boolean }> => {
       // Upstream #13270: a saved user message waiting on execution is updated in place with the
       // current wait reason; it never becomes a skipped row, so it precedes the fork's SUP-15552
       // write-time coalescing of skipped rows.
@@ -32992,6 +33168,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // does not contain.
       const storedPayload = patch.payload !== undefined ? patch.payload : payload;
       const coalescingIssueId = readWakeIssueIdFromPayload(storedPayload);
+      if (deferrable && (recoveryActionId || coalescingIssueId || issueId)) {
+        if (!isTransactionHandle(executor)) {
+          return db.transaction(tx => writeSkippedRequest(skipReason, patch, waitCondition, tx));
+        }
+        const runner = executor as unknown as Db;
+        if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+          await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+          return { created: false };
+        }
+        const scopedIssueId = coalescingIssueId ?? issueId;
+        if (scopedIssueId && isUuidLike(scopedIssueId)) {
+          await executor.execute(sql`select id from issues where id = ${scopedIssueId} and company_id = ${agent.companyId} for update`);
+          const hold = await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, scopedIssueId);
+          if (hold?.recoveryCarrierPark) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+            return { created: false };
+          }
+        }
+      }
       if (deferrable) {
         // Write-time coalescing (SUP-15552): while the transient condition
         // persists an agent can be skipped repeatedly (timer, assignment and
@@ -33107,12 +33302,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       if (waitCondition && issueId && isUuidLike(issueId)) {
         const waitIssueId = issueId;
-        return db.transaction(async (tx) => {
+        const recordWait = async (tx: WakeupWriteExecutor) => {
           await tx.execute(sql`select id from issues where id = ${waitIssueId} and company_id = ${agent.companyId} for update`);
           return recordExecutionWait(tx as unknown as Db, {
             issueId: waitIssueId, request, condition: waitCondition, coalesce: coalesceExecutionWait,
           });
-        });
+        };
+        return isTransactionHandle(executor) ? recordWait(executor) : db.transaction(recordWait);
       }
       await executor.insert(agentWakeupRequests).values(request);
       return { created: true };
@@ -33418,6 +33614,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId,
       );
       if (activePauseHold) {
+        if (activePauseHold.recoveryCarrierPark) {
+          await suppressParkedNativeStatusWakeIntent(db, agent.companyId, agentId, opts);
+          return null;
+        }
         const treeHoldInteractionWake =
           await isVerifiedIssueTreeControlInteractionWake(db, {
             companyId: agent.companyId,
@@ -33479,9 +33679,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const outcome = await db
         .transaction(async (tx) => {
+          const runner = tx as unknown as Db;
+          if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+            return { kind: "deferred" as const };
+          }
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          if ((await issueTreeControlService(runner).getActivePauseHoldGate(agent.companyId, issueId))?.recoveryCarrierPark) {
+            await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+            return { kind: "deferred" as const };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -35115,23 +35324,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             coalescedTargetRun.status === "scheduled_retry",
         },
       );
+      let snapshotFailure: Parameters<typeof buildContextSnapshotWriteFailureEvent>[0] | undefined;
       const persistCoalescedWake = async (executor: Db) => {
-        const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+        const writeSnapshot = (runner: Db) => runner
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+          .returning()
+          .then((rows) => rows[0] ?? coalescedTargetRun);
+        const mergedRun = await runContextSnapshotWriteGuarded({
           writeSite: "enqueueWakeup:same-scope-coalesce",
           runId: coalescedTargetRun.id,
-          agentId,
-          companyId: agent.companyId,
-          write: () =>
-            executor
-              .update(heartbeatRuns)
-              .set({
-                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-                updatedAt: new Date(),
-              })
-              .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-              .returning()
-              .then((rows) => rows[0] ?? coalescedTargetRun),
+          // Roll back only this diagnostic update if PostgreSQL rejects it;
+          // the outer action-gated transaction must remain usable for receipt.
+          write: () => isTransactionHandle(executor)
+            ? executor.transaction(tx => writeSnapshot(tx as unknown as Db))
+            : writeSnapshot(executor),
           fallback: coalescedTargetRun,
+          record: async failure => { snapshotFailure = failure; },
         });
         await executor.insert(agentWakeupRequests).values({
           ...durableReceiptFields,
@@ -35152,30 +35365,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return mergedRun;
       };
       const nestedIssueId = readNonEmptyString(parseObject(mergedContextSnapshot.paperclipIssue).id);
-      const mergedRun = nestedIssueId && isUuidLike(nestedIssueId)
-        ? await db.transaction(async (tx) => {
+      let parkRefused = false;
+      const mergedRun = await (recoveryActionId || (nestedIssueId && isUuidLike(nestedIssueId))
+        ? db.transaction(async (tx) => {
             // Match restore's run-then-issue lock order even when this queued run
             // was previously unbound and therefore absent from its first scan.
             await tx.execute(sql`select id from heartbeat_runs where company_id = ${agent.companyId} and id = ${coalescedTargetRun.id} for update`);
-            const [lockedIssue] = await tx.select({
-              assigneeAgentId: issues.assigneeAgentId,
-              executionState: issues.executionState,
-            }).from(issues).where(and(
-              eq(issues.companyId, agent.companyId),
-              eq(issues.id, nestedIssueId),
-            )).for("update");
-            const state = parseObject(lockedIssue?.executionState);
-            const participant = parseObject(state.currentParticipant);
-            if (lockedIssue &&
-              state.status === "pending" &&
-              lockedIssue.assigneeAgentId !== agentId &&
-              !(participant.type === "agent" && participant.agentId === agentId)
-            ) return null;
+            const runner = tx as unknown as Db;
+            if (recoveryActionId && await lockRecoveryActionWakeGate(runner, agent.companyId, recoveryActionId)) {
+              parkRefused = true;
+              await suppressParkedNativeStatusWakeIntent(runner, agent.companyId, agentId, opts);
+              return null;
+            }
+            if (nestedIssueId && isUuidLike(nestedIssueId)) {
+              const [lockedIssue] = await tx.select({
+                assigneeAgentId: issues.assigneeAgentId,
+                executionState: issues.executionState,
+              }).from(issues).where(and(
+                eq(issues.companyId, agent.companyId),
+                eq(issues.id, nestedIssueId),
+              )).for("update");
+              const state = parseObject(lockedIssue?.executionState);
+              const participant = parseObject(state.currentParticipant);
+              if (lockedIssue &&
+                state.status === "pending" &&
+                lockedIssue.assigneeAgentId !== agentId &&
+                !(participant.type === "agent" && participant.agentId === agentId)
+              ) return null;
+            }
             return persistCoalescedWake(tx as unknown as Db);
           })
-        : await persistCoalescedWake(db);
+        : persistCoalescedWake(db)).finally(async () => {
+          if (snapshotFailure) {
+            await recordHeartbeatRunContextSnapshotFailure(snapshotFailure, agentId, agent.companyId);
+          }
+        });
       if (!mergedRun) {
-        await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
+        if (!parkRefused) await writeSkippedHeartbeatRequest("heartbeat.nested_issue_owner_changed", { issueId: nestedIssueId });
         return null;
       }
       return mergedRun;
@@ -35185,6 +35411,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the context, so the task key and execution context stay unchanged.
     const nestedIssueId = readNonEmptyString(parseObject(enrichedContextSnapshot.paperclipIssue).id);
     const queueOutcome = await db.transaction(async (tx) => {
+      if (recoveryActionId && await lockRecoveryActionWakeGate(tx as unknown as Db, agent.companyId, recoveryActionId)) {
+        await suppressParkedNativeStatusWakeIntent(tx as unknown as Db, agent.companyId, agentId, opts);
+        return { kind: "deferred" as const };
+      }
       if (nestedIssueId && isUuidLike(nestedIssueId)) {
         const [nestedIssue] = await tx.select({
           assigneeAgentId: issues.assigneeAgentId,
@@ -35294,7 +35524,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { kind: "queued" as const, run: newRun };
     });
 
-    if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind !== "queued") return null;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -35548,6 +35778,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .orderBy(desc(agentWakeupRequests.requestedAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
+        if (!wakeRun && !delivered) {
+          // A typed-park refusal terminates only the original native intent.
+          // Do not turn that suppression back into a retryable queued outbox.
+          const [intent] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, candidate.id)).limit(1);
+          if (intent?.status === "skipped") {
+            recovered += 1;
+            continue;
+          }
+        }
 
         // The committer intent is the durable outbox entry. When admission is
         // blocked, enqueueWakeup creates a separate deferred dispatch receipt;

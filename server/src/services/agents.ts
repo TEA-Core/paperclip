@@ -10,19 +10,14 @@ import {
   agentApiKeys,
   agentRuntimeState,
   agentTaskSessions,
-  agentWakeupRequests,
-  activityLog,
   costEvents,
   decisionQueueItems,
   decisionQueues,
   decisionRetention,
   decisionTriage,
   decisionTriageEvents,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueExecutionDecisions,
   issues,
-  issueComments,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -329,7 +324,7 @@ export function hasAgentShortnameCollision(
   if (!candidateShortname) return false;
 
   return existingAgents.some((agent) => {
-    if (agent.status === "terminated") return false;
+    if (agent.status === "terminated" || agent.status === "deleted") return false;
     if (options?.excludeAgentId && agent.id === options.excludeAgentId) return false;
     return normalizeAgentUrlKey(agent.name) === candidateShortname;
   });
@@ -718,7 +713,7 @@ export function agentService(db: Db) {
     const existing = await getById(id);
     if (!existing) return null;
 
-    if (existing.status === "terminated" && data.status && data.status !== "terminated") {
+    if ((existing.status === "terminated" || existing.status === "deleted") && data.status && data.status !== existing.status) {
       throw conflict("Terminated agents cannot be resumed");
     }
     if (
@@ -810,10 +805,11 @@ export function agentService(db: Db) {
       if (changesWikiMaintainerMarker) {
         await lockWikiMaintainerResolution(txDb, existing.companyId, "exclusive");
       }
-      const current = data.status !== undefined
-        ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
-        : existing;
+      const current = await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null);
       if (!current) return null;
+      if (current.status === "deleted") {
+        throw conflict("Deleted agents cannot be updated");
+      }
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }
@@ -898,7 +894,7 @@ export function agentService(db: Db) {
     list: async (companyId: string, options?: { includeTerminated?: boolean }) => {
       const conditions = [eq(agents.companyId, companyId)];
       if (!options?.includeTerminated) {
-        conditions.push(ne(agents.status, "terminated"));
+        conditions.push(ne(agents.status, "terminated"), ne(agents.status, "deleted"));
       }
       const [rows, allCompanyRows] = await Promise.all([
         db.select().from(agents).where(and(...conditions)),
@@ -1008,6 +1004,7 @@ export function agentService(db: Db) {
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot pause deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
       return updateAgent(id, {
@@ -1021,6 +1018,7 @@ export function agentService(db: Db) {
     resume: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot resume deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot be resumed");
@@ -1037,6 +1035,7 @@ export function agentService(db: Db) {
     clearError: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (existing.status === "deleted") throw conflict("Cannot clear error on deleted agent");
       if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
@@ -1108,29 +1107,9 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
-        // The actor identity remains truthful, but its deletable FK links must
-        // not take issue landing obligations or legacy close settlement with it.
-        await tx.update(activityLog).set({ agentId: null, runId: null }).where(and(
-          eq(activityLog.entityType, "issue"),
-          or(
-            inArray(activityLog.action, ["issue.delivery_requirement_reclassified", "issue.repository_landing_debt"]),
-            and(eq(activityLog.action, "issue.updated"), sql`${activityLog.details}->>'status' = 'done'`),
-          ),
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        ));
-        await tx.delete(activityLog).where(
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        );
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
-        await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
+        // Tombstoning retains every historical row, including landing debt,
+        // without deleting the agent/run FK targets or detaching their identity.
+        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         // Decision-table actor rows carry check constraints tying the 'agent'
         // actor type to a non-null agent FK. Re-label this agent's rows as
         // system-owned before the FKs detach (migration 0222) so the rows
@@ -1154,21 +1133,32 @@ export function agentService(db: Db) {
           .update(decisionRetention)
           .set({ archivedByType: "system", archivedByAgentId: null })
           .where(eq(decisionRetention.archivedByAgentId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
         await tx.delete(principalPermissionGrants).where(and(
           eq(principalPermissionGrants.companyId, existing.companyId),
           eq(principalPermissionGrants.principalType, "agent"),
           eq(principalPermissionGrants.principalId, id),
         ));
-        const deleted = await tx
-          .delete(agents)
+        const tombstone = await tx
+          .update(agents)
+          .set({
+            status: "deleted",
+            name: "Deleted agent",
+            title: null,
+            capabilities: null,
+            adapterConfig: {},
+            runtimeConfig: {},
+            permissions: {},
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            metadata: { tombstone: true, deletedAt: new Date().toISOString() },
+            updatedAt: new Date(),
+          })
           .where(eq(agents.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
-        return deleted ? normalizeAgentRow(deleted) : null;
+        return tombstone ? normalizeAgentRow(tombstone) : null;
       });
     },
 
@@ -1332,6 +1322,9 @@ export function agentService(db: Db) {
       if (existing.status === "pending_approval") {
         throw conflict("Cannot create keys for pending approval agents");
       }
+      if (existing.status === "deleted") {
+        throw conflict("Cannot create keys for deleted agents");
+      }
       if (existing.status === "terminated") {
         throw conflict("Cannot create keys for terminated agents");
       }
@@ -1417,7 +1410,7 @@ export function agentService(db: Db) {
 
     orgForCompany: async (companyId: string) => {
       const allCompanyRows = await listCompanyAgentRows(companyId);
-      const rows = allCompanyRows.filter((row) => row.status !== "terminated");
+      const rows = allCompanyRows.filter((row) => row.status !== "terminated" && row.status !== "deleted");
       const normalizedRows = normalizeAgentRows(rows, allCompanyRows);
       const byManager = new Map<string | null, typeof normalizedRows>();
       for (const row of normalizedRows) {
@@ -1480,7 +1473,7 @@ export function agentService(db: Db) {
 
       const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
       const matches = normalizeAgentRows(rows, rows)
-        .filter((agent) => agent.urlKey === urlKey && agent.status !== "terminated");
+        .filter((agent) => agent.urlKey === urlKey && agent.status !== "terminated" && agent.status !== "deleted");
       if (matches.length === 1) {
         return { agent: matches[0] ?? null, ambiguous: false } as const;
       }

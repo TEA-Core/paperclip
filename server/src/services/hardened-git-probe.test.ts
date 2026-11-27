@@ -1,8 +1,9 @@
-import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HardenedGitError,
   IGNORED_ARTIFACT_DIRECTORY_NAMES,
@@ -14,6 +15,28 @@ import {
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
+
+/**
+ * Test seam for a mid-check swap: when `swapOnOpen` names a path, the first
+ * `open` of that path runs `swap` first, so the file the probe saw as regular
+ * at its `lstat` is something else by the time it opens it. Every other call
+ * goes straight to the real module.
+ */
+const fsControl = vi.hoisted(() => ({ swapOnOpen: null as null | { path: string; swap: () => void } }));
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    open: (...args: Parameters<typeof actual.open>) => {
+      const pending = fsControl.swapOnOpen;
+      if (pending && String(args[0]) === pending.path) {
+        fsControl.swapOnOpen = null;
+        pending.swap();
+      }
+      return actual.open(...args);
+    },
+  };
+});
 
 // Real repositories, real git: every planted program writes a marker file, so
 // "did not execute" is observed rather than assumed.
@@ -149,6 +172,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fsControl.swapOnOpen = null;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -410,6 +434,27 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     const layout = managedLayout();
     const result = await probeNoRepositoryWorktree(layout.input);
     expect(result).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
+  });
+
+  it("keeps a record_only close available when another registered card has stashed work", async () => {
+    const layout = managedLayout();
+    const otherBranch = "SUP-8-other-card";
+    const other = layout.addWorktree(otherBranch);
+    writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+    git(other, "stash", "push", "-qm", "other card draft");
+    const result = await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set([otherBranch]) });
+    expect(result).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
+  });
+
+  it("refuses this card's stash even when another card's stash is on top", async () => {
+    const layout = managedLayout();
+    writeFileSync(path.join(layout.worktree, "a.txt"), "this card's work\n");
+    git(layout.worktree, "stash", "push", "-qm", "this card draft");
+    const otherBranch = "SUP-8-other-card";
+    const other = layout.addWorktree(otherBranch);
+    writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+    git(other, "stash", "push", "-qm", "other card draft");
+    expect(await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set([otherBranch]) })).toMatchObject({ ok: false });
   });
 
   // Repository-local configuration the server must never run, and must not let
@@ -1142,6 +1187,25 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(await recheckRecordedWorktree(await measured(layout))).toEqual({ ok: true });
     });
 
+    it("keeps the record_only write available when another registered card stashes after measurement", async () => {
+      const layout = managedLayout();
+      const otherBranch = "SUP-8-other-card";
+      const other = layout.addWorktree(otherBranch);
+      layout.input.attributedBranches = new Set([otherBranch]);
+      const input = await measured(layout);
+      writeFileSync(path.join(other, "a.txt"), "other card's work\n");
+      git(other, "stash", "push", "-qm", "other card draft");
+      expect(await recheckRecordedWorktree({ ...input, stashScope: layout.input })).toEqual({ ok: true });
+    });
+
+    it("refuses this card's stash created after record_only measurement", async () => {
+      const layout = managedLayout();
+      const input = await measured(layout);
+      writeFileSync(path.join(layout.worktree, "a.txt"), "this card's work\n");
+      git(layout.worktree, "stash", "push", "-qm", "this card draft");
+      expect(await recheckRecordedWorktree({ ...input, stashScope: layout.input })).toMatchObject({ ok: false });
+    });
+
     it("refuses with a timed-out reason, not a status one, when the shared budget is spent", async () => {
       const layout = managedLayout();
       const result = await recheckRecordedWorktree({ ...(await measured(layout)), budgetMs: 1 });
@@ -1445,6 +1509,636 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       const result = await probeNoRepositoryWorktree({ ...layout.input, timeoutMs: 500 });
       expect(result.ok).toBe(false);
       expect(Date.now() - started).toBeLessThan(15_000);
+    });
+  });
+});
+
+// The record_only stash provenance rule. A stash refuses a record_only close
+// only when the stash commit itself records one of this card's branches
+// (`WIP on <branch>:` / `On <branch>:`). The reflog label, which
+// `git stash store -m` rewrites freely, and the parents, which every card on
+// the same base commit shares, are never read. Row ids follow the frozen
+// grading matrix; every row also asserts that the close left the stash stack
+// exactly as it found it.
+describe("record_only stash provenance rule (frozen matrix)", () => {
+  const OWN = "SUP-7-record-ruling";
+  const SIBLING = "SUP-8-other-card";
+
+  interface StashFixture {
+    layout: ManagedLayout;
+    /** The managed checkout M. */
+    m: string;
+    /** This card's recorded worktree X. */
+    x: string;
+    /** The registered sibling worktree Y, created and registered on first use. */
+    y: () => string;
+    registered: Set<string>;
+    stashRef: string;
+    stashLog: string;
+    stash: (dir: string, ...args: string[]) => void;
+    create: (dir: string) => string;
+    store: (dir: string, label: string, commit: string) => void;
+    deleted: (branch: string, commit?: boolean) => void;
+    ff: (dir: string) => void;
+    input: () => ManagedLayout["input"];
+  }
+
+  function stashFixture(): StashFixture {
+    const layout = managedLayout();
+    const m = layout.repoRoot;
+    const registered = new Set<string>();
+    let change = 0;
+    let sibling: string | null = null;
+    const touch = (dir: string) => writeFileSync(path.join(dir, "a.txt"), `change ${++change}\n`);
+    const fixture: StashFixture = {
+      layout,
+      m,
+      x: layout.worktree,
+      registered,
+      y: () => {
+        if (sibling === null) {
+          sibling = layout.addWorktree(SIBLING);
+          registered.add(SIBLING);
+        }
+        return sibling;
+      },
+      stashRef: path.join(m, ".git", "refs", "stash"),
+      stashLog: path.join(m, ".git", "logs", "refs", "stash"),
+      stash: (dir, ...args) => {
+        touch(dir);
+        git(dir, "stash", "push", "-q", ...args);
+      },
+      create: (dir) => {
+        touch(dir);
+        const commit = git(dir, "stash", "create");
+        git(dir, "checkout", "-q", "--", "a.txt");
+        return commit;
+      },
+      store: (dir, label, commit) => {
+        git(dir, "stash", "store", "-m", label, commit);
+      },
+      deleted: (branch, commit = false) => {
+        git(m, "switch", "-q", "-c", branch);
+        if (commit) {
+          writeFileSync(path.join(m, "b.txt"), `${branch}\n`);
+          git(m, "add", "b.txt");
+          git(m, "commit", "-qm", `work on ${branch}`);
+        }
+        fixture.stash(m);
+        git(m, "switch", "-q", "main");
+        git(m, "branch", "-q", "-D", branch);
+      },
+      ff: (dir) => {
+        const clone = path.join(root, `ff-${++change}`);
+        git(root, "clone", "-q", layout.origin, clone);
+        writeFileSync(path.join(clone, "base.txt"), `base ${change}\n`);
+        git(clone, "add", "base.txt");
+        git(clone, "commit", "-qm", "base moves");
+        git(clone, "push", "-q", "origin", "main");
+        git(dir, "fetch", "-q", "origin");
+        git(dir, "merge", "-q", "--ff-only", "origin/main");
+      },
+      input: () => ({ ...layout.input, attributedBranches: new Set(registered) }),
+    };
+    return fixture;
+  }
+
+  /** Nine `git stash push -m <120 KB>` entries from `dir`: about 1.08 MB of reflog, over the old 1 MiB read bound. */
+  const longMessagePushes = (f: StashFixture, dir: string, count = 9) => {
+    for (let index = 0; index < count; index += 1) f.stash(dir, "-m", `${index}`.padEnd(120_000, "x"));
+  };
+
+  const REFLOG_LINE = (id: string, subject: string) =>
+    `${"0".repeat(40)} ${id} t <t@example.com> 1700000000 +0000\t${subject}\n`;
+
+  /**
+   * The stash stack as git sees it (entry ids, newest first); a stack git cannot
+   * read is compared by its error. One `git log -g` process and no helper: a
+   * `git stash list` timeout kills only `git stash`, which leaves its `git log`
+   * child blocked on a FIFO reflog after the test.
+   */
+  function stashList(m: string): string {
+    try {
+      return execFileSync("git", ["-C", m, "log", "-g", "--format=%H", "refs/stash", "--"], {
+        env: fixtureEnv,
+        stdio: "pipe",
+        timeout: 3_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * MIB,
+      }).toString();
+    } catch (error) {
+      return `unreadable: ${(error as { status?: number }).status ?? "timeout"}`;
+    }
+  }
+
+  async function probeKeepingStash(fixture: StashFixture) {
+    const before = stashList(fixture.m);
+    const started = performance.now();
+    const result = await probeNoRepositoryWorktree(fixture.input());
+    // A FIFO or any other unreadable evidence must not hang the probe.
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(stashList(fixture.m)).toBe(before);
+    return result;
+  }
+
+  type Row = [id: string, setup: (fixture: StashFixture) => void];
+
+  const refuseRows: [id: string, branch: string, setup: (fixture: StashFixture) => void][] = [
+    ["ST-01 this card's stash, WIP on form", OWN, (f) => f.stash(f.x)],
+    ["ST-01b this card's stash beside a sibling's corrupt stash commit", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+      const commit = git(f.m, "rev-parse", "refs/stash");
+      const object = path.join(f.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+    }],
+    ["ST-02 this card's stash, On form", OWN, (f) => f.stash(f.x, "-m", "this card draft")],
+    ["ST-03 this card's entry below a sibling's tip", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+    }],
+    ["ST-04 three-parent stash of an untracked file", OWN, (f) => {
+      writeFileSync(path.join(f.x, "u.txt"), "untracked\n");
+      git(f.x, "stash", "push", "-qu");
+    }],
+    ["ST-05 packed tip", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-05b only the packed tip names the commit (SS-PACKED)", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+      rmSync(f.stashLog);
+    }],
+    ["ST-06 this card's entry below a packed tip", OWN, (f) => {
+      f.stash(f.x);
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-07a free-text reflog label (SS-UNPARSE)", OWN, (f) => f.store(f.x, "parked notes", f.create(f.x))],
+    ["ST-07b a failed autostash's label", OWN, (f) => f.store(f.x, "autostash", f.create(f.x))],
+    ["ST-08 relabelled as the registered sibling's, On form", OWN, (f) => {
+      f.y();
+      f.store(f.x, `On ${SIBLING}: draft`, f.create(f.x));
+    }],
+    ["ST-09 relabelled as the registered sibling's, WIP on form", OWN, (f) => {
+      f.y();
+      f.store(f.x, `WIP on ${SIBLING}: 1234567 init`, f.create(f.x));
+    }],
+    ["ST-10 relabelled as the project branch", OWN, (f) => f.store(f.x, "WIP on main: 1234567 init", f.create(f.x))],
+    ["ST-11 a tip with no reflog line (SS-TIP)", OWN, (f) => {
+      f.stash(f.y());
+      writeFileSync(f.stashRef, `${f.create(f.x)}\n`);
+    }],
+    ["ST-12 no reflog; the tip names the commit", OWN, (f) => {
+      f.stash(f.x);
+      rmSync(f.stashLog);
+    }],
+    ["ST-13 no ref; the reflog names the commit", OWN, (f) => {
+      f.stash(f.x);
+      rmSync(f.stashRef);
+    }],
+    ["ST-14 own branch wins over registration (SS-OWN)", OWN, (f) => {
+      f.registered.add(OWN);
+      f.stash(f.x);
+    }],
+    ["ST-15 recorded branch carries the identifier after a rename", OWN, (f) => {
+      f.stash(f.x);
+      git(f.x, "branch", "-m", OWN, `${OWN}-2`);
+    }],
+    ["ST-16 a second unregistered worktree carrying the identifier", "SUP-7-extra", (f) => {
+      f.stash(f.layout.addWorktree("SUP-7-extra"));
+    }],
+    ["ST-17 a deleted branch that carried the identifier", "SUP-7-scratch", (f) => f.deleted("SUP-7-scratch")],
+    ["ST-18 the identifier match ignores case", "sup-7-notes", (f) => f.deleted("sup-7-notes")],
+    ["ST-19 own stash, then the card fast-forwards", OWN, (f) => {
+      f.stash(f.x);
+      f.ff(f.x);
+    }],
+    ["ST-20 garbage loose ref over a packed tip; the reflog names the commit", OWN, (f) => {
+      f.stash(f.x);
+      git(f.m, "pack-refs", "--all");
+      writeFileSync(f.stashRef, "garbage\n");
+    }],
+    ["ST-21 one missing object does not abort the read", OWN, (f) => {
+      f.stash(f.x);
+      appendFileSync(f.stashLog, REFLOG_LINE("e".repeat(40), "WIP on main: 1234567 x"));
+    }],
+    ["ST-23 this card's entry below nine 120 KB-message stashes (reflog over 1 MiB)", OWN, (f) => {
+      f.stash(f.x);
+      git(f.x, "checkout", "-q", "--detach");
+      longMessagePushes(f, f.x);
+      git(f.x, "checkout", "-q", OWN);
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
+    ["ST-24 this card's entry below a registered sibling's 1 MiB of long-message stashes", OWN, (f) => {
+      f.stash(f.x);
+      longMessagePushes(f, f.y());
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
+    ["ST-22 work stashed while a sibling stood on this card's branch", OWN, (f) => {
+      const y = f.y();
+      git(y, "switch", "-q", "--ignore-other-worktrees", OWN);
+      f.stash(y);
+      git(y, "switch", "-q", SIBLING);
+    }],
+  ];
+
+  it.each(refuseRows)("refuses %s", async (_id, branch, setup) => {
+    const fixture = stashFixture();
+    setup(fixture);
+    const result = await probeKeepingStash(fixture);
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain(`stashed on this card's branch ${branch} `);
+  });
+
+  const admitRows: Row[] = [
+    ["ST-00 no stash", () => {}],
+    ["ST-30 the registered sibling's stash, WIP on form", (f) => f.stash(f.y())],
+    ["ST-31 the registered sibling's stash, On form", (f) => f.stash(f.y(), "-m", "other card draft")],
+    ["ST-32 a stash on the project branch", (f) => f.stash(f.m)],
+    ["ST-33 a deleted branch that names no card", (f) => f.deleted("scratch")],
+    ["ST-34 a deleted branch that names no card, on its own commit", (f) => f.deleted("scratch", true)],
+    ["ST-35 a sibling's detached-HEAD stash", (f) => {
+      const y = f.y();
+      git(y, "checkout", "-q", "--detach");
+      f.stash(y);
+      git(y, "checkout", "-q", SIBLING);
+    }],
+    ["ST-36 a sibling's stash relabelled as this card's, On form", (f) => {
+      f.store(f.y(), `On ${OWN}: forged`, f.create(f.y()));
+    }],
+    ["ST-37 a sibling's stash relabelled as this card's, WIP on form", (f) => {
+      f.store(f.y(), `WIP on ${OWN}: 1234567 init`, f.create(f.y()));
+    }],
+    ["ST-38 a registered branch that also mentions this card", (f) => {
+      const follow = "SUP-8-follow-up-for-SUP-7";
+      f.registered.add(follow);
+      f.stash(f.layout.addWorktree(follow));
+    }],
+    ["ST-39 a packed sibling stash", (f) => {
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+    }],
+    ["ST-40a free-text label on a sibling's stash", (f) => f.store(f.y(), "parked notes", f.create(f.y()))],
+    ["ST-40b a sibling's failed autostash", (f) => f.store(f.y(), "autostash", f.create(f.y()))],
+    ["ST-41 an unreadable ref", (f) => writeFileSync(f.stashRef, "garbage\n")],
+    ["ST-42 an unreadable ref over a packed sibling stash", (f) => {
+      f.stash(f.y());
+      git(f.m, "pack-refs", "--all");
+      writeFileSync(f.stashRef, "garbage\n");
+    }],
+    ["ST-43 a ref naming a blob", (f) => writeFileSync(f.stashRef, `${git(f.m, "rev-parse", "HEAD:a.txt")}\n`)],
+    ["ST-44 a missing object whose reflog label names this card", (f) => {
+      f.stash(f.y());
+      appendFileSync(f.stashLog, REFLOG_LINE("e".repeat(40), `WIP on ${OWN}: 1234567 x`));
+    }],
+    ["ST-45 a deleted branch carrying another card's identifier", (f) => f.deleted("SUP-9-x")],
+    ["ST-46a SUP-70 is not SUP-7", (f) => f.deleted("SUP-70-x")],
+    ["ST-46b xSUP-7 is not SUP-7", (f) => f.deleted("xSUP-7-y")],
+    ["ST-47 a sibling's stash after this card fast-forwards", (f) => {
+      f.stash(f.y());
+      f.ff(f.x);
+    }],
+    ["ST-49 a corrupt stash commit object", (f) => {
+      f.stash(f.y());
+      const commit = git(f.m, "rev-parse", "refs/stash");
+      const object = path.join(f.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+    }],
+    ["ST-51 only a registered sibling's stashes in a reflog over 1 MiB", (f) => {
+      longMessagePushes(f, f.y());
+      expect(statSync(f.stashLog).size).toBeGreaterThan(MIB);
+    }],
+    // Admitted by design: each is the same repository state as an admit row
+    // above up to file contents, or a state record_only never inspects. They
+    // are pinned so nobody closes them by re-introducing the wedge.
+    ["HIDE-1 this card's detached-HEAD stash (same state as ST-35)", (f) => {
+      git(f.x, "checkout", "-q", "--detach");
+      f.stash(f.x);
+      git(f.x, "checkout", "-q", OWN);
+    }],
+    ["HIDE-2 this card's stash on a deleted temporary branch (same state as ST-33)", (f) => {
+      git(f.x, "switch", "-q", "-c", "tmp-scratch");
+      f.stash(f.x);
+      git(f.x, "switch", "-q", OWN);
+      git(f.x, "branch", "-q", "-D", "tmp-scratch");
+    }],
+    ["HIDE-3 a dangling stash commit with no ref", (f) => {
+      f.create(f.x);
+    }],
+    ["HIDE-4 work committed, then reset away", (f) => {
+      writeFileSync(path.join(f.x, "a.txt"), "committed then reset\n");
+      git(f.x, "commit", "-qam", "SUP-7 work");
+      git(f.x, "reset", "-q", "--hard", "origin/main");
+    }],
+  ];
+
+  it.each(admitRows)("admits %s", async (_id, setup) => {
+    const fixture = stashFixture();
+    setup(fixture);
+    expect(await probeKeepingStash(fixture)).toMatchObject({ ok: true, branch: OWN });
+  });
+
+  it("ST-52 refuses a regular stash reflog over the 16 MiB bound as unverified, even with no stash of this card", async () => {
+    const fixture = stashFixture();
+    fixture.stash(fixture.y());
+    const padding = REFLOG_LINE("0".repeat(40), "x".repeat(4_000)).repeat(Math.ceil((16 * MIB) / 4_000) + 16);
+    appendFileSync(fixture.stashLog, padding);
+    expect(statSync(fixture.stashLog).size).toBeGreaterThan(16 * MIB);
+    const result = await probeNoRepositoryWorktree(fixture.input());
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+  });
+
+  // Captain rulings Q43 (symbolic link) and the FIFO ruling (option a): any
+  // stash reflog path that holds something other than a regular file refuses
+  // as unverified. Only a missing reflog contributes nothing.
+  describe("a stash reflog that is not a regular file", () => {
+    /** Move the reflog out of the repository and leave a symlink to it in its place. */
+    function symlinkReflog(fixture: StashFixture, contents?: string): string {
+      const target = path.join(mkdtempSync(path.join(root, "stash-reflog-target-")), "stash");
+      writeFileSync(target, contents ?? readFileSync(fixture.stashLog));
+      rmSync(fixture.stashLog);
+      symlinkSync(target, fixture.stashLog);
+      return target;
+    }
+
+    async function refusesUnverified(fixture: StashFixture) {
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+      expect((result as { reason: string }).reason).toContain("not a regular file");
+    }
+
+    /** Replace the reflog with a FIFO. */
+    function fifoReflog(fixture: StashFixture) {
+      rmSync(fixture.stashLog);
+      execFileSync("mkfifo", [fixture.stashLog]);
+    }
+
+    /**
+     * Keep writing `contents` into the FIFO at `fifo`, so every reader (git
+     * included) sees the real reflog through it. Returns a stopper that kills
+     * the writer's whole process group.
+     */
+    function feedFifo(fifo: string, contents: string): () => void {
+      const source = path.join(mkdtempSync(path.join(root, "stash-reflog-feed-")), "stash");
+      writeFileSync(source, contents);
+      const writer = spawn("sh", ["-c", 'while :; do cat "$1" > "$2"; done', "feed", source, fifo], {
+        detached: true,
+        stdio: "ignore",
+      });
+      return () => {
+        try {
+          process.kill(-writer.pid!, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      };
+    }
+
+    /** Bind a Unix socket at a short path, then move it into the reflog's place. */
+    async function socketReflog(fixture: StashFixture) {
+      const bound = path.join(root, "s.sock");
+      const server = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(bound, resolve);
+      });
+      rmSync(fixture.stashLog);
+      renameSync(bound, fixture.stashLog);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      expect(lstatSync(fixture.stashLog).isSocket()).toBe(true);
+    }
+
+    // ST-05c keeps its setup (this card's stash at the tip, a directory as the
+    // reflog) and its refusal; the reason is now the unverified reflog, which
+    // is decided before the tip is attributed.
+    it("ST-05c refuses this card's tip when the reflog is a directory", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      rmSync(fixture.stashLog);
+      mkdirSync(fixture.stashLog);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-50a refuses a reflog that is a directory", async () => {
+      const fixture = stashFixture();
+      mkdirSync(fixture.stashLog, { recursive: true });
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-50b refuses a reflog that is a FIFO", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      fifoReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-58 refuses a FIFO fed with the real reflog that holds this card's stash below a sibling's top", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      const contents = readFileSync(fixture.stashLog, "utf8");
+      fifoReflog(fixture);
+      const stop = feedFifo(fixture.stashLog, contents);
+      try {
+        // Git reads the stack through the FIFO: this card's stash is on it.
+        expect(stashList(fixture.m).split("\n")).toContain(own);
+        await refusesUnverified(fixture);
+      } finally {
+        stop();
+      }
+    });
+
+    it("ST-59 refuses a reflog that is regular at the first check and swapped to a FIFO before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          fifoReflog(fixture);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+    });
+
+    it("ST-60 refuses a reflog that is a Unix socket", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      await socketReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-61 refuses a reflog that is regular at the first check and swapped to a directory before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          rmSync(fixture.stashLog);
+          mkdirSync(fixture.stashLog);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+    });
+
+    it("ST-62 still admits when the reflog file is missing and the tip is a registered sibling's", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      rmSync(fixture.stashLog);
+      expect(await probeNoRepositoryWorktree(fixture.input())).toMatchObject({ ok: true, branch: OWN });
+    });
+
+    it("ST-53 refuses a symlinked reflog that holds this card's stash below a sibling's top", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture);
+      // Git reads through the link: this card's stash is still on the stack.
+      expect(stashList(fixture.m).split("\n")).toContain(own);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-54 refuses a symlinked reflog holding only a registered sibling's stash", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture);
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-55 refuses a symlink to an empty reflog", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      symlinkReflog(fixture, "");
+      await refusesUnverified(fixture);
+    });
+
+    it("ST-57 refuses a reflog that is regular at the first check and swapped to a symlink before it is read", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.x);
+      const own = git(fixture.m, "rev-parse", "refs/stash");
+      fixture.stash(fixture.y());
+      let swapped = false;
+      fsControl.swapOnOpen = {
+        path: fixture.stashLog,
+        swap: () => {
+          symlinkReflog(fixture);
+          swapped = true;
+        },
+      };
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      expect(swapped).toBe(true);
+      // Git still reads this card's stash through the swapped-in link.
+      expect(stashList(fixture.m).split("\n")).toContain(own);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain("holds a stash reflog that could not be verified");
+    });
+
+    it("ST-56 refuses a dangling reflog symlink", async () => {
+      const fixture = stashFixture();
+      fixture.stash(fixture.y());
+      rmSync(symlinkReflog(fixture));
+      await refusesUnverified(fixture);
+    });
+  });
+
+  describe("at the close write", () => {
+    async function measuredWithSibling() {
+      const fixture = stashFixture();
+      fixture.registered.add(SIBLING);
+      const result = await probeNoRepositoryWorktree(fixture.input());
+      if (!result.ok) throw new Error(result.reason);
+      const recheck = () =>
+        recheckRecordedWorktree({
+          worktreePath: result.worktreePath,
+          commonDir: result.commonDir,
+          branch: result.branch,
+          headSha: result.headSha,
+          stashScope: fixture.input(),
+        });
+      return { fixture, recheck };
+    }
+
+    it.each([
+      ["W-01 this card stashes after measurement", (f: StashFixture) => f.stash(f.x)],
+      ["W-05 this card stashes after measurement on its recorded branch that is also registered to another card", (f: StashFixture) => {
+        f.registered.add(OWN);
+        f.stash(f.x);
+      }],
+      ["W-04 this card's stash relabelled as the registered sibling's", (f: StashFixture) => {
+        f.y();
+        f.store(f.x, `On ${SIBLING}: draft`, f.create(f.x));
+      }],
+    ])("refuses %s", async (_id, step) => {
+      const { fixture, recheck } = await measuredWithSibling();
+      step(fixture);
+      const before = stashList(fixture.m);
+      const result = await recheck();
+      expect(stashList(fixture.m)).toBe(before);
+      expect(result.ok).toBe(false);
+      expect((result as { reason: string }).reason).toContain(`stashed on this card's branch ${OWN} `);
+    });
+
+    it("W-06 refuses as timed out when the write budget runs out while the stash entries are read one by one", async () => {
+      const fixture = stashFixture();
+      fixture.registered.add(SIBLING);
+      const measured = await probeNoRepositoryWorktree(fixture.input());
+      if (!measured.ok) throw new Error(measured.reason);
+      // 2,000 reflog entries that name no object, then this card's stash, then
+      // a sibling's stash on top whose commit object is corrupt. The corrupt
+      // object fails the batched subject read, so every entry is read on its
+      // own; the budget runs out before this card's entry is reached.
+      mkdirSync(path.dirname(fixture.stashLog), { recursive: true });
+      const missing = Array.from({ length: 2_000 }, (_, index) =>
+        REFLOG_LINE(index.toString(16).padStart(40, "d"), "WIP on main: 1234567 x"));
+      writeFileSync(fixture.stashLog, missing.join(""));
+      fixture.stash(fixture.x);
+      fixture.stash(fixture.y());
+      const commit = git(fixture.m, "rev-parse", "refs/stash");
+      const object = path.join(fixture.m, ".git", "objects", commit.slice(0, 2), commit.slice(2));
+      chmodSync(object, 0o644);
+      truncateSync(object, 20);
+      const budgetMs = 1_500;
+      expect(await recheckRecordedWorktree({
+        worktreePath: measured.worktreePath,
+        commonDir: measured.commonDir,
+        branch: measured.branch,
+        headSha: measured.headSha,
+        stashScope: fixture.input(),
+        budgetMs,
+      })).toEqual({
+        ok: false,
+        reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
+      });
+    });
+
+    it.each([
+      ["W-02 the registered sibling stashes after measurement", (f: StashFixture) => f.stash(f.y())],
+      ["W-03 the managed checkout stashes on the project branch after measurement", (f: StashFixture) => f.stash(f.m)],
+    ])("admits %s", async (_id, step) => {
+      const { fixture, recheck } = await measuredWithSibling();
+      step(fixture);
+      const before = stashList(fixture.m);
+      expect(await recheck()).toEqual({ ok: true });
+      expect(stashList(fixture.m)).toBe(before);
     });
   });
 });

@@ -74,7 +74,7 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
     [gates.budgetBlocked, "budget_blocked"], [gates.pendingWait, "durable_wait"],
     [gates.activeExecution, "existing_execution"], [gates.ownedLifecycle, "owned_lifecycle"],
     [gates.conversation, "conversation"],
-    [!gates.agentInvokable || ["paused", "terminated", "pending_approval"].includes(agent.status), "agent_not_invokable"],
+    [!gates.agentInvokable || ["paused", "terminated", "deleted", "pending_approval"].includes(agent.status), "agent_not_invokable"],
   ] as const) if (blocked) return { kind: "skip", reason };
   if (episode.attempt >= episode.maxAttempts) return { kind: "exhausted", attempt: episode.attempt, maxAttempts: episode.maxAttempts };
   const nextAttempt = episode.attempt + 1;

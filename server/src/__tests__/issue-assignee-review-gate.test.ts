@@ -705,6 +705,7 @@ describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
         expectedUpdatedAt: null,
       }],
       ["attribution plus undefined fields", { actorUserId: "local-board", title: undefined, assigneeAgentId: undefined }],
+      ["agent API-key attribution", { actorAgentApiKeyId: "api-key-1" }],
     ])("treats %s as field-less", (_name, data) => {
       expect(isFieldlessIssueWrite(data)).toBe(true);
     });

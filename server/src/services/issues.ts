@@ -1,3 +1,4 @@
+import { readRecoveryCarrierParkSnapshot, recoveryActionIdentityMatches } from "./recovery-carrier-park-state.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -80,6 +81,7 @@ import {
   projects,
   toolConnections,
   workspaceOperations,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
@@ -157,6 +159,7 @@ import {
 import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
   resolveProjectDefaultIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { isTerminalRecoveryAction as isTerminalRecoveryActionShared } from "./issue-continuation-path.js";
@@ -187,6 +190,49 @@ import { redactSensitiveText } from "../redaction.js";
  */
 export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionOptions) {
   return redactSecretTokens(redactCurrentUserText(body, opts));
+}
+
+const issuesWithRecordedLostFutureMonitorCheck = new WeakSet<object>();
+
+export function recordedLostFutureMonitorCheck(issue: object | null | undefined): boolean {
+  return !!issue && issuesWithRecordedLostFutureMonitorCheck.has(issue);
+}
+
+export async function logLostFutureMonitorCheck(
+  tx: Db,
+  before: typeof issues.$inferSelect,
+  after: typeof issues.$inferSelect,
+  attribution: Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId" | "boardApiKeyId" | "agentApiKeyId">,
+  activityPublications?: ActivityPublication[],
+): Promise<boolean> {
+  const lostAt = before.monitorNextCheckAt;
+  if (
+    before.status === after.status ||
+    (after.status !== "done" && after.status !== "cancelled") ||
+    after.monitorNextCheckAt ||
+    !lostAt ||
+    lostAt.getTime() <= after.updatedAt.getTime()
+  ) {
+    return false;
+  }
+  const lostMonitorPolicy = normalizeIssueExecutionPolicy(before.executionPolicy ?? null)?.monitor;
+  const lostMonitorState = parseIssueExecutionState(before.executionState)?.monitor;
+  await logActivityInTransaction(tx, {
+    companyId: after.companyId,
+    ...attribution,
+    boardApiKeyId: attribution.boardApiKeyId,
+    action: "issue.monitor_cleared",
+    entityType: "issue",
+    entityId: after.id,
+    details: {
+      identifier: after.identifier ?? null,
+      previousNextCheckAt: lostAt.toISOString(),
+      recoveryPolicy: lostMonitorPolicy?.recoveryPolicy ?? lostMonitorState?.recoveryPolicy ?? null,
+      reason: "cleared_by_close_future_check",
+      notes: lostMonitorPolicy?.notes ?? before.monitorNotes ?? lostMonitorState?.notes ?? null,
+    },
+  }, activityPublications);
+  return true;
 }
 
 export const ISSUE_VERSION_CONFLICT_CODE = "issue_version_conflict";
@@ -268,6 +314,7 @@ import {
   logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
+  type LogActivityInput,
 } from "./activity-log.js";
 import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
@@ -4189,6 +4236,7 @@ function createIssueBlockerAttention(
     directBlockerIssueId: input.directBlockerIssueId ?? null,
     terminalBlockerIssueId: input.terminalBlockerIssueId ?? null,
     terminalBlocker: input.terminalBlocker ?? null,
+    ...(input.carrierPark ? { carrierPark: input.carrierPark } : {}),
   };
 }
 
@@ -4341,9 +4389,14 @@ async function listIssueBlockerAttentionMap(
     (row) => row.companyId === companyId && row.status === "blocked",
   );
   const attentionMap = new Map<string, IssueBlockerAttention>();
+  const { parks: carrierParks, blockers: rootBlockers } = await readRecoveryCarrierParkSnapshot(
+    dbOrTx, companyId, issueRows.map(row => row.id),
+  );
   for (const row of issueRows) {
     if (row.status !== "blocked") {
-      attentionMap.set(row.id, createIssueBlockerAttention({ computed: false }));
+      const carrierPark = carrierParks.get(row.id);
+      attentionMap.set(row.id, createIssueBlockerAttention({ computed: Boolean(carrierPark), carrierPark,
+        ...(carrierPark?.state === "stale" ? { state: "needs_attention", reason: "attention_required" } : {}) }));
     }
   }
   if (roots.length === 0) return attentionMap;
@@ -4378,7 +4431,11 @@ async function listIssueBlockerAttentionMap(
       }
       const explicitBlockerRowsPromise: Promise<
         IssueBlockerAttentionQueryRow[]
-      > = dbOrTx
+      > = depth === 0
+        ? Promise.resolve(chunk.flatMap(issueId => (rootBlockers.get(issueId) ?? []).map(row => ({
+            ...row, issueId, blockerIssueId: row.id,
+          }))))
+        : dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
           blockerIssueId: issues.id,
@@ -4949,6 +5006,11 @@ async function listIssueBlockerAttentionMap(
     });
     if (topLevelEdges.length === 0) {
       const allEdges = edgesByIssueId.get(root.id) ?? [];
+      const carrierPark = carrierParks.get(root.id);
+      if (carrierPark?.state === "accepted") {
+        attentionMap.set(root.id, createIssueBlockerAttention({ computed: true, carrierPark }));
+        continue;
+      }
       if (allEdges.length > 0) {
         const terminalSampleNode = nodesById.get(allEdges[0].blockerIssueId);
         attentionMap.set(root.id, createIssueBlockerAttention({
@@ -5054,6 +5116,15 @@ async function listIssueBlockerAttentionMap(
     }));
   }
 
+  for (const [id, carrierPark] of carrierParks) {
+    const attention = attentionMap.get(id);
+    if (!attention) continue;
+    attention.carrierPark = carrierPark;
+    if (carrierPark.state === "stale" && attention.state === "covered") {
+      attention.state = "needs_attention";
+      attention.reason = "attention_required";
+    }
+  }
   return attentionMap;
 }
 
@@ -11987,6 +12058,7 @@ export function issueService(
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        actorAgentApiKeyId?: string | null;
         boardApiKeyId?: string | null;
         /**
          * Internal only. Set by `provisionIssueExecutionWorkspace` when it writes
@@ -12074,6 +12146,7 @@ export function issueService(
         actorRunId,
         actorRunStopId,
         actorUserId,
+        actorAgentApiKeyId,
         boardApiKeyId,
         systemWorkspaceBinding,
         companyGuard,
@@ -12482,7 +12555,16 @@ export function issueService(
             parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
             isolatedWorkspacesEnabled,
           ),
-          suppliedExecutionWorkspaceId: issueData.executionWorkspaceId,
+          // SUP-24798: re-supplying the id the issue already holds changes no
+          // binding, so it is not an override. The delivery-identity stamp on a
+          // project_primary row re-supplies the stored id (board refresh and the
+          // agent's entry into review); counting it refused that write in every
+          // allowIssueOverride:false project. A different id, or any
+          // preference, is still checked as before.
+          suppliedExecutionWorkspaceId:
+            issueData.executionWorkspaceId === existing.executionWorkspaceId
+              ? undefined
+              : issueData.executionWorkspaceId,
           suppliedExecutionWorkspacePreference: issueData.executionWorkspacePreference,
         });
       }
@@ -12526,6 +12608,7 @@ export function issueService(
       // the pre-transaction read. A lock that appears between those reads is
       // still cleared by the write, and the held wake must be promoted.
       const clearedExecutionRunId: { value: string | null } = { value: null };
+      const lostFutureMonitorCheckRecorded = { value: false };
 
       const runUpdate = async (tx: any) => {
         // The receipt baseline must be read under the same row lock as the
@@ -12794,6 +12877,16 @@ export function issueService(
           return null;
         }
         await recordChatCompletion(tx, receiptExisting, updated);
+        if (await logLostFutureMonitorCheck(tx as unknown as Db, receiptExisting, updated, {
+          actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+          actorId: actorAgentId ?? actorUserId ?? "issue_service",
+          boardApiKeyId: boardApiKeyId ?? null,
+          agentApiKeyId: actorAgentApiKeyId ?? null,
+          agentId: actorAgentId ?? null,
+          runId: actorAgentId ? actorRunId ?? null : null,
+        }, activityPublications)) {
+          lostFutureMonitorCheckRecorded.value = true;
+        }
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
         if (actorUserId && issueData.status !== undefined) {
@@ -13221,6 +13314,9 @@ export function issueService(
       if (!isTransactionHandle(dbOrTx) && !postCommitActions) {
         await executeIssuePostCommitActions(db, ownedPostCommitActions);
       }
+      if (result && lostFutureMonitorCheckRecorded.value) {
+        issuesWithRecordedLostFutureMonitorCheck.add(result);
+      }
       return result;
     },
 
@@ -13262,27 +13358,52 @@ export function issueService(
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        const [lockedIssue] = await tx
-          .select({ companyId: issues.companyId, status: issues.status })
-          .from(issues)
-          .where(eq(issues.id, id))
-          .for("update");
-        if (!lockedIssue) return null;
+        const [carrier] = await tx.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+        if (!carrier) return null;
+        // Match park admission's source-before-carrier lock order, including released fences.
+        const actionSources = await tx.select({ sourceId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          or(eq(issueRecoveryActions.recoveryIssueId, id), sql`exists (
+            select 1 from ${issueTreeHolds}
+            where ${issueTreeHolds.companyId} = ${carrier.companyId} and ${issueTreeHolds.rootIssueId} = ${id}
+              and ${issueTreeHolds.mode} = 'pause' and ${issueTreeHolds.status} in ('active', 'released')
+              and ${recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`)}
+          )`),
+        ));
+        const sourceIds = [...new Set(actionSources.map(row => row.sourceId))].sort();
+        if (sourceIds.length) await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, carrier.companyId), inArray(issues.id, sourceIds),
+        )).orderBy(asc(issues.id)).for("update");
+        const [lockedCarrier] = await tx.select({ status: issues.status }).from(issues).where(and(
+          eq(issues.id, id), eq(issues.companyId, carrier.companyId),
+        )).for("update");
+        if (!lockedCarrier) return null;
+        const parks = await tx.select({ status: issueTreeHolds.status, actionStatus: issueRecoveryActions.status,
+          actionSourceId: issueRecoveryActions.sourceIssueId }).from(issueTreeHolds).leftJoin(issueRecoveryActions, and(
+          eq(issueRecoveryActions.companyId, carrier.companyId),
+          recoveryActionIdentityMatches(sql`${issueTreeHolds.recoveryCarrierPark} ->> 'recoveryActionId'`, sql`${issueRecoveryActions.id}`),
+        )).where(and(eq(issueTreeHolds.companyId, carrier.companyId), eq(issueTreeHolds.rootIssueId, id),
+          eq(issueTreeHolds.mode, "pause"), inArray(issueTreeHolds.status, ["active", "released"]),
+          sql`${issueTreeHolds.recoveryCarrierPark} is not null`));
+        if (parks.some(hold => hold.status === "active" || !hold.actionSourceId || !sourceIds.includes(hold.actionSourceId) ||
+            !hold.actionStatus || !["resolved", "cancelled"].includes(hold.actionStatus))) {
+          throw conflict("Recovery carrier cannot be deleted while its board park has pending effects.");
+        }
         // The issue lock serializes this check with attribution FK insertion.
         // Invalidating proof does not make its child contribution disposable.
         const [attribution] = await tx
           .select({ id: issueChildCarrierAttributions.id })
           .from(issueChildCarrierAttributions)
           .where(and(
-            eq(issueChildCarrierAttributions.companyId, lockedIssue.companyId),
+            eq(issueChildCarrierAttributions.companyId, carrier.companyId),
             or(
-              lockedIssue.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
+              lockedCarrier.status !== "cancelled" ? eq(issueChildCarrierAttributions.childIssueId, id) : sql`false`,
               and(
                 eq(issueChildCarrierAttributions.ancestorIssueId, id),
                 sql`EXISTS (
                   SELECT 1 FROM ${issues}
                   WHERE ${issues.id} = ${issueChildCarrierAttributions.childIssueId}
-                    AND ${issues.companyId} = ${lockedIssue.companyId} AND ${issues.status} <> 'cancelled'
+                    AND ${issues.companyId} = ${carrier.companyId} AND ${issues.status} <> 'cancelled'
                 )`,
               ),
             ),

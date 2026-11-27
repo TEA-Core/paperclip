@@ -64,7 +64,7 @@ export async function materializeExternalChatQuestionResponseInput(input: {
         run.status !== "running" ||
         isNativeRunnerOwnershipHeld(run) ||
         (run.nativeIssueId !== null && run.nativeIssueId !== binding.issueId) ||
-        ["paused", "terminated", "pending_approval", "error"].includes(
+        ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
           agent.status,
         )
       ) {

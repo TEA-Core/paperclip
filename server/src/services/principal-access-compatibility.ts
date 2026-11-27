@@ -83,7 +83,7 @@ export async function backfillPrincipalAccessCompatibility(
       principalId: agents.id,
     })
     .from(agents)
-    .where(notInArray(agents.status, ["pending_approval", "terminated"]));
+    .where(notInArray(agents.status, ["pending_approval", "terminated", "deleted"]));
 
   const agentMembershipsInserted = nonTerminalAgents.length > 0
     ? await db
