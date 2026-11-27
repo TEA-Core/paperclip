@@ -12353,10 +12353,19 @@ export function recoveryService(
       // instead of the action waiting on a human indefinitely.
       let rerouteOwnerAgentId: string | null = null;
       if (wakePolicyType === "board_escalation") {
-        rerouteOwnerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
-          sourceIssue,
-          candidate.previousOwnerAgentId,
+        // Fork (two-fleet routing): an external-pull assignee's card is never
+        // re-homed onto another Paperclip agent, so its board escalation stays
+        // with the board and only walks toward its ceiling.
+        const externalPullAssignee = await getExternalPullAgent(
+          sourceIssue.companyId,
+          sourceIssue.assigneeAgentId,
         );
+        rerouteOwnerAgentId = externalPullAssignee
+          ? null
+          : await resolveStrandedIssueRecoveryOwnerAgentId(
+            sourceIssue,
+            candidate.previousOwnerAgentId,
+          );
         if (!rerouteOwnerAgentId) {
           // Still no invokable owner: burn the attempt so the action walks
           // toward its ceiling instead of re-resolving on every sweep.

@@ -279,6 +279,29 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     },
   );
 
+  it.each(["paused", "terminated"] as const)(
+    "stale recovery wake sweep: keeps a %s external-pull assignee's board escalation board-owned",
+    async (status) => {
+      const fleet = await seedFleet();
+      await setAgentStatus(fleet.externalAgentId, status);
+      const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
+      const { svc, enqueueWakeup } = makeSweep();
+      await svc.reconcileStillbornAssignedBacklog();
+      // Let the board escalation go stale so the wake sweep re-resolves it.
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date(Date.now() - 24 * 60 * 60_000) })
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+
+      const result = await svc.reconcileStaleRecoveryActionWakes();
+
+      expect(result.rerouted).toBe(0);
+      await expectBoardOnlyAction(await recoveryActionRows(issueId));
+      await expectNotReassigned(fleet, issueId);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
+
   it("stillborn backlog: surfaces a live external-pull assignee's card to the board once it is older than the exemption bound", async () => {
     const fleet = await seedFleet();
     const issueId = await seedBacklogCard(fleet.companyId, fleet.externalAgentId);
