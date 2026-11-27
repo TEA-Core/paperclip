@@ -1,10 +1,16 @@
-import { and, desc, eq } from "drizzle-orm";
-import { activityLog, issueWorkProducts, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import {
+  activityLog,
+  externalObjectMentions,
+  externalObjects,
+  issueComments,
+  issueWorkProducts,
+  type Db,
+} from "@paperclipai/db";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   fetchPullRequestHeadSha,
-  resolveLinkedPullRequestsWithState,
   parseRepoUrl,
   resolveCardDeliveryBaseRef,
   resolveIssueRepoContext,
@@ -296,15 +302,91 @@ async function fetchGitHubRepositoryIdentity(token: string, owner: string, repo:
 
 const MAX_RECORDED_DELIVERY_COMMITS = 10;
 
+const WORK_PRODUCT_WRITE_ACTIONS = ["issue.work_product_created", "issue.work_product_updated"] as const;
+
 /**
- * The merged PR must be THIS card's own delivery. Only two ties count:
- *  - the PR is linked to the card on record: a `pull_request` work product the
- *    attach route did not create, or a cached external-object link;
- *  - a delivery commit recorded on the card (work-product head/merge commits,
- *    `executionState.deliveredHeadSha`) is the PR head or merge commit, or is
- *    one of the PR's own commits, listed live from GitHub.
- * A head branch name is not a tie: any merged PR can carry the card identifier
- * in its branch name, so the name proves nothing about delivery.
+ * The card's `pull_request` work products that only the board wrote. A row
+ * counts when its `issue.work_product_created` activity row exists and that row
+ * and every `issue.work_product_updated` row for it name a `user` actor. An
+ * agent may create or edit a work product on its own card, and the server's
+ * carrier fan-out (`system`) mirrors rows an agent wrote on another card, so
+ * neither is evidence the board can rely on. A row with no activity record
+ * does not count. `source_trust` and `created_by_run_id` cannot tell these
+ * writers apart (both are null for a board write and for a default-trust
+ * agent write, and an agent can leave `created_by_run_id` null).
+ */
+async function boardWrittenWorkProductIds(db: Db, issue: { id: string; companyId: string }, productIds: string[]) {
+  if (productIds.length === 0) return new Set<string>();
+  const rows = await db
+    .select({ action: activityLog.action, actorType: activityLog.actorType, details: activityLog.details })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issue.id),
+      inArray(activityLog.action, [...WORK_PRODUCT_WRITE_ACTIONS]),
+    ));
+  const created = new Set<string>();
+  const tainted = new Set<string>();
+  for (const row of rows) {
+    const id = typeof row.details?.workProductId === "string" ? row.details.workProductId : null;
+    if (!id || !productIds.includes(id)) continue;
+    if (row.actorType !== "user") tainted.add(id);
+    else if (row.action === "issue.work_product_created") created.add(id);
+  }
+  return new Set(productIds.filter((id) => created.has(id) && !tainted.has(id)));
+}
+
+/**
+ * True when a board user's comment on the card names the PR. Only a comment
+ * mention counts: a user wrote it (no agent author and no derived agent
+ * author) and no plugin created the mention. A mention from an agent's comment,
+ * the description or a document does not count.
+ */
+async function boardCommentMentionsPullRequest(
+  db: Db,
+  issue: { id: string; companyId: string },
+  pr: { owner: string; repo: string; pullRequestNumber: number },
+) {
+  const rows = await db
+    .select({
+      externalId: externalObjects.externalId,
+      authorUserId: issueComments.authorUserId,
+      authorAgentId: issueComments.authorAgentId,
+      derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+    })
+    .from(externalObjectMentions)
+    .innerJoin(externalObjects, eq(externalObjects.id, externalObjectMentions.objectId))
+    .innerJoin(issueComments, eq(issueComments.id, externalObjectMentions.sourceRecordId))
+    .where(and(
+      eq(externalObjectMentions.companyId, issue.companyId),
+      eq(externalObjectMentions.sourceIssueId, issue.id),
+      eq(externalObjectMentions.sourceKind, "comment"),
+      eq(externalObjectMentions.objectType, "pull_request"),
+      isNull(externalObjectMentions.createdByPluginId),
+      eq(externalObjects.providerKey, "github"),
+      eq(issueComments.companyId, issue.companyId),
+      eq(issueComments.issueId, issue.id),
+    ));
+  const wanted = `${pr.owner}/${pr.repo}#pull/${pr.pullRequestNumber}`.toLowerCase();
+  return rows.some((row) =>
+    row.externalId.toLowerCase() === wanted &&
+    !!row.authorUserId && !row.authorAgentId && !row.derivedAuthorAgentId);
+}
+
+/**
+ * The merged PR must be THIS card's own delivery, shown by evidence the board
+ * wrote. Only two ties count:
+ *  - the board linked the PR to the card: a `pull_request` work product only the
+ *    board wrote (not the one the attach route creates), or a board user's
+ *    comment on the card that names the PR;
+ *  - a head or merge commit recorded on such a board-written work product is
+ *    the PR head or merge commit, or is one of the PR's own commits, listed
+ *    live from GitHub.
+ * Evidence an agent can write does not count: an agent can link any PR to its
+ * own card, and the active run writes the card's delivery identity, so
+ * `executionState.deliveredHeadSha` is not a source. A head branch name is not
+ * a tie either: any merged PR can carry the card identifier in its branch name.
  * Returns null when nothing ties the PR to the card, or "unverifiable" when the
  * PR's commit list could not be read.
  */
@@ -316,61 +398,57 @@ async function resolveCardDeliveryPossession(
     headSha: string; mergeCommitSha: string;
   },
 ): Promise<BoardLandingProofPossession | null | "unverifiable"> {
-  const [card] = await db
-    .select({ executionState: issues.executionState })
-    .from(issues)
-    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
   const prKey = `${pr.owner}/${pr.repo}#${pr.pullRequestNumber}`.toLowerCase();
-  const products = await db
-    .select({ externalId: issueWorkProducts.externalId, url: issueWorkProducts.url, metadata: issueWorkProducts.metadata })
+  const allProducts = await db
+    .select({
+      id: issueWorkProducts.id,
+      externalId: issueWorkProducts.externalId,
+      url: issueWorkProducts.url,
+      metadata: issueWorkProducts.metadata,
+    })
     .from(issueWorkProducts)
     .where(and(
       eq(issueWorkProducts.companyId, issue.companyId),
       eq(issueWorkProducts.issueId, issue.id),
       eq(issueWorkProducts.type, "pull_request"),
     ));
+  const candidates = allProducts.filter((product) =>
+    ((product.metadata ?? {}) as Record<string, unknown>).source !== BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE);
+  const boardWritten = await boardWrittenWorkProductIds(db, issue, candidates.map((product) => product.id));
   const recordedShas = new Set<string>();
   const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pullRequestNumber}`.toLowerCase();
-  for (const product of products) {
+  for (const product of candidates) {
+    if (!boardWritten.has(product.id)) continue;
     const metadata = (product.metadata ?? {}) as Record<string, unknown>;
-    if (metadata.source === BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE) continue;
     const repository = typeof metadata.repository === "string" ? metadata.repository.toLowerCase() : null;
     const sameRepo = repository === `${pr.owner}/${pr.repo}`.toLowerCase();
     const linked =
       product.externalId?.toLowerCase() === prKey ||
       product.url?.toLowerCase().replace(/\/+$/, "") === prUrl ||
       (sameRepo && metadata.prNumber === pr.pullRequestNumber);
-    if (linked) return { kind: "linked_work_product", detail: `work product ${product.externalId ?? product.url}` };
+    if (linked) return { kind: "linked_work_product", detail: `board-written work product ${product.externalId ?? product.url}` };
     for (const key of ["headSha", "mergeCommitSha"] as const) {
       const value = typeof metadata[key] === "string" ? (metadata[key] as string).trim().toLowerCase() : "";
       if (/^[0-9a-f]{40}$/.test(value)) recordedShas.add(value);
     }
   }
-  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
-  const linkedPr = linkedPrs.find((candidate) =>
-    candidate.owner.toLowerCase() === pr.owner.toLowerCase() &&
-    candidate.repo.toLowerCase() === pr.repo.toLowerCase() &&
-    candidate.number === pr.pullRequestNumber);
-  if (linkedPr) return { kind: "linked_external_object", detail: `linked ${linkedPr.displayName}` };
-  const state = card?.executionState && typeof card.executionState === "object"
-    ? (card.executionState as Record<string, unknown>)
-    : null;
-  const delivered = typeof state?.deliveredHeadSha === "string" ? state.deliveredHeadSha.trim().toLowerCase() : "";
-  if (/^[0-9a-f]{40}$/.test(delivered)) recordedShas.add(delivered);
-  const candidates = [...recordedShas].slice(0, MAX_RECORDED_DELIVERY_COMMITS);
-  for (const recorded of candidates) {
-    if (recorded === pr.headSha || recorded === pr.mergeCommitSha) {
-      return { kind: "recorded_delivery_commit", detail: `recorded delivery commit ${recorded.slice(0, 12)} is the PR commit` };
+  if (await boardCommentMentionsPullRequest(db, issue, pr)) {
+    return { kind: "linked_external_object", detail: `board comment names ${pr.owner}/${pr.repo}#${pr.pullRequestNumber}` };
+  }
+  const recorded = [...recordedShas].slice(0, MAX_RECORDED_DELIVERY_COMMITS);
+  for (const sha of recorded) {
+    if (sha === pr.headSha || sha === pr.mergeCommitSha) {
+      return { kind: "recorded_delivery_commit", detail: `board-recorded delivery commit ${sha.slice(0, 12)} is the PR commit` };
     }
   }
-  if (candidates.length === 0) return null;
+  if (recorded.length === 0) return null;
   const prCommits = await listPullRequestCommits(pr.token, pr.owner, pr.repo, pr.pullRequestNumber);
   if (prCommits === null) return "unverifiable";
-  const member = candidates.find((recorded) => prCommits.has(recorded));
+  const member = recorded.find((sha) => prCommits.has(sha));
   if (member) {
     return {
       kind: "recorded_delivery_commit",
-      detail: `recorded delivery commit ${member.slice(0, 12)} is one of the PR's own commits`,
+      detail: `board-recorded delivery commit ${member.slice(0, 12)} is one of the PR's own commits`,
     };
   }
   return null;

@@ -336,12 +336,18 @@ must resolve the name to the same full name, so a renamed or transferred
 repository is refused. The PR's base repository must carry the same immutable
 repository id. The attach records that id, and the close re-checks it
 (`landing_proof_repo_identity_mismatch`). The PR must be this card's own
-delivery. A `pull_request` work product on the card that the attach did not
-create, or a linked external object, can link the PR. A delivery commit recorded
-on the card can also tie it, when that commit is the PR head or merge commit
-or is one of the PR's own commits. A head branch name is not a tie, because any
-pull request can carry the card identifier in its branch name. Otherwise the
-call is refused `landing_proof_not_card_delivery`. The close re-checks this tie
+delivery, shown by evidence the board wrote. A `pull_request` work product on
+the card counts only when its create and update activity rows all name a board
+user, and the work product the attach creates never counts. A board user's
+comment on the card that names the PR also links it. A head or merge commit
+recorded on such a board-written work product also ties the PR, when that commit
+is the PR head or merge commit or is one of the PR's own commits. Evidence an
+agent can write does not count: an agent can link a PR to its own card, and the
+active run writes the card's delivery identity, so a link or comment from an
+agent, a server fan-out row and `executionState.deliveredHeadSha` are not ties.
+A head branch name is not a tie, because any pull request can carry the card
+identifier in its branch name. Otherwise the call is refused
+`landing_proof_not_card_delivery`. The close re-checks this tie
 too.
 A failed check is a typed 4xx refusal. `landing_proof_not_on_base` means a
 readable compare showed the merge commit outside the base branch. A network

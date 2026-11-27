@@ -18,6 +18,7 @@ import {
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
+  issueComments,
   issueWorkProducts,
   issues,
   projectWorkspaces,
@@ -30,6 +31,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
 import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -270,9 +272,12 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     workflow?: "completed" | "pending";
     executionBranchAhead?: boolean;
     /**
-     * The delivery commit the card recorded on entering review. It defaults to
-     * the head commit of PR #501, which ties that PR to the card. Null records none.
+     * The PR the board linked to the card before the attach: a url-only
+     * `pull_request` work product whose create activity row names a board
+     * user. It defaults to PR #501. Null links nothing.
      */
+    boardLinkedPr?: number | null;
+    /** An `executionState.deliveredHeadSha`, which the active run writes. Default none. */
     deliveredHeadSha?: string | null;
   } = {}) {
     seq += 1;
@@ -310,7 +315,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         lastUsedAt: now, openedAt: now, createdAt: now, updatedAt: now,
       });
     }
-    const deliveredHeadSha = options.deliveredHeadSha === undefined ? HEAD_OF_MERGED : options.deliveredHeadSha;
+    const deliveredHeadSha = options.deliveredHeadSha ?? null;
     const participant = options.participant === "agent"
       ? { type: "agent", agentId }
       : { type: "user", userId: "local-board" };
@@ -334,7 +339,47 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
           lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
         },
     });
-    return { companyId, agentId, issueId, identifier };
+    const card = { companyId, agentId, issueId, identifier };
+    const boardLinkedPr = options.boardLinkedPr === undefined ? 501 : options.boardLinkedPr;
+    if (boardLinkedPr !== null) await linkPr(card, boardLinkedPr);
+    return card;
+  }
+
+  /**
+   * Records a `pull_request` work product on the card the way a writer leaves
+   * it: the row (url only, so the attach adds its own row) plus the
+   * `issue.work_product_created` activity row that names the writer.
+   */
+  async function linkPr(
+    card: { companyId: string; issueId: string; agentId: string },
+    prNumber: number,
+    options: { actorType?: "user" | "agent" | "system"; metadata?: Record<string, unknown> } = {},
+  ) {
+    const actorType = options.actorType ?? "user";
+    const [product] = await db.insert(issueWorkProducts).values({
+      companyId: card.companyId, issueId: card.issueId, type: "pull_request", provider: "github",
+      title: `PR #${prNumber}`, url: `https://github.com/${OWNER}/${REPO}/pull/${prNumber}`, status: "merged",
+      reviewState: "none", isPrimary: false, healthStatus: "unknown", metadata: options.metadata ?? {},
+    }).returning();
+    await db.insert(activityLog).values({
+      companyId: card.companyId, actorType,
+      actorId: actorType === "user" ? "local-board" : actorType === "agent" ? card.agentId : "pr-delivery",
+      agentId: actorType === "agent" ? card.agentId : null,
+      action: "issue.work_product_created", entityType: "issue", entityId: card.issueId,
+      details: { workProductId: product!.id, type: "pull_request", provider: "github" },
+    });
+    return product!.id;
+  }
+
+  /** Puts the assignee agent on a live run and makes it the request actor. */
+  async function actAsAssigneeRun(card: { companyId: string; agentId: string; issueId: string }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId: card.companyId, agentId: card.agentId, status: "running", contextSnapshot: { issueId: card.issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, card.issueId));
+    currentActor = { type: "agent", agentId: card.agentId, companyId: card.companyId, source: "agent_key", runId } as Express.Request["actor"];
+    return runId;
   }
 
   const patch = (id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
@@ -356,7 +401,10 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   const proofRows = (id: string) => db.select().from(activityLog).where(and(
     eq(activityLog.entityId, id), eq(activityLog.action, "issue.landing_proof_attached"),
   ));
-  const workProducts = (id: string) => db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, id));
+  /** The work products the attach route wrote (a seeded board link is not one). */
+  const workProducts = async (id: string) =>
+    (await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, id)))
+      .filter((row) => typeof (row.metadata as Record<string, unknown> | null)?.landingProofActivityId === "string");
   const statusOf = async (id: string) => (await db.select({ status: issues.status }).from(issues).where(eq(issues.id, id)))[0]?.status;
 
   it("(a)(d) a stuck card with record_only landing debt is refused 409, then closes done after a board proof, and only the close discharges the debt", async () => {
@@ -416,7 +464,9 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     ["merge commit not on base", goodProof({ pullRequestNumber: 504, mergeCommitSha: MERGE_OFF_BASE }), 422, "landing_proof_not_on_base"],
     ["no sha at all", goodProof({ mergeCommitSha: undefined }), 400, undefined],
   ] as const)("(b) refuses a %s and records nothing", async (_label, body, status, code) => {
-    const { issueId } = await seedStuckCard();
+    // The board linked the named PR, so each case reaches its own check.
+    const pullRequestNumber = (body as { pullRequestNumber?: number }).pullRequestNumber ?? 501;
+    const { issueId } = await seedStuckCard({ boardLinkedPr: pullRequestNumber });
     await reclassifyRecordOnly(issueId);
     const refused = await attach(issueId, body);
     expect(refused.status, JSON.stringify(refused.body)).toBe(status);
@@ -535,27 +585,29 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     expect(refused.status).toBe(409);
     expect(refused.body.code).toBe("landing_proof_not_applicable");
   });
-  describe("the merged PR must be this card's own delivery", () => {
-    it("refuses another card's merged PR with landing_proof_not_card_delivery and records nothing", async () => {
-      const { issueId } = await seedStuckCard();
-      await reclassifyRecordOnly(issueId);
-      const refused = await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE }));
-      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
-      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+  describe("the merged PR must be this card's own delivery, shown by evidence the board wrote", () => {
+    const expectRefusedNotCardDelivery = async (issueId: string, response: request.Response) => {
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.code).toBe("landing_proof_not_card_delivery");
       expect(await proofRows(issueId)).toHaveLength(0);
       expect(await workProducts(issueId)).toHaveLength(0);
       expect((await patch(issueId, { status: "done" })).status).toBe(409);
       expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+    };
+
+    it("refuses another card's merged PR with landing_proof_not_card_delivery and records nothing", async () => {
+      const { issueId } = await seedStuckCard();
+      await reclassifyRecordOnly(issueId);
+      await expectRefusedNotCardDelivery(issueId, await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE })));
     });
 
-    it("accepts the card's own merged PR linked on record, and the close discharges the debt", async () => {
-      const { companyId, issueId } = await seedStuckCard();
-      await db.insert(issueWorkProducts).values({
-        companyId, issueId, type: "pull_request", provider: "github", externalId: `${OWNER}/${REPO}#506`,
-        title: "PR #506", url: `https://github.com/${OWNER}/${REPO}/pull/506`, status: "merged",
-        reviewState: "none", isPrimary: true, healthStatus: "unknown",
-        metadata: { prNumber: 506, repository: `${OWNER}/${REPO}` },
+    it("accepts a PR the board linked through the work-product API, and the close discharges the debt", async () => {
+      const { issueId } = await seedStuckCard({ boardLinkedPr: null });
+      const linked = await request(app).post(`/api/issues/${issueId}/work-products`).send({
+        type: "pull_request", provider: "github", title: "Delivery PR", url: `https://github.com/${OWNER}/${REPO}/pull/506`,
+        status: "merged",
       });
+      expect(linked.status, JSON.stringify(linked.body)).toBe(201);
       await reclassifyRecordOnly(issueId);
       const attached = await attach(issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE }));
       expect(attached.status, JSON.stringify(attached.body)).toBe(201);
@@ -567,86 +619,157 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
-    it("accepts the card's own merged PR linked only by an external-object mention cached as closed", async () => {
-      const { companyId, issueId } = await seedStuckCard();
+    it("refuses a PR the card's own agent linked through the work-product API", async () => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      await reclassifyRecordOnly(card.issueId);
+      await actAsAssigneeRun(card);
+      const linked = await request(app).post(`/api/issues/${card.issueId}/work-products`).send({
+        type: "pull_request", provider: "github", title: "Unrelated PR", url: `https://github.com/${OWNER}/${REPO}/pull/505`,
+        status: "merged",
+      });
+      expect(linked.status, JSON.stringify(linked.body)).toBe(201);
+      board();
+      await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE })));
+    });
+
+    it("refuses a board link that the card's agent edited afterwards", async () => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      const linked = await request(app).post(`/api/issues/${card.issueId}/work-products`).send({
+        type: "pull_request", provider: "github", title: "Delivery PR", url: `https://github.com/${OWNER}/${REPO}/pull/506`,
+        status: "merged",
+      });
+      expect(linked.status, JSON.stringify(linked.body)).toBe(201);
+      await reclassifyRecordOnly(card.issueId);
+      await actAsAssigneeRun(card);
+      const edited = await request(app).patch(`/api/work-products/${linked.body.id}`).send({ title: "Delivery PR (edited)" });
+      expect(edited.status, JSON.stringify(edited.body)).toBe(200);
+      board();
+      await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE })));
+    });
+
+    it.each([
+      ["an agent", "agent" as const],
+      ["the server's carrier fan-out", "system" as const],
+    ])("refuses a link that %s wrote", async (_label, actorType) => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      await linkPr(card, 506, { actorType });
+      await reclassifyRecordOnly(card.issueId);
+      await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE })));
+    });
+
+    it("refuses a link that has no activity record of who wrote it", async () => {
+      const { companyId, issueId } = await seedStuckCard({ boardLinkedPr: null });
+      await db.insert(issueWorkProducts).values({
+        companyId, issueId, type: "pull_request", provider: "github", externalId: `${OWNER}/${REPO}#506`,
+        title: "PR #506", url: `https://github.com/${OWNER}/${REPO}/pull/506`, status: "merged",
+        reviewState: "none", isPrimary: true, healthStatus: "unknown",
+        metadata: { prNumber: 506, repository: `${OWNER}/${REPO}` },
+      });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE }));
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+    });
+
+    async function mentionInComment(card: { companyId: string; issueId: string; agentId: string }, author: "user" | "agent") {
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({
+        id: commentId, companyId: card.companyId, issueId: card.issueId, body: `Delivered in ${OWNER}/${REPO}#508`,
+        ...(author === "user" ? { authorUserId: "local-board", authorType: "user" } : { authorAgentId: card.agentId, authorType: "agent" }),
+      } as typeof issueComments.$inferInsert);
       const [object] = await db.insert(externalObjects).values({
-        companyId, providerKey: "github", objectType: "pull_request", externalId: `${OWNER}/${REPO}#pull/508`,
+        companyId: card.companyId, providerKey: "github", objectType: "pull_request", externalId: `${OWNER}/${REPO}#pull/508`,
         data: { state: "closed", merged: true, merge_commit_sha: MENTIONED_MERGE },
       }).returning();
       await db.insert(externalObjectMentions).values({
-        companyId, sourceIssueId: issueId, sourceKind: "comment", objectId: object!.id,
-        providerKey: "github", objectType: "pull_request",
+        companyId: card.companyId, sourceIssueId: card.issueId, sourceKind: "comment", sourceRecordId: commentId,
+        objectId: object!.id, providerKey: "github", objectType: "pull_request",
       });
-      await reclassifyRecordOnly(issueId);
-      const attached = await attach(issueId, goodProof({ pullRequestNumber: 508, mergeCommitSha: MENTIONED_MERGE }));
+    }
+
+    it("accepts a merged PR that a board user's comment on the card names, cached as closed", async () => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      await mentionInComment(card, "user");
+      await reclassifyRecordOnly(card.issueId);
+      const attached = await attach(card.issueId, goodProof({ pullRequestNumber: 508, mergeCommitSha: MENTIONED_MERGE }));
       expect(attached.status, JSON.stringify(attached.body)).toBe(201);
       expect(attached.body.proof.possession).toMatchObject({ kind: "linked_external_object" });
-      const closed = await patch(issueId, { status: "done" });
+      const closed = await patch(card.issueId, { status: "done" });
       expect(closed.status, JSON.stringify(closed.body)).toBe(200);
-      expect((await debtDispositions(issueId))[0]).toMatchObject({
+      expect((await debtDispositions(card.issueId))[0]).toMatchObject({
         landingDebtDisposition: "discharged", landingProof: { source: "board_merged_pr", pullRequestNumber: 508 },
       });
     });
 
-    it("accepts a merged PR that lists the card's recorded delivery commit among its own commits", async () => {
-      const { issueId } = await seedStuckCard();
-      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
-      await db.update(issues).set({
-        executionState: { ...(row!.executionState as object), deliveredHeadSha: RECORDED_DELIVERY },
-      }).where(eq(issues.id, issueId));
-      github.prCommits.set(507, [RECORDED_DELIVERY, RECORDED_PR_HEAD]);
+    it("refuses a merged PR that only an agent's comment on the card names", async () => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      await mentionInComment(card, "agent");
+      await reclassifyRecordOnly(card.issueId);
+      await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 508, mergeCommitSha: MENTIONED_MERGE })));
+    });
+
+    it("refuses a run-written delivery commit (executionState.deliveredHeadSha) as a tie", async () => {
+      // The active run writes deliveredHeadSha; here it even equals PR #501's head.
+      const { issueId } = await seedStuckCard({ boardLinkedPr: null, deliveredHeadSha: HEAD_OF_MERGED });
       await reclassifyRecordOnly(issueId);
-      const withDebt = await attach(issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
-      expect(withDebt.status, JSON.stringify(withDebt.body)).toBe(201);
-      expect(withDebt.body.proof.possession).toMatchObject({ kind: "recorded_delivery_commit" });
-      github.prCommits.delete(507);
-      const refusedWithout = await seedStuckCard();
-      await reclassifyRecordOnly(refusedWithout.issueId);
-      const refused = await attach(refusedWithout.issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
-      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
+      await expectRefusedNotCardDelivery(issueId, await attach(issueId, goodProof()));
+    });
+
+    it("accepts a merged PR that lists a commit recorded on a board-written work product among its own commits", async () => {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      // The board recorded an earlier PR of this card with its head commit.
+      await linkPr(card, 400, { metadata: { headSha: RECORDED_DELIVERY } });
+      github.prCommits.set(507, [RECORDED_DELIVERY, RECORDED_PR_HEAD]);
+      await reclassifyRecordOnly(card.issueId);
+      const attached = await attach(card.issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(attached.body.proof.possession).toMatchObject({ kind: "recorded_delivery_commit" });
+      // The same commit recorded on an agent-written work product is not a tie.
+      const other = await seedStuckCard({ boardLinkedPr: null });
+      await linkPr(other, 400, { actorType: "agent", metadata: { headSha: RECORDED_DELIVERY } });
+      await reclassifyRecordOnly(other.issueId);
+      await expectRefusedNotCardDelivery(other.issueId, await attach(other.issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE })));
     });
 
     it("refuses an unrelated later merged PR whose merge commit only has the recorded delivery commit as an ancestor", async () => {
-      // The card's recorded delivery commit is already on base (it is the base head).
-      const { issueId } = await seedStuckCard({ deliveredHeadSha: MERGE_ON_BASE });
-      await reclassifyRecordOnly(issueId);
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      // The board-recorded delivery commit is already on base (it is the base head).
+      await linkPr(card, 400, { metadata: { headSha: MERGE_ON_BASE } });
+      await reclassifyRecordOnly(card.issueId);
       // PR #505 merged later: its merge commit descends from the recorded commit,
       // but the recorded commit is not one of the PR's own commits.
       github.ancestors.set(OTHER_CARD_MERGE, new Set([MERGE_ON_BASE]));
       github.ancestors.set(sha("e6"), new Set([MERGE_ON_BASE]));
-      const refused = await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE }));
-      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
-      expect(refused.body.code).toBe("landing_proof_not_card_delivery");
-      expect(await proofRows(issueId)).toHaveLength(0);
-      expect(await workProducts(issueId)).toHaveLength(0);
-      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+      await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE })));
     });
 
     it("refuses as unverifiable when the PR commit list cannot be read, and records nothing", async () => {
-      const { issueId } = await seedStuckCard({ deliveredHeadSha: RECORDED_DELIVERY });
-      await reclassifyRecordOnly(issueId);
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      await linkPr(card, 400, { metadata: { headSha: RECORDED_DELIVERY } });
+      await reclassifyRecordOnly(card.issueId);
       github.prCommitsStatus = 502;
-      const refused = await attach(issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
+      const refused = await attach(card.issueId, goodProof({ pullRequestNumber: 507, mergeCommitSha: RECORDED_PR_MERGE }));
       expect(refused.status, JSON.stringify(refused.body)).toBe(422);
       expect(refused.body.code).toBe("landing_proof_unverifiable");
-      expect(await proofRows(issueId)).toHaveLength(0);
-      expect(await workProducts(issueId)).toHaveLength(0);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+      expect(await workProducts(card.issueId)).toHaveLength(0);
     });
 
-    it("does not count the work product the attach itself created as the card's link", async () => {
-      const { issueId } = await seedStuckCard();
-      await reclassifyRecordOnly(issueId);
-      expect((await attach(issueId, goodProof())).status).toBe(201);
-      // The card's recorded delivery commit is cleared; only the attach-created
-      // work product (with the PR's own commits) still names PR #501.
-      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
-      await db.update(issues).set({
-        executionState: { ...(row!.executionState as object), deliveredHeadSha: null },
-      }).where(eq(issues.id, issueId));
-      const close = await patch(issueId, { status: "done" });
+    it("refuses the close once an agent edits the board link, because the attach's own work product never counts", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      expect((await attach(card.issueId, goodProof())).status).toBe(201);
+      const [seeded] = (await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, card.issueId)))
+        .filter((row) => !(row.metadata as Record<string, unknown> | null)?.landingProofActivityId);
+      await db.insert(activityLog).values({
+        companyId: card.companyId, actorType: "agent", actorId: card.agentId, agentId: card.agentId,
+        action: "issue.work_product_updated", entityType: "issue", entityId: card.issueId,
+        details: { workProductId: seeded!.id, changedKeys: ["title"] },
+      });
+      const close = await patch(card.issueId, { status: "done" });
       expect(close.status, JSON.stringify(close.body)).toBe(409);
       expect(close.body.error).toContain("landing_proof_not_card_delivery");
-      expect((await debtDispositions(issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
+      expect((await debtDispositions(card.issueId)).map((d) => d.landingDebtDisposition)).toEqual(["outstanding"]);
     });
   });
 
@@ -695,7 +818,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       ["carries the identifier without its hyphen", (identifier: string) => `${identifier.replace("-", "").toLowerCase()}-fix`],
       ["starts with the identifier in upper case", (identifier: string) => `${identifier.toUpperCase()}-delivery`],
     ])("refuses an unrelated merged PR whose head branch %s, and the debt stays owed", async (_label, branchFor) => {
-      const { issueId, identifier } = await seedStuckCard({ deliveredHeadSha: null });
+      const { issueId, identifier } = await seedStuckCard({ boardLinkedPr: null });
       await reclassifyRecordOnly(issueId);
       github.prs.get(505)!.head.ref = branchFor(identifier);
       const refused = await attach(issueId, goodProof({ pullRequestNumber: 505, mergeCommitSha: OTHER_CARD_MERGE }));
@@ -886,13 +1009,28 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
-    function mcpAttach(apiKey: string, card: { companyId: string; issueId: string; agentId?: string }, body: object) {
+    let previousJwtSecret: string | undefined;
+    beforeAll(() => {
+      previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = `landing-proof-jwt-${randomUUID()}`;
+    });
+    afterAll(() => {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+    });
+
+    function mcpAttach(
+      apiKey: string,
+      card: { companyId: string; issueId: string; agentId?: string },
+      body: object,
+      options: { path?: string; runId?: string | null } = {},
+    ) {
       const client = new PaperclipApiClient({
-        apiUrl: authApiUrl, apiKey, companyId: card.companyId, agentId: card.agentId ?? null, runId: null,
+        apiUrl: authApiUrl, apiKey, companyId: card.companyId, agentId: card.agentId ?? null, runId: options.runId ?? null,
       });
       const tool = createToolDefinitions(client).find((candidate) => candidate.name === "paperclipApiRequest")!;
       return tool.execute({
-        method: "POST", path: `/api/issues/${card.issueId}/landing-proof`, jsonBody: JSON.stringify(body),
+        method: "POST", path: options.path ?? `/api/issues/${card.issueId}/landing-proof`, jsonBody: JSON.stringify(body),
       }).then((response) => JSON.parse(response.content[0]!.text) as Record<string, any>);
     }
 
@@ -931,6 +1069,35 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       const result = await mcpAttach(foreignBoardToken, card, goodProof());
       expect([403, 404], JSON.stringify(result)).toContain(result.status);
       expect(await proofRows(card.issueId)).toHaveLength(0);
+    });
+
+    it("refuses the assignee's run-scoped agent JWT, on the id and on the identifier alias, and records nothing", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: card.companyId, agentId: card.agentId, status: "running", contextSnapshot: { issueId: card.issueId },
+      });
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, card.issueId));
+      const runToken = createLocalAgentJwt(card.agentId, card.companyId, "codex_local", runId);
+      expect(runToken).toBeTruthy();
+      for (const path of [`/api/issues/${card.issueId}/landing-proof`, `/api/issues/${card.identifier}/landing-proof`]) {
+        const result = await mcpAttach(runToken!, card, goodProof(), { path, runId });
+        expect(result.status, JSON.stringify(result)).toBe(403);
+      }
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+      expect(await workProducts(card.issueId)).toHaveLength(0);
+    });
+
+    it("treats the identifier alias as the same card: a board key attaches there, and the id replays it", async () => {
+      const card = await seedStuckCard();
+      await reclassifyRecordOnly(card.issueId);
+      const viaAlias = await mcpAttach(boardToken, card, goodProof(), { path: `/api/issues/${card.identifier}/landing-proof` });
+      expect(viaAlias.error, JSON.stringify(viaAlias)).toBeUndefined();
+      expect(viaAlias.replayed ?? false).toBe(false);
+      const viaId = await mcpAttach(boardToken, card, goodProof());
+      expect(viaId.replayed, JSON.stringify(viaId)).toBe(true);
+      expect(await proofRows(card.issueId)).toHaveLength(1);
     });
 
     it("refuses a call with a missing or unknown bearer token, and records nothing", async () => {
