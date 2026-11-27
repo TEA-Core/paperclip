@@ -2311,6 +2311,13 @@
       "when": 1795278102599,
       "tag": "0331_board_recovery_carrier_park",
       "breakpoints": true
+    },
+    {
+      "idx": 330,
+      "version": "7",
+      "when": 1795278103599,
+      "tag": "0332_breezy_harrier",
+      "breakpoints": true
     }
   ]
 }
