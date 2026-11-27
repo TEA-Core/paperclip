@@ -117,19 +117,75 @@ describe("mapOpenCodeServeEvent (recorded 2.2.4 streams)", () => {
     expect(JSON.parse(mapped.lines[0])).toEqual({
       type: "session_usage",
       sessionID: "ses_1",
-      part: { type: "session-usage", usage: { inputTokens: 125, cachedInputTokens: 30, outputTokens: 11 }, costUsd: 0.25 },
+      part: { type: "session-usage", usage: { inputTokens: 125, cachedInputTokens: 30, outputTokens: 11 }, costUsd: 0.25, complete: true },
     });
   });
 
-  it("drops a session.usage.updated event with unusable counters", () => {
+  it("marks a session.usage.updated event with unusable counters incomplete", () => {
     const state = createOpenCodeServeEventState();
-    expect(
-      mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1", tokens: { input: "lots" } } }, state),
-    ).toEqual({ lines: [], outcome: null });
-    expect(mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1" } }, state)).toEqual({
-      lines: [],
-      outcome: null,
+    const unusable = mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1", tokens: { input: "lots" } } }, state);
+    expect(unusable.outcome).toBeNull();
+    expect(JSON.parse(unusable.lines[0])).toEqual({ type: "session_usage", sessionID: "ses_1", part: { type: "session-usage", complete: false } });
+    const empty = mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1" } }, state);
+    expect(JSON.parse(empty.lines[0]).part).toEqual({ type: "session-usage", complete: false });
+    // An unreadable update means usage moved on unrecorded: never complete.
+    expect(parseOpenCodeJsonl([...unusable.lines, ...empty.lines].join("\n"))).toMatchObject({ sessionUsage: null, sessionUsageComplete: false });
+  });
+
+  it("merges a partial later update field by field and does not mark it complete", () => {
+    const state = createOpenCodeServeEventState();
+    const lines = [
+      ...mapOpenCodeServeEvent(
+        { type: "session.usage.updated", data: { sessionID: "ses_1", cost: 0.01, tokens: { input: 5, output: 2, cache: { read: 1, write: 0 } } } },
+        state,
+      ).lines,
+      // More model work, reported by a partial update that carries only output.
+      ...mapOpenCodeServeEvent({ type: "session.usage.updated", data: { sessionID: "ses_1", tokens: { output: 7 } } }, state).lines,
+    ];
+    expect(JSON.parse(lines[1]).part).toEqual({
+      type: "session-usage",
+      usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 7 },
+      costUsd: 0.01,
+      complete: false,
     });
+    const parsed = parseOpenCodeJsonl(lines.join("\n"));
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0.01 });
+    expect(parsed.sessionUsageComplete).toBe(false);
+    // A later complete update restores completeness.
+    const next = mapOpenCodeServeEvent(
+      { type: "session.usage.updated", data: { sessionID: "ses_1", cost: 0.02, tokens: { input: 9, output: 7, cache: { read: 1 } } } },
+      state,
+    ).lines;
+    expect(parseOpenCodeJsonl([...lines, ...next].join("\n"))).toMatchObject({
+      sessionUsage: { usage: { inputTokens: 9, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0.02 },
+      sessionUsageComplete: true,
+    });
+  });
+
+  it("reads the transport's final session record", () => {
+    const parsed = parseOpenCodeJsonl(
+      JSON.stringify({ type: "session_usage_final", sessionID: "ses_1", part: { type: "session-usage", usage: { inputTokens: 9, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0.02 } }),
+    );
+    expect(parsed.sessionUsageFinal).toEqual({ usage: { inputTokens: 9, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0.02 });
+    expect(parsed.sessionUsage).toBeNull();
+  });
+
+  it("validates fallback step counters and counts cache writes, leaving the V1 step sums unchanged", () => {
+    const stream = [
+      JSON.stringify({ type: "step_finish", part: { reason: "tool-calls", tokens: { input: 10, output: 3, cache: { read: 2, write: 4 } }, cost: 0.01 } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: -5, output: 1.5, cache: { read: 1, write: 0 } }, cost: 0.02 } }),
+    ].join("\n");
+    const parsed = parseOpenCodeJsonl(stream);
+    // The V2 fallback refuses the negative and fractional counters and adds
+    // the cache write to input.
+    expect(parsed.stepUsage).toEqual({ inputTokens: 14, cachedInputTokens: 3, outputTokens: 3 });
+    expect(parsed.stepCostUsd).toBeCloseTo(0.03, 10);
+    expect(parsed.stepUsageIssues).toEqual([
+      "step_finish #2: tokens.input refused (-5)",
+      "step_finish #2: tokens.output refused (1.5)",
+    ]);
+    // The legacy sums the V1 CLI reports are exactly as before.
+    expect(parsed.usage).toEqual({ inputTokens: 5, cachedInputTokens: 3, outputTokens: 4.5 });
   });
 
   it("keeps the last session_usage line and ignores malformed ones", () => {

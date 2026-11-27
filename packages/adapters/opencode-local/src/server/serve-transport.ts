@@ -38,6 +38,8 @@ import {
  */
 
 const SERVE_START_TIMEOUT_MS = 30_000;
+// Bounds the post-turn session read that backs a complete usage record.
+const FINAL_USAGE_READ_TIMEOUT_MS = 5_000;
 const SERVER_USERNAME = "opencode";
 // The text `opencode run` gives the model when it auto-rejects a permission request.
 const PERMISSION_REJECT_MESSAGE =
@@ -305,6 +307,38 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     }
   };
 
+  // Emit one session-usage reading as a synthetic stdout line (see
+  // session-usage.ts). A payload without complete counters emits nothing.
+  const emitSessionUsage = async (type: "session_usage_baseline" | "session_usage_final", sessionId: string, text: string) => {
+    const totals = parseOpenCodeSessionTotals(text);
+    if (!totals) return;
+    await emit(
+      "stdout",
+      `${redact(JSON.stringify({
+        type,
+        sessionID: sessionId,
+        part: { type: "session-usage", usage: totals.usage, costUsd: totals.costUsd },
+      }))}\n`,
+    );
+  };
+
+  // Read the session once more after the turn ends: its cumulative totals are
+  // the final record that lets the run's usage count as complete even when the
+  // last `session.usage.updated` event was partial. Best effort and bounded;
+  // without it the run keeps its event and step evidence, flagged incomplete.
+  const emitFinalSessionUsage = async (sessionId: string) => {
+    const limit = timeout(FINAL_USAGE_READ_TIMEOUT_MS);
+    try {
+      const reading = await Promise.race([request(`/api/session/${encodeURIComponent(sessionId)}`), limit.promise]);
+      if (reading === "timeout" || reading.status !== 200) return;
+      await emitSessionUsage("session_usage_final", sessionId, reading.text);
+    } catch {
+      // The run keeps the usage evidence it already has.
+    } finally {
+      limit.cancel();
+    }
+  };
+
   const finish = async (exitCodeOnTurnEnd: number): Promise<RunProcessResult> => {
     abort.abort();
     const running = runningProcesses.get(input.runId);
@@ -398,17 +432,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       // result can report only what this attempt spent (session-usage.ts). A
       // payload without complete counters emits nothing, and the run falls
       // back to the per-step stdout sums.
-      const baseline = parseOpenCodeSessionTotals(existing.text);
-      if (baseline) {
-        await emit(
-          "stdout",
-          `${redact(JSON.stringify({
-            type: "session_usage_baseline",
-            sessionID: sessionId,
-            part: { type: "session-usage", usage: baseline.usage, costUsd: baseline.costUsd },
-          }))}\n`,
-        );
-      }
+      await emitSessionUsage("session_usage_baseline", sessionId, existing.text);
       const switched = await request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: "POST",
         body: JSON.stringify({ model }),
@@ -439,6 +463,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     // (wall-clock timeout, external cancel, crash) and the stream closes.
     await Promise.race([turnDone.promise, serverExited, pumpEnded]);
     exitCodeOnTurnEnd = outcome === "succeeded" ? 0 : 1;
+    if (outcome !== null) await emitFinalSessionUsage(sessionId);
   } catch (error) {
     failure = redact(error instanceof Error ? error.message : String(error));
     await reportFailure(failure);

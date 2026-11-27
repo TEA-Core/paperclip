@@ -1158,6 +1158,32 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect((result.resultJson as Record<string, unknown>).usageSource).toBe("session_usage");
   });
 
+  it("reports the final session record when the last usage update was partial", async () => {
+    const { result } = await runServe({ FAKE_USAGE_PARTIAL_LAST: "1", FAKE_USAGE_COST: "0.001" });
+
+    // Events: full 5/1/2, then a partial update with only output 7. The
+    // post-turn session read carries the real final 9/1/7, so the later usage
+    // is kept and the result counts as complete.
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 7, cachedInputTokens: 1 });
+    expect(result.costUsd).toBe(0.001);
+    expect(result.usageBasis).toBe("per_run");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.usageComplete).toBe(true);
+    expect(resultJson.usageIssues).toBeUndefined();
+  });
+
+  it("flags usage incomplete when a partial last update has no final record", async () => {
+    const { result } = await runServe({ FAKE_USAGE_PARTIAL_LAST: "1", FAKE_NO_FINAL_SESSION_USAGE: "1" });
+
+    // The partial output 7 is kept (not the earlier 2), and the run says the
+    // usage is not backed by a final record.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 7, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.usageComplete).toBe(false);
+    expect(resultJson.usageIssues).toEqual(["last session usage update was partial and no final session record was read"]);
+  });
+
   it("keeps the usage already spent when a serve run times out", async () => {
     const { result } = await runServe({ FAKE_HANG_TURN: "1" }, { timeoutSec: 1 });
 

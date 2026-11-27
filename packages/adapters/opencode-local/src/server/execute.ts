@@ -1622,10 +1622,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           usageReconciliation: useServeTransport
             ? reconcileOpenCodeRunUsage({
                 sessionUsage: parsed.sessionUsage,
+                sessionUsageComplete: parsed.sessionUsageComplete,
+                sessionUsageFinal: parsed.sessionUsageFinal,
                 sessionUsageBaseline: parsed.sessionUsageBaseline,
                 resumedSession: Boolean(resumeSessionId),
-                stepUsage: parsed.usage,
-                stepCostUsd: parsed.costUsd,
+                // Validated step sums with cache writes counted as input; the
+                // legacy parsed.usage stays the V1 CLI contract.
+                stepUsage: parsed.stepUsage,
+                stepCostUsd: parsed.stepCostUsd,
+                stepUsageIssues: parsed.stepUsageIssues,
               })
             : null,
         };
@@ -1691,6 +1696,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
           };
       const costUsd = reconciled ? reconciled.costUsd : attempt.parsed.costUsd;
+      // Record how the usage was derived and whether a final record backs it,
+      // so an incomplete or refused reading is visible on the run.
+      const usageResultFields = reconciled
+        ? {
+            usageSource: reconciled.source,
+            usageComplete: reconciled.complete,
+            ...(reconciled.issues.length > 0 ? { usageIssues: reconciled.issues } : {}),
+          }
+        : {};
       const terminalBillingError = isOpenCodeTerminalBillingError(
         "",
         attempt.proc.stderr,
@@ -1717,7 +1731,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
             paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
-            ...(reconciled ? { usageSource: reconciled.source } : {}),
+            ...usageResultFields,
           },
           summary: attempt.parsed.summary,
           clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
@@ -1845,7 +1859,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: synthesizedExitCode,
           errorCode: errorCode ?? classifiedErrorCode ?? attempt.proc.errorCode ?? null,
           ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
-          ...(reconciled ? { usageSource: reconciled.source } : {}),
+          ...usageResultFields,
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

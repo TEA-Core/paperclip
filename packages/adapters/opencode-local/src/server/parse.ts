@@ -1,7 +1,12 @@
 import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
 import {
-  parseOpenCodeSessionUsageEvent,
+  foldOpenCodeSessionCounters,
+  mergeOpenCodeSessionCounters,
+  mergeOpenCodeSessionTotals,
   parseOpenCodeSessionUsagePart,
+  readOpenCodeSessionCounters,
+  readOpenCodeStepUsage,
+  type OpenCodeSessionCounters,
   type OpenCodeSessionTotals,
 } from "./session-usage.js";
 
@@ -82,6 +87,16 @@ export function parseOpenCodeJsonl(stdout: string) {
   // Both are OpenCodeSessionTotals, not step sums: see session-usage.ts.
   let sessionUsage: OpenCodeSessionTotals | null = null;
   let sessionUsageBaseline: OpenCodeSessionTotals | null = null;
+  // False once the last usage update was partial or unreadable; only a later
+  // complete update (or the transport's final session reading) restores it.
+  let sessionUsageComplete = true;
+  let sessionUsageFinal: OpenCodeSessionTotals | null = null;
+  // The V2 fallback's step sums: validated counters, cache writes as input.
+  // The legacy `usage`/`costUsd` above stay exactly as the V1 CLI reports them.
+  const stepUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  let stepCostUsd = 0;
+  const stepUsageIssues: string[] = [];
+  let stepIndex = 0;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -129,14 +144,30 @@ export function parseOpenCodeJsonl(stdout: string) {
       usage.cachedInputTokens += asNumber(cache.read, 0);
       usage.outputTokens += asNumber(tokens.output, 0) + asNumber(tokens.reasoning, 0);
       costUsd += asNumber(part.cost, 0);
+      stepIndex += 1;
+      const step = readOpenCodeStepUsage(part, `step_finish #${stepIndex}`);
+      stepUsage.inputTokens += step.usage.inputTokens;
+      stepUsage.cachedInputTokens += step.usage.cachedInputTokens;
+      stepUsage.outputTokens += step.usage.outputTokens;
+      stepCostUsd += step.costUsd;
+      stepUsageIssues.push(...step.issues);
       continue;
     }
 
     if (type === "session_usage") {
-      // Cumulative for the whole session; the last event wins, and the
-      // reconciliation step subtracts the pre-run baseline.
+      // Cumulative for the whole session, merged field by field so a partial
+      // later update never loses a counter; the reconciliation step subtracts
+      // the pre-run baseline.
+      const part = parseObject(event.part);
+      const totals = parseOpenCodeSessionUsagePart(part);
+      if (totals) sessionUsage = mergeOpenCodeSessionTotals(sessionUsage, totals);
+      sessionUsageComplete = totals !== null && part.complete !== false;
+      continue;
+    }
+
+    if (type === "session_usage_final") {
       const totals = parseOpenCodeSessionUsagePart(event.part);
-      if (totals) sessionUsage = totals;
+      if (totals) sessionUsageFinal = mergeOpenCodeSessionTotals(sessionUsageFinal, totals);
       continue;
     }
 
@@ -178,7 +209,12 @@ export function parseOpenCodeJsonl(stdout: string) {
     usage,
     costUsd,
     sessionUsage,
+    sessionUsageComplete: sessionUsage !== null && sessionUsageComplete,
+    sessionUsageFinal,
     sessionUsageBaseline,
+    stepUsage,
+    stepCostUsd,
+    stepUsageIssues,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
     paperclipToolCallCount: paperclipToolCallIds.size,
@@ -264,10 +300,12 @@ export type OpenCodeServeTurnOutcome = "succeeded" | "failed" | "interrupted";
 export interface OpenCodeServeEventState {
   toolNames: Map<string, string>;
   toolInputs: Map<string, unknown>;
+  /** Cumulative usage counters merged across `session.usage.updated` events. */
+  sessionCounters: OpenCodeSessionCounters;
 }
 
 export function createOpenCodeServeEventState(): OpenCodeServeEventState {
-  return { toolNames: new Map(), toolInputs: new Map() };
+  return { toolNames: new Map(), toolInputs: new Map(), sessionCounters: {} };
 }
 
 function serveToolErrorText(data: Record<string, unknown>): string {
@@ -355,7 +393,9 @@ export function mapOpenCodeServeEvent(
             messageID,
             reason: asString(data.finish, ""),
             tokens: data.tokens,
-            cost: asNumber(data.cost, 0),
+            // Raw, so the V2 fallback can refuse an invalid cost; the legacy
+            // step sum still reads it with asNumber(cost, 0).
+            cost: data.cost,
           },
         })],
         outcome: null,
@@ -363,13 +403,24 @@ export function mapOpenCodeServeEvent(
     case "session.usage.updated": {
       // The session's cumulative usage and cost, emitted after each model
       // response. Durable where a dropped `step_finish` is not; carried as a
-      // synthetic line so the stdout parser stays the single contract.
-      const totals = parseOpenCodeSessionUsageEvent(data);
-      if (!totals) return none;
+      // synthetic line so the stdout parser stays the single contract. A
+      // partial update is merged field by field into the counters already
+      // seen and the line is marked incomplete, so a later partial update can
+      // neither be lost nor leave an earlier total standing as complete.
+      const reading = readOpenCodeSessionCounters(data);
+      state.sessionCounters = mergeOpenCodeSessionCounters(state.sessionCounters, reading.counters);
+      const merged = state.sessionCounters;
+      const complete = reading.complete && merged.input !== undefined && merged.output !== undefined;
+      const totals = foldOpenCodeSessionCounters(merged);
+      const seen = Object.keys(merged).length > 0;
       return {
         lines: [line({
           type: "session_usage",
-          part: { type: "session-usage", usage: totals.usage, costUsd: totals.costUsd },
+          part: {
+            type: "session-usage",
+            ...(totals && seen ? { usage: totals.usage, costUsd: totals.costUsd } : {}),
+            complete: complete && totals !== null,
+          },
         })],
         outcome: null,
       };

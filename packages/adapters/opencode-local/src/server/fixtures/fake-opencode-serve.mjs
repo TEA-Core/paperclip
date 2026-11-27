@@ -31,8 +31,16 @@ const addTokens = (a, b) => ({
   cache: { read: a.cache.read + b.cache.read, write: a.cache.write + b.cache.write },
 });
 const turnCost = () => Number(process.env.FAKE_USAGE_COST ?? "0");
-const usageEvent = (id, tokens, cost) =>
-  push("session.usage.updated", { sessionID: id, cost, tokens: addTokens(priorUsage(id), tokens) });
+// The session's live cumulative usage, so GET /api/session/{id} after a turn
+// returns the final record the way a real server does.
+const liveUsage = new Map();
+const currentUsage = (id) => liveUsage.get(id) ?? { tokens: priorUsage(id), cost: priorCost(id) };
+const prompted = new Set();
+const usageEvent = (id, tokens, cost) => {
+  const totals = { tokens: addTokens(priorUsage(id), tokens), cost };
+  liveUsage.set(id, totals);
+  push("session.usage.updated", { sessionID: id, cost: totals.cost, tokens: totals.tokens });
+};
 
 const server = http.createServer(async (req, res) => {
   let body = "";
@@ -75,7 +83,9 @@ const server = http.createServer(async (req, res) => {
     const [, id, rest] = sessionMatch;
     if (!rest && req.method === "GET") {
       return id === "ses_known" || id === "ses_fake"
-        ? json(200, { data: { id, tokens: priorUsage(id), cost: priorCost(id) } })
+        ? prompted.has(id) && process.env.FAKE_NO_FINAL_SESSION_USAGE === "1"
+          ? json(200, { data: { id } })
+          : json(200, { data: { id, ...currentUsage(id) } })
         : json(404, { _tag: "SessionNotFoundError", message: `Session not found: ${id}` });
     }
     const permissionReply = /^\/permission\/([^/]+)\/reply$/.exec(rest ?? "");
@@ -116,6 +126,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (rest === "/prompt") {
       if (process.env.FAKE_PROMPT_STATUS) return json(Number(process.env.FAKE_PROMPT_STATUS), { _tag: "PromptRejected" });
+      prompted.add(id);
       json(200, { data: { id: "msg_1" } });
       const base = { sessionID: id, assistantMessageID: "msg_a" };
       if (process.env.FAKE_QUESTION === "1") {
@@ -157,6 +168,14 @@ const server = http.createServer(async (req, res) => {
         usageEvent(id, { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, priorCost(id));
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, cost: 0 });
         usageEvent(id, { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, priorCost(id) + turnCost());
+        if (process.env.FAKE_USAGE_PARTIAL_LAST === "1") {
+          // More model work after the full total, reported by a partial
+          // cumulative update that carries only the output counter (7, up
+          // from 2). The session's real cumulative input grew too (9 from 5).
+          const full = { input: 9, output: 7, reasoning: 0, cache: { read: 1, write: 0 } };
+          liveUsage.set(id, { tokens: addTokens(priorUsage(id), full), cost: priorCost(id) + turnCost() });
+          push("session.usage.updated", { sessionID: id, tokens: { output: priorUsage(id).output + full.output } });
+        }
         if (process.env.FAKE_HANG_TURN === "1") return;
         if (process.env.FAKE_ENDS_MID_TURN === "close-stream") {
           for (const res of clients) res.end();
