@@ -412,9 +412,11 @@ export function reconcileOpenCodeRunUsage(input: {
   const reason = cumulative
     ? "resumed session has no pre-run usage baseline; step sums used"
     : "session reported no usage; step sums used";
+  const stepTokens =
+    input.stepUsage.inputTokens + input.stepUsage.cachedInputTokens + input.stepUsage.outputTokens;
   return {
     usage: input.stepUsage,
-    costUsd: input.stepCostUsd,
+    costUsd: input.stepCostUsd === 0 && stepTokens > 0 ? null : input.stepCostUsd,
     usageBasis: "per_run",
     source: "step_finish",
     complete: false,

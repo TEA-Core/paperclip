@@ -191,6 +191,25 @@ describe("reconcileOpenCodeRunUsage", () => {
         stepCostUsd: 0,
       }).costUsd,
     ).toBe(0);
+    // The step_finish fallback applies the same rule.
+    expect(
+      reconcileOpenCodeRunUsage({
+        sessionUsage: null,
+        sessionUsageBaseline: null,
+        resumedSession: false,
+        stepUsage: steps,
+        stepCostUsd: 0,
+      }).costUsd,
+    ).toBeNull();
+    expect(
+      reconcileOpenCodeRunUsage({
+        sessionUsage: null,
+        sessionUsageBaseline: null,
+        resumedSession: false,
+        stepUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        stepCostUsd: 0,
+      }).costUsd,
+    ).toBe(0);
   });
 
   it("keeps the after cost when the baseline cost is unknown", () => {
