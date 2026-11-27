@@ -334,7 +334,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(result.checks).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "opencode_command_resolvable" }),
     ]));
-  });
+  }, 60_000);
 
   it("discovers a non-empty real catalog that contains the configured model", async () => {
     resetOpenCodeModelsCacheForTests();
@@ -356,7 +356,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     });
     expect(available.map((entry) => entry.id)).toContain(model);
     expect(available.length).toBeGreaterThan(1);
-  });
+  }, 60_000);
 
   it("rejects a configured model that the real catalog does not list", async () => {
     resetOpenCodeModelsCacheForTests();
@@ -384,7 +384,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       env: emptyCatalogEnv,
       model,
     })).rejects.toThrow(`OpenCode V2 model discovery returned no models for "${model}".`);
-  });
+  }, 60_000);
 
   it("executes a real V2 run and resumes its session", async () => {
     const first = await execute(context({ runId: "acceptance-first" }));
