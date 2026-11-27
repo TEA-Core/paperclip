@@ -7,6 +7,7 @@ import {
   countIssueAttributableCommits,
   worktreeHasUncommittedContent,
 } from "./done-transition-guard.js";
+import { legacyWorktreeIsDirty, runLegacyWorktreeProbe } from "./hardened-git-probe.js";
 
 // SUP-22880: the repository_delivery local-worktree probes (the dirty-worktree
 // and ahead-of-base signals), driven through the real guard functions against
@@ -441,5 +442,40 @@ describe("legacy status probe fails closed when it cannot build its snapshot saf
       unverified: true,
       reason: expect.stringContaining("index"),
     });
+  });
+});
+
+describe("legacy status probe never fails open on output larger than its limit (SUP-23163)", () => {
+  const maxBuffer = 4096;
+
+  function repoWithManyTrackedFiles(): string {
+    const repo = plainRepo("repo");
+    for (let i = 0; i < 100; i++) {
+      writeFileSync(path.join(repo, `tracked-file-with-a-deliberately-long-name-${String(i).padStart(3, "0")}.txt`), "x\n");
+    }
+    git(repo, "add", ".");
+    git(repo, "commit", "-qm", "many files");
+    return repo;
+  }
+
+  function probeWithSmallBuffer(repo: string) {
+    return runLegacyWorktreeProbe((options) => legacyWorktreeIsDirty(repo, { ...options, maxBuffer }));
+  }
+
+  it("reports a worktree whose status output passes the limit dirty", async () => {
+    const repo = repoWithManyTrackedFiles();
+    for (let i = 0; i < 100; i++) {
+      writeFileSync(path.join(repo, `tracked-file-with-a-deliberately-long-name-${String(i).padStart(3, "0")}.txt`), "changed\n");
+    }
+    expect(await probeWithSmallBuffer(repo)).toBe(true);
+  });
+
+  it("reports a clean worktree whose index listing passes the limit unverified, naming the cause", async () => {
+    const repo = repoWithManyTrackedFiles();
+    expect(await probeWithSmallBuffer(repo)).toMatchObject({
+      unverified: true,
+      reason: expect.stringContaining("index listing exceeded"),
+    });
+    expect(await worktreeHasUncommittedContent(repo)).toBe(false);
   });
 });

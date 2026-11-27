@@ -97,6 +97,14 @@ export class HardenedGitError extends Error {
   }
 }
 
+/** The process printed more than its output limit; its kind stays "failed" for every caller that does not ask. */
+export class HardenedGitOutputOverflow extends HardenedGitError {
+  constructor() {
+    super("failed", "git output exceeded the buffer");
+    this.name = "HardenedGitOutputOverflow";
+  }
+}
+
 let trustedGitBinary: string | null | undefined;
 
 function isRootOwnedAndNotWritableByOthers(target: string): boolean {
@@ -203,6 +211,8 @@ export interface HardenedGitOptions {
   input?: string;
   /** Exit codes other than 0 that still mean success (`check-ignore` exits 1 when nothing matched). */
   successExitCodes?: readonly number[];
+  /** Standard-output limit in bytes; defaults to 16 MiB. */
+  maxBuffer?: number;
 }
 
 /**
@@ -213,8 +223,16 @@ export interface HardenedGitOptions {
 export function runBoundedProcess(
   file: string,
   args: readonly string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string; successExitCodes?: readonly number[] },
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    input?: string;
+    successExitCodes?: readonly number[];
+    maxBuffer?: number;
+  },
 ): Promise<string> {
+  const maxBuffer = options.maxBuffer ?? MAX_BUFFER;
   return new Promise((resolve, reject) => {
     const killGroup = options.timeoutMs > 0;
     const child = spawn(file, args, {
@@ -251,9 +269,9 @@ export function runBoundedProcess(
     }
     child.stdout!.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BUFFER) {
+      if (size > maxBuffer) {
         kill();
-        finish(new HardenedGitError("failed", "git output exceeded the buffer"));
+        finish(new HardenedGitOutputOverflow());
         return;
       }
       chunks.push(chunk);
@@ -294,6 +312,7 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
     timeoutMs,
     input: options.input,
     successExitCodes: options.successExitCodes,
+    maxBuffer: options.maxBuffer,
   });
   if (!deadline) return run;
   return run.catch((error: unknown) => {
@@ -502,17 +521,18 @@ async function listIndexEntries(
   return entries;
 }
 
-/** `status --porcelain=v1 -z --untracked-files=all` through the snapshot git dir, one entry per NUL-separated record. */
+/** `status --porcelain=v1 -z` through the snapshot git dir, one entry per NUL-separated record. */
 async function snapshotStatusRecords(
   snapshotGitDir: string,
   workTree: string,
   ignoreSubmodules: "all" | "dirty",
   options: HardenedGitOptions,
+  untrackedFiles: "all" | "normal" = "all",
 ): Promise<string[]> {
   const raw = await runHardenedGit(
     [
       "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
-      "status", "--porcelain=v1", "-z", "--untracked-files=all", `--ignore-submodules=${ignoreSubmodules}`,
+      "status", "--porcelain=v1", "-z", `--untracked-files=${untrackedFiles}`, `--ignore-submodules=${ignoreSubmodules}`,
     ],
     options,
   );
@@ -645,15 +665,31 @@ async function legacyTreeIsDirty(
     throw refusedSnapshotInput("the repository's info/exclude", error);
   }
   let snapshotReady = false;
-  let measured: { dirty: boolean; gitlinks: string[] };
+  let measured: { dirty: true } | { dirty: false; gitlinks: string[] };
   try {
     measured = await withSnapshotGitDir(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: options.deadline },
       async (snapshot) => {
         snapshotReady = true;
-        const entries = await listIndexEntries(snapshot, identity.topLevel, options);
+        try {
+          if ((await snapshotStatusRecords(snapshot, identity.topLevel, "dirty", options, "normal")).length > 0) {
+            return { dirty: true };
+          }
+        } catch (error) {
+          if (error instanceof HardenedGitOutputOverflow) return { dirty: true };
+          throw error;
+        }
+        let entries: IndexEntry[];
+        try {
+          entries = await listIndexEntries(snapshot, identity.topLevel, options);
+        } catch (error) {
+          if (error instanceof HardenedGitOutputOverflow) {
+            throw new HardenedGitError("refused", "the worktree's index listing exceeded the probe's output limit");
+          }
+          throw error;
+        }
         const gitlinks = [...new Set(entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path))];
-        return { dirty: (await snapshotStatusRecords(snapshot, identity.topLevel, "dirty", options)).length > 0, gitlinks };
+        return { dirty: false, gitlinks };
       },
     );
   } catch (error) {
