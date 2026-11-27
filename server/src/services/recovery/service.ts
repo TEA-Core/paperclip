@@ -194,6 +194,8 @@ import { isExternalPullAgent } from "../agent-work-delivery.js";
 import {
   decideExternalPullRecoveryExemption,
   EXTERNAL_PULL_RECOVERY_EXEMPTION_CLEARED_ACTION,
+  EXTERNAL_PULL_RECOVERY_NOTICE_REASONS,
+  type ExternalPullRecoveryBoardOnlyReason,
   type ExternalPullRecoveryExemption,
 } from "./external-pull-exemption.js";
 import {
@@ -1702,6 +1704,38 @@ export function recoveryService(
       boardCleared: await isExternalPullRecoveryExemptionBoardCleared(issue.companyId, issue.id, runner),
       now,
     });
+  }
+
+  async function postExternalPullRecoveryNotice(
+    input: {
+      issue: Pick<typeof issues.$inferSelect, "id" | "companyId">;
+      assignee: Pick<typeof agents.$inferSelect, "id" | "name">;
+      reason: ExternalPullRecoveryBoardOnlyReason | "recovery_exhausted";
+      episodeId: string;
+    },
+    runner: Db = db,
+  ) {
+    const marker = `external_pull_recovery_notice:${input.reason}:${input.episodeId}`;
+    const alreadyNoticed = await runner
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, input.issue.companyId),
+        eq(issueComments.issueId, input.issue.id),
+        eq(issueComments.authorType, "system"),
+        sql`${issueComments.body} like ${`%${marker}%`}`,
+      ))
+      .limit(1);
+    if (alreadyNoticed.length > 0) return;
+    await issueService(runner).addComment(
+      input.issue.id,
+      `Recovery notice for ${input.assignee.name}: ${EXTERNAL_PULL_RECOVERY_NOTICE_REASONS[input.reason]} ` +
+        `The card stays assigned to ${input.assignee.name}; no other agent was assigned or woken, and the board owns ` +
+        `the recovery decision. (\`${marker}\`)`,
+      {},
+      { authorType: "system" },
+      runner,
+    );
   }
 
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined, runner: Db = db): Promise<AgentInvokability> {
@@ -6934,15 +6968,18 @@ export function recoveryService(
       }
 
       // Fork (two-fleet routing): a parked card of a live `external_pull` owner
-      // is not stranded. Any other card of such an owner (active card, dead
-      // owner, age bound, board override) reaches only the board-owned hold
-      // below, never the manager ladder.
+      // is not stranded. Any other card of such an owner reaches only the
+      // board-owned hold below, never the manager ladder. A dead owner, the age
+      // bound and a board override divert at once; a live owner's active card
+      // first passes the normal live-path guards.
       const externalPullExemption = await evaluateExternalPullRecoveryExemption(issue, agentId, now);
       if (externalPullExemption.kind === "exempt") {
         result.skipped += 1;
         return;
       }
       const externalPullBoardOnly = externalPullExemption.kind === "board_only";
+      const externalPullActiveCard =
+        externalPullExemption.kind === "board_only" && externalPullExemption.reason === "active_card";
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       // A native chat can finish between the earlier settlement read and this
@@ -7068,7 +7105,7 @@ export function recoveryService(
         return;
       }
 
-      if ((issue.status !== "in_review" && !agentInvokable) || externalPullBoardOnly) {
+      const openOwnerUnavailableHold = async () => {
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
@@ -7099,7 +7136,9 @@ export function recoveryService(
               ? { externalPullExemptionLapsed: externalPullExemption.reason }
               : {}),
           },
-          nextAction: "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
+          nextAction: externalPullActiveCard
+            ? "The external-pull assignee still owns this card. Confirm its progress with the assignee, or record an intentional manual resolution."
+            : "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
           wakePolicy: null,
           monitorPolicy: null,
           maxAttempts: null,
@@ -7124,6 +7163,18 @@ export function recoveryService(
             fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
           },
         });
+        if (externalPullExemption.kind === "board_only" && agent) {
+          await postExternalPullRecoveryNotice({
+            issue,
+            assignee: agent,
+            reason: externalPullExemption.reason,
+            episodeId: upserted.id,
+          });
+        }
+      };
+
+      if ((issue.status !== "in_review" && !agentInvokable) || (externalPullBoardOnly && !externalPullActiveCard)) {
+        await openOwnerUnavailableHold();
         return;
       }
 
@@ -7260,6 +7311,11 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
+        return;
+      }
+
+      if (externalPullActiveCard) {
+        await openOwnerUnavailableHold();
         return;
       }
 
@@ -10443,7 +10499,14 @@ export function recoveryService(
     // source owned by an `external_pull` agent, whatever its status, age, owner
     // status or board override; the board action stays the decision item and
     // the card stays with its owner.
-    if (await getExternalPullAgent(input.issue.companyId, input.issue.assigneeAgentId, db)) {
+    const externalPullAssignee = await getExternalPullAgent(input.issue.companyId, input.issue.assigneeAgentId, db);
+    if (externalPullAssignee) {
+      await postExternalPullRecoveryNotice({
+        issue: input.issue,
+        assignee: externalPullAssignee,
+        reason: "recovery_exhausted",
+        episodeId: input.recoveryActionId,
+      }, db);
       return EXHAUSTED_RECOVERY_UNAVAILABLE;
     }
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);

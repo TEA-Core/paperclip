@@ -33,6 +33,16 @@ export type ExternalPullRecoveryBoardOnlyReason =
   | "exemption_expired"
   | "board_cleared";
 
+export const EXTERNAL_PULL_RECOVERY_NOTICE_REASONS: Readonly<
+  Record<ExternalPullRecoveryBoardOnlyReason | "recovery_exhausted", string>
+> = {
+  owner_not_invokable: "the assignee is paused, terminated or pending approval, so it cannot pull this card.",
+  active_card: "this active card has no live execution path.",
+  exemption_expired: "this parked card has had no activity within the recovery exemption window.",
+  board_cleared: "the board cleared the recovery exemption for this card.",
+  recovery_exhausted: "automatic recovery for this card is exhausted.",
+};
+
 export type ExternalPullRecoveryExemption =
   | { kind: "none" }
   | { kind: "exempt" }

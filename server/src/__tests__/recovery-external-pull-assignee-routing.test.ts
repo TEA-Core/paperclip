@@ -10,7 +10,9 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -378,6 +380,14 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     return { issueId, runId };
   }
 
+  async function externalPullNotices(issueId: string) {
+    const rows = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    return rows.filter((row) => row.authorType === "system" && row.body.includes("external_pull_recovery_notice:"));
+  }
+
   it("stranded assigned issue: surfaces an in_progress card of a live external-pull assignee to the board without re-homing it", async () => {
     const fleet = await seedFleet();
     const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
@@ -385,6 +395,7 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     const { svc, enqueueWakeup } = makeSweep();
 
     const result = await svc.reconcileStrandedAssignedIssues();
+    await svc.reconcileStrandedAssignedIssues();
 
     expect(result.escalated).toBe(0);
     expect(result.noLivePathOwnerUnavailable).toBe(1);
@@ -396,6 +407,35 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
     expect(actions[0].ownerType).toBe("board");
     expect(actions[0].ownerAgentId).toBeNull();
+    const notices = await externalPullNotices(issueId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].body).toContain("firstmate-primary");
+    expect(notices[0].body).toContain("external_pull_recovery_notice:active_card:");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stranded assigned issue: leaves an in_progress card of a live external-pull assignee alone while a wake interaction is pending", async () => {
+    const fleet = await seedFleet();
+    const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
+    await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, issueId));
+    await db.insert(issueThreadInteractions).values({
+      companyId: fleet.companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Ship it?" },
+    });
+    const { svc, enqueueWakeup } = makeSweep();
+
+    const result = await svc.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathOwnerUnavailable).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+    expect((await issueRow(issueId))?.status).toBe("in_progress");
+    await expectNotReassigned(fleet, issueId);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await externalPullNotices(issueId)).toHaveLength(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -613,6 +653,7 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     const { svc, enqueueWakeup } = makeSweep();
 
     const result = await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
+    await svc.reconcileExhaustedRecoveryDrain({ companyId: fleet.companyId });
 
     expect(result.recoveryIssueMinted).toBe(0);
     expect(await recoveryChildren(issueId)).toHaveLength(0);
@@ -621,6 +662,10 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     const [action] = await recoveryActionRows(issueId);
     expect(action.ownerType).toBe("board");
     expect(action.recoveryIssueId).toBeNull();
+    const notices = await externalPullNotices(issueId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].body).toContain("firstmate-primary");
+    expect(notices[0].body).toContain(`external_pull_recovery_notice:recovery_exhausted:${action.id}`);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
