@@ -759,7 +759,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       try {
         return await request(createApp(db, boardActor(fixture.company)))
           .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
-          .send({ decision: "approved", comment: "Independent final approval." });
+          .send({ decision: "approved", comment: "Independent final approval.", displacementReason: "Board decides the final stage for the pending reviewer." });
       } finally {
         if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
         else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
@@ -1929,7 +1929,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       try {
         return await request(createApp(db, boardActor(fixture.company)))
           .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
-          .send({ decision, comment: "Independent stage decision." });
+          .send({ decision, comment: "Independent stage decision.", displacementReason: "Board decides the stage for the pending reviewer." });
       } finally {
         if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
         else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;

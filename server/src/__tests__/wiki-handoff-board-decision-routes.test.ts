@@ -244,10 +244,16 @@ describeEmbeddedPostgres("Wiki handoff board stage decision on an unassigned car
     return (await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).length;
   }
 
+  // The seeded stage is still pending on its reviewer, so the board override must
+  // carry the displacement reason that the board stage decision rule requires.
   function approve(app: express.Express, issueId: string) {
     return request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "Accepted weekly report." });
+      .send({
+        decision: "approved",
+        comment: "Accepted weekly report.",
+        displacementReason: "Board closes the accepted weekly report for the pending reviewer.",
+      });
   }
 
   it("approves the unassigned handoff, records the decision, and leaves it unassigned with no wake", async () => {

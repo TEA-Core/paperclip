@@ -843,7 +843,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       });
       const response = await request(board)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Advance to approval." });
+        .send({ decision: "approved", comment: "Advance to approval.", displacementReason: "Board advances the stage for the pending reviewer." });
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(await cardRow(issueId)).toMatchObject({
         executionState: { currentStageId: secondStageId },
