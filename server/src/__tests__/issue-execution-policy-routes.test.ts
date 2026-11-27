@@ -5621,8 +5621,10 @@ describe("issue execution policy routes", () => {
       expect(res.body.code).toBe("approval_final_delivery_preflight_stale");
       // SUP-23801 reconciliation: the fold transactional path takes two extra
       // locked reads (stage-decision lock and snapshot revalidation) before the
-      // final delivery preflight detects the replacement run.
-      expect(mockIssueService.getByIdForUpdate).toHaveBeenCalledTimes(5);
+      // final delivery preflight detects the replacement run. The assignee
+      // write adds one more: the execution-policy seat rules are re-judged
+      // against the locked row.
+      expect(mockIssueService.getByIdForUpdate).toHaveBeenCalledTimes(6);
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
