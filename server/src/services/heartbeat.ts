@@ -1085,6 +1085,9 @@ function countConsecutivePreAdapterSetupFailures(
 const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
+// Statuses the scheduled monitor dispatcher selects (tickDueIssueMonitors).
+const ISSUE_MONITOR_DISPATCH_STATUSES = ["in_progress", "in_review", "blocked"] as const;
+const ISSUE_MONITOR_UNFIREABLE_ACTION = "issue.monitor_unfireable";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 // A reviewer that runs to completion and comments without deciding is deliberately
 // deferring, not dead, so its stage keeps getting re-armed instead of escalating.
@@ -13443,6 +13446,106 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // A due monitor that the dispatch query below can never select (an issue in
+  // `todo`/`backlog`/a closed status, a human assignee, or no assignee with a
+  // non-`wake_owner` policy) would otherwise stay armed with no activity row at
+  // all (SUP-25400: an agent release moves the issue to `todo` and drops the
+  // assignee but leaves the monitor scheduled). Record one
+  // `issue.monitor_unfireable` row per due schedule so the loss is visible in
+  // the issue activity API. Detection only: the monitor stays armed and no wake
+  // is routed. A row whose `details.nextCheckAt` equals the current
+  // `monitorNextCheckAt` marks that schedule as reported; a re-arm to another
+  // time is reported again when it comes due.
+  async function reportUnfireableDueIssueMonitors(now: Date) {
+    const dispatchable = and(
+      isNull(issues.assigneeUserId),
+      or(
+        sql`${issues.assigneeAgentId} is not null`,
+        sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
+      ),
+      inArray(issues.status, [...ISSUE_MONITOR_DISPATCH_STATUSES]),
+    );
+    const rows = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          sql`${issues.monitorNextCheckAt} is not null`,
+          lte(issues.monitorNextCheckAt, now),
+          sql`not (${dispatchable})`,
+          sql`not exists (
+            select 1 from ${activityLog}
+            where ${activityLog.companyId} = ${issues.companyId}
+              and ${activityLog.entityType} = 'issue'
+              and ${activityLog.entityId} = ${issues.id}::text
+              and ${activityLog.action} = ${ISSUE_MONITOR_UNFIREABLE_ACTION}
+              and ${activityLog.details}->>'nextCheckAt' = to_char(
+                date_trunc('milliseconds', ${issues.monitorNextCheckAt}) at time zone 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+              )
+          )`,
+        ),
+      )
+      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
+      .limit(50);
+
+    let reported = 0;
+    for (const row of rows as IssueMonitorDispatchRow[]) {
+      if (!row.monitorNextCheckAt) continue;
+      const monitor =
+        normalizeIssueExecutionPolicy(row.executionPolicy ?? null)?.monitor ??
+        null;
+      const recoveryPolicy = monitorRecoveryPolicy(monitor);
+      const reasons: string[] = [];
+      if (
+        !(ISSUE_MONITOR_DISPATCH_STATUSES as readonly string[]).includes(
+          row.status,
+        )
+      ) {
+        reasons.push("status_not_dispatchable");
+      }
+      if (row.assigneeUserId) reasons.push("human_assignee");
+      else if (!row.assigneeAgentId && recoveryPolicy !== "wake_owner") {
+        reasons.push("no_assignee_agent");
+      }
+      try {
+        await logActivity(db, {
+          companyId: row.companyId,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          action: ISSUE_MONITOR_UNFIREABLE_ACTION,
+          entityType: "issue",
+          entityId: row.id,
+          details: {
+            identifier: row.identifier,
+            status: row.status,
+            assigneeAgentId: row.assigneeAgentId,
+            assigneeUserId: row.assigneeUserId,
+            nextCheckAt: row.monitorNextCheckAt.toISOString(),
+            attemptCount: row.monitorAttemptCount ?? 0,
+            notes: row.monitorNotes ?? null,
+            serviceName: monitor?.serviceName ?? null,
+            recoveryPolicy,
+            reason: reasons[0] ?? "not_dispatchable",
+            reasons,
+            source: "scheduled",
+          },
+        });
+        reported += 1;
+      } catch (err) {
+        logger.error(
+          { err, issueId: row.id },
+          "issue monitor unfireable report failed",
+        );
+      }
+    }
+    return reported;
+  }
+
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const hasDispatchTarget = or(
@@ -13460,7 +13563,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
           hasDispatchTarget,
-          inArray(issues.status, ["in_progress", "in_review", "blocked"]),
+          inArray(issues.status, [...ISSUE_MONITOR_DISPATCH_STATUSES]),
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -13488,7 +13591,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
               hasDispatchTarget,
-              inArray(issues.status, ["in_progress", "in_review", "blocked"]),
+              inArray(issues.status, [...ISSUE_MONITOR_DISPATCH_STATUSES]),
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -13524,10 +13627,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    let unfireable = 0;
+    try {
+      unfireable = await reportUnfireableDueIssueMonitors(now);
+    } catch (err) {
+      logger.error({ err }, "issue monitor unfireable scan failed");
+    }
+
     return {
       checked: dueMonitors.length,
       triggered,
       skipped,
+      unfireable,
     };
   }
 
