@@ -83,15 +83,39 @@ describe("plugin issue event visibility", () => {
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
-  it("strips the document title of an unreadable issue's document event", () => {
+  it("keeps the document title of an unreadable issue's document event", () => {
     const original = event({
       eventType: "issue.document.created",
-      payload: { key: "plan", documentId: "doc-1", title: "Restricted document title", revisionNumber: 1 },
+      payload: { key: "plan", documentId: "doc-1", title: "Document title", revisionNumber: 1, body: "Restricted body" },
     });
     expect(pluginEventForRecipient(original, false).payload).toEqual({
       key: "plan",
       documentId: "doc-1",
+      title: "Document title",
       revisionNumber: 1,
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
+  });
+
+  it("passes only metadata of an unreadable issue's nested and unknown fields", () => {
+    const original = event({
+      payload: {
+        identifier: "PAP-1",
+        status: "in_progress",
+        changes: {
+          status: { from: "todo", to: "in_progress" },
+          description: { from: "Restricted old body", to: "Restricted new body" },
+        },
+        quote: "Restricted quote",
+        notes: "Restricted notes",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      identifier: "PAP-1",
+      status: "in_progress",
+      changes: { status: { from: "todo", to: "in_progress" } },
+      updatedAt: "2026-01-01T00:00:00.000Z",
     });
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
@@ -114,7 +138,6 @@ describe("plugin issue event visibility", () => {
       runId: "run-1",
       agentId: "agent-1",
       status: "failed",
-      error: null,
       errorCode: "adapter_failed",
       issueId: "issue-1",
     });

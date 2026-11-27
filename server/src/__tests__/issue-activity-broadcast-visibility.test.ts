@@ -344,7 +344,7 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     expect(readerEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual(details);
   });
 
-  it("withholds a restricted issue's document quote and document title from a subscriber that cannot read it", async () => {
+  it("withholds a restricted issue's document quote from a subscriber that cannot read it and keeps the document title", async () => {
     const { company, userId } = await seedCompany(db);
     const restrictedIssue = await seedIssue(db, company.id, {
       title: RESTRICTED_TITLE,
@@ -384,14 +384,107 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     const restrictedDetails = (events: LiveEvent[]) =>
       events.filter(isActivityFor(restrictedIssue.id)).map((event) => event.payload.details);
     expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
-    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DOCUMENT_TITLE);
+    // Titles are metadata: the document title stays, like the issue's own title.
     expect(restrictedDetails(nonReaderEvents)).toEqual([
       { key: "plan", documentKey: "plan", threadId: "thread-1" },
-      { key: "plan", documentId: "doc-1", revisionNumber: 2 },
+      documentDetails,
     ]);
     expect(restrictedDetails(readerEvents)).toEqual([quoteDetails, documentDetails]);
-    // The issue's own title stays on non-document events.
     expect(nonReaderEvents.find(isActivityFor(ownIssue.id))?.payload.details).toMatchObject({ title: ownIssue.title });
+  });
+
+  it("sends a non-reader only the metadata of nested issue-update details", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    const details = {
+      identifier: restrictedIssue.identifier,
+      title: RESTRICTED_TITLE,
+      status: "in_progress",
+      description: RESTRICTED_DESCRIPTION,
+      labelIds: ["label-1"],
+      changes: {
+        status: { from: "todo", to: "in_progress" },
+        description: { from: "Restricted previous description", to: RESTRICTED_DESCRIPTION },
+      },
+      _previous: { status: "todo", description: "Restricted previous description" },
+    };
+    await logActivity(db, {
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: restrictedIssue.id,
+      details,
+    });
+    await logIssueCreated(db, company.id, ownIssue);
+
+    await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
+    await waitFor(() => readerEvents.some(isActivityFor(ownIssue.id)));
+
+    expect(JSON.stringify(nonReaderEvents)).not.toContain("Restricted previous description");
+    expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    expect(nonReaderEvents.find(isActivityFor(restrictedIssue.id))?.payload.details).toEqual({
+      identifier: restrictedIssue.identifier,
+      title: RESTRICTED_TITLE,
+      status: "in_progress",
+      labelIds: ["label-1"],
+      changes: { status: { from: "todo", to: "in_progress" } },
+      _previous: { status: "todo" },
+    });
+    expect(readerEvents.find(isActivityFor(restrictedIssue.id))?.payload.details).toEqual(details);
+  });
+
+  it("sends run output that names no issue only as metadata to a subscriber without company-wide read", async () => {
+    const { company, userId } = await seedCompany(db);
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { scopedAgent, nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+    // The run's context names no issue, so no issue read decides its output.
+    const run = await db
+      .insert(heartbeatRuns)
+      .values({ companyId: company.id, agentId: scopedAgent.id, status: "running", contextSnapshot: {} })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const port = await startLiveEventsServer();
+    const scopedEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    const progress = {
+      runId: run.id,
+      agentId: scopedAgent.id,
+      issueId: null,
+      phase: "working",
+      message: RESTRICTED_DESCRIPTION,
+      lastAssistantSnippet: RESTRICTED_DESCRIPTION,
+    };
+    publishLiveEvent({ companyId: company.id, type: "heartbeat.run.progress", payload: progress });
+    publishLiveEvent({ companyId: company.id, type: "agent.status", payload: { agentId: scopedAgent.id, status: "idle" } });
+
+    const isAgentStatus = (event: LiveEvent) => event.type === "agent.status";
+    await waitFor(() => scopedEvents.some(isAgentStatus));
+    await waitFor(() => readerEvents.some(isAgentStatus));
+
+    expect(JSON.stringify(scopedEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    expect(scopedEvents[0]!.payload).toEqual({ runId: run.id, agentId: scopedAgent.id, issueId: null, phase: "working" });
+    // A subscriber with company-wide read still receives the full event.
+    expect(readerEvents[0]!.payload).toEqual(progress);
   });
 
   it("sends run and goal events about an unreadable issue without their issue content", async () => {
@@ -469,12 +562,13 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     await waitFor(() => readerEvents.some(isAgentStatus));
 
     expect(JSON.stringify(nonReaderEvents)).not.toContain(RESTRICTED_DESCRIPTION);
+    // Only metadata passes: identifiers, states, enums, counters and timestamps.
     expect(nonReaderEvents.map((event) => event.payload)).toEqual([
-      { ...progress, message: null, lastAssistantSnippet: null },
-      { ...status, error: null, finalText: null },
-      { ...runEvent, message: null, payload: null },
-      { ...log, chunk: null },
-      { ...goal, goal: { ...goal.goal, objective: null, lastReason: null } },
+      { runId: run.id, agentId: scopedAgent.id, issueId: restrictedIssue.id, phase: "working", currentToolName: "Bash" },
+      { runId: run.id, agentId: scopedAgent.id, issueId: null, status: "failed", errorCode: "adapter_failed" },
+      { runId: run.id, agentId: scopedAgent.id, issueId: restrictedIssue.id, seq: 1, eventType: "assistant" },
+      { runId: run.id, agentId: scopedAgent.id, issueId: restrictedIssue.id, seq: 1, stream: "stdout" },
+      { issueId: restrictedIssue.id, agentId: scopedAgent.id, revision: 3, goal: { status: "active" } },
       { agentId: scopedAgent.id, status: "idle" },
     ]);
     // A subscriber that can read the issue still receives every event in full.

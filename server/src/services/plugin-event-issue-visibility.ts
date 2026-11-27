@@ -1,6 +1,6 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { isIssueDocumentEvent, isRecord, withoutUnreadableIssueContent } from "./issue-event-content.js";
+import { isRecord, issueEventMetadata } from "./issue-event-content.js";
 import { pluginCapabilityValidator } from "./plugin-capability-validator.js";
 
 const capabilityValidator = pluginCapabilityValidator();
@@ -15,39 +15,37 @@ export function pluginCanReadIssues(manifest: PaperclipPluginManifestV1 | null |
 }
 
 /** A plugin's `issues.get` reads every issue of the company or none of them. */
-const UNREADABLE = { ownIssue: false, summarizedIssue: () => false };
+const NOTHING_READABLE = () => false;
 
-/** Output of a run on an issue, which only a reader of that issue may receive. */
-const RUN_ISSUE_CONTENT_FIELDS = ["error", "finalText"] as const;
-
-function withoutRunIssueContent(payload: Record<string, unknown>): Record<string, unknown> {
-  const present = RUN_ISSUE_CONTENT_FIELDS.filter((field) => payload[field] != null);
-  if (typeof payload.issueId !== "string" || payload.issueId.length === 0 || present.length === 0) return payload;
-  const next = { ...payload };
-  for (const field of present) next[field] = null;
-  return next;
+/**
+ * The payload of an event about a run on an issue as a plugin may receive it:
+ * unchanged when the plugin can read issues or the run has no issue (`issueId`
+ * is the run's resolved issue), and only its metadata otherwise.
+ */
+export function pluginRunPayloadForRecipient(
+  payload: Record<string, unknown>,
+  canReadIssue: boolean,
+  issueId: string | null,
+): Record<string, unknown> {
+  return canReadIssue || !issueId ? payload : issueEventMetadata(payload, NOTHING_READABLE);
 }
 
 /**
- * The domain event as a plugin may receive it. An issue event can carry issue
- * content in its payload (the description of `issue.created`, the comment
- * snippet of `issue.comment.created`, the title of an `issue.document.*`
- * document, the titles of referenced and blocking issues); a plugin that
- * cannot read the issue gets the event without that content, keeping the
- * identifiers it needs to react. A run event (`agent.run.*`) about an issue
- * the plugin cannot read arrives with its `error` and `finalText` set to
- * `null`.
+ * The domain event as a plugin may receive it. A plugin that cannot read the
+ * issue an event concerns receives only the event's metadata (see
+ * `issueEventMetadata`): an `issue.*` event, and an `agent.run.*` event about
+ * a run on an issue. A plugin that can read issues receives the event unchanged.
  */
 export function pluginEventForRecipient(event: PluginEvent, canReadIssue: boolean): PluginEvent {
   if (canReadIssue || !isRecord(event.payload)) return event;
   if (event.entityType === "issue") {
-    return {
-      ...event,
-      payload: withoutUnreadableIssueContent(event.payload, UNREADABLE, isIssueDocumentEvent(event.eventType)),
-    };
+    return { ...event, payload: issueEventMetadata(event.payload, NOTHING_READABLE) };
   }
   if (event.entityType === "heartbeat_run") {
-    const payload = withoutRunIssueContent(event.payload);
+    const issueId = typeof event.payload.issueId === "string" && event.payload.issueId.length > 0
+      ? event.payload.issueId
+      : null;
+    const payload = pluginRunPayloadForRecipient(event.payload, false, issueId);
     return payload === event.payload ? event : { ...event, payload };
   }
   return event;
