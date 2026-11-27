@@ -177,7 +177,7 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
     const { issueId, stageId } = await seedLadderCard();
     for (let call = 0; call < 5; call++) {
       expect((await evaluateDoneTransitionGuardForBackstopClose({
-        db, issue: await readIssue(issueId), closeComment: null,
+        db, issue: await readIssue(issueId), actorId: "system:execution-control-reconciliation", closeComment: null,
       })).allowed).toBe(false);
     }
     await db.update(issues).set({
@@ -203,7 +203,7 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
     try {
       await limitedDb.execute(sql`set lock_timeout = '50ms'`);
       const verdict = await evaluateDoneTransitionGuardForBackstopClose({
-        db: limitedDb, issue: await readIssue(issueId), closeComment: null,
+        db: limitedDb, issue: await readIssue(issueId), actorId: "system:execution-control-reconciliation", closeComment: null,
       });
       expect(verdict).toMatchObject({
         allowed: false,
@@ -216,7 +216,7 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
       await holding;
     }
     expect((await evaluateDoneTransitionGuardForBackstopClose({
-      db, issue: await readIssue(issueId), closeComment: null,
+      db, issue: await readIssue(issueId), actorId: "system:execution-control-reconciliation", closeComment: null,
     })).allowed).toBe(false);
     expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
     expect(await rows(issueId, REFUSED)).toHaveLength(3);
@@ -226,19 +226,19 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
   it("refreshes only the changed card when another capped card owns the latest company refusal", async () => {
     const first = await seedLadderCard();
     for (let call = 0; call < 5; call++) {
-      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(first.issueId), closeComment: null });
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(first.issueId), actorId: "system:execution-control-reconciliation", closeComment: null });
     }
     await ageActivity(first.issueId, 1);
     const second = await seedLadderCard();
     for (let call = 0; call < 5; call++) {
-      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(second.issueId), closeComment: null });
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(second.issueId), actorId: "system:execution-control-reconciliation", closeComment: null });
     }
     const untouched = await rows(second.issueId, REFUSED);
     await db.update(issues).set({
       executionPolicy: policy([{ id: first.stageId, type: "review" }, { id: randomUUID(), type: "review" }]),
     }).where(eq(issues.id, first.issueId));
     expect((await evaluateDoneTransitionGuardForBackstopClose({
-      db, issue: await readIssue(first.issueId), closeComment: null,
+      db, issue: await readIssue(first.issueId), actorId: "system:execution-control-reconciliation", closeComment: null,
     })).allowed).toBe(false);
     const after = await rows(second.issueId, REFUSED);
     for (const original of untouched) {
@@ -252,13 +252,13 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
   it("does not create new audit row versions for unchanged capped refusals", async () => {
     const { issueId } = await seedLadderCard();
     for (let call = 0; call < 5; call++) {
-      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(issueId), closeComment: null });
+      await evaluateDoneTransitionGuardForBackstopClose({ db, issue: await readIssue(issueId), actorId: "system:execution-control-reconciliation", closeComment: null });
     }
     const before = await db.select({ id: activityLog.id, version: sql<string>`xmin::text` })
       .from(activityLog).where(eq(activityLog.entityId, issueId)).orderBy(activityLog.id);
     for (let call = 0; call < 2; call++) {
       expect((await evaluateDoneTransitionGuardForBackstopClose({
-        db, issue: await readIssue(issueId), closeComment: null,
+        db, issue: await readIssue(issueId), actorId: "system:execution-control-reconciliation", closeComment: null,
       })).allowed).toBe(false);
     }
     expect(await db.select({ id: activityLog.id, version: sql<string>`xmin::text` })
@@ -485,7 +485,6 @@ describeEmbeddedPostgres("SUP-24136 repeated identical review-ladder refusals", 
       details: {
         identifier: null,
         callingActor: "system:execution-control-reconciliation",
-        callingRunId: null,
         reason: `review_ladder_unsatisfied:${second.stageId}`,
         skipReason: `review_ladder_unsatisfied:${second.stageId}`,
         stageIndex: 0,

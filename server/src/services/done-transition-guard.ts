@@ -1133,7 +1133,6 @@ export async function githubBranchHasMergedPr(
 
 type DoneTransitionAuditProvenance = {
   actorId: string;
-  runId: string | null;
   closeRowAudits?: Array<Parameters<typeof logActivity>[1]>;
 };
 
@@ -1157,7 +1156,7 @@ async function writeAuditLog(
         ? "done-transition-guard"
         : issue.doneTransitionAuditProvenance?.actorId ?? "done-transition-guard",
       agentId: null,
-      runId: isLadderRefusal ? null : issue.doneTransitionAuditProvenance?.runId ?? null,
+      runId: null,
       agentApiKeyId: null,
       action,
       entityType: "issue",
@@ -5642,8 +5641,7 @@ export async function resolveCitedCommits(
  *   stays countable in the ghost-PASS census and dies with the close on
  *   rollback.
  *
- * Tier-close audit payloads retain the supplied caller actor/run provenance;
- * omitted provenance defaults to the guard actor and no run.
+ * Tier-close audit payloads retain the supplied caller actor provenance.
  *
  * Callers must invoke this BEFORE opening their close transaction on an
  * unlocked read: the delivery guard probes GitHub and the tier evaluator
@@ -5653,8 +5651,7 @@ export async function resolveCitedCommits(
 export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   db: Db;
   issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string };
-  actorId?: string;
-  runId?: string | null;
+  actorId: string;
   closeComment: string | null;
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
@@ -5691,7 +5688,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       conflict: DoneTierDualSourceConflict;
     }
 > {
-  const { db, issue, actorId = "done-transition-guard", runId = null, closeComment, structuredDoneTier, listComments } = input;
+  const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
   // SUP-25336: the same pure source resolver the route doors run, before any
   // guard probe or rendering.
   const tierSources = resolveDoneTierDeclarationSources(closeComment, structuredDoneTier);
@@ -5706,7 +5703,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
   const guardIssue = {
     ...issue,
-    doneTransitionAuditProvenance: { actorId, runId, closeRowAudits },
+    doneTransitionAuditProvenance: { actorId, closeRowAudits },
   };
   const debt = await prepareLandingDebtClose(db, issue);
   const guardResult = await evaluateDoneTransitionGuard(db, guardIssue, null, false, undefined, debt.owed);
@@ -5745,7 +5742,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         actorType: "system",
         actorId,
         agentId: null,
-        runId,
+        runId: null,
         agentApiKeyId: null,
         action: "issue.done_transition_tier1_close",
         entityType: "issue",
@@ -5764,7 +5761,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         actorType: "system",
         actorId,
         agentId: null,
-        runId,
+        runId: null,
         agentApiKeyId: null,
         action: "issue.done_transition_tier2_close",
         entityType: "issue",
@@ -6892,7 +6889,6 @@ async function evaluateDoneTransitionGuardCore(
       ...(issue.doneTransitionAuditProvenance
         ? {
             callingActor: issue.doneTransitionAuditProvenance.actorId,
-            callingRunId: issue.doneTransitionAuditProvenance.runId,
           }
         : {}),
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,

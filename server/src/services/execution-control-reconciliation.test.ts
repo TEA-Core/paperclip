@@ -572,7 +572,6 @@ describeEmbeddedPostgres(
           runId: null,
           details: expect.objectContaining({
             callingActor: "system:execution-control-reconciliation",
-            callingRunId: null,
             ladderStateKey: expect.any(String),
           }),
         }),
@@ -696,7 +695,7 @@ describeEmbeddedPostgres(
       expect(slot?.status).toBe("failed");
     });
 
-    it("still terminalizes a summary task blocked after selection (blocked stays in the stranded population)", async () => {
+    it("preserves a summary task blocked after selection and its slot binding", async () => {
       const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
       const slotId = randomUUID();
       await db.insert(summarySlots).values({
@@ -743,10 +742,10 @@ describeEmbeddedPostgres(
         transactionSpy.mockRestore();
         const result = await reaping;
 
-        expect(result).toEqual({ scanned: 1, terminalized: 1 });
-        expect((await getIssue(issueId))?.status).toBe("done");
+        expect(result).toEqual({ scanned: 1, terminalized: 0 });
+        expect((await getIssue(issueId))?.status).toBe("blocked");
         const [slot] = await db.select().from(summarySlots).where(eq(summarySlots.id, slotId)).limit(1);
-        expect(slot).toMatchObject({ status: "failed", generatingIssueId: null });
+        expect(slot).toMatchObject({ status: "generating", generatingIssueId: issueId });
       } finally {
         releaseLock();
         transactionSpy.mockRestore();

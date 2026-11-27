@@ -368,6 +368,7 @@ export async function reapStrandedSummaryGenerationIssues(
     .select({
       issueId: issues.id,
       companyId: issues.companyId,
+      status: issues.status,
     })
     .from(issues)
     .where(
@@ -497,6 +498,7 @@ export async function reapStrandedSummaryGenerationIssues(
             // since the scan belongs to its own owner.
             if (!issue) return false;
             if (issue.status === "done" || issue.status === "cancelled") return false;
+            if (issue.status === "blocked" && candidate.status !== "blocked") return false;
             if (issue.assigneeAgentId !== SUMMARIZER_AGENT_ID) return false;
             // Amended-contract continuation path: an armed monitor.
             if (issue.monitorNextCheckAt) return false;

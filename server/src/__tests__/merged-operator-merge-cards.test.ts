@@ -1159,7 +1159,6 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
           runId: null,
           details: expect.objectContaining({
             callingActor: "system:merged-operator-merge-cards",
-            callingRunId: null,
           }),
         }),
       ]),
