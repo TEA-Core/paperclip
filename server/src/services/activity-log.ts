@@ -279,7 +279,10 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
  * into an HTTP 500 — and a client that correctly retries on 500 then double-posts. A failed
  * audit write is logged with the entity it belonged to instead (SUP-9856).
  *
- * Callers running inside a transaction must use {@link logActivityInTransaction}.
+ * When handed a transaction, the insert runs inside a savepoint (SUP-24746): a failed audit
+ * rolls back to the savepoint only, so the caller's transaction stays usable and its mutation
+ * still commits without the audit row. Callers that need the audit row and the mutation to
+ * share one fate must use {@link logActivityInTransaction}.
  *
  * `postCommitPublications` defers the realtime/plugin publication instead of firing it inline:
  * a caller that is still mid-write collects the publications and drains them once its write
@@ -319,7 +322,7 @@ export async function logActivity(
 
 async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
   if (!(db instanceof PgTransaction)) return persistActivity(db, input);
-  return db.transaction(async (savepoint) => persistActivity(savepoint as unknown as Db, input));
+  return db.transaction((savepoint) => persistActivity(savepoint as unknown as Db, input));
 }
 
 /**
