@@ -935,6 +935,47 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(rows[0]?.details).toMatchObject({ nextCheckAt: "2026-04-11T12:30:00.123Z" });
     });
 
+    it("writes exactly one row per due monitor when two ticks overlap", async () => {
+      const issueIds: string[] = [];
+      for (let index = 0; index < 30; index += 1) {
+        const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+        issueIds.push(issueId);
+      }
+      const first = heartbeatService(db);
+      const second = heartbeatService(db);
+
+      await Promise.all([first.tickTimers(tickAt), second.tickTimers(tickAt)]);
+      // A later tick picks up anything the skipped overlapping tick left.
+      await first.tickTimers(new Date(tickAt.getTime() + 30_000));
+
+      const rows = await db
+        .select({ entityId: activityLog.entityId })
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.monitor_unfireable"));
+      const counts = new Map<string, number>();
+      for (const row of rows) counts.set(row.entityId, (counts.get(row.entityId) ?? 0) + 1);
+      expect(rows).toHaveLength(issueIds.length);
+      for (const issueId of issueIds) expect(counts.get(issueId)).toBe(1);
+    });
+
+    it("does not report a fireable monitor whose wake claim is still fresh", async () => {
+      // Eligible and due, but the scheduler claimed it a minute ago: an
+      // in-flight wake, not an unfireable monitor.
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "in_progress" });
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: new Date(tickAt.getTime() - 60_000) })
+        .where(eq(issues.id, issueId));
+
+      const result = await heartbeatService(db).tickTimers(tickAt);
+
+      expect(result.enqueued).toBe(0);
+      expect(await unfireableRows(issueId)).toHaveLength(0);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+    });
+
     it("records nothing before the schedule comes due", async () => {
       const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
 
