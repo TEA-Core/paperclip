@@ -1002,6 +1002,9 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         landingProofRefusal: { code: "landing_proof_sha_mismatch" },
         remedy: expect.stringContaining("landing_proof_sha_mismatch"),
       });
+      // The remedy names only the board action that unlocks this path: a board comment does not.
+      expect(response.body.details.remedy).toContain("writing a pull_request work product");
+      expect(response.body.details.remedy).not.toContain("board comment");
       expect((await fixture.read()).status).toBe("in_review");
       expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
       expect(fixture.writes).toEqual([]);

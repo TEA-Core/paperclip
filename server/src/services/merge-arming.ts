@@ -4022,8 +4022,8 @@ async function resolveMergedBeforeVerdictLanding(
         `every linked pull_request work product is MERGED, but the live GitHub landing proof for ${label} ` +
         `(${pr.owner}/${pr.repo}#${pr.pullRequestNumber}, recorded metadata.mergeCommitSha ${mergeCommitSha}) refused ` +
         `with ${verified.code}: ${verified.reason}. The pull request must be MERGED in the card's delivery repository ` +
-        "with that merge commit on the card's base branch, and a board user must tie it to the card (a board-written " +
-        "work product or a board comment naming the PR). Fix the record, then submit the final verdict again. " +
+        "with that merge commit on the card's base branch, and a board user must tie it to the card by writing a " +
+        "pull_request work product for it. Fix the record, then submit the final verdict again. " +
         "Do not open a replacement PR.",
     };
   }
