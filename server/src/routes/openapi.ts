@@ -11264,7 +11264,8 @@ registerCurrentRoute({
     "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
     "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
     "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
-    "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; or a board user's comment on the card naming the PR, or a head or merge " +
+    "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
+    "or a board user's comment on the card naming the PR, or a head or merge " +
     "commit recorded on such a work product that is the PR head or merge commit or one of the PR's own commits; links, comments " +
     "and delivery identities an agent wrote do not count, and a head branch name is not a tie; otherwise 422 " +
     "`landing_proof_not_card_delivery`), and the " +
