@@ -36,6 +36,7 @@ import {
   resetRuntimeServicesForTests,
   setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
+  type RuntimeServiceRef,
 } from "../services/workspace-runtime.ts";
 import { listLocalServiceRegistryRecords } from "../services/local-service-supervisor.ts";
 import {
@@ -664,6 +665,32 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     await expect(fs.stat(started)).resolves.toBeTruthy();
     await expect(git(["symbolic-ref", "--quiet", "HEAD"], fixture.source).catch(() => null)).resolves.toBeNull();
     await expect(git(["rev-parse", "HEAD"], fixture.source)).resolves.toBe(fixture.commitX);
+  }, 30_000);
+
+  it("starts a git_worktree row on its recorded branch when a tag shares the branch name", async () => {
+    const fixture = await makeLinkedSource();
+    await git(["branch", "topic", "branch-a"], fixture.owner);
+    await git(["tag", "topic", "branch-a"], fixture.owner);
+    await git(["switch", "-q", "topic"], fixture.source);
+    await expect(git(["symbolic-ref", "--short", "HEAD"], fixture.source)).resolves.toBe("heads/topic");
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: "topic",
+      baseRef: "branch-a",
+      projectCwd: fixture.owner,
+      strategyType: "git_worktree",
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
+    await expect(git(["symbolic-ref", "HEAD"], fixture.source)).resolves.toBe("refs/heads/topic");
   }, 30_000);
 
   it("starts a project_primary row that never recorded a branch", async () => {
@@ -1384,7 +1411,9 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       await expectNoStartingRuntimeRows();
     }, 30_000);
 
-    it("fails a start whose service exits before its starting row is persisted", async () => {
+    // Holds the project row so a deferred start's service exits while its
+    // `starting` row is being persisted, and returns what the start settled to.
+    async function startExitingWhileRowPersists(assertRecordedCheckoutBranch: boolean) {
       const fixture = await makeLinkedSource();
       const scope = await seedCompany();
       const seeded = await seedWorkspace({
@@ -1425,22 +1454,25 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         }
       }
       let pending: Promise<unknown> = Promise.resolve(null);
-      let failure: unknown;
+      let outcome: { refs: RuntimeServiceRef[] } | { error: unknown } | null = null;
       try {
-        pending = startRuntimeServicesForWorkspaceControl(controlInput({
-          scope,
-          fixture,
-          executionWorkspaceId: seeded.workspaceId,
-          service: {
-            name: "web",
-            command: `while [ ! -e ${quoteShell(release)} ]; do sleep 0.02; done; exit 2`,
-            port: { type: "auto" },
-            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
-            lifecycle: "shared",
-            reuseScope: "execution_workspace",
-            stopPolicy: { type: "manual" },
-          },
-        })).then(() => null, (error: unknown) => error);
+        pending = startRuntimeServicesForWorkspaceControl({
+          ...controlInput({
+            scope,
+            fixture,
+            executionWorkspaceId: seeded.workspaceId,
+            service: {
+              name: "web",
+              command: `while [ ! -e ${quoteShell(release)} ]; do sleep 0.02; done; exit 2`,
+              port: { type: "auto" },
+              readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
+              lifecycle: "shared",
+              reuseScope: "execution_workspace",
+              stopPolicy: { type: "manual" },
+            },
+          }),
+          assertRecordedCheckoutBranch,
+        }).then((refs) => ({ refs }), (error: unknown) => ({ error }));
         await waitFor("the starting row insert to wait on the project row", async () => {
           const rows = await db.execute<{ waiting: number }>(sql`
             select count(*)::int as waiting from pg_stat_activity
@@ -1453,7 +1485,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         // record stopped.
         await waitFor("the failure path", async () => (await registryRecords()).length === 0);
         releaseLock();
-        failure = await pending;
+        outcome = await pending as typeof outcome;
       } finally {
         await fs.writeFile(release, "");
         releaseLock();
@@ -1461,11 +1493,39 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         // Never leave the start running into the next test.
         await pending;
       }
+      return outcome;
+    }
 
-      expect(failure).toBeInstanceOf(Error);
-      expect(failure).toMatchObject({ message: expect.stringMatching(/exited before readiness/) });
+    it("fails a start whose service exits before its starting row is persisted", async () => {
+      const outcome = await startExitingWhileRowPersists(true);
+
+      expect(outcome).toMatchObject({ error: expect.any(Error) });
+      expect(outcome).toMatchObject({ error: { message: expect.stringMatching(/exited before readiness/) } });
       expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
       await expectNoStartingRuntimeRows();
+    }, 30_000);
+
+    it("still resolves a non-guarded start whose service exits before its starting row is persisted", async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const outcome = await startExitingWhileRowPersists(false);
+        // Let any rejection left without a handler surface before checking.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        expect(outcome).not.toHaveProperty("error");
+        expect(outcome).toMatchObject({
+          refs: [expect.objectContaining({ status: "failed", stoppedAt: expect.any(String) })],
+        });
+        expect(unhandled).toEqual([]);
+        expect(listRuntimeServicePortReservationsForTests()).toEqual([]);
+        await expectNoStartingRuntimeRows();
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
     }, 30_000);
 
     it("releases the in-process port claim", async () => {

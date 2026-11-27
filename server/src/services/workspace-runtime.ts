@@ -6877,11 +6877,13 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         executionWorkspaceId: input.workspace.id ?? null,
         recorder: input.recorder ?? null,
       });
-      // The identity guard accepts a detached HEAD only at the recorded tip.
-      // Every registration check precedes the branch check, so a detached
-      // `branch_mismatch` here is a registered worktree at the recorded tip:
-      // it is not drift, and the managed start leaves the checkout as it is.
-      if (validation.reasonCode === "branch_mismatch" && validation.actualBranchName === null) {
+      // The identity guard compares full refs and accepts only HEAD on
+      // `refs/heads/<recorded>` or detached at the recorded tip. Every
+      // registration check precedes the branch check, so a `branch_mismatch`
+      // that passed the guard is a registered worktree on the recorded branch
+      // (whose short name git disambiguated) or at its tip: it is not drift,
+      // and the managed start leaves the checkout as it is.
+      if (validation.reasonCode === "branch_mismatch") {
         await assertGitIndexIntegrity(reuseWorktreePath);
         await assertGitHeadResolvable(reuseWorktreePath);
         validation = { valid: true };
@@ -11512,10 +11514,14 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     await persistRuntimeServiceRecord(persistenceDb, started.record);
     refs.push(toRuntimeServiceRef(started.record));
 
-    // Track every deferred start, not only one still `starting`: a service that
-    // exits while the row above is persisted is already `stopped`, and its
-    // readiness rejection must still fail the start.
-    if (options?.deferReadiness && !started.record.reused) {
+    // A branch-checked managed start tracks every deferred start, not only one
+    // still `starting`: a service that exits while the row above is persisted
+    // is already finalized, and its readiness rejection must still fail the
+    // start. Other starts keep tracking only `starting` rows, so such an exit
+    // still resolves with its finalized record; widening that is a known follow-up.
+    const trackReadiness =
+      input.assertRecordedCheckoutBranch === true || started.record.status === "starting";
+    if (options?.deferReadiness && trackReadiness && !started.record.reused) {
       pendingReadiness.push({ ...started, service });
       startedServiceIds.push(started.record.id);
     }
