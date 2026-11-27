@@ -1,4 +1,4 @@
-import { and, eq, isNull, ne } from "drizzle-orm";
+import { and, eq, isNull, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -306,7 +306,7 @@ export function pluginManagedAgentService(
     const rows = await db
       .select()
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     return rows.find((row) => rowIsManagedAgent(row, options.pluginKey, declaration.agentKey)) ?? null;
   }
 
@@ -314,7 +314,7 @@ export function pluginManagedAgentService(
     const adapterType = await resolveManagedAdapterType(companyId, declaration);
     return db.transaction(async (tx) => {
       const [agent] = await tx.select().from(agents).where(and(
-        eq(agents.id, agentId), eq(agents.companyId, companyId), ne(agents.status, "terminated"),
+        eq(agents.id, agentId), eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"]),
       )).for("update");
       if (!agent || !rowIsManagedAgent(agent, options.pluginKey, declaration.agentKey)) {
         throw conflict("Managed agent ownership changed before relink");
@@ -354,7 +354,7 @@ export function pluginManagedAgentService(
     const rows = await db
       .select({ adapterType: agents.adapterType })
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+      .where(and(eq(agents.companyId, companyId), notInArray(agents.status, ["terminated", "deleted"])));
     const counts = new Map<string, number>();
     for (const row of rows) {
       const adapterType = normalizeAdapterType(row.adapterType);
@@ -617,7 +617,7 @@ export function pluginManagedAgentService(
       const boundAgentId = typeof binding?.data?.agentId === "string" ? binding.data.agentId : null;
       if (!boundAgentId) return resolution(companyId, declaration, null, "missing");
       const agent = await agentSvc.getById(boundAgentId);
-      if (!agent || agent.companyId !== companyId || agent.status === "terminated") {
+      if (!agent || agent.companyId !== companyId || (agent.status === "terminated" || agent.status === "deleted")) {
         return resolution(companyId, declaration, null, "missing");
       }
       return resolution(companyId, declaration, agent as Agent, "resolved");

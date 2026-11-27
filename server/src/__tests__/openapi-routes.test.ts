@@ -6,6 +6,9 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { z } from "zod";
+import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
+import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -265,6 +268,25 @@ describe("openapi routes", () => {
     expect(Object.keys(remove.responses)).toEqual(expect.arrayContaining(["200", "400", "401", "403", "404", "409"]));
   });
 
+  it("documents the board-only SUP-25193 landing-proof route with its typed refusals", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/landing-proof"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      required: expect.arrayContaining(["owner", "repo", "pullRequestNumber", "reason"]),
+      additionalProperties: false,
+    });
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["200", "201", "403", "409", "422"]));
+    for (const code of [
+      "landing_proof_not_applicable", "landing_proof_wrong_repo", "landing_proof_pr_not_found",
+      "landing_proof_pr_not_merged", "landing_proof_pr_closed_unmerged", "landing_proof_sha_mismatch",
+      "landing_proof_not_on_base", "landing_proof_unverifiable", "landing_proof_repo_identity_mismatch",
+      "landing_proof_not_card_delivery",
+    ]) {
+      expect(operation.description).toContain(code);
+    }
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
@@ -503,6 +525,41 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();
   });
 
+  it("serves the future-monitor loss activity contract advertised by MCP", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    expect(res.status).toBe(200);
+    const api = res.body.paths["/api/issues/{id}/activity"].get.responses["200"]
+      .content["application/json"].schema.items.oneOf[0];
+    const tool = createToolDefinitions(new PaperclipApiClient({
+      apiUrl: "http://localhost:3100/api", apiKey: "test-token", companyId: null, agentId: null, runId: null,
+    })).find((candidate) => candidate.name === "paperclipListIssueActivity");
+    expect(tool?.outputSchema).toBeDefined();
+    const output = z.toJSONSchema(tool!.outputSchema!);
+    const required = ["identifier", "previousNextCheckAt", "recoveryPolicy", "reason", "notes"];
+    const actorType = { type: "string", enum: ["agent", "user", "system", "plugin"] };
+    const previousNextCheckAt = { type: "string", format: "date-time" };
+    const recoveryPolicy = { type: "string", enum: ["wake_owner", "create_recovery_issue", "escalate_to_board"] };
+    const reason = "cleared_by_close_future_check";
+    expect(api.properties.details).toMatchObject({
+      required, properties: { previousNextCheckAt, recoveryPolicy: { ...recoveryPolicy, nullable: true }, reason: { enum: [reason] } },
+    });
+    expect(api.properties.actorType).toEqual(actorType);
+    expect(api.required).toEqual(expect.arrayContaining(["actorType", "actorId", "agentId", "runId", "details"]));
+    expect(output).toMatchObject({
+      properties: { items: { items: { anyOf: [{
+        required: api.required,
+        properties: {
+          actorType,
+          details: { required, properties: {
+            previousNextCheckAt,
+            recoveryPolicy: { anyOf: [recoveryPolicy, { type: "null" }] },
+            reason: { const: reason },
+          } },
+        },
+      }, expect.anything()] } } },
+    });
+  });
+
   it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
     const { spec } = loadSpecRoutes();
     const schema =
@@ -561,6 +618,29 @@ describe("openapi routes", () => {
     expect(identity.required).toEqual(["repo", "branch", "headSha"]);
     expect(identity.description).toContain("delivery_identity_write_rejected");
     expect(identity.description).toContain("in_review");
+  });
+
+  it("pins the delivery-receipt-recovery headSha to exactly 40 lowercase hex characters (M6)", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/delivery-receipt-recovery"].post;
+    const headSha = operation.requestBody.content["application/json"].schema.properties.headSha;
+    expect(headSha.pattern).toBe("^[0-9a-f]{40}$");
+    expect(headSha.type).toBe("string");
+    const mirror = new RegExp(headSha.pattern);
+    expect(mirror.test("a".repeat(40))).toBe(true);
+    for (const value of [
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(64),
+      "a".repeat(65),
+      "A".repeat(40),
+      "g".repeat(40),
+      `${"a".repeat(40)}\n`,
+      "",
+    ]) {
+      expect(mirror.test(value), JSON.stringify(value)).toBe(false);
+    }
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["400", "201"]));
   });
 
   it("documents the deliveryIdentity.headSha pattern the live delivery write applies", () => {

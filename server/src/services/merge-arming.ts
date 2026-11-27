@@ -33,6 +33,12 @@ import {
   invalidateDeliveryReceipt,
   type DeliveryReceiptClaim,
 } from "./delivery-receipt-recovery.js";
+import {
+  childCarrierAttributionMatches,
+  childCarrierStampBlock,
+  resolveChildCarrierDecisionHead,
+  type ChildCarrierProof,
+} from "./child-carrier-attribution.js";
 
 export {
   isGitHubTokenResolution,
@@ -584,6 +590,15 @@ export interface WorkspaceDiscoveryFailure {
 export interface WorkspaceDiscoveryResult {
   matched: WorkspacePullRequestMatch[];
   terminalFailure: WorkspaceDiscoveryFailure | null;
+  /**
+   * SUP-24033: lower-cased `owner/repo` of every repo whose open PRs were read
+   * COMPLETELY: the response was a short page with an absent (or `self`-only)
+   * `Link` header and no malformed entry (see `OpenPullRequestsSuccess.incomplete`).
+   * A cached draft mention whose repo is absent here was never fully live-checked
+   * by this discovery (drafts do not contribute repo pairs; an incomplete page may
+   * hide a live draft), so its draft bit cannot be called stale.
+   */
+  scannedRepos: string[];
 }
 
 /**
@@ -706,6 +721,7 @@ async function discoverCardPullRequestByWorkspace(
       : null;
   const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const matched: WorkspacePullRequestMatch[] = [];
+  const scannedRepos: string[] = [];
   let terminalFailure: WorkspaceDiscoveryFailure | null = null;
 
   for (const pair of pairs) {
@@ -770,6 +786,11 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
+      // SUP-24033: an incomplete list (full page, a Link header that is not absent or a
+      // page-1 self link, or a malformed entry) means open PRs may be unread or
+      // unreadable, so the repo is NOT fully scanned and an owned live draft can stay
+      // invisible.
+      if (!listResult.incomplete) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -800,7 +821,7 @@ async function discoverCardPullRequestByWorkspace(
     if (terminalFailure) break;
   }
 
-  return { matched, terminalFailure };
+  return { matched, terminalFailure, scannedRepos };
 }
 
 /**
@@ -1058,8 +1079,10 @@ async function fetchGitHubNodeIdOnce(
 }
 
 /**
- * Each enable request is given up on (and its HTTP request aborted) after this long, so a call is over within
- * `ENABLE_WORST_CASE_MS` (attempts, back-off included), well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
+ * Each enable attempt, including its authority callback and HTTP request, is bounded by this deadline.
+ * On expiry the request is aborted and a late callback cannot send an enable mutation.
+ * `ENABLE_WORST_CASE_MS` includes callbacks, requests and back-off under default options,
+ * well under the in-flight record's grace (`disarmTiming.inFlightGraceMs`).
  */
 export const ENABLE_ATTEMPT_TIMEOUT_MS = 10_000;
 export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
@@ -1067,7 +1090,7 @@ export const ENABLE_WORST_CASE_MS = 3 * ENABLE_ATTEMPT_TIMEOUT_MS + 250 + 500;
 export const enableTiming: { attemptTimeoutMs: number } = { attemptTimeoutMs: ENABLE_ATTEMPT_TIMEOUT_MS };
 
 export interface EnableAutoMergeOptions {
-  /** Per-request bound in ms (the request is aborted at it); defaults to ENABLE_ATTEMPT_TIMEOUT_MS. */
+  /** Per-attempt bound in ms, covering authority validation and the request; the request is aborted at expiry. */
   attemptTimeoutMs?: number;
   /** Total attempts for the arming mutation; the first call counts as attempt 1. Defaults to 3. */
   maxAttempts?: number;
@@ -1329,7 +1352,7 @@ export function isArmRecordRefusal(message: string): boolean {
 }
 
 export type ArmRecordOpening =
-  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number }) => Promise<void> }
+  | { ok: true; forget: () => Promise<void>; settleEnable: (result: { success: boolean; error: string | null; status: number; mayHaveApplied: boolean }) => Promise<void> }
   | { ok: false; kind: "failed" | "skipped"; message: string };
 
 /**
@@ -1419,7 +1442,7 @@ export async function openArmRecord(
     forget: settle,
     settleEnable: async (result) => {
       if (result.success) return;
-      if (result.error === "network_error" || result.error?.startsWith("timeout after ") || isTransientArmingStatus(result.status)) {
+      if (result.mayHaveApplied) {
         await startRetries();
       } else {
         await settle();
@@ -1532,25 +1555,26 @@ export async function disableAutoMerge(
   return { success: result.success, error: result.error };
 }
 
+function mutationMayHaveApplied(result: { success: boolean; error: string | null; status: number }): boolean {
+  return result.success || result.error === "network_error"
+    || result.error?.startsWith("timeout after ") === true
+    || result.status === 408 || isTransientArmingStatus(result.status);
+}
+
 export async function enableAutoMerge(
   token: string,
   nodeId: string,
   options: EnableAutoMergeOptions = {},
-): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
+): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number; mayHaveApplied: boolean }> {
   const maxAttempts = options.maxAttempts ?? 3;
   const baseDelay = options.retryDelayMs ?? 250;
   const attemptTimeoutMs = options.attemptTimeoutMs ?? enableTiming.attemptTimeoutMs;
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   if (options.expectedHeadOid !== undefined && !/^[0-9a-f]{40}$/i.test(options.expectedHeadOid)) {
-    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0 };
+    return { success: false, alreadyQueued: false, error: "invalid expectedHeadOid", status: 0, mayHaveApplied: false };
   }
   const attempt = async (): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> => {
-    const refusal = await options.beforeAttempt?.();
-    if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
-    const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
-    const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
-
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<"timeout">((resolve) => {
@@ -1559,6 +1583,12 @@ export async function enableAutoMerge(
     type Answer = { success: boolean; alreadyQueued: boolean; error: string | null; status: number };
     const work = (async (): Promise<Answer> => {
       try {
+        const refusal = await options.beforeAttempt?.();
+        if (controller.signal.aborted) return { success: false, alreadyQueued: false, error: `timeout after ${attemptTimeoutMs}ms`, status: 0 };
+        if (refusal) return { success: false, alreadyQueued: false, error: `authority_changed: ${refusal}`, status: 0 };
+        const headBinding = options.expectedHeadOid ? `, expectedHeadOid: "${options.expectedHeadOid}"` : "";
+        const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}"${headBinding} }) { clientMutationId } }`;
+
         const response = await ghFetch(GITHUB_GRAPHQL_URL, {
           method: "POST",
           headers: {
@@ -1604,11 +1634,13 @@ export async function enableAutoMerge(
   };
 
   let result = await attempt();
+  let mayHaveApplied = mutationMayHaveApplied(result);
   for (let attemptNo = 1; attemptNo < maxAttempts && isTransientArmingStatus(result.status); attemptNo++) {
     await sleep(baseDelay * 2 ** (attemptNo - 1));
     result = await attempt();
+    mayHaveApplied ||= mutationMayHaveApplied(result);
   }
-  return result;
+  return { ...result, mayHaveApplied };
 }
 
 /**
@@ -1656,6 +1688,8 @@ export interface MergePullRequestOptions {
   maxAttempts?: number;
   retryDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Revalidate caller authority before every mutation, including retries. */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 /**
@@ -1676,6 +1710,13 @@ export async function mergePullRequest(
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   const attempt = async (): Promise<{ success: boolean; error: string | null; status: number }> => {
+    let refusal: string | null;
+    try {
+      refusal = await options.beforeAttempt?.() ?? null;
+    } catch {
+      refusal = "authority could not be verified";
+    }
+    if (refusal) return { success: false, error: `authority_changed:${refusal}`, status: 0 };
     const query = `mutation { mergePullRequest(input: { pullRequestId: "${nodeId}", expectedHeadOid: "${expectedHeadOid}", mergeMethod: ${mergeMethod} }) { clientMutationId pullRequest { merged } } }`;
 
     try {
@@ -2334,6 +2375,18 @@ export async function resolveDeliveryIdentity(
     const sourceIssueId = typeof record.sourceIssueId === "string" && record.sourceIssueId.length > 0
       ? record.sourceIssueId
       : undefined;
+    // SUP-23026 (AS-05 bind-existing-pr): a bound-PR record carries TWO branches.
+    // `branch` is the verified PR HEAD branch; `cardBranch` is the card's own
+    // control-plane delivery branch, stamped by the write path from the control
+    // plane. D1 ownership validates `cardBranch`; the PR identity validates
+    // `branch`. Only the server may stamp kind/cardBranch (the route schema is
+    // strict), so a forged kind cannot launder a foreign branch: a record that
+    // claims as05_bound_pr without BOTH PR fields fails closed below, and its
+    // cardBranch still has to pass the same D1 gate.
+    const recordKind = record.kind === "as05_bound_pr" ? "as05_bound_pr" : null;
+    const cardBranch = typeof record.cardBranch === "string" && record.cardBranch.length > 0
+      ? record.cardBranch
+      : null;
     const recordedRepoRaw = record.repo;
     const recordedRepo =
       recordedRepoRaw !== undefined &&
@@ -2377,7 +2430,7 @@ export async function resolveDeliveryIdentity(
         identifier,
       };
     }
-    if (prNumber !== null || prUrl !== null || sourceIssueId !== undefined) {
+    if (prNumber !== null || prUrl !== null || sourceIssueId !== undefined || recordKind !== null) {
       if (prNumber === null || prUrl === null) {
         return {
           branch: null,
@@ -2387,6 +2440,15 @@ export async function resolveDeliveryIdentity(
           identifier,
         };
       }
+    }
+    if (recordKind === "as05_bound_pr" && cardBranch === null) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded AS-05 delivery identity has no card branch",
+        branchIsOwn: true,
+        identifier,
+      };
     }
     if (recordedRepo === null) {
       return {
@@ -2452,17 +2514,23 @@ export async function resolveDeliveryIdentity(
     const terminalCarrierBoundDelivery =
       branchOwnership.carrierOwnerTerminal === true && hasBoundPr;
     const mergedOnlyBinding = orphanBoundDelivery || terminalCarrierBoundDelivery;
+    // SUP-23026 (AS-05): D1 compares the CARD branch. For a generic record that
+    // is `branch` itself; for a bound-PR record it is `cardBranch` (the PR head
+    // in `branch` is intentionally not the card's worktree branch).
+    const d1Branch = recordKind === "as05_bound_pr" ? cardBranch : branch;
     if (
       !orphanBoundDelivery &&
       (branchOwnership.branch === null ||
         // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
-        branch !== branchOwnership.branch)
+        d1Branch !== branchOwnership.branch)
     ) {
       return {
         branch: null,
         repo: null,
         recordedUnusable:
-          "recorded delivery identity's branch does not match this card's control-plane delivery branch",
+          recordKind === "as05_bound_pr"
+            ? "recorded AS-05 delivery identity's card branch does not match this card's control-plane delivery branch"
+            : "recorded delivery identity's branch does not match this card's control-plane delivery branch",
         branchIsOwn: true,
         identifier,
       };
@@ -2520,7 +2588,13 @@ export async function resolveDeliveryIdentity(
   };
 }
 
-function deliveryBindingValidationError(
+/**
+ * ADR-091: static validation of a recorded PR binding against its repo — the
+ * source-issue and canonical-URL halves every consumer applies before the live
+ * verification. Exported (SUP-23026) so the delivery-identity WRITE path runs
+ * the identical checks at record time: one verifier, not two.
+ */
+export function deliveryBindingValidationError(
   binding: DeliveryBinding,
   repo: { owner: string; repo: string },
   issueId: string,
@@ -2537,7 +2611,7 @@ function deliveryBindingValidationError(
 
 type MergedDeliveryVerification =
   | { outcome: "proven" }
-  | { outcome: "unproven"; reason: string }
+  | { outcome: "unproven"; reason: string; notOnBase?: true }
   | { outcome: "auth-failed"; status: number };
 
 /**
@@ -2599,12 +2673,14 @@ export async function verifyMergedPullRequestOnBaseBranch(
   if (typeof aheadBy === "number" ? aheadBy === 0 : status === "identical" || status === "behind") {
     return { outcome: "proven" };
   }
-  return {
-    outcome: "unproven",
-    reason: status
-      ? `merge commit ${mergeCommitSha.slice(0, 7)} is not on base branch ${baseRef} (compare status: ${status})`
-      : "merge-commit containment check returned an unreadable compare response",
-  };
+  if (status) {
+    return {
+      outcome: "unproven",
+      reason: `merge commit ${mergeCommitSha.slice(0, 7)} is not on base branch ${baseRef} (compare status: ${status})`,
+      notOnBase: true,
+    };
+  }
+  return { outcome: "unproven", reason: "merge-commit containment check returned an unreadable compare response" };
 }
 
 /**
@@ -2662,7 +2738,15 @@ function normalizeCardDeliveryBaseRef(raw: string): string | null {
   return branch;
 }
 
-async function resolveExactBoundPullRequest(
+/**
+ * The exact live verification of a recorded PR binding — one PR, by number, in
+ * the card's project repo, checked against the live open-state, head branch,
+ * and head SHA (with the SUP-21513 merged-on-base carve-out). Exported
+ * (SUP-23026) so the delivery-identity WRITE path proves the SAME exact PR at
+ * record time that approval time will verify: the write-time and approval-time
+ * consumers share one verifier, never two.
+ */
+export async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
   issueId: string,
@@ -2964,6 +3048,15 @@ export async function narrowToDelivered<
   const delivered = usePrefixPredicate
     ? candidates.filter((pr) => isDeliveredByCardIdentifierPrefix(pr, repo, identifier as string))
     : candidates.filter((pr) => isDeliveredByCard(pr, repo, branch));
+  if (delivered.length === 0 && branchIsOwn) {
+    const attributed = [];
+    for (const pr of candidates) {
+      if (await childCarrierAttributionMatches(db, companyId, issueId, pr)) attributed.push(pr);
+    }
+    if (attributed.length === 1) {
+      return { outcome: "narrowed", delivered: attributed, deliveryBranch: branch };
+    }
+  }
   if (delivered.length === 0) {
     return {
       outcome: "not-delivered",
@@ -2974,6 +3067,56 @@ export async function narrowToDelivered<
     };
   }
   return { outcome: "narrowed", delivered, deliveryBranch: branch };
+}
+
+async function refuseChildCarrierPublication(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number; headRefName?: string | null },
+  headSha: string,
+): Promise<ArmingOutcome | null> {
+  const block = await childCarrierStampBlock(db, companyId, {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    headSha,
+    headRef: pr.headRefName ?? null,
+  }, issueId);
+  if (block) return { kind: "skipped", message: block, headSha };
+  return null;
+}
+
+async function writeAttributionGuardedApprovalStatus(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number; headRefName?: string | null },
+  headSha: string,
+  issueIdentifier: string,
+  token: string,
+): Promise<WriteCommitStatusResult> {
+  const authority = () => childCarrierStampBlock(db, companyId, {
+    owner: pr.owner, repo: pr.repo, number: pr.number, headSha, headRef: pr.headRefName ?? null,
+  }, issueId);
+  const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, { beforeAttempt: authority });
+  if (!result.success && !result.mayHaveApplied) return result;
+  let changed: string | null;
+  try {
+    changed = await authority();
+  } catch {
+    changed = "child attribution could not be verified after publication";
+  }
+  if (!changed) return result;
+  // PostgreSQL and GitHub cannot commit atomically. Void a confirmed or possible
+  // publication after revocation, and explicitly report unconfirmed compensation.
+  const voided = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier, {
+    state: "failure", description: `approval voided: ${changed}`.slice(0, COMMIT_STATUS_DESCRIPTION_MAX),
+  });
+  return {
+    ...result, success: false, transient: false,
+    error: `child_authority_changed:${voided.success ? "status-voided" : `void-unconfirmed:${voided.error ?? "unknown"}`}:${changed}`,
+  };
 }
 
 export async function publishApprovalStatus(
@@ -3181,6 +3324,8 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
+      const childCarrierBlock = await refuseChildCarrierPublication(db, companyId, issueId, pr, headSha);
+      if (childCarrierBlock) return childCarrierBlock;
       const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
         db,
         companyId,
@@ -3205,13 +3350,7 @@ export async function publishApprovalStatus(
       if (receipt && "kind" in receipt) return receipt;
       // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
       // recording a failure; a deterministic refusal returns after one attempt.
-      const result = await writeCommitStatusWithRetry(
-        pr.candidate.token,
-        pr.owner,
-        pr.repo,
-        headSha,
-        issueIdentifier,
-      );
+      const result = await writeAttributionGuardedApprovalStatus(db, companyId, issueId, pr, headSha, issueIdentifier, pr.candidate.token);
       if (result.success) {
         if (receipt) {
           const consumed = await consumeDeliveryReceipt(db, receipt.claim);
@@ -3360,6 +3499,8 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
+    const childCarrierBlock = await refuseChildCarrierPublication(db, companyId, issueId, pr, headSha);
+    if (childCarrierBlock) return childCarrierBlock;
     const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
       db,
       companyId,
@@ -3371,7 +3512,7 @@ export async function publishApprovalStatus(
     if (receipt && "kind" in receipt) return receipt;
     // SUP-16081 fix #2: retry the transient class (network/5xx/429) before
     // recording a failure; a deterministic refusal returns after one attempt.
-    const result = await writeCommitStatusWithRetry(token, pr.owner, pr.repo, headSha, issueIdentifier);
+    const result = await writeAttributionGuardedApprovalStatus(db, companyId, issueId, pr, headSha, issueIdentifier, token);
     if (result.success) {
       if (receipt) {
         const consumed = await consumeDeliveryReceipt(db, receipt.claim);
@@ -3400,7 +3541,13 @@ export async function publishApprovalStatus(
 }
 
 export type DecisionHeadResolution =
-  | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
+  | {
+      kind: "resolved";
+      headSha: string;
+      displayName: string;
+      pr: { owner: string; repo: string; number: number };
+      childCarrierProof?: ChildCarrierProof;
+    }
   | {
       kind: "unresolvable";
       reason: string;
@@ -3425,6 +3572,22 @@ export type DecisionHeadResolution =
        * reasons, which have no branch to certify.
        */
       pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
+      /**
+       * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
+       * from cached mentions, live workspace discovery found no draft, AND that
+       * discovery read every cached draft's repo completely (not a full
+       * 100-entry page). Those
+       * cached draft bits can be stale, so the final-delivery preflight alone
+       * revalidates them live. Never set when a live-discovered draft exists:
+       * a merged mention must not mask a draft the forge just reported.
+       */
+      cachedDraftMentions?: Array<{
+        owner: string;
+        repo: string;
+        number: number;
+        displayName: string;
+        headRefName: string | null;
+      }>;
     };
 
 /**
@@ -3490,6 +3653,11 @@ export async function resolveApprovalDecisionHead(
   closingTransition: boolean,
 ): Promise<DecisionHeadResolution> {
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+  const childCarrier = await resolveChildCarrierDecisionHead(db, companyId, issueId);
+  if (childCarrier.kind === "resolved") return childCarrier;
+  if (childCarrier.kind === "unresolvable") {
+    return { kind: "unresolvable", reason: childCarrier.reason };
+  }
   if (deliveryIdentity.binding && deliveryIdentity.repo) {
     const bindingError = deliveryBindingValidationError(deliveryIdentity.binding, deliveryIdentity.repo, issueId);
     if (bindingError) {
@@ -3643,6 +3811,18 @@ export async function resolveApprovalDecisionHead(
     return {
       kind: "unresolvable",
       reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
+      ...(draftMatched.length === 0 &&
+        draftLinkedPRs.every((pr) => discovery.scannedRepos.includes(`${pr.owner}/${pr.repo}`.toLowerCase()))
+        ? {
+            cachedDraftMentions: draftLinkedPRs.map((pr) => ({
+              owner: pr.owner,
+              repo: pr.repo,
+              number: pr.number,
+              displayName: pr.displayName,
+              headRefName: pr.headRefName,
+            })),
+          }
+        : {}),
     };
   }
 
@@ -3691,8 +3871,12 @@ const finalDeliveryLiveSchema = z.object({
  * open-PR resolver (cached mentions, live workspace discovery) legitimately
  * returns nothing. Exactly one LIVE-merged mentioned carrier is accepted, and
  * only after the same live merged-state, base-branch merge-commit containment,
- * and branch/repo ownership checks as the ordinary path. Every other
- * resolution path (approval publication, merge arming, reconciliation) stays
+ * and branch/repo ownership checks as the ordinary path.
+ *
+ * SUP-24033: a head_draft refusal that came from cached open+draft mentions
+ * alone is revalidated live (resolveStaleDraftMergedCarrier); the base refusal
+ * stands unless exactly one card-owned draft mention is live-merged and passes
+ * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
  *
  * SUP-24825: a merged carrier whose PR URL names a repository other than the
@@ -3706,6 +3890,15 @@ export async function preflightFinalDelivery(
   const resolved = await resolveApprovalDecisionHead(db, companyId, issueId, identifier, true);
   if (resolved.kind === "resolved") {
     return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
+  }
+  if (resolved.reason.startsWith("head_draft:")) {
+    // SUP-24033: a cached open+draft mention is a stale-able bit — the resolver
+    // returns head_draft from it before the no-pr fallback could run, so a PR
+    // merged since still blocked final delivery. Revalidate it live. Every
+    // outcome except one live-merged, card-owned carrier keeps the base
+    // head_draft refusal unchanged.
+    const carrier = await resolveStaleDraftMergedCarrier(db, companyId, issueId, resolved);
+    return carrier ? verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier) : resolved;
   }
   if (resolved.reason.startsWith("no-pr:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
@@ -3733,7 +3926,7 @@ async function verifyLiveFinalDeliveryHead(
   db: Db,
   companyId: string,
   issueId: string,
-  resolved: { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } },
+  resolved: Extract<DecisionHeadResolution, { kind: "resolved" }>,
 ): Promise<DecisionHeadResolution> {
   const { pr } = resolved;
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
@@ -3747,6 +3940,9 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
+    if (resolved.childCarrierProof && (live.merged || live.state !== "open")) {
+      return { kind: "unresolvable", reason: "head_not_open: child carrier delivery must remain OPEN and unmerged" };
+    }
     if (live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
@@ -3788,6 +3984,54 @@ async function verifyLiveFinalDeliveryHead(
   return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
 }
 
+/** SUP-24033: the stale-draft revalidation reads each mention live; above this many it refuses instead of fanning out. */
+const MAX_STALE_DRAFT_MENTION_READS = 5;
+
+/**
+ * SUP-24033: revalidate the cached open+draft mentions behind a `head_draft`
+ * refusal against live state. Returns a carrier ONLY when all of these hold;
+ * otherwise null and the caller keeps the base refusal:
+ *  - the refusal came from cached drafts alone (no live-discovered draft);
+ *  - every cached draft is the card's own delivery (cached repo+branch pass
+ *    narrowToDelivered), so a foreign PR the card merely cites cannot carry it;
+ *    SUP-25333: a draft cached without a head branch is narrowed on the head
+ *    branch its live read reports (a cached branch is never overridden);
+ *  - the card cites at most MAX_STALE_DRAFT_MENTION_READS PRs (bounded reads);
+ *  - every mention reads live (no unreadable), none is a live open draft, and
+ *    exactly one is live-merged;
+ *  - that merged PR is one of the revalidated cached drafts.
+ * The caller then runs the full verifyLiveFinalDeliveryHead on it.
+ */
+async function resolveStaleDraftMergedCarrier(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+): Promise<{ kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } } | null> {
+  const drafts = refusal.cachedDraftMentions;
+  if (!drafts || drafts.length === 0) return null;
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
+  const liveHeadRefs = new Map<string, string>();
+  const carrier = await resolveSingleMergedMentionCarrier(
+    db, companyId, issueId, refusal.reason, mentioned, liveHeadRefs,
+  );
+  if (carrier.kind !== "resolved") return null;
+  // SUP-25333: narrow after the live reads so a draft cached without a head
+  // branch is judged on its live head branch instead of failing on null.
+  const anchored = drafts.map((draft) => ({
+    ...draft,
+    headRefName: draft.headRefName ?? liveHeadRefs.get(pullRequestKey(draft)) ?? null,
+  }));
+  const owned = await narrowToDelivered(db, companyId, issueId, anchored);
+  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
+  return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
+}
+
+function pullRequestKey(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner}/${pr.repo}#${pr.number}`.toLowerCase();
+}
+
 /**
  * SUP-22346: among the issue's explicitly mentioned PRs (cached state is
  * irrelevant — a PR merged out-of-band is cached closed), resolve the single
@@ -3808,18 +4052,26 @@ async function resolveSingleMergedMentionCarrier(
   db: Db,
   companyId: string,
   issueId: string,
+  liveDraftRefusal: string | null = null,
+  // SUP-24033: the stale-draft path passes the list it already cap-checked so the
+  // live reads cannot run over a second, uncapped read of the mentions.
+  checkedMentions?: LinkedPullRequest[],
+  // SUP-25333: when given, receives each successfully read mention's live head branch.
+  liveHeadRefs?: Map<string, string>,
 ): Promise<
   | { kind: "none" }
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | { kind: "unresolvable"; reason: string }
 > {
-  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  const mentioned =
+    checkedMentions ?? (await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true }));
   const mergedCarriers: Array<{
     kind: "resolved";
     headSha: string;
     displayName: string;
     pr: { owner: string; repo: string; number: number };
   }> = [];
+  let liveDraft = false;
   for (const pr of mentioned) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
     // SUP-22355: a mention no credential can even attempt is unreadable —
@@ -3829,6 +4081,10 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
+        if (live.headRef) liveHeadRefs?.set(pullRequestKey(pr), live.headRef);
+        if (liveDraftRefusal !== null && live.merged !== true && live.open === true && live.draft === true) {
+          liveDraft = true;
+        }
         if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
@@ -3850,6 +4106,9 @@ async function resolveSingleMergedMentionCarrier(
       };
     }
   }
+  // SUP-24033: a genuine live draft keeps its head_draft refusal even beside a
+  // merged mention; the merged carrier must not mask an open draft.
+  if (liveDraft && liveDraftRefusal !== null) return { kind: "unresolvable", reason: liveDraftRefusal };
   if (mergedCarriers.length === 0) return { kind: "none" };
   if (mergedCarriers.length > 1) {
     const names = mergedCarriers.map((carrier) => carrier.displayName).join(", ");
@@ -3900,6 +4159,12 @@ async function certifyNoPrDeliveryBranchHead(
   issueId: string,
 ): Promise<NoPrBranchAnchor | null> {
   const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  // SUP-23026 (AS-05): a bound-PR record's `branch` is the PR HEAD branch, not a
+  // delivery-branch ref — certifying it as a no-pr anchor would name the wrong
+  // ref. Structurally unreachable while resolveApprovalDecisionHead resolves
+  // bound cards through the binding first (a bound card with a failed
+  // verification is unresolvable before this runs); the exclusion is defensive.
+  if (identity.binding) return null;
   if (identity.branch === null || identity.repo === null) return null;
   if (!identity.branchIsOwn) return null;
   const headSha = await fetchBranchHeadShaAcrossCandidates(
@@ -4440,6 +4705,10 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   baseRef: string | null;
   /** The head repository (body.head.repo.full_name); a fork head differs from the base repo. */
   headRepoFullName?: string | null;
+  /** SUP-25193: the base repository's immutable identity (body.base.repo.id / node_id / full_name). */
+  baseRepoId?: number | null;
+  baseRepoNodeId?: string | null;
+  baseRepoFullName?: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4529,6 +4798,7 @@ async function fetchPullRequestHeadShaOnce(
     typeof headRepo?.full_name === "string" && headRepo.full_name.length > 0 ? headRepo.full_name : null;
   const base = body.base as Record<string, unknown> | undefined;
   const baseRef = typeof base?.ref === "string" && base.ref.length > 0 ? base.ref : null;
+  const baseRepo = base?.repo as Record<string, unknown> | undefined;
   const mergeCommitSha =
     typeof body.merge_commit_sha === "string" && body.merge_commit_sha.length > 0
       ? body.merge_commit_sha
@@ -4547,6 +4817,10 @@ async function fetchPullRequestHeadShaOnce(
       mergeCommitSha,
       baseRef,
       headRepoFullName,
+      baseRepoId: typeof baseRepo?.id === "number" ? baseRepo.id : null,
+      baseRepoNodeId: typeof baseRepo?.node_id === "string" && baseRepo.node_id.length > 0 ? baseRepo.node_id : null,
+      baseRepoFullName:
+        typeof baseRepo?.full_name === "string" && baseRepo.full_name.length > 0 ? baseRepo.full_name : null,
     };
   }
   return {
@@ -4569,7 +4843,7 @@ async function fetchPullRequestHeadShaOnce(
  * HeadShaResult. A deterministic result (success, 4xx, malformed body) returns
  * after the first attempt — byte-for-byte unchanged from the single-attempt read.
  */
-async function fetchPullRequestHeadSha(
+export async function fetchPullRequestHeadSha(
   token: string,
   owner: string,
   repo: string,
@@ -4577,6 +4851,168 @@ async function fetchPullRequestHeadSha(
   signal?: AbortSignal,
 ): Promise<HeadShaResult> {
   return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number, signal), { signal });
+}
+
+/**
+ * SUP-24033: read the entries of one open-PR list page. ALLOW-LIST RULE: every field
+ * that a consumer reads to decide ownership, liveness, draft state or anchoring is
+ * validated here, and an entry that violates any of them is dropped from `items`
+ * AND marks the whole list `malformed` (the caller then treats the list as
+ * incomplete: unscanned, the base behaviour). The consumers are
+ * `discoverCardPullRequestByWorkspace` (this file) and the open-PR probe in
+ * done-transition-guard.ts; both read exactly `number`, `head.ref`, `title` and
+ * `draft`. Validated per field:
+ *   entry     a non-null object (an array has no `number`, so the number check covers it)
+ *   number    a safe positive integer          (identity of the PR)
+ *   head.ref  a string, `head` a non-null object (ownership anchor: branch)
+ *   title     a string                         (ownership anchor: title-led identifier)
+ *   draft     a boolean                        (draft state; `draft === true` is what
+ *                                               consumers test, so a non-boolean would
+ *                                               silently read as "ready")
+ * `body` is stored on the item but read by no consumer, so it is not validated.
+ */
+export function readOpenPullRequestEntries(
+  body: unknown[],
+): { items: OpenPullRequestListItem[]; malformed: boolean } {
+  const items: OpenPullRequestListItem[] = [];
+  let malformed = false;
+  for (const raw of body) {
+    if (typeof raw !== "object" || raw === null) {
+      malformed = true;
+      continue;
+    }
+    const pr = raw as Record<string, unknown>;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || pr.number <= 0) {
+      malformed = true;
+      continue;
+    }
+    const head = pr.head as Record<string, unknown> | undefined | null;
+    if (
+      typeof head !== "object" ||
+      head === null ||
+      typeof head.ref !== "string" ||
+      typeof pr.title !== "string" ||
+      typeof pr.draft !== "boolean"
+    ) {
+      malformed = true;
+    }
+    items.push({
+      number: pr.number,
+      draft: typeof pr.draft === "boolean" ? pr.draft : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+      title: typeof pr.title === "string" ? pr.title : null,
+      body: typeof pr.body === "string" ? pr.body : null,
+    });
+  }
+  return { items, malformed };
+}
+
+/** The open-PR list is read as one page of this size; there is no pagination. */
+const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
+
+const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
+
+/**
+ * SUP-24033: true when a `rel=self` link target is page 1 of THIS EXACT request: an
+ * absolute URL with the same origin and path, no fragment, the same query
+ * parameters, and a `page` parameter that is absent or exactly `1`. A relative,
+ * empty, other-host or other-page target describes some other list.
+ */
+function selfTargetIsPageOneOfRequest(target: string, requestUrl: string): boolean {
+  try {
+    const self = new URL(target);
+    const request = new URL(requestUrl);
+    if (self.origin !== request.origin || self.pathname !== request.pathname || self.hash !== "") return false;
+    const pageOfSelf = self.searchParams.getAll("page");
+    if (pageOfSelf.length > 1 || (pageOfSelf.length === 1 && pageOfSelf[0] !== "1")) return false;
+    const rest = (params: URLSearchParams) =>
+      [...params.entries()].filter(([key]) => key !== "page").map(([key, value]) => `${key}=${value}`).sort().join("&");
+    return rest(self.searchParams) === rest(request.searchParams);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * SUP-24033: true unless the `Link` header of the open-PR list response PROVES the
+ * page is a complete list. A WHITELIST, not a blacklist: false (complete) only for
+ *  (a) an absent header (null), or
+ *  (b) a header in which EVERY link-value parses fully as `<uri>` plus `;`-separated
+ *      `token=token|"quoted"` parameters, carries a `rel` parameter, has no other
+ *      parameter, has only the relation `self` among its rel tokens, and whose
+ *      target is page 1 of THIS request (`selfTargetIsPageOneOfRequest`).
+ * Everything else is true: an empty header, a link-value with no `rel`, any
+ * parameter other than `rel` (title, rev, anchor, name*, a flag), a trailing comma
+ * or semicolon, a stray character, a single-quoted, unterminated or escaped value,
+ * and every other relation (`next`, `last`, `prev`, `previous`, `first`, `canonical`, ...).
+ *
+ * Why `prev`, `first` and `last` are NOT harmless: this scan reads only page 1 (no
+ * `page` parameter). A real GitHub page-1 response never carries `prev` or `first`
+ * (they appear only on later pages) and carries `next` plus `last` when more pages
+ * exist, so those relations on a page-1 response mean more pages or an altered
+ * response, never a final page. `self` is the one relation consistent with a
+ * complete list. One left-to-right scan, no backtracking: linear in the header.
+ */
+export function linkHeaderLeavesPagesUnread(header: string | null, requestUrl: string): boolean {
+  if (header === null) return false;
+  const n = header.length;
+  let i = 0;
+  const skipOws = () => {
+    while (i < n && (header[i] === " " || header[i] === "\t")) i += 1;
+  };
+  const readToken = () => {
+    const start = i;
+    while (i < n && LINK_TOKEN_CHAR.test(header[i]!)) i += 1;
+    return header.slice(start, i);
+  };
+  skipOws();
+  if (i >= n) return true;
+  for (;;) {
+    if (header[i] !== "<") return true;
+    const end = header.indexOf(">", i + 1);
+    if (end === -1 || header.slice(i + 1, end).includes("<")) return true;
+    const target = header.slice(i + 1, end);
+    i = end + 1;
+    let sawRel = false;
+    for (;;) {
+      skipOws();
+      if (i >= n) return !sawRel;
+      if (header[i] === ",") {
+        if (!sawRel) return true;
+        i += 1;
+        skipOws();
+        if (i >= n) return true;
+        break;
+      }
+      if (header[i] !== ";") return true;
+      i += 1;
+      skipOws();
+      if (readToken().toLowerCase() !== "rel") return true;
+      skipOws();
+      if (header[i] !== "=") return true;
+      i += 1;
+      skipOws();
+      let value: string;
+      if (header[i] === '"') {
+        i += 1;
+        const start = i;
+        while (i < n && header[i] !== '"') {
+          if (header[i] === "\\") return true;
+          i += 1;
+        }
+        if (i >= n) return true;
+        value = header.slice(start, i);
+        i += 1;
+      } else {
+        value = readToken();
+        if (value === "") return true;
+      }
+      const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
+      if (tokens.length === 0 || tokens.some((token) => token !== "self")) return true;
+      if (!selfTargetIsPageOneOfRequest(target, requestUrl)) return true;
+      sawRel = true;
+    }
+  }
 }
 
 export interface OpenPullRequestListItem {
@@ -4590,6 +5026,17 @@ export interface OpenPullRequestListItem {
 export interface OpenPullRequestsSuccess extends GitHubFetchResult {
   ok: true;
   items: OpenPullRequestListItem[];
+  /**
+   * SUP-24033: true unless this response is PROVEN to be the complete, well-formed
+   * open-PR list. Incomplete when ANY of: the raw page filled
+   * `OPEN_PULL_REQUESTS_PAGE_SIZE` entries (counted before malformed entries are
+   * dropped); the `Link` header is anything other than absent or `self`-only (see
+   * `linkHeaderLeavesPagesUnread`); or an entry is not a well-formed open-PR record
+   * (see `readOpenPullRequestEntries`: an object with a positive-integer `number`, a
+   * string `head.ref` and `title`, and a boolean `draft`), because it may have been
+   * an owned live draft.
+   */
+  incomplete: boolean;
 }
 
 export interface OpenPullRequestsFailure extends GitHubFetchResult {
@@ -4623,7 +5070,7 @@ async function fetchOpenPullRequestsOnce(
 ): Promise<OpenPullRequestsResult> {
   const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
-  )}/pulls?state=open&per_page=100`;
+  )}/pulls?state=open&per_page=${OPEN_PULL_REQUESTS_PAGE_SIZE}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-merge-arming",
@@ -4649,21 +5096,17 @@ async function fetchOpenPullRequestsOnce(
     return { ok: false, status: response.status, message: "empty_response", items: [] };
   }
 
-  const items: OpenPullRequestListItem[] = [];
-  for (const raw of body) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const pr = raw as Record<string, unknown>;
-    if (typeof pr.number !== "number") continue;
-    const head = pr.head as Record<string, unknown> | undefined | null;
-    items.push({
-      number: pr.number,
-      draft: typeof pr.draft === "boolean" ? pr.draft : null,
-      headRef: typeof head?.ref === "string" ? head.ref : null,
-      title: typeof pr.title === "string" ? pr.title : null,
-      body: typeof pr.body === "string" ? pr.body : null,
-    });
-  }
-  return { ok: true, status: response.status, message: null, items };
+  const { items, malformed } = readOpenPullRequestEntries(body);
+  return {
+    ok: true,
+    status: response.status,
+    message: null,
+    items,
+    incomplete:
+      malformed ||
+      body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE ||
+      linkHeaderLeavesPagesUnread(response.headers?.get("link") ?? null, url),
+  };
 }
 
 async function writeCommitStatus(
@@ -4701,9 +5144,8 @@ async function writeCommitStatus(
       signal,
     });
   } catch {
-    // No response at all — the request never reached GitHub. Transient by
-    // definition: the network path is the only thing standing between us and a
-    // write, so a retry is warranted (SUP-16081 fix #2).
+    // A lost response does not prove that GitHub rejected the write. Retry the
+    // transport failure, while retaining that it may already have applied.
     return { success: false, error: "network_error", status: 0, transient: true };
   }
 
@@ -4843,6 +5285,8 @@ export interface WriteCommitStatusRetryOptions {
   signal?: AbortSignal;
   /** The status context to write (default `paperclip/approved`). */
   context?: string;
+  /** Fail closed before each external write; a refusal is not retried. */
+  beforeAttempt?: () => Promise<string | null>;
 }
 
 export interface WriteCommitStatusResult {
@@ -4852,8 +5296,10 @@ export interface WriteCommitStatusResult {
   status: number;
   /** Whether the last attempt's failure was transient. */
   transient: boolean;
-  /** How many attempts were actually made (1 for a deterministic refusal). */
+  /** HTTP attempts actually made; zero when authority refuses before the first write. */
   attempts: number;
+  /** Any sent attempt accepted the write or could have applied despite a failed response. */
+  mayHaveApplied: boolean;
   /** GitHub's id for the status it accepted, when the answer carried one. */
   statusId?: string | null;
 }
@@ -4878,15 +5324,28 @@ export async function writeCommitStatusWithRetry(
   const delayMs = options.delayMs ?? 1000;
   const delay = options.delay ?? ((ms: number) => abortableDelay(ms, options.signal));
 
-  let result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
-  let made = 1;
+  let made = 0;
+  let mayHaveApplied = false;
+  const attempt = async () => {
+    let refusal: string | null;
+    try {
+      refusal = await options.beforeAttempt?.() ?? null;
+    } catch {
+      refusal = "authority could not be verified";
+    }
+    if (refusal) return { success: false, error: `authority_changed:${refusal}`, status: 0, transient: false };
+    made += 1;
+    const result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
+    mayHaveApplied ||= mutationMayHaveApplied(result);
+    return result;
+  };
+  let result = await attempt();
   while (!result.success && result.transient && made < attempts && !options.signal?.aborted) {
     await delay(delayMs);
     if (options.signal?.aborted) break;
-    result = await writeCommitStatus(token, owner, repo, headSha, issueIdentifier, options.description, options.state, options.signal, options.context);
-    made += 1;
+    result = await attempt();
   }
-  return { ...result, attempts: made };
+  return { ...result, attempts: made, mayHaveApplied };
 }
 
 // GitHub rejects a commit-status description over 140 characters.
@@ -5097,6 +5556,8 @@ export async function publishHeadBoundRelease(
       | { ok: true; target: { owner: string; repo: string; number: number; branch: string } }
       | { ok: false; reason: string }
     >;
+    /** The card being released. Every stamp door runs the same child-attribution gate for this card. */
+    issueId?: string;
     /**
      * Destroys the request's database connection (see createRequestScopedDb). Called when the release is
      * abandoned: an open transaction then rolls back on the server and its lock is freed, so work that was
@@ -5186,7 +5647,7 @@ export async function publishHeadBoundRelease(
         delayMs: input.retryDelayMs ?? 1000,
         signal,
       }),
-      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+      { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       compensation(),
     );
   const timedOut = (what: string) => ({ ok: false as const, status: 0, message: `timeout: ${what} did not answer within ${deadlines.fetchMs}ms` });
@@ -5233,7 +5694,17 @@ export async function publishHeadBoundRelease(
   };
   // The PR's liveness and the card's eligibility, both as they are now.
   // `conn` is the lock's own connection: eligibility is read on it, never on a second pool connection.
-  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  const recheck = async (conn: Db): Promise<HeadBoundReleaseOutcome | null> => {
+    const childBlock = await childCarrierStampBlock(conn, companyId, {
+      owner,
+      repo,
+      number,
+      headSha: input.headSha,
+      headRef: input.expectedBranch,
+    }, input.issueId);
+    if (childBlock) return { kind: "refused", message: childBlock };
+    return (await liveRefusal()) ?? (await eligibilityRefusal(conn));
+  };
   // A success that cannot be confirmed is voided by a failure status; the answer says whether that worked.
   // Single-flight: the deadline's void and the release's own never both write a failure status.
   let voiding: Promise<string> | undefined;
@@ -5305,7 +5776,7 @@ export async function publishHeadBoundRelease(
         delayMs: input.retryDelayMs ?? 1000,
         signal,
       }),
-      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1 },
+      { success: false, error: `timeout: the marker write did not answer within ${deadlines.fetchMs}ms`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       compensation(),
     );
   let confirmedStatusId: string | null = null;
@@ -5348,9 +5819,18 @@ export async function publishHeadBoundRelease(
     const attempts = 3;
     for (let attempt = 1; ; attempt += 1) {
       const refusal = await recheck(conn);
-      if (refusal) return refusal;
+      if (refusal) {
+        if (!statusMayExist) return refusal;
+        const outcome = await voidSuccess("the release's authority changed before a retry");
+        return {
+          kind: refusal.kind === "refused" ? "stale" : "failed",
+          headSha: input.headSha,
+          message: `${refusal.message}; the status may have been written; ${outcome}`,
+        };
+      }
       // Nothing is written once the release's clock has run out.
       if (envelope.aborted) return deadlineOutcome();
+      const previouslyMayExist = statusMayExist;
       statusMayExist = true;
       let inFlight: ReturnType<typeof writeCommitStatusWithRetry> | undefined;
       const write = await bounded(
@@ -5359,8 +5839,9 @@ export async function publishHeadBoundRelease(
           attempts: 1,
           signal,
         })),
-        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1 },
+        { success: false, error: `timeout: the status write did not answer within ${deadlines.fetchMs}ms; it may have been written`, status: 0, transient: false, attempts: 1, mayHaveApplied: true },
       );
+      statusMayExist = previouslyMayExist || write.mayHaveApplied;
       if (write.success) {
         // Confirm the PR is still the live, open, non-draft head on the bound branch, not only the SHA.
         const after = await liveRefusal(true);
@@ -5385,6 +5866,11 @@ export async function publishHeadBoundRelease(
                 ? `the status written to ${input.headSha} was followed by a failure status`
                 : `a failure status on ${input.headSha} could NOT be written (${marked.error ?? `HTTP ${marked.status}`})`),
           };
+        }
+        const childBlock = await childCarrierStampBlock(conn, companyId, { owner, repo, number, headSha: input.headSha }, input.issueId);
+        if (childBlock) {
+          const outcome = await voidSuccess("child attribution changed while the release was written");
+          return { kind: "stale", headSha: input.headSha, message: `status:stale:child-authority-changed-after-write: ${childBlock}; ${outcome}` };
         }
         // The head is still live, but the card's authority is read once more: a decision reversed, a card
         // cancelled or a delivery retargeted while the write was in flight must not stay released.
@@ -5433,13 +5919,13 @@ export async function publishHeadBoundRelease(
             compensateLateSuccess(inFlight);
             recheckAfterNoAnswer();
           }
-          const outcome = await voidSuccess("the release's status write did not answer");
-          return { kind: "failed", message: `status:failed:status_write: ${write.error ?? "no answer"}; the status may have been written; ${outcome}` };
         }
-        statusMayExist = false;
+        if (statusMayExist) {
+          const outcome = await voidSuccess("the release's status write could not be confirmed");
+          return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}; the status may have been written; ${outcome}` };
+        }
         return { kind: "failed", message: `status:failed:status_write: ${write.error ?? `HTTP ${write.status}`}` };
       }
-      statusMayExist = false;
       await new Promise<void>((resolve) => setTimeout(resolve, input.retryDelayMs ?? 1000));
     }
   };
@@ -5807,7 +6293,7 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
     ));
   const agentStanding = agentIds.map((id) => {
     const agent = agentRows.find((candidate) => candidate.id === id);
-    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
+    return [id, !!agent && agent.companyId === companyId && agent.status !== "terminated" && agent.status !== "deleted" && agent.status !== "pending_approval" && !(lapsePaused && agent.status === "paused")];
   });
   memberRows.sort((a, b) => a.principalId.localeCompare(b.principalId));
   return JSON.stringify([
@@ -5862,7 +6348,7 @@ async function decisionStandingProblem(db: Db, companyId: string, issueId: strin
           .select({ companyId: agents.companyId, status: agents.status })
           .from(agents)
           .where(eq(agents.id, decision.actorAgentId));
-        if (!agent || agent.companyId !== companyId || agent.status === "terminated" || agent.status === "pending_approval") {
+        if (!agent || agent.companyId !== companyId || (agent.status === "terminated" || agent.status === "deleted") || agent.status === "pending_approval") {
           return `the agent that decided stage ${stageId} is no longer a current agent of the company`;
         }
         if (lapsePaused && agent.status === "paused") {
@@ -5952,7 +6438,13 @@ export async function armMergeOnApproval(
   // lookups take time, and a card whose decision, ladder, head, certificate or release changed in that
   // time is not what was authorized. It is read again right before the merge lever is pulled.
   const guard = options.authorityGuard ?? await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: options.expectedHeadOid });
-  const authorityChanged = () => guard.stillHolds();
+  let attributionPr: LinkedPullRequest | undefined;
+  const authorityChanged = async () => (await guard.stillHolds()) ?? (attributionPr
+    ? await childCarrierStampBlock(db, companyId, {
+        owner: attributionPr.owner, repo: attributionPr.repo, number: attributionPr.number,
+        headSha: options.expectedHeadOid ?? null, headRef: attributionPr.headRefName ?? null,
+      }, issueId)
+    : null);
 
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
   if (deliveryIdentity.recordedUnusable) {
@@ -6007,6 +6499,16 @@ export async function armMergeOnApproval(
       message: `skipped:ambiguous: Multiple linked PRs (${linkedPRs.length}): ${prList}`,
     };
   }
+  const linked = linkedPRs[0]!;
+  attributionPr = linked;
+  const childBlock = await childCarrierStampBlock(db, companyId, {
+    owner: linked.owner,
+    repo: linked.repo,
+    number: linked.number,
+    headSha: options.expectedHeadOid ?? null,
+    headRef: linked.headRefName ?? null,
+  }, issueId);
+  if (childBlock) return { kind: "skipped", message: childBlock };
 
   const pr = linkedPRs[0]!;
 
@@ -6166,6 +6668,12 @@ export async function armMergeOnApproval(
         message: `armed: Auto-merge enabled for ${pr.displayName}`,
       };
     }
+    if (result.mayHaveApplied) {
+      return {
+        kind: "failed",
+        message: `failed:arm-unconfirmed: ${pr.displayName} — an enable attempt may have applied (${result.error ?? "unknown"}); the take-back record is retained`,
+      };
+    }
     if (result.error?.startsWith("authority_changed:")) {
       return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${result.error.slice("authority_changed:".length).trim()}; nothing was armed` };
     }
@@ -6223,7 +6731,7 @@ export async function armMergeOnApproval(
       if (changedBeforeMerge) {
         return { kind: "skipped", message: `skipped:authority-changed: ${pr.displayName} — ${changedBeforeMerge}; no direct merge` };
       }
-      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod);
+      const mergeResult = await mergePullRequest(token, nodeId, mergeHead, defaultMergeMethod, { beforeAttempt: authorityChanged });
 
       if (mergeResult.success) {
         return {

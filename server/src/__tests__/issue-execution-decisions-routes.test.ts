@@ -12,6 +12,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueChildCarrierAttributions,
   issueExecutionDecisions,
   issueWorkProducts,
   issues,
@@ -38,9 +39,12 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type * as GitHubFetch from "../services/github-fetch.js";
 import type * as GitHubCredential from "../services/github-credential.js";
+import * as childCarrierAttribution from "../services/child-carrier-attribution.js";
+import { carrierOwnerChildAttributionBlock, childCarrierCommits } from "../services/child-carrier-attribution.js";
 
 const github = vi.hoisted(() => vi.fn<typeof fetch>());
 vi.mock("../services/github-fetch.js", async (original) => ({
@@ -252,6 +256,12 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
   afterEach(async () => {
     github.mockReset();
+    // The routes enqueue stage wakes fire-and-forget (`void enqueueExecutionStageWakeup(...)`
+    // in the board stage-decision route), so a wake can still be running after the
+    // response. Its agent_wakeup_requests insert can then commit between the
+    // agentWakeupRequests and agents deletes below and fail the agents delete with
+    // agent_wakeup_requests_agent_id_agents_id_fk. Await every in-flight wake first.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(issueDeliveryReceiptLinks);
     await db.delete(issueDeliveryReceipts);
     await db.delete(activityLog);
@@ -295,6 +305,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement,
     assigneeAgentId = null,
     mentionState,
+    openListLink,
+    openListEntries,
     adr072 = false,
     atStage = 0,
     laterStages,
@@ -311,7 +323,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string | null;
     /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
-    mentionState?: "merged" | "ambiguous" | "closed-unmerged";
+    mentionState?: "merged" | "ambiguous" | "closed-unmerged" | "stale-draft-merged";
+    /**
+     * SUP-24033: only with mentionState "stale-draft-merged". The cached mention
+     * is a stale open draft of the delivery PR that has since merged; the live
+     * open-PR list is a SHORT page of unrelated PRs, optionally with this Link header.
+     */
+    openListLink?: string;
+    /** SUP-24033: replaces the 50 unrelated well-formed entries of the open-PR list (malformed-entry cells). */
+    openListEntries?: unknown[];
     /** SUP-24085: an ADR-072 close ladder — review (pre_merge), review (post_merge), approval (post_merge). */
     adr072?: boolean;
     /** Index of the pending stage; every earlier stage is completed. */
@@ -395,7 +415,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     // SUP-22346: mentionState models the out-of-band-merged carrier — the
     // cached mention is closed, so every open-PR resolver sees nothing and the
     // live open-PR list is empty.
-    const mergedMention = mentionState === "merged" || mentionState === "ambiguous";
+    const mergedMention = mentionState === "merged" || mentionState === "ambiguous" || mentionState === "stale-draft-merged";
     const pr = {
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
@@ -412,7 +432,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         companyId: company.id, providerKey: "github", objectType: "pull_request",
         externalId: "TEA-Core/paperclip#pull/42", displayKey: "42", displayTitle: identifier,
         sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/42",
-        canonicalIdentityHash: randomUUID(), data: pr,
+        canonicalIdentityHash: randomUUID(),
+        data: mentionState === "stale-draft-merged" ? { ...pr, state: "open", draft: true, merged: false } : pr,
       }).returning();
       if (!unmentioned) {
         await db.insert(externalObjectMentions).values({
@@ -513,7 +534,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           ? { ...pr.head, sha: "b".repeat(40) } : pr.head;
         return Response.json({ ...pr, head });
       }
-      if (url.includes("/pulls?")) return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      if (url.includes("/pulls?")) {
+        if (mentionState === "stale-draft-merged") {
+          const unrelated = openListEntries ?? Array.from({ length: 50 }, (_, i) => ({
+            number: 1000 + i, draft: false, title: `Unrelated ${i}`, body: null, head: { ref: `unrelated-${i}` },
+          }));
+          return Response.json(unrelated, openListLink ? { headers: { link: openListLink } } : undefined);
+        }
+        return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      }
       if (url.includes("/compare/")) {
         return Response.json(mergedMention ? { status: "behind", ahead_by: 0 } : { ahead_by: 1 });
       }
@@ -731,6 +760,120 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     // Publication stays open-PR-only: a merged carrier gets no status write.
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
+  });
+
+  // SUP-24033 R4L: the cached mention is a stale open draft of the delivery PR
+  // (merged since). The open-PR list read is a SHORT page, but it advertises a
+  // next page, so an owned live draft could sit there unseen. Every terminal
+  // door must keep the base head_draft refusal; a short page with no next page is
+  // a complete scan and the verified merged carrier is accepted as before.
+  describe("stale cached draft with a merged live carrier and a short open-PR page (SUP-24033)", () => {
+    // The open-PR list request the scan issues, and its page-1 self link.
+    const REQ = "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100";
+    const U = `<${REQ}>`;
+    type Door = "PATCH final verdict" | "board stage-decision" | "approval comment";
+    const DOORS: Door[] = ["PATCH final verdict", "board stage-decision", "approval comment"];
+    const expectHeadDraftRefusal = (response: request.Response) => {
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body).toMatchObject({
+        details: { code: "approval_final_delivery_preflight", reason: expect.stringMatching(/^head_draft:/) },
+      });
+    };
+    type Fixture = Awaited<ReturnType<typeof pendingDelivery>>;
+    async function attempt(door: Door, fixture: Fixture): Promise<request.Response> {
+      if (door === "PATCH final verdict") return fixture.approve();
+      if (door === "approval comment") {
+        return request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/comments`)
+          .send({ body: "## Review: APPROVED\n\nIndependent final review." });
+      }
+      const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+      try {
+        return await request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+          .send({ decision: "approved", comment: "Independent final approval." });
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+        else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+      }
+    }
+    async function expectRefusedAtEveryDoor(options: { openListLink?: string; openListEntries?: unknown[] }) {
+      for (const door of DOORS) {
+        const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", ...options });
+        expectHeadDraftRefusal(await attempt(door, fixture));
+        expect((await fixture.read()).status, door).toBe("in_review");
+        expect(await db.select().from(issueExecutionDecisions), door).toEqual([]);
+        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id)), door).toEqual([]);
+        expect(fixture.writes, door).toEqual([]);
+      }
+    }
+
+    // A short page whose Link header is anything but absent or self-only is not a
+    // proven complete list: the owned live draft that may sit past it was never read.
+    it.each([
+      ["rel=next", `${U}; rel="next"`],
+      ["rel=next and rel=last", `${U}; rel="next", ${U}; rel="last"`],
+      ["a link-value with no rel", U],
+      ["only title=", `${U}; title="t"`],
+      ["no rel in the second link-value after rel=self", `<https://api.github.com/x?page=1>; rel="self", ${U}`],
+      ["rel=last alone", `${U}; rel="last"`],
+      ["rel=prev alone", `${U}; rel="prev"`],
+      ["rel=first alone", `${U}; rel="first"`],
+      ["rel=previous alone", `${U}; rel="previous"`],
+      ["single-quoted rel='next'", `${U}; rel='next'`],
+      ["a trailing comma after rel=next", `${U}; rel="next",`],
+      ["an unterminated quote", `${U}; rel="next`],
+      ["an escaped rel value", `${U}; rel="\\next"`],
+      ["a rel* extended parameter", `${U}; rel*=UTF-8''next`],
+    ])("every door refuses head_draft when the Link header is %s", async (_label, openListLink) => {
+      await expectRefusedAtEveryDoor({ openListLink });
+    });
+
+    // A rel=self link must name page 1 of THIS request; any other self target
+    // describes some other list.
+    it.each([
+      ["page 2", `<${REQ}&page=2>`],
+      ["a relative target", "</repos/TEA-Core/paperclip/pulls?state=open&per_page=100>"],
+      ["an empty target", "<>"],
+      ["another host", "<https://example.test/repos/TEA-Core/paperclip/pulls?state=open&per_page=100>"],
+      ["another repository", "<https://api.github.com/repos/TEA-Core/other/pulls?state=open&per_page=100>"],
+    ])("every door refuses head_draft when the rel=self target is %s", async (_label, target) => {
+      await expectRefusedAtEveryDoor({ openListLink: `${target}; rel="self"` });
+    });
+
+    // Owner ruling (fail closed) and the allow-list rule: every field of a list entry
+    // that a consumer reads (number, head.ref, title, draft) is validated, so an entry
+    // the code cannot read may have been an owned live draft and the list is not complete.
+    const OWNED = { number: 50, draft: true, head: { ref: "R-delivery" }, title: "Owned draft", body: null };
+    it.each([
+      ["a number as a string", [{ ...OWNED, number: "50" }]],
+      ["a null number", [{ ...OWNED, number: null }]],
+      ["an absent number", [{ draft: true, head: { ref: "R-delivery" }, title: "Owned draft" }]],
+      ["a null title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: null }]],
+      ["a numeric title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: 7 }]],
+      ["an array title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: ["x"] }]],
+      ["an object title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: { a: 1 } }]],
+      ["an absent title", [{ number: 50, draft: true, head: { ref: "unrelated" } }]],
+      ["a string draft flag", [{ number: 50, draft: "true", head: { ref: "unrelated" }, title: "t" }]],
+      ["an entry that is a JSON string", ["50"]],
+      ["a null entry", [null]],
+      ["an entry that is an array", [[OWNED]]],
+      ["99 malformed entries", Array.from({ length: 99 }, () => null)],
+    ])("every door refuses head_draft when the open-PR list holds %s", async (_label, openListEntries) => {
+      await expectRefusedAtEveryDoor({ openListEntries });
+    });
+
+    it.each([
+      ["no Link header", undefined],
+      ["Link rel=self to page 1 of this request", `${U}; rel="self"`],
+    ])("PATCH final verdict accepts the verified merged carrier on a short page with %s", async (_label, openListLink) => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink });
+      const response = await fixture.approve();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect((await fixture.read()).status).toBe("done");
+      expect(fixture.writes).toEqual([]);
+    });
   });
 
   it("keeps the merged-carrier gate fail-closed when the mentioned PR is closed but NOT merged (SUP-22346)", async () => {
@@ -1406,6 +1549,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const agentId = (await fixture.read()).createdByAgentId!;
     const [run] = await db.insert(heartbeatRuns).values({
       companyId: fixture.company.id, agentId, status: "running",
+      contextSnapshot: { issueId: fixture.issue.id },
     }).returning();
     await db.update(issues).set({
       assigneeAgentId: agentId, assigneeUserId: null, executionRunId: run!.id, executionLockedAt: new Date(),
@@ -1623,7 +1767,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     ["title", "NEW.title := 'Renamed while the run was cancelled';"],
     ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
     ["execution state", `NEW.execution_state := NEW.execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb;`],
-  ])("refuses a final PATCH when a concurrent %s change lands during its own run cancellation", async (_label, mutation) => {
+  ])("approves a final PATCH whose own run release carries a concurrent %s change", async (_label, mutation) => {
     const fixture = await pendingDelivery({ mergeArmingEnabled: true });
     await holdAgentRun(fixture);
     let response!: request.Response;
@@ -1633,15 +1777,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       `${mutation} return NEW;`,
       async () => { response = await fixture.approve(reassignToBoardUser); },
     );
-    expect(response.status).toBe(409);
-    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    // SUP-23801: the reassignment stop is deferred past the commit, so the
+    // final PATCH no longer opens a pre-commit cancellation window. The
+    // decision commits and the carried change rides the same row write.
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
     const stored = await fixture.read();
-    expect(stored.status).toBe("in_review");
-    expect(stored.executionState?.completedStageIds).toEqual([]);
-    expect(stored.executionState?.approvalStatus).toBeUndefined();
-    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-    expect(fixture.writes).toEqual([]);
-    expect(fixture.armCalls).toEqual([]);
+    expect(stored.status).toBe("done");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+    if (_label === "title") {
+      expect(stored.title).toBe("Renamed while the run was cancelled");
+    } else if (_label === "execution policy") {
+      expect((stored.executionPolicy as Record<string, unknown>).commentRequired).toBe(true);
+    } else {
+      expect((stored.executionState as Record<string, unknown>).lastDecisionOutcome).toBe("changes_requested");
+    }
   });
 
   it("publishes nothing and keeps the escalation pending when the accept transaction fails after the decision", async () => {
@@ -2067,6 +2216,81 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const fixture = await pendingDelivery({ adr072: true, draft: true, atStage: 2 });
       const before = await fixture.read();
       await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "head_draft");
+    });
+
+    it.each(["open", "merged during preflight", "attachment exception"] as const)("certifies only an open forked child contribution without carrier publication (%s)", async (scenario) => {
+      const mergeDuringPreflight = scenario === "merged during preflight";
+      const fixture = await pendingDelivery({ adr072: true, atStage: 2, mergeArmingEnabled: true, missing: true });
+      const child = await fixture.read();
+      const ownerId = randomUUID();
+      const carrierBranch = `${fixture.company.issuePrefix}-2-carrier`;
+      await db.insert(issues).values({
+        id: ownerId, companyId: fixture.company.id, projectId: child.projectId,
+        identifier: `${fixture.company.issuePrefix}-2`, issueNumber: 2, title: "Carrier owner", status: "in_progress", priority: "medium",
+      });
+      const [workspace] = await db.insert(executionWorkspaces).values({
+        companyId: fixture.company.id, projectId: child.projectId!, sourceIssueId: ownerId,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: carrierBranch, status: "active",
+        cwd: "/tmp/as02-no-local-repo", repoUrl: "https://github.com/TEA-Core/paperclip", baseRef: "main", branchName: carrierBranch,
+      }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, ownerId));
+      await db.update(issues).set({
+        parentId: ownerId,
+        executionState: { ...child.executionState, childCarrierClaim: { prNumber: 42, prUrl: "https://github.com/TEA-Core/paperclip/pull/42", headSha: fixture.pr.head.sha } },
+      }).where(eq(issues.id, child.id));
+      fixture.pr.head.ref = carrierBranch;
+      const before = await fixture.read();
+      const originalEnumeration = childCarrierCommits.enumerate;
+      const transport = github.getMockImplementation()!;
+      github.mockImplementation(async (input, init) => {
+        if (mergeDuringPreflight && String(input).includes("/compare/")) {
+          return Response.json({ status: "identical", ahead_by: 0, behind_by: 0 });
+        }
+        return transport(input, init);
+      });
+      const attachmentFault = scenario === "attachment exception"
+        ? vi.spyOn(childCarrierAttribution, "recordChildCarrierDecision")
+          .mockRejectedValueOnce(new Error("Injected post-commit attachment failure"))
+        : null;
+      try {
+        childCarrierCommits.enumerate = async () => {
+          if (mergeDuringPreflight) Object.assign(fixture.pr, {
+            state: "closed", merged: true, merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19", base: { ref: "main" },
+          });
+          return { ok: true, shas: ["c".repeat(40)] };
+        };
+        const response = await fixture.approve();
+        if (mergeDuringPreflight) {
+          await expectRefusedUnchanged(fixture, response, before, "approval_final_delivery_preflight", "head_not_open");
+        } else {
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+          const stored = await fixture.read();
+          const [proof] = await db.select().from(issueChildCarrierAttributions).where(eq(issueChildCarrierAttributions.childIssueId, child.id));
+          expect(stored.status).toBe("done");
+          expect(stored.executionWorkspaceId).toBe(child.executionWorkspaceId);
+          expect(approvalStatusOf(stored).finalDelivery).toMatchObject({
+            decisionId: stored.executionState?.lastDecisionId, headSha: fixture.pr.head.sha,
+            childCarrierProof: {
+              attributionId: proof!.id, ancestorIssueId: ownerId, branchName: carrierBranch, commitShas: ["c".repeat(40)],
+            },
+          });
+          const block = await carrierOwnerChildAttributionBlock(db, fixture.company.id, ownerId, {
+            owner: "TEA-Core", repo: "paperclip", number: 42, headSha: fixture.pr.head.sha, headRef: carrierBranch,
+          });
+          if (scenario === "attachment exception") {
+            expect(proof?.childDecisionId).toBeNull();
+            expect(block).toContain("child-carrier-owner-gate");
+          } else {
+            expect(proof?.childDecisionId).toBe(stored.executionState?.lastDecisionId);
+            expect(block).toBeNull();
+          }
+        }
+        expect(fixture.writes).toEqual([]);
+        expect(fixture.armCalls).toEqual([]);
+      } finally {
+        attachmentFault?.mockRestore();
+        childCarrierCommits.enumerate = originalEnumeration;
+      }
     });
 
     it.each(stageDoors)("%s: certifies and stamps the exact delivery head on the final-stage approve", async (door) => {

@@ -67,7 +67,7 @@ import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../e
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { assertIssueExecutionWorkspaceOverrideAllowed, issueService } from "./issues.js";
+import { assertIssueExecutionWorkspaceOverrideAllowed, issueService, logLostFutureMonitorCheck } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -803,7 +803,8 @@ export async function supersedeOpenRoutineExecutionSiblings(
         lt(issues.createdAt, supersedingCreatedAt),
       ),
     )
-    .orderBy(asc(issues.createdAt));
+    .orderBy(asc(issues.createdAt))
+    .for("update");
   if (siblings.length === 0) return [];
 
   const superseded: Array<{ issueId: string; identifier: string | null; previousStatus: string }> = [];
@@ -832,6 +833,13 @@ export async function supersedeOpenRoutineExecutionSiblings(
       .where(and(eq(issues.id, sibling.id), inArray(issues.status, OPEN_ISSUE_STATUSES)))
       .returning();
     if (!retired) continue;
+
+    await logLostFutureMonitorCheck(executor, sibling, retired, {
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+    });
 
     await executor.insert(issueComments).values({
       companyId: superseding.companyId,
@@ -2027,7 +2035,7 @@ export function routineService(
       trigger: typeof routineTriggers.$inferSelect | null;
       source: "schedule" | "manual" | "api" | "webhook";
       actor?: Actor;
-      issue: { id: string; title: string; identifier: string | null; status: string; parentId: string | null; projectId: string | null; originKind: string | null; originId: string | null; responsibleUserId: string | null };
+      issue: { id: string; title: string; identifier: string | null; status: string; parentId: string | null; projectId: string | null; projectWorkspaceId: string | null; description: string | null; originKind: string | null; originId: string | null; responsibleUserId: string | null };
       routineRunId: string;
     },
     publications: ActivityPublication[],
@@ -2102,6 +2110,9 @@ export function routineService(
           details: {
             title: input.issue.title,
             identifier: input.issue.identifier,
+            projectId: input.issue.projectId ?? null,
+            projectWorkspaceId: input.issue.projectWorkspaceId ?? null,
+            description: input.issue.description ?? null,
             status: input.issue.status,
             ...routineReference,
           },

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, eq, isNull, ne, sql, notInArray } from "drizzle-orm";
 import {
   type Db,
   agents,
@@ -197,7 +197,7 @@ export function emailConnectionService(
             and(
               eq(agents.id, agentId),
               eq(agents.companyId, companyId),
-              ne(agents.status, "terminated"),
+              notInArray(agents.status, ["terminated", "deleted"]),
             ),
           );
         if (!agent) throw badRequest("Select an available company agent");

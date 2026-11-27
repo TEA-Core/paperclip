@@ -227,7 +227,7 @@ export function resourceMembershipService(db: Db, options: ResourceMembershipSer
           )),
       ]);
       const starEligibleProjectRows = projectRows.filter((row) => row.starredAt && !row.projectArchivedAt);
-      const starEligibleAgentRows = agentRows.filter((row) => row.starredAt && row.agentStatus !== "terminated");
+      const starEligibleAgentRows = agentRows.filter((row) => row.starredAt && row.agentStatus !== "terminated" && row.agentStatus !== "deleted");
       const starredDocumentRows = documentRows
         .filter((row): row is typeof row & { starredAt: Date } => row.starredAt !== null)
         .sort((a, b) => b.starredAt.getTime() - a.starredAt.getTime());
@@ -357,7 +357,7 @@ export function resourceMembershipService(db: Db, options: ResourceMembershipSer
           eq(agents.companyId, input.companyId),
         ),
       });
-      if (!agent || agent.status === "terminated") throw notFound("Agent not found");
+      if (!agent || (agent.status === "terminated" || agent.status === "deleted")) throw notFound("Agent not found");
 
       const existing = await db.query.agentMemberships.findFirst({
         where: and(

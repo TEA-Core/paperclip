@@ -428,6 +428,8 @@ function createRunContextDb(
     // whether this issue is a summary-generation card; the generic fallback
     // row would fabricate one and hijack the return assignee.
     if (tableName === "summary_slots") return [];
+    // Landing-debt probe: no reclassification rows exist in these fixtures.
+    if (tableName === "activity_log") return [];
     if (heartbeatRunQuery) {
       const predicate = heartbeatRunQueries.at(-1);
       const [selectedRunId, selectedCompanyId, selectedAgentId, selectedStatus] = predicate?.params ?? [];
@@ -834,8 +836,10 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue(),
+    // The written row carries the stored issue (e.g. its deliveryRequirement),
+    // as the real UPDATE ... RETURNING does.
+    mockIssueService.update.mockImplementation(async (id: string, patch: Record<string, unknown>) => ({
+      ...((await mockIssueService.getById(id)) ?? makeIssue()),
       ...patch,
     }));
     mockIssueService.addComment.mockResolvedValue({
@@ -2727,10 +2731,12 @@ describe("agent issue mutation checkout ownership", () => {
         .send(patch);
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining(patch),
-      );
+      // SUP-23801: an assignee change persists on the transactional path and
+      // passes the tx handle as a third argument; other escape-hatch fields
+      // keep the two-argument non-transactional call.
+      const updateCall = mockIssueService.update.mock.calls.at(-1);
+      expect(updateCall?.[0]).toBe(issueId);
+      expect(updateCall?.[1]).toEqual(expect.objectContaining(patch));
     });
 
     it("records escape_hatch_manager_chain in the issue.updated activity when the ancestor escape hatch applies", async () => {
@@ -3255,6 +3261,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
         expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
+        expect.anything(),
       );
     });
 
@@ -3287,6 +3294,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
         expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
+        expect.anything(),
       );
     });
   });
@@ -4818,6 +4826,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
         expect.objectContaining({ assigneeAgentId: peerAgentId }),
+        expect.anything(),
       );
     });
 

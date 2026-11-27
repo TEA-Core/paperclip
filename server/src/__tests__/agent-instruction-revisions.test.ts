@@ -7,11 +7,19 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, agentApiKeys, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns,
   agentInstructionRevisions, agentInstructionHeads, issueThreadInteractions, issues, createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
+
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/agents-gid.js")).mockAgentsGroupLookup(await importOriginal()));
+
+const agentsGid = assignableAgentsGid();
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { instructionBytes, instructionPath, materializeInstructionBytes, readInstructionBytes } from "../services/agent-instruction-files.js";
 import { agentInstructionsService, resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import type { AuthorizationActor } from "../services/authorization.js";
+import { agentFileStore } from "../services/agent-file-store.js";
+import { changeConsentGateService, type ConsumedChangeConsent } from "../services/change-consent-gate.js";
 import { upsertAgentInstructionsFileSchema } from "@paperclipai/shared";
 
 describe("canonical instruction revisions", () => {
@@ -64,6 +72,84 @@ describe("canonical instruction revisions", () => {
   async function save(content: string, baseRevisionId: string | null) {
     return service.commit({ ...target(), entryFile, content, baseRevisionId, source: "cleanup" }, actor);
   }
+  it.skipIf(agentsGid === undefined)("copies bundle files and creates the managed root without group write under umask 002", async () => {
+    const externalRoot = await fs.mkdtemp(path.join(home, "external-import-"));
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "# Imported entry\n");
+    await fs.mkdir(path.join(externalRoot, "doctrine"));
+    await fs.writeFile(path.join(externalRoot, "doctrine", "mission.md"), "# Mission\n");
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).updateBundle({
+        ...agent,
+        adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: externalRoot, instructionsEntryFile: "AGENTS.md" },
+      }, { mode: "managed" }));
+      expect(result.bundle.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect((await fs.stat(path.join(root, "doctrine"))).mode & 0o7777).toBe(0o750);
+      for (const [relative, content] of [["AGENTS.md", "# Imported entry\n"], ["doctrine/mission.md", "# Mission\n"]]) {
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(content);
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+        expect((await fs.stat(path.join(root, relative))).gid).toBe(agentsGid);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("migrates the legacy prompt entry and creates its root without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).ensureManagedBundle({
+        ...agent, adapterConfig: { promptTemplate: "# Legacy prompt" },
+      }));
+      expect(result.state.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("# Legacy prompt");
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).gid).toBe(agentsGid);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("imports bundle files and creates their root without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const files = { "AGENTS.md": "# Imported entry\n", "doctrine/mission.md": "# Mission\n" };
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).materializeManagedBundle(agent, files));
+      expect(result.bundle.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect((await fs.stat(path.join(root, "doctrine"))).mode & 0o7777).toBe(0o750);
+      for (const [relative, content] of Object.entries(files)) {
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(content);
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+        expect((await fs.stat(path.join(root, relative))).gid).toBe(agentsGid);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("creates an empty imported entry without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).materializeManagedBundle(agent, {}));
+      expect(result.bundle.rootPath).toBe(root);
+      expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("");
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).gid).toBe(agentsGid);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
   it.each(["current", "history", "revision", "diff", "candidates"])("denies peer %s reads without a configuration grant or responsible-user target access", async (operation) => {
     const first = await base();
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId));
@@ -203,6 +289,65 @@ describe("canonical instruction revisions", () => {
       details: { code: "reflection_coach_adoption_carrier_required" },
     });
     expect((await service.readCurrent(target(), actor))?.revision.id).toBe(first.revision.id);
+  });
+  // SUP-24773: the route consumes one accepted confirmation, then the file store's own
+  // commit door re-authorizes. One accept must land one non-entry managed file.
+  describe("route-consumed consent for a non-entry managed file", () => {
+    const instructionsKey = () => `agent:${agentId}:instructions`;
+    const extraPath = "notes/extra.md";
+    async function seedConsent(opts: { carrier: boolean; resolvedAt: Date; key?: string }) {
+      const sourceRunId = randomUUID(), issueId = randomUUID(), id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId: actorId, status: "succeeded" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Review instructions" });
+      await db.insert(issueThreadInteractions).values({ id, companyId, issueId, kind: "request_confirmation", status: "accepted", sourceRunId, createdByAgentId: actorId,
+        payload: { version: 1, prompt: "Apply the instruction change?", detailsMarkdown: "```diff\n+approved\n```", target: { type: "custom", key: opts.key ?? instructionsKey(), revisionId: "proposal" },
+          ...(opts.carrier ? { adoptionCarrier: { issueId } } : {}) },
+        result: { version: 1, outcome: "accepted" }, resolvedByUserId: userId, resolvedAt: opts.resolvedAt,
+      });
+      return id;
+    }
+    async function consentResult(id: string) {
+      return (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0].result as unknown as Record<string, unknown>;
+    }
+    const routeDoor = (key = instructionsKey()) => changeConsentGateService(db).assertConsented({ companyId, actorAgentId: actorId, actorRunId: runId, targetKeys: [key] });
+    const write = (content: string, consent?: ConsumedChangeConsent | null) =>
+      agentFileStore(db).write({ companyId, agentId, path: extraPath, bytes: Buffer.from(content), baseHash: null }, actor, consent ?? undefined);
+    beforeEach(async () => {
+      await base();
+      await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, actorId));
+      await db.insert(principalPermissionGrants).values({ companyId, principalType: "agent", principalId: actorId, permissionKey: "agents:suggest-changes" });
+    });
+    it("lands one write on one accepted confirmation and never reaches an older carrier-less accept", async () => {
+      const stale = await seedConsent({ carrier: false, resolvedAt: new Date(Date.now() - 86_400_000) });
+      const accepted = await seedConsent({ carrier: true, resolvedAt: new Date() });
+      const consent = await routeDoor();
+      expect(consent).toBeTruthy();
+      await expect(write("# Approved\n", consent)).resolves.toMatchObject({ changed: true });
+      expect(await fs.readFile(path.join(root, extraPath), "utf8")).toBe("# Approved\n");
+      expect(await consentResult(accepted)).toMatchObject({ consumedByRunId: runId });
+      expect(await consentResult(stale)).not.toHaveProperty("consumedAt");
+    });
+    it("refuses at both doors without an accepted confirmation, keeping the generic denial", async () => {
+      await expect(routeDoor()).rejects.toMatchObject({ status: 403, details: { code: "reflection_coach_mutation_gate_required" } });
+      await expect(write("# Unapproved\n")).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
+      await expect(fs.stat(path.join(root, extraPath))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+    it("does not honor a forged, replayed or foreign-target consent receipt", async () => {
+      await seedConsent({ carrier: true, resolvedAt: new Date() });
+      const consent = await routeDoor();
+      const forged = JSON.parse(JSON.stringify(consent)) as ConsumedChangeConsent;
+      await expect(write("# Forged\n", forged)).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
+      await expect(write("# Approved\n", consent)).resolves.toMatchObject({ changed: true });
+      await expect(write("# Replayed\n", consent)).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
+      await seedConsent({ carrier: true, resolvedAt: new Date(), key: `agent:${actorId}:instructions` });
+      const foreignTarget = await routeDoor(`agent:${actorId}:instructions`);
+      await expect(write("# Foreign target\n", foreignTarget)).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
+      expect(await fs.readFile(path.join(root, extraPath), "utf8")).toBe("# Approved\n");
+    });
+    it("still surfaces the adoption-carrier refusal when the only accept names no carrier", async () => {
+      await seedConsent({ carrier: false, resolvedAt: new Date() });
+      await expect(write("# No carrier\n")).rejects.toMatchObject({ status: 403, details: { code: "reflection_coach_adoption_carrier_required" } });
+    });
   });
   it("shares head/CAS and attribution between board and agent writers", async () => {
     const first = await base();

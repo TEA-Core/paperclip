@@ -111,7 +111,7 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     services.dispose();
   });
 
-  it("rejects a plugin-host issues.update that selects release-assurance authority and leaves the policy unchanged", async () => {
+  it("does not forward an executionPolicy that selects release-assurance authority through a plugin-host issues.update", async () => {
     const company = await createCompany(db, "PRA");
     const [approver] = await db.insert(agents).values({
       companyId: company.id,
@@ -133,29 +133,29 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
       .then((rows) => rows[0]!);
     const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
 
-    await expect(
-      services.issues.update({
-        issueId: issue.id,
-        companyId: company.id,
-        patch: {
-          executionPolicy: {
-            mode: "normal",
-            approvalAuthority: "release_assurance",
-            stages: [{
-              id: randomUUID(),
-              type: "approval",
-              approvalsNeeded: 1,
-              participants: [{ id: randomUUID(), type: "agent", agentId: approver!.id }],
-            }],
-            monitor: null,
-          },
-        } as never,
-      }),
-    ).rejects.toMatchObject({ status: 422 });
+    // executionPolicy is not an SDK-declared issues.update field: the host drops it.
+    await services.issues.update({
+      issueId: issue.id,
+      companyId: company.id,
+      patch: {
+        title: "Renamed by the plugin",
+        executionPolicy: {
+          mode: "normal",
+          approvalAuthority: "release_assurance",
+          stages: [{
+            id: randomUUID(),
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: approver!.id }],
+          }],
+          monitor: null,
+        },
+      } as never,
+    });
 
     const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
-    expect(row).toEqual(issue);
-    expect(await db.select().from(activityLog)).toEqual([]);
+    expect(row!.title).toBe("Renamed by the plugin");
+    expect(row!.executionPolicy).toBeNull();
     services.dispose();
   });
 
