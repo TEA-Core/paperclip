@@ -83,6 +83,11 @@ type CompanyScope = {
 
 const HEX_BRANCH = "ab".repeat(20);
 
+// Runtime readiness measures its deadline with the wall clock. A host clock
+// that steps by tens of seconds must not expire it before a service that
+// answers within a second gets its first probe.
+const READINESS_TIMEOUT_SEC = 60;
+
 type LinkedSource = Awaited<ReturnType<typeof makeLinkedSource>>;
 
 async function makeLinkedSource() {
@@ -405,7 +410,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
                   readiness: {
                     type: "http",
                     urlTemplate: "http://127.0.0.1:{{port}}",
-                    timeoutSec: 10,
+                    timeoutSec: READINESS_TIMEOUT_SEC,
                     intervalMs: 50,
                   },
                   lifecycle: "shared",
@@ -1107,7 +1112,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
               readiness: {
                 type: "http",
                 urlTemplate: "http://127.0.0.1:{{port}}",
-                timeoutSec: 10,
+                timeoutSec: READINESS_TIMEOUT_SEC,
                 intervalMs: 50,
               },
               lifecycle: "shared",
@@ -1261,7 +1266,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             name: "preview",
             command: httpCommand(started),
             port: { type: "auto", envKey: "PORT" },
-            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
             expose: exposeConfig,
           },
         });
@@ -1310,7 +1315,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
               name: "preview",
               command: barrierCommand({ barrierPort: barrierAddress.port, exitAfterRelease: false }),
               port: { type: "auto", envKey: "PORT" },
-              readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 15, intervalMs: 50 },
+              readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
               expose: exposeConfig,
             },
           }));
@@ -1357,7 +1362,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             name: "web",
             command: `chmod 000 ${quoteShell(fixture.root)}; exit 2`,
             port: { type: "auto" },
-            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
             lifecycle: "shared",
             reuseScope: "execution_workspace",
             stopPolicy: { type: "manual" },
@@ -1411,17 +1416,18 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       await lockHeld;
       const registryRecords = () =>
         listLocalServiceRegistryRecords({ metadata: { executionWorkspaceId: seeded.workspaceId } });
-      // Polls a condition the start exposes no event for.
+      // Polls a condition the start exposes no event for, on the monotonic clock.
       async function waitFor(label: string, done: () => Promise<boolean>) {
-        const deadline = Date.now() + 15_000;
+        const deadline = performance.now() + 15_000;
         while (!await done()) {
-          if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+          if (performance.now() > deadline) throw new Error(`timed out waiting for ${label}`);
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
       }
+      let pending: Promise<unknown> = Promise.resolve(null);
       let failure: unknown;
       try {
-        const pending = startRuntimeServicesForWorkspaceControl(controlInput({
+        pending = startRuntimeServicesForWorkspaceControl(controlInput({
           scope,
           fixture,
           executionWorkspaceId: seeded.workspaceId,
@@ -1429,7 +1435,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             name: "web",
             command: `while [ ! -e ${quoteShell(release)} ]; do sleep 0.02; done; exit 2`,
             port: { type: "auto" },
-            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
             lifecycle: "shared",
             reuseScope: "execution_workspace",
             stopPolicy: { type: "manual" },
@@ -1452,6 +1458,8 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
         await fs.writeFile(release, "");
         releaseLock();
         await locker;
+        // Never leave the start running into the next test.
+        await pending;
       }
 
       expect(failure).toBeInstanceOf(Error);
@@ -1472,7 +1480,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
           name: "web",
           command: httpCommand(started),
           port: { type: "auto" },
-          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
           lifecycle: "shared",
           reuseScope: "execution_workspace",
           stopPolicy: { type: "manual" },
@@ -1534,7 +1542,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
             name: "preview",
             command: httpCommand(started),
             port: { type: "auto", envKey: "PORT" },
-            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: READINESS_TIMEOUT_SEC, intervalMs: 50 },
             expose: {
               type: "tailscale_https",
               hostname: "auto",
