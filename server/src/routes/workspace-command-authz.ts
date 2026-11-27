@@ -91,7 +91,7 @@ export function assertNoAgentProjectWorkspaceSourceMutation(req: Request, paths:
 }
 
 export function collectExecutionWorkspaceIdentityPaths(workspacePatch: unknown, prefix = ""): string[] {
-  return collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName"], prefix);
+  return collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName", "baseRef"], prefix);
 }
 
 export function assertNoAgentExecutionWorkspaceIdentityMutation(req: Request, paths: string[]) {
