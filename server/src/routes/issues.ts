@@ -1,5 +1,11 @@
 import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
+import {
+  assertReviewEntryRequest,
+  listReviewEntryBlockers,
+  prepareReviewEntry,
+  verifyReviewEntryAtTransition,
+} from "../services/review-entry-precondition.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -40,6 +46,7 @@ import {
   gt,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   sql,
@@ -74,6 +81,7 @@ import {
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
+  issueReviewEntryReceipts,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -17632,6 +17640,37 @@ export function issueRoutes(
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, decisions));
   });
 
+  router.get("/issues/:id/review-entry-receipts", async (req, res) => {
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const receipts = await db.select().from(issueReviewEntryReceipts).where(and(
+      eq(issueReviewEntryReceipts.companyId, issue.companyId),
+      eq(issueReviewEntryReceipts.issueId, issue.id),
+    ));
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, receipts));
+  });
+
+  router.get("/issues/:id/review-entry-blockers", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    if (req.actor.boardKeyScope === "read_only") {
+      throw forbidden("Review-entry blockers require a board operator, not a read-only key.");
+    }
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+      const [operator] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, issue.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, req.actor.userId ?? ""),
+        eq(companyMemberships.status, "active"),
+        ne(companyMemberships.membershipRole, "viewer"),
+      )).limit(1);
+      if (!operator) throw forbidden("Review-entry blockers require an active board company operator.");
+    }
+    const blockers = await listReviewEntryBlockers(db, issue);
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, blockers));
+  });
+
   router.post(
     "/issues/:id/approvals",
     validate(linkIssueApprovalSchema),
@@ -19842,6 +19881,7 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
+    if (req.body.reviewEntryPrecondition !== undefined) assertReviewEntryRequest(req.body);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({
@@ -19920,7 +19960,7 @@ export function issueRoutes(
         } else if (boundaryDecision.allowed) {
           mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing, {
             allowVisibleIssueWrite: true,
-            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined,
+            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined || req.body.reviewEntryPrecondition !== undefined,
           });
           if (!mutationAccess) return;
         } else if (
@@ -20029,6 +20069,7 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
       doneTier,
+      reviewEntryPrecondition,
       deliveryIdentity: requestedDeliveryIdentity,
       // SUP-16525 §4: request-level flag, not an issue column — keep it out of
       // `updateFields` so it never reaches svc.update as a spurious write.
@@ -20733,6 +20774,14 @@ export function issueRoutes(
       requestedStatus: requestedTransitionStatus,
       closer: doneCloser,
     });
+    const reviewEntryActor = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId ?? null,
+    };
+    const preparedReviewEntry = reviewEntryPrecondition === undefined ? null : await prepareReviewEntry(
+      db, existing, reviewEntryPrecondition, reviewEntryActor,
+    );
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -20776,6 +20825,11 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+    // Reject a precondition that would otherwise degrade to close, auto-skip or
+    // a reviewer decision before any goal/run side effect can occur.
+    if (preparedReviewEntry && (transition.patch.status !== "in_review" || transition.decision)) {
+      throw conflict("Conditional first entry must produce an independent review handoff.", { code: "review_entry_precondition_failed" });
+    }
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
     // will persist. The gate is keyed on the request explicitly supplying an
     // assignee; a workflow-owned assignment is exempt for an implicit handoff
@@ -21898,11 +21952,13 @@ export function issueRoutes(
     const issueMutationStopId = randomUUID();
     if (assigneeWillChange && existing.assigneeAgentId) {
       rejectExpectedUpdatedAtBeforeSideEffect();
-      await stopRunnerGoalForOwnershipChange({
-        companyId: existing.companyId,
-        issueId: existing.id,
-        agentId: existing.assigneeAgentId,
-      });
+      if (!preparedReviewEntry) {
+        await stopRunnerGoalForOwnershipChange({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          agentId: existing.assigneeAgentId,
+        });
+      }
       // SUP-23801: every retained reassignment stop is deferred until the
       // issue update commits. Only the execution run link carries
       // cancellation authority: target a run that still holds the execution
@@ -22245,6 +22301,7 @@ export function issueRoutes(
     let commentDeduplicated = false;
     let deduplicatedFromCommentId: string | null = null;
     let commentHandledInTransaction = false;
+    let reviewEntryReceiptId: string | undefined;
     let attachmentCommentSourceTrust;
     try {
       attachmentCommentSourceTrust = commentAttachmentIds?.length
@@ -22313,6 +22370,7 @@ export function issueRoutes(
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
+      || preparedReviewEntry !== null
       // SUP-24402: a zero-delta close re-checks its measured worktree inside the write.
       || zeroDeltaCloseMeasurement !== null
       // SUP-24429: a record_only request reads the stored requirement under the
@@ -22373,6 +22431,20 @@ export function issueRoutes(
       }
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
+          let entryProof;
+          if (preparedReviewEntry && reviewEntryPrecondition) {
+            await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
+            const locked = await svc.getByIdForUpdate(existing.id, tx);
+            if (!locked) return null;
+            entryProof = await verifyReviewEntryAtTransition(
+              tx as unknown as Db, locked, reviewEntryPrecondition, reviewEntryActor, preparedReviewEntry, commentBody!,
+            );
+            // Recompute from the locked state; never persist an unlocked
+            // stage selection even if its expected policy still matches.
+            Object.assign(issueUpdateData, entryProof.transition.patch);
+            Object.assign(updateFields, entryProof.transition.patch);
+            Object.assign(transition, entryProof.transition);
+          }
           // SUP-24429: re-read the stored requirement and status under the issue
           // row lock. A request that changed either after the unlocked read above
           // must not let this write store `done` together with record_only on a
@@ -22739,6 +22811,25 @@ export function issueRoutes(
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
+          if (entryProof && reviewEntryPrecondition && preparedReviewEntry) {
+            const [receipt] = await tx.insert(issueReviewEntryReceipts).values({
+              companyId: updated.companyId, issueId: updated.id,
+              beforeStatusVersion: reviewEntryPrecondition.expectedStatusVersion,
+              afterStatusVersion: updated.statusVersion,
+              rulingRevisionId: reviewEntryPrecondition.entryRulingRevisionId,
+              artifactRevisionId: reviewEntryPrecondition.artifact.revisionId,
+              evidence: entryProof.evidence, capturedAt: preparedReviewEntry.capturedAt,
+              recordedAt: sql`clock_timestamp()`,
+            }).returning({ id: issueReviewEntryReceipts.id });
+            reviewEntryReceiptId = receipt!.id;
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId,
+              boardApiKeyId: actor.boardApiKeyId,
+              agentId: actor.agentId, runId: actor.runId,
+              action: "issue.review_entry_accepted", entityType: "issue", entityId: updated.id, issueId: updated.id,
+              details: { receiptId: reviewEntryReceiptId, stageId: entryProof.evidence.stageId },
+            }, postCommitActivityPublications);
+          }
           if (updated.status === "done") await finalizePatchLandingDebt?.(tx as unknown as Db, updated);
           // SUP-23925: the tier1/tier2 close rows commit on THIS transaction,
           // only after the terminal write landed, so a refused or raced close
@@ -22985,6 +23076,12 @@ export function issueRoutes(
       }
     } catch (err) {
       await rewakeSuppressedReassignmentRun();
+      const databaseError = err as { code?: string; cause?: { code?: string } };
+      if (preparedReviewEntry && ["55P03", "40P01", "57014"].includes(databaseError.cause?.code ?? databaseError.code ?? "")) {
+        throw conflict("Review-entry authority is busy or changed; read the issue and receipts before submitting again.", {
+          code: "review_entry_workspace_busy",
+        });
+      }
       if (recordOnlyCloseFlipLockedStored !== null) {
         await recordRecordOnlyCloseFlipRefusal(recordOnlyCloseFlipLockedStored, "locked_recheck");
       }
@@ -23133,6 +23230,11 @@ export function issueRoutes(
     // compensation scope above is disarmed.
     suppressedReassignmentCancelledRun = null;
     recordDeferredGuardSkipDisposition?.();
+    if (preparedReviewEntry && existing.assigneeAgentId) {
+      await stopRunnerGoalForOwnershipChange({
+        companyId: existing.companyId, issueId: existing.id, agentId: existing.assigneeAgentId,
+      });
+    }
     if (pendingReassignmentStopRunId) {
       let cancellationFailed = false;
       let cancellationError: unknown;
@@ -24558,6 +24660,7 @@ export function issueRoutes(
       comment != null || commentDeduplicated
         ? { commentDeduplicated, deduplicatedFromCommentId }
         : {};
+    const entryReceipt = reviewEntryReceiptId ? { reviewEntryReceiptId } : {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
       res.json({
@@ -24567,10 +24670,11 @@ export function issueRoutes(
         changes,
         comment,
         ...commentReceipt,
+        ...entryReceipt,
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment, ...commentReceipt });
+    res.json({ ...issueResponse, changes, comment, ...commentReceipt, ...entryReceipt });
   });
 
   router.delete("/issues/:id", async (req, res) => {

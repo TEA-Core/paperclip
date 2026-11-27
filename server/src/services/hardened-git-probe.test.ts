@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  captureReviewEntryWorktree,
   HardenedGitError,
   IGNORED_ARTIFACT_DIRECTORY_NAMES,
   LEGACY_WORKTREE_GIT_OPTIONS,
@@ -12,6 +13,7 @@ import {
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
   recheckRecordedWorktree,
+  recheckReviewEntryWorktree,
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
@@ -841,6 +843,34 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       writeTree(layout.worktree, "node_modules/pkg/index.js", "module.exports = 1;\n");
       writeTree(layout.worktree, "node_modules/pkg/.gitignore", "*\n");
       expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+
+    it("refuses a same-size tracked edit at the locked recheck", async () => {
+      const layout = managedLayout();
+      const first = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
+      if (!first.ok) throw new Error(first.reason);
+      const tracked = git(layout.worktree, "ls-files").split("\n")[0]!;
+      const original = readFileSync(path.join(layout.worktree, tracked));
+      writeFileSync(path.join(layout.worktree, tracked), Buffer.from(original.map((byte) => byte ^ 1)));
+      expect(await recheckReviewEntryWorktree(first)).toMatchObject({ ok: false });
+    });
+
+    it("binds allowed ignored artefacts into the first-entry status manifest and its locked recheck", async () => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, "node_modules/\ndist/\n");
+      writeTree(layout.worktree, "node_modules/pkg/index.js", "module.exports = 1;\n");
+      const first = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
+      if (!first.ok) throw new Error(first.reason);
+      expect(await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") })).toEqual(first);
+      expect(await recheckReviewEntryWorktree(first)).toEqual({ ok: true });
+      writeTree(layout.worktree, "dist/bundle.js", "built\n");
+      const changed = await captureReviewEntryWorktree({ ...layout.input, publishedBaseSha: git(layout.origin, "rev-parse", "main") });
+      if (!changed.ok) throw new Error(changed.reason);
+      expect(changed.statusManifestDigest).not.toBe(first.statusManifestDigest);
+      expect({ ...changed, statusManifestDigest: first.statusManifestDigest }).toEqual(first);
+      expect(await recheckReviewEntryWorktree(first)).toEqual({
+        ok: false, reason: "The worktree, index, status, HEAD or refs changed after capture.",
+      });
     });
 
     it("accepts a pnpm monorepo's installed and built tree at every depth", async () => {

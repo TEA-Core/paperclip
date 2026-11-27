@@ -70,6 +70,8 @@ import {
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { EffectiveRunConfigSecretManifestEntry } from "./effective-run-config-fingerprints.js";
 import type { ProjectExecutionWorkspacePolicy } from "@paperclipai/shared";
+import { runHardenedGit } from "./hardened-git-probe.js";
+import { PROVISIONED_GIT_ADMIN_IDENTITY_KEY, parseGitAdminIdentity, readGitAdminDirectoryIdentity } from "./worktree-git-admin-identity.js";
 
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
@@ -861,8 +863,32 @@ export async function provisionIssueExecutionWorkspace(
       );
     }
   }
+  // Reuse never re-attests mutable Git metadata. A fresh provision records the
+  // baseline; absent/failed legacy captures remain ineligible for review entry.
+  const restoringGitAdminIdentity = resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
+    && !reprovisionedAfterUnavailableReuse;
+  let persistedGitAdminIdentity = restoringGitAdminIdentity
+    ? parseGitAdminIdentity(reusableExistingExecutionWorkspace?.metadata?.[PROVISIONED_GIT_ADMIN_IDENTITY_KEY])
+    : null;
+  if (!restoringGitAdminIdentity && executionWorkspace.strategy === "git_worktree"
+      && executionWorkspace.worktreePath && (input.selectedEnvironmentForConfig?.driver ?? "local") === "local") {
+    try {
+      const gitDir = (await runHardenedGit(
+        ["-C", executionWorkspace.worktreePath, "rev-parse", "--path-format=absolute", "--git-dir"],
+        { cwd: "/", timeoutMs: 5_000, ceilingDirectory: path.dirname(executionWorkspace.worktreePath) },
+      )).trim();
+      persistedGitAdminIdentity = await readGitAdminDirectoryIdentity(await fs.realpath(gitDir));
+    } catch (error) {
+      logger.warn({ runId: run.id, issueId, executionWorkspaceCwd: executionWorkspace.cwd,
+        error: error instanceof Error ? error.message : String(error) },
+      "Could not record provisioned Git admin identity; conditional review entry is unavailable");
+    }
+  }
   const nextExecutionWorkspaceMetadata = {
     ...baseExecutionWorkspaceMetadata,
+    ...(executionWorkspace.strategy === "git_worktree"
+      ? { [PROVISIONED_GIT_ADMIN_IDENTITY_KEY]: persistedGitAdminIdentity }
+      : {}),
     ...(persistedWorktreeInstanceRoot
       ? { [WORKTREE_INSTANCE_ROOT_METADATA_KEY]: persistedWorktreeInstanceRoot }
       : {}),
