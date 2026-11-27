@@ -375,6 +375,163 @@ bindings require a board delivery receipt. An existing receipt for the PR must
 still authorize the published head. A later head on the certified PR may be
 re-stamped only after Guard A verifies unchanged content.
 
+### Conditional first review entry for recorded deliverables
+
+`PATCH /api/issues/{id}` accepts an entry-only `reviewEntryPrecondition` with
+`status: done` and one inline submission `comment`. No other mutation may ride
+that request, including `doneTier`, classification, policy, assignment or delivery
+identity. The operation must leave the issue `in_review` at its first pending
+independent review stage. It is not a close, review decision, approval stamp,
+acceptance ruling or waiver of repository landing debt.
+
+The strict request pins:
+
+```json
+{
+  "status": "done",
+  "comment": "Submit the recorded summary for independent review.",
+  "reviewEntryPrecondition": {
+    "kind": "noRepositoryDelivery",
+    "expectedStatusVersion": 7,
+    "expectedExecutionWorkspaceId": "<workspace UUID>",
+    "expectedExecutionPolicy": {},
+    "expectedExecutionState": null,
+    "entryRulingRevisionId": "<revision UUID>",
+    "artifact": { "documentKey": "summary", "revisionId": "<revision UUID>" }
+  }
+}
+```
+
+Use the exact stored policy and execution state from the issue read, not the
+illustrative empty policy above. The current assignee must submit the request.
+An agent must own the issue's live execution and checkout run. The issue must
+already be `record_only`, with a never-entered ladder, an eligible independent
+reviewer, no linked repository delivery and no outstanding landing debt.
+The current `entry-ruling` revision must be substantive and independently authored.
+The current reviewed document revision must be separate from that ruling.
+
+Only the card's own active, managed isolated Git worktree is supported.
+Entry is checked, optimistic admission: the server observes the tree and its
+possible writers and refuses what it sees, but it does not exclude writers.
+Inside the locked transaction the server resolves the physical path (realpath and device:inode, including
+aliases) of every possible local writer across companies: live local execution
+workspaces, project workspaces of non-archived projects (not remote-managed),
+live non-adapter-managed runtime services, live operations and queued/running
+runs outside remote environments. It refuses another card, workspace or run
+sharing that directory, a directory inside it, or an ancestor directory from
+which it can write the tree. Only the card's own project-workspace binding is
+exempt metadata; a live run or another workspace at that primary checkout is
+still a writer. Missing suffixes are resolved component by component, following
+each symlink target before consuming a later `..`. A missing path overlapping the
+worktree refuses. A dangling link or other resolution error refuses with
+`review_entry_workspace_unverified` when a resolved hop or target's deepest
+existing ancestor reaches the managed projects root. Outside links into that
+root are not an escape; genuinely outside links and targets do not block.
+Concrete managed-tree aliases remain cross-company blockers. Valid broad
+ancestors at or above the managed projects root constrain their own company only,
+so another company's `/` configuration is not an invisible instance-wide blocker.
+`review_entry_workspace_not_isolated` names the remedy: provision an isolated
+worktree for this card. A `project_primary` directory cannot qualify, even clean.
+Provision summary-routine cards with their own fresh isolated-worktree workspace
+after deployment. Provisioning records the canonical Git admin-directory pathname
+and device/inode in workspace metadata; reuse retains that baseline, never learns
+a replacement from mutable Git files. Ordinary agent keys cannot set it. Legacy
+workspaces without it refuse entry with `review_entry_workspace_unverified` and
+must be reprovisioned. This change does not edit or migrate live routines.
+
+The owner yields its isolated directory while its conditional PATCH runs.
+This is a sole-owner local-worktree contract, not a privileged host freeze or a
+claim that database locks fence host filesystem writers or other database
+writers. Do not use it for shared folders or out-of-band writers. The
+transaction bounds lock waits, locks the issue row, then row-locks the workspace
+binding, ruling, owning run, artifact and reviewer rows in one fixed order.
+Ordinary workspace, runtime-service, operation and run writers take no
+review-entry lock and never refuse one another; row-lock contention on the
+entry's own rows fails closed as `review_entry_workspace_busy`. Disjoint
+admissions, including different worktrees of one checkout, remain concurrent.
+
+Accepted residual: a writer can start on, or write to, the card-owned isolated
+worktree after the final in-transaction check and before commit. The receipt
+records the state observed at that check; it is neither an exclusion guarantee
+nor close evidence.
+
+Each linked-worktree admin directory must have a bounded regular `gitdir`
+back-pointer and a consistent forward `.git` pointer to the same admin-directory
+device/inode. Entry requires the submitting admin pathname and device/inode to
+match its provisioned baseline, including at the locked fingerprint recheck.
+Rewriting both pointers to borrow a sibling's index/HEAD refuses even if the old
+registration is prunable or removed. Another registration's HEAD symref to the
+submitting branch also refuses. A deleted sibling on an independent branch may
+remain registered: its missing linked `.git` target (ENOENT) is skipped after the
+HEAD check. Other unreadable or inconsistent registrations fail closed, and the
+submitting tree always needs its valid back-pointer. Relative pointers resolve
+against their containing directory, as Git does.
+
+Accepted filesystem residuals: tracked-file hardlinks can alias bytes outside
+the tree. A copied worktree directory or a hand-written `.git` file outside the
+registration mapping can share the submitting admin directory, index, HEAD or
+branch (through a hand-written admin directory whose `commondir` names the
+managed common directory) without a path overlap or a changed provisioned
+identity. Entry does not discover these unregistered aliases. These limits do not provide an exclusion guarantee.
+
+GitHub credentialed reads pin the project's published base to a commit before
+the transaction. Every checked tip must be positively covered by that base;
+local default refs, equal trees and synthetic merge histories are not authority.
+The issue-locked transaction rechecks classification, debt, policy/state, owning
+run, repository binding, pinned revisions and observed writers and recomputes
+the ordinary stage transition. The full hardened clean/index/ignored-file,
+branch-attribution and `git fsck --strict` proof runs before the transaction;
+inside it a cheap recheck requires the same HEAD, branch, Git admin identity, index
+digest, refs digest and status-manifest digest (porcelain status plus the allowed
+ignored entries), under one 15-second Git budget. A provider refusal keeps its typed code
+(`review_entry_repository_work_owed`, `review_entry_published_base_unavailable`);
+a tip the provider does not know (404/422 compare) is owed repository work.
+A `refs/tags/*` ref is admitted only when its peeled target is a commit reachable
+from the provider-attested compared tips (or from the pinned published base when
+that commit exists locally), checked in one batched traversal against private
+snapshot metadata; a provider base newer than the local clone does not block a
+tag already in proven ancestry. Any other tag,
+and any private ref outside branches, remote-tracking refs and covered tags
+(including a sibling worktree's `refs/stash`), refuses with
+`review_entry_git_refused`. Ownership is never inferred from equal content.
+Disclosed residuals: the refs digest and locked recheck cover the whole shared
+common Git directory, so a sibling worktree's commit or fetch between capture and
+the transaction yields a retriable `review_entry_git_changed`, and a sibling
+`refs/stash` keeps refusing until it is removed.
+
+The handoff, submission comment, `issue.review_entry_accepted` activity and
+append-only `issue_review_entry_receipts` row commit together. The response
+includes `reviewEntryReceiptId`, also with `Prefer: return=minimal`.
+`GET /api/issues/{id}/review-entry-receipts` is an ordinary company-scoped evidence
+read. It retains the immutable ruling and artifact revisions, actor/run, before
+and after versions, selected reviewer, repository/base identities and bounded Git
+snapshot digests. `capturedAt` and `recordedAt` are capture and transaction-write
+times, not an external clock's assertion of the exact commit instant.
+Receipt and pinned revision content updates/deletes are refused by the database;
+foreign-key `SET NULL` of a revision's run/agent provenance still applies.
+Deleting a company, issue or document whose evidence a receipt retains returns
+409 `review_entry_receipt_retained` with the receipt ID before any delete work.
+As with the release-assurance ledger, a serving role cannot truncate it;
+privileged database administration remains outside the append-only guarantee.
+
+A stale, busy or unverified request returns a typed `review_entry_*` conflict
+without a successful receipt, inline comment or handoff. If the transport outcome
+is unknown, read the issue and receipts before deciding what to do; never resend
+without the precondition. A receipt cannot be consumed again after reopening,
+changes requested, policy edits or reassignment. Revised-artifact resubmission
+uses the existing review workflow. Final closure still needs fresh, lawful Tier
+evidence and all existing landing checks; an entry receipt is not that evidence.
+
+`GET /api/issues/{id}/review-entry-blockers` is a board-operator diagnostic for an
+active isolated-worktree binding. Local/instance operators and active non-viewer
+company board members may read it; viewer sessions and read-only board keys may
+not. It lists this company's blockers using admission's liveness and physical-path
+predicates: source table, row id, recorded path (null for an issue/workspace claim),
+code and reason. Broad root ancestors are company-scoped; concrete managed-tree
+writers are still checked across companies without exposing foreign IDs or paths.
+The read performs no Git command/provider proof, locking or mutation and grants
+no admission token.
+
 For a stranded pending execution-policy review/approval stage whose recorded
 agent participant is not its assignee, a board actor authorized to assign to
 that participant may call `POST /api/issues/{id}/restore-participant` with

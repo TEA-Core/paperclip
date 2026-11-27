@@ -1193,6 +1193,20 @@ export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
 
 export type DoneTierDeclaration = z.infer<typeof doneTierDeclarationSchema>;
 
+// This is a request to prove first-review admission, never a close declaration.
+const reviewEntryPreconditionSchema = z.object({
+  kind: z.literal("noRepositoryDelivery"),
+  expectedStatusVersion: z.number().int().nonnegative(),
+  expectedExecutionWorkspaceId: z.string().uuid(),
+  expectedExecutionPolicy: z.record(z.string(), z.unknown()).nullable(),
+  expectedExecutionState: z.record(z.string(), z.unknown()).nullable(),
+  entryRulingRevisionId: z.string().uuid(),
+  artifact: z.object({
+    documentKey: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+    revisionId: z.string().uuid(),
+  }).strict(),
+}).strict();
+
 export const updateIssueObjectSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     watchdog: true,
@@ -1205,6 +1219,7 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
     doneTier: doneTierDeclarationSchema.optional(),
+    reviewEntryPrecondition: reviewEntryPreconditionSchema.optional(),
     commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),

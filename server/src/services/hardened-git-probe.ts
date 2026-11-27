@@ -1,11 +1,13 @@
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { PROJECT_REPOSITORIES_DIR, PROJECT_REPOSITORIES_EXCLUDE_LINE } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { GitAdminIdentity, readGitAdminDirectoryIdentity } from "./worktree-git-admin-identity.js";
 
 // SUP-22880 / SUP-22570: the one Git runner for probes that read a workspace an
 // agent can write.
@@ -51,6 +53,7 @@ const MAX_BUFFER = 16 * 1024 * 1024;
 const MAX_COMPARED_TIPS = 5;
 const MAX_EXCLUDE_FILE_BYTES = 1024 * 1024;
 const MAX_INDEX_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_GITDIR_FILE_BYTES = 64 * 1024;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // The two overrides that stop repository-local configuration from running a
@@ -401,16 +404,21 @@ async function copyRegularFile(
   signal?: AbortSignal,
 ): Promise<number> {
   return withRegularFile(source, maxBytes, async (handle, size) => {
+    const before = await handle.stat();
     if (size === 0) {
       await writeFile(destination, "");
-      return 0;
+    } else {
+      await pipeline(
+        handle.createReadStream({ start: 0, end: size - 1, autoClose: false }),
+        createWriteStream(destination),
+        { signal },
+      );
     }
-    await pipeline(
-      handle.createReadStream({ start: 0, end: size - 1, autoClose: false }),
-      createWriteStream(destination),
-      { signal },
-    );
-    if ((await handle.stat()).size !== size) throw new HardenedGitError("failed", "file changed while it was copied");
+    const after = await handle.stat();
+    if (after.size !== size || after.mtimeMs !== before.mtimeMs) {
+      throw new HardenedGitError("failed", "file changed while it was copied");
+    }
+    await utimes(destination, before.atime, before.mtime);
     return size;
   });
 }
@@ -567,16 +575,16 @@ async function isIgnoredArtifactDirectory(workTree: string, entry: string): Prom
 
 /**
  * The first ignored entry that refuses, with whether its name is on the
- * allowlist (then no committed rule ignores it); null when there is none.
- * `trackedPaths` are the paths the index holds; the status check has already
- * shown each unmodified.
+ * allowlist, plus the complete ignored-entry manifest. `disallowed` is null
+ * when no entry refuses. `trackedPaths` are paths the index holds; status has
+ * already shown each unmodified.
  */
 async function firstDisallowedIgnoredEntry(
   snapshotGitDir: string,
   workTree: string,
   trackedPaths: ReadonlySet<string>,
   options: HardenedGitOptions,
-): Promise<{ entry: string; listed: boolean } | null> {
+): Promise<{ disallowed: { entry: string; listed: boolean } | null; entries: string[] }> {
   const gitArgs = ["-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`];
   const entries = (await runHardenedGit(
     [...gitArgs, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory"],
@@ -584,10 +592,10 @@ async function firstDisallowedIgnoredEntry(
   )).split("\0").filter((record) => record.length > 0);
   const listed: string[] = [];
   for (const entry of entries) {
-    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return { entry, listed: false };
+    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return { disallowed: { entry, listed: false }, entries };
     listed.push(entry);
   }
-  if (listed.length === 0) return null;
+  if (listed.length === 0) return { disallowed: null, entries };
   // Which rule ignores each listed directory itself (named without the trailing
   // slash, so a `.gitignore` inside it does not count): `source NUL line NUL
   // pattern NUL path NUL`, with an empty source for a path no rule ignores.
@@ -604,7 +612,7 @@ async function firstDisallowedIgnoredEntry(
     if (committedSource && !pattern.startsWith("!")) committed.add(`${directory}/`);
   }
   const uncommitted = listed.find((entry) => !committed.has(entry));
-  return uncommitted === undefined ? null : { entry: uncommitted, listed: true };
+  return { disallowed: uncommitted === undefined ? null : { entry: uncommitted, listed: true }, entries };
 }
 
 function escapeRegExp(text: string): string {
@@ -724,6 +732,8 @@ export interface NoRepositoryWorktreeProbeInput {
    */
   countCommitsAheadOfBase: (sha: string) => Promise<number>;
   timeoutMs?: number;
+  /** One shared budget, including all subprocesses and index snapshot copies. */
+  deadline?: ProbeDeadline;
 }
 
 export type NoRepositoryWorktreeProbeResult =
@@ -744,7 +754,7 @@ function refuse(reason: string): { ok: false; reason: string } {
 }
 
 type CleanWorktreeVerdict =
-  | { ok: true; branch: string; headSha: string }
+  | { ok: true; branch: string; headSha: string; gitAdminIdentity: GitAdminIdentity; indexDigest: string; statusManifestDigest: string }
   | { ok: false; reason: string };
 
 /** Why the path is not a plain, full-history Git work tree; null when it is one. */
@@ -965,12 +975,14 @@ async function stashRefusal(worktreePath: string, options: HardenedGitOptions): 
  * worktree checked out on a branch that names the issue. `repositoryStash`
  * runs the zero-delta repository-wide stash refusal; record-only callers pass
  * false and run `cardStashRefusal` once, for the recorded worktree's branch.
+ * First review entry independently refuses another registration on its branch.
  */
 async function verifyCleanLinkedWorktree(
   worktreePath: string,
   expectedCommonDir: string,
   options: HardenedGitOptions,
   repositoryStash: boolean,
+  refuseSharedBranch = false,
 ): Promise<CleanWorktreeVerdict> {
   const worktreeOptions: HardenedGitOptions = { ...options, ceilingDirectory: path.dirname(worktreePath) };
   const shapeRefusal = await worktreeShapeRefusal(worktreePath, worktreeOptions);
@@ -988,8 +1000,6 @@ async function verifyCleanLinkedWorktree(
   if (identity.commonDir !== expectedCommonDir || path.dirname(identity.gitDir) !== path.join(expectedCommonDir, "worktrees")) {
     return { ok: false, reason: "is not a linked worktree of the managed checkout" };
   }
-  const headSha = await readHeadCommit(worktreePath, worktreeOptions);
-  if (!headSha) return { ok: false, reason: "has no HEAD commit" };
   let branchRef: string;
   try {
     branchRef = (await runHardenedGit(["-C", worktreePath, "symbolic-ref", "--quiet", "HEAD"], worktreeOptions)).trim();
@@ -997,6 +1007,68 @@ async function verifyCleanLinkedWorktree(
     return { ok: false, reason: "has a detached HEAD" };
   }
   if (!branchRef.startsWith("refs/heads/")) return { ok: false, reason: "has a detached HEAD" };
+  let gitAdminIdentity: GitAdminIdentity;
+  try {
+    const backlink = await readOptionalRegularFile(path.join(identity.gitDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
+    const target = backlink?.endsWith("\n") ? backlink.slice(0, -1) : backlink;
+    if (!target || /[\0\r\n]/.test(target) ||
+        await realpath(path.isAbsolute(target) ? target : `${identity.gitDir}/${target}`) !== path.join(worktreePath, ".git")) {
+      return { ok: false, reason: "has a linked-worktree Git directory registered to a different path" };
+    }
+    gitAdminIdentity = await readGitAdminDirectoryIdentity(identity.gitDir);
+    for (const name of (await readdir(path.join(identity.commonDir, "worktrees"))).sort()) {
+      if (options.deadline) remainingBudget(options.deadline);
+      const registeredDir = path.join(identity.commonDir, "worktrees", name);
+      const registered = await lstat(registeredDir, { bigint: true });
+      if (!registered.isDirectory() || registered.isSymbolicLink()) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      if (refuseSharedBranch && registeredDir !== identity.gitDir) {
+        if (await readOptionalRegularFile(path.join(registeredDir, "HEAD"), MAX_GITDIR_FILE_BYTES) === null) {
+          return { ok: false, reason: "has unverifiable linked-worktree HEAD registration" };
+        }
+        // Git resolves chained symrefs too. Check before skipping a prunable
+        // directory: its registered HEAD can still name the submitting branch.
+        const registeredBranch = (await runHardenedGit(
+          ["--git-dir", registeredDir, "symbolic-ref", "--quiet", "HEAD"],
+          { ...options, successExitCodes: [0, 1] },
+        )).trim();
+        if (registeredBranch === branchRef) {
+          return { ok: false, reason: "has another registered worktree HEAD sharing its branch" };
+        }
+      }
+      const pointer = await readOptionalRegularFile(path.join(registeredDir, "gitdir"), MAX_GITDIR_FILE_BYTES);
+      const linkedFile = pointer?.endsWith("\n") ? pointer.slice(0, -1) : pointer;
+      if (!linkedFile || /[\0\r\n]/.test(linkedFile)) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      const linkedPath = await realpath(path.isAbsolute(linkedFile) ? linkedFile : `${registeredDir}/${linkedFile}`)
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT" && registeredDir !== identity.gitDir) return null;
+          throw error;
+        });
+      if (linkedPath === null) continue;
+      const gitfile = await readOptionalRegularFile(linkedPath, MAX_GITDIR_FILE_BYTES);
+      const forward = gitfile?.endsWith("\n") ? gitfile.slice(0, -1) : gitfile;
+      if (!forward?.startsWith("gitdir: ") || /[\0\r\n]/.test(forward)) {
+        return { ok: false, reason: "has unverifiable linked-worktree registration" };
+      }
+      const targetDir = forward.slice("gitdir: ".length);
+      const actual = await lstat(
+        await realpath(path.isAbsolute(targetDir) ? targetDir : `${path.dirname(linkedPath)}/${targetDir}`),
+        { bigint: true },
+      );
+      if (actual.dev !== registered.dev || actual.ino !== registered.ino ||
+          registeredDir !== identity.gitDir && registered.dev.toString() === gitAdminIdentity.device
+            && registered.ino.toString() === gitAdminIdentity.inode) {
+        return { ok: false, reason: "has ambiguous or shared linked-worktree Git directory registration" };
+      }
+    }
+  } catch {
+    return { ok: false, reason: "has an unverifiable linked-worktree Git directory back-pointer" };
+  }
+  const headSha = await readHeadCommit(worktreePath, worktreeOptions);
+  if (!headSha) return { ok: false, reason: "has no HEAD commit" };
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
@@ -1011,21 +1083,36 @@ async function verifyCleanLinkedWorktree(
   if (exclude !== null && !excludeHasOnlyServerWrittenRules(exclude)) {
     return { ok: false, reason: "has info/exclude ignore rules the server did not write" };
   }
+  let digests: { indexDigest: string; statusManifestDigest: string } | undefined;
   try {
     const dirtyReason = await withSnapshotGitDir(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: worktreeOptions.deadline },
       async (snapshot) => {
+        const index = createHash("sha256");
+        for (const name of (await readdir(snapshot)).filter((file) => file === "index" || file.startsWith("sharedindex.")).sort()) {
+          index.update(`${name}\0`);
+          await withRegularFile(path.join(snapshot, name), MAX_INDEX_FILE_BYTES, async (handle) => {
+            for await (const chunk of handle.createReadStream({ autoClose: false })) index.update(chunk);
+          });
+        }
         const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
           const entryRefusal = indexEntryRefusal(entry);
           if (entryRefusal) return entryRefusal;
           trackedPaths.add(entry.path);
         }
-        if ((await snapshotStatusRecords(snapshot, worktreePath, "all", worktreeOptions)).length > 0) {
+        const status = await snapshotStatusRecords(snapshot, worktreePath, "all", worktreeOptions);
+        if (status.length > 0) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
-        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
-        if (ignored === null) return null;
+        const { disallowed: ignored, entries } = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
+        if (ignored === null) {
+          digests = {
+            indexDigest: index.digest("hex"),
+            statusManifestDigest: createHash("sha256").update(JSON.stringify({ status, ignored: entries })).digest("hex"),
+          };
+          return null;
+        }
         const entry = JSON.stringify(ignored.entry.slice(0, 200));
         return ignored.listed
           ? `has a regenerated-artefact directory that no committed ignore rule ignores (${entry})`
@@ -1036,7 +1123,8 @@ async function verifyCleanLinkedWorktree(
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha };
+  if (!digests) return { ok: false, reason: "status could not be verified" };
+  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, gitAdminIdentity, ...digests };
 }
 
 /** Why `sha` may not stand as "level with the default branch"; null when it does. */
@@ -1114,7 +1202,9 @@ export async function probeNoRepositoryWorktree(
   } catch {
     return refuse("the managed checkout has no .git directory");
   }
-  const options: HardenedGitOptions = { cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: managedRoot };
+  const options: HardenedGitOptions = {
+    cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: managedRoot, deadline: input.deadline,
+  };
 
   const own = await verifyCleanLinkedWorktree(candidate, commonDir, options, false);
   if (!own.ok) return refuse(`the recorded worktree ${own.reason}`);
@@ -1311,6 +1401,139 @@ export async function recheckRecordedWorktree(input: {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
   return { ok: true };
+}
+
+export type ReviewEntryWorktreeSnapshot =
+  | {
+      ok: true;
+      branch: string;
+      headSha: string;
+      treeSha: string;
+      worktreePath: string;
+      commonDir: string;
+      comparedTips: string[];
+      indexDigest: string;
+      refsDigest: string;
+      statusManifestDigest: string;
+      gitAdminIdentity: GitAdminIdentity;
+    }
+  | { ok: false; reason: string };
+
+type ReviewEntryFingerprint = Pick<
+  Extract<ReviewEntryWorktreeSnapshot, { ok: true }>,
+  "branch" | "headSha" | "gitAdminIdentity" | "indexDigest" | "refsDigest" | "statusManifestDigest"
+>;
+
+const REVIEW_ENTRY_BUDGET_MS = 15_000;
+
+async function readRefs(worktreePath: string, options: HardenedGitOptions): Promise<string> {
+  return runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname) %(refname) %(*objectname)"], options);
+}
+
+/** HEAD, index bytes, porcelain status (tracked, untracked and ignored) and refs of one worktree. */
+async function reviewEntryFingerprint(
+  worktreePath: string,
+  commonDir: string,
+  options: HardenedGitOptions,
+): Promise<{ ok: true; fingerprint: ReviewEntryFingerprint } | { ok: false; reason: string }> {
+  const beforeRefs = await readRefs(worktreePath, options);
+  const verdict = await verifyCleanLinkedWorktree(worktreePath, commonDir, { ...options, cwd: path.dirname(commonDir) }, true, true);
+  if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
+  const afterRefs = await readRefs(worktreePath, options);
+  if (beforeRefs !== afterRefs) return { ok: false, reason: "Git refs changed during first-entry capture" };
+  return {
+    ok: true,
+    fingerprint: {
+      branch: verdict.branch, headSha: verdict.headSha, indexDigest: verdict.indexDigest,
+      statusManifestDigest: verdict.statusManifestDigest,
+      gitAdminIdentity: verdict.gitAdminIdentity,
+      refsDigest: createHash("sha256").update(afterRefs).digest("hex"),
+    },
+  };
+}
+
+/** Entry uses the established clean/attribution predicate, plus object integrity
+ * and content-addressed metadata. No tree-equivalence or local-base shortcut.
+ * Repository drivers never run: fsck, index and tree reads use private metadata.
+ */
+export async function captureReviewEntryWorktree(
+  input: NoRepositoryWorktreeProbeInput & { publishedBaseSha: string },
+): Promise<ReviewEntryWorktreeSnapshot> {
+  const deadline: ProbeDeadline = { at: performance.now() + REVIEW_ENTRY_BUDGET_MS, expired: false };
+  const options: HardenedGitOptions = { cwd: "/", deadline };
+  const unattributed = { ok: false as const, reason: "Unattributed private or tag refs prevent strict first-entry proof" };
+  try {
+    const beforeRefs = await readRefs(input.recordedWorktreePath, options);
+    if (beforeRefs.split("\n").filter(Boolean).some((ref) => !/^[0-9a-f]+ refs\/(?:heads|remotes|tags)\//.test(ref))) {
+      return unattributed;
+    }
+    const tagTargets = [...new Set(beforeRefs.split("\n").flatMap((line) => {
+      const [objectName, refName, peeled] = line.split(" ");
+      return refName?.startsWith("refs/tags/") ? [peeled || objectName!] : [];
+    }))];
+    const probe = await probeNoRepositoryWorktree({ ...input, deadline });
+    if (!probe.ok) return probe;
+    const identity = await readWorktreeIdentity(probe.worktreePath, options);
+    const treeSha = await withSnapshotGitDir(
+      { identity, headSha: probe.headSha, config: snapshotConfig(identity.objectFormat), exclude: null, deadline },
+      async (snapshot) => {
+        await runHardenedGit(
+          ["--git-dir", snapshot, "fsck", "--strict", "--no-reflogs", "--no-dangling", ...probe.comparedTips], options,
+        );
+        if (tagTargets.length > 0) {
+          const types = (await runHardenedGit(
+            ["--git-dir", snapshot, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            { ...options, input: `${tagTargets.join("\n")}\n` },
+          )).split("\n").filter(Boolean);
+          if (types.length !== tagTargets.length || types.some((line) => !line.endsWith(" commit"))) return null;
+          const baseIsLocal = await runHardenedGit(
+            ["--git-dir", snapshot, "cat-file", "-e", `${input.publishedBaseSha}^{commit}`], options,
+          ).then(() => true, (error: unknown) => {
+            if (deadline.expired) throw error;
+            return false;
+          });
+          const roots = [...probe.comparedTips, ...(baseIsLocal ? [input.publishedBaseSha] : [])];
+          const uncovered = (await runHardenedGit(
+            ["--git-dir", snapshot, "rev-list", "--count", "--stdin"],
+            { ...options, input: `${[...tagTargets, ...roots.map((root) => `^${root}`)].join("\n")}\n` },
+          )).trim();
+          if (uncovered !== "0") return null;
+        }
+        return (await runHardenedGit(["--git-dir", snapshot, "rev-parse", `${probe.headSha}^{tree}`], options)).trim();
+      },
+    );
+    if (treeSha === null) return unattributed;
+    const measured = await reviewEntryFingerprint(probe.worktreePath, probe.commonDir, options);
+    if (!measured.ok) return measured;
+    if (measured.fingerprint.refsDigest !== createHash("sha256").update(beforeRefs).digest("hex") ||
+        measured.fingerprint.branch !== probe.branch || measured.fingerprint.headSha !== probe.headSha) {
+      return { ok: false, reason: "Git refs changed during first-entry capture" };
+    }
+    return { ...probe, treeSha, ...measured.fingerprint };
+  } catch {
+    return { ok: false, reason: deadline.expired ? "First-entry Git proof timed out" : "First-entry Git integrity could not be verified" };
+  }
+}
+
+/** The locked section's cheap recheck: no fsck, no provider call. The isolated
+ * worktree must still carry exactly the captured HEAD, index, status and refs.
+ */
+export async function recheckReviewEntryWorktree(
+  captured: Extract<ReviewEntryWorktreeSnapshot, { ok: true }>,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
+  const deadline: ProbeDeadline = { at: performance.now() + REVIEW_ENTRY_BUDGET_MS, expired: false };
+  try {
+    const measured = await reviewEntryFingerprint(captured.worktreePath, captured.commonDir, { cwd: "/", deadline });
+    if (!measured.ok) return measured;
+    const { branch, headSha, gitAdminIdentity, indexDigest, refsDigest, statusManifestDigest } = captured;
+    if (!isDeepStrictEqual(measured.fingerprint, { branch, headSha, gitAdminIdentity, indexDigest, refsDigest, statusManifestDigest })) {
+      return { ok: false, reason: "The worktree, index, status, HEAD or refs changed after capture." };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: deadline.expired ? "First-entry Git recheck timed out" : "First-entry Git state could not be rechecked" };
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1800,7 +2023,7 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
         }
         const statusRecords = await snapshotStatusRecords(snapshot, worktreePath, "all", options);
         if (statusRecords.length > 0) return { statusRecords };
-        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, options);
+        const { disallowed: ignored } = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, options);
         if (ignored !== null) {
           const entry = JSON.stringify(ignored.entry.slice(0, 200));
           return {
