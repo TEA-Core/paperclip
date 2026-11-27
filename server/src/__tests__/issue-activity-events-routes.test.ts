@@ -715,6 +715,9 @@ describe("issue activity event routes", () => {
     })!;
     const issue = {
       ...makeIssue(),
+      // The board user it seats as approver did not file it: a creator never
+      // holds a seat (execution-policy seat rules).
+      createdByUserId: "another-board-user",
       executionPolicy: existingPolicy,
     };
     mockIssueService.getById.mockResolvedValue(issue);

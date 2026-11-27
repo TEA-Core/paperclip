@@ -972,12 +972,15 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
       });
     expect(created.status, JSON.stringify(created.body)).toBe(201);
 
-    // Drift the assignee onto the approver WITHOUT sending a policy: this is the
-    // post-fire reassignment the create-time guards cannot see by construction.
+    // Drift the assignee onto the approver WITHOUT sending a policy. An API
+    // reassign into a seat is now refused (execution-policy seat rules), so
+    // the drift is a stored legacy row, as on the cards that predate the rule.
     const drifted = await request(createApp(companyId))
       .patch(`/api/issues/${created.body.id}`)
       .send({ assigneeAgentId: closerAgentId });
-    expect(drifted.status, JSON.stringify(drifted.body)).toBe(200);
+    expect(drifted.status, JSON.stringify(drifted.body)).toBe(422);
+    expect(drifted.body.code).toBe("execution_policy_seat_conflict");
+    await db.update(issues).set({ assigneeAgentId: closerAgentId }).where(eq(issues.id, created.body.id));
 
     // And the repair PATCH still goes through.
     const repaired = await request(createApp(companyId))

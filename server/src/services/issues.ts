@@ -321,6 +321,7 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
+import { assertExecutionPolicySeatsLawful } from "./execution-policy-seat-rules.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -2225,6 +2226,13 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
   parkDeliberately?: boolean;
+  /**
+   * Internal only, never part of an API schema: the API create doors set it so
+   * that the policy the issue will carry (the caller's, or the project or
+   * company default applied below) may not seat the issue's creator or
+   * assignee as reviewer or approver (execution-policy-seat-rules.ts).
+   */
+  enforceExecutionPolicySeatRules?: boolean;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -2504,6 +2512,7 @@ function normalizeAcceptedPlanDecompositionFingerprintValue(
 
 const ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS = new Set([
   "id",
+  "enforceExecutionPolicySeatRules",
   "companyId",
   "parentId",
   "identifier",
@@ -2535,6 +2544,35 @@ function normalizeAcceptedPlanDecompositionFingerprintChild(
         !ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS.has(key),
     ),
   );
+}
+
+/**
+ * The execution policy an issue created without one inherits: the project
+ * default, else the company default, else none (SUP-10835).
+ */
+async function resolveDefaultIssueExecutionPolicy(
+  dbOrTx: DbReader,
+  companyId: string,
+  projectId: string | null,
+): Promise<ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy>> {
+  let normalized: ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy> = null;
+  if (projectId) {
+    const projectDefaultPolicy = await dbOrTx
+      .select({ defaultExecutionPolicy: projects.defaultExecutionPolicy })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
+    normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
+  }
+  if (!normalized) {
+    const companyDefaultPolicy = await dbOrTx
+      .select({ defaultExecutionPolicy: companies.defaultExecutionPolicy })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
+    normalized = resolveProjectDefaultIssueExecutionPolicy(companyDefaultPolicy);
+  }
+  return normalized;
 }
 
 function createAcceptedPlanDecompositionRequestFingerprint(input: {
@@ -10495,6 +10533,26 @@ export function issueService(
         .then((rows) => rows[0] ?? null);
       if (!sourceIssue) throw notFound("Source issue not found");
 
+      // Board ruling 2026-11-27: judge every child's resulting policy before
+      // the first child exists. Children are created one transaction each, so
+      // a refusal in create() for child N would leave children 1..N-1 behind.
+      for (const child of data.children) {
+        if (child.enforceExecutionPolicySeatRules !== true) continue;
+        const childPolicy = child.executionPolicy
+          ?? await resolveDefaultIssueExecutionPolicy(
+            db,
+            sourceIssue.companyId,
+            child.projectId ?? sourceIssue.projectId ?? null,
+          );
+        assertExecutionPolicySeatsLawful({
+          executionPolicy: childPolicy ?? null,
+          creator: { agentId: child.createdByAgentId, userId: child.createdByUserId },
+          assignee: { agentId: child.assigneeAgentId, userId: child.assigneeUserId },
+          judgeCreator: true,
+          judgeAssignee: true,
+        });
+      }
+
       const requestFingerprint =
         createAcceptedPlanDecompositionRequestFingerprint({
           acceptedPlanRevisionId: data.acceptedPlanRevisionId,
@@ -10864,6 +10922,7 @@ export function issueService(
         assertCanReuseIssue,
         onDeduplicated,
         parkDeliberately: _parkDeliberately,
+        enforceExecutionPolicySeatRules,
         ...issueData
       } = data;
       const explicitTitle = issueData.title?.trim();
@@ -11301,26 +11360,23 @@ export function issueService(
         // no path to a terminal state once a disposition is missed (SUP-10835).
         // Project default wins over company default when both are set.
         if (!issueData.executionPolicy) {
-          let normalized: ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy> = null;
-          if (issueData.projectId) {
-            const projectDefaultPolicy = await tx
-              .select({ defaultExecutionPolicy: projects.defaultExecutionPolicy })
-              .from(projects)
-              .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-              .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
-            normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
-          }
-          if (!normalized) {
-            const companyDefaultPolicy = await tx
-              .select({ defaultExecutionPolicy: companies.defaultExecutionPolicy })
-              .from(companies)
-              .where(eq(companies.id, companyId))
-              .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
-            normalized = resolveProjectDefaultIssueExecutionPolicy(companyDefaultPolicy);
-          }
+          const normalized = await resolveDefaultIssueExecutionPolicy(
+            tx,
+            companyId,
+            issueData.projectId ?? null,
+          );
           if (normalized) {
             issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
           }
+        }
+        if (enforceExecutionPolicySeatRules === true) {
+          assertExecutionPolicySeatsLawful({
+            executionPolicy: issueData.executionPolicy ?? null,
+            creator: { agentId: issueData.createdByAgentId, userId: issueData.createdByUserId },
+            assignee: { agentId: issueData.assigneeAgentId, userId: issueData.assigneeUserId },
+            judgeCreator: true,
+            judgeAssignee: true,
+          });
         }
         await assertIssueExecutionPolicyAgentReferencesResolve(
           tx,

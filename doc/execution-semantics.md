@@ -94,6 +94,24 @@ be completed and the last recorded decision to be approved; a pending post-merge
 stage does not delay that stamp. The review workflow follows stage order and
 waits for post-merge stages before closing `done`.
 
+An issue's creator and its assignee never hold a reviewer or approver seat.
+Every API write that sets the policy or the assignee is judged against the
+issue as it will be after the write: issue create (including a policy inherited
+from the project or company default), child create, accepted-plan
+decomposition, `PATCH /api/issues/{id}` (assignee, policy, both, the `monitor`
+alias, and a whole-policy replace) and checkout. The server compares principal
+ids, never names: an agent participant against `createdByAgentId` and
+`assigneeAgentId`, a user participant against `createdByUserId` and
+`assigneeUserId`. A violation is refused with `422` and the code
+`execution_policy_seat_conflict`; `details` names the seat (`reviewer` or
+`approver`), the stage, the participant id and the conflicting role (`creator`
+or `assignee`). The rule applies to agent and board callers alike, and the
+server never removes a seat to make a write pass. Two limits keep stored cards
+repairable without a migration: the creator is judged only when the write
+changes the seats, and the assignee is not judged while an active stage holds
+the card (it is `in_review`, or blocked with a pending stage whose current
+participant is the assignee) unless the write moves the assignee.
+
 For a native completion review addressed to an agent, the server saves the review
 card and a durable reviewer wake in the same transaction. The reviewer can act
 on the child task even when its own parent task waits for that child. The child

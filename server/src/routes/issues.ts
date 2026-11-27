@@ -485,6 +485,12 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
+import {
+  assertExecutionPolicySeatsLawful,
+  activeExecutionStageId,
+  executionPolicySeatsChanged,
+  stageHoldsAssignee,
+} from "../services/execution-policy-seat-rules.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
@@ -18095,6 +18101,9 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
+        // Board ruling 2026-11-27: the creator and the assignee never hold a
+        // reviewer or approver seat of the policy the issue will carry.
+        enforceExecutionPolicySeatRules: true,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         trustExplicitExecutionPolicy:
@@ -18959,6 +18968,7 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
+        enforceExecutionPolicySeatRules: true,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         actorAgentId: actor.agentId,
@@ -19226,6 +19236,9 @@ export function issueRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           actorRunId: actor.runId,
+          // The decomposition service judges every child's resulting policy
+          // (its own, or the inherited default) before it creates the first one.
+          enforceExecutionPolicySeatRules: true,
           actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
           trustExplicitResponsibleUserId: actor.actorType === "user",
           actorAgentId: actor.agentId,
@@ -20491,6 +20504,35 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    // Board ruling 2026-11-27: the creator and the assignee never hold a
+    // reviewer or approver seat. Judged on the client's own fields, before the
+    // stage transition below moves the assignee onto a seated participant.
+    {
+      const assigneeAgentWritten = normalizedAssigneeAgentId !== undefined;
+      const assigneeUserWritten = req.body.assigneeUserId !== undefined;
+      if (updateFields.executionPolicy !== undefined || assigneeAgentWritten || assigneeUserWritten) {
+        assertExecutionPolicySeatsLawful({
+          executionPolicy: nextExecutionPolicy,
+          creator: { agentId: existing.createdByAgentId, userId: existing.createdByUserId },
+          assignee: {
+            agentId: assigneeAgentWritten ? normalizedAssigneeAgentId : existing.assigneeAgentId,
+            userId: assigneeUserWritten
+              ? (req.body.assigneeUserId as string | null)
+              : existing.assigneeUserId,
+          },
+          // The creator never changes: it is judged only when the seats do.
+          judgeCreator:
+            updateFields.executionPolicy !== undefined
+            && executionPolicySeatsChanged(previousExecutionPolicy, nextExecutionPolicy),
+          // While a stage holds the card its seated participant is the
+          // assignee by design (in_review, or blocked mid-review).
+          judgeAssignee:
+            assigneeAgentWritten || assigneeUserWritten || !stageHoldsAssignee(existing),
+          // A reassign within the active stage hands it to another participant.
+          assigneeMayHoldStageId: activeExecutionStageId(existing),
+        });
+      }
+    }
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -24623,6 +24665,17 @@ export function issueRoutes(
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
           assigneeUserId: null,
+        });
+        // Board ruling 2026-11-27: a checkout that moves the issue onto the
+        // caller makes it the assignee, which never holds a seat. The seats are
+        // unchanged, so only the new assignee is judged.
+        assertExecutionPolicySeatsLawful({
+          executionPolicy: issue.executionPolicy ?? null,
+          creator: { agentId: issue.createdByAgentId, userId: issue.createdByUserId },
+          assignee: { agentId: req.body.agentId, userId: null },
+          judgeCreator: false,
+          judgeAssignee: true,
+          assigneeMayHoldStageId: activeExecutionStageId(issue),
         });
       }
 

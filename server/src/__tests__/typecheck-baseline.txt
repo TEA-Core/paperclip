@@ -597,8 +597,8 @@ server/src/__tests__/inbox-archive-routes.test.ts(226,23): TS2502
 server/src/__tests__/instance-settings-routes.test.ts(1217,49): TS2345
 server/src/__tests__/instrumentation.test.ts(310,70): TS2307
 server/src/__tests__/invite-test-resolution-route.test.ts(69,7): TS2322
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(4302,98): TS2322
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(4303,98): TS2345
+server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(4312,98): TS2322
+server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(4313,98): TS2345
 server/src/__tests__/issue-execution-policy-routes.test.ts(1296,44): TS2493
 server/src/__tests__/issue-execution-policy-routes.test.ts(1316,7): TS2322
 server/src/__tests__/issue-execution-policy-routes.test.ts(1446,7): TS2322
