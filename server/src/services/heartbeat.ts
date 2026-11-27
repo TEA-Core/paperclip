@@ -207,6 +207,7 @@ import {
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   createGitRemoteAuthProvider,
   forkForcesHostGitHub,
@@ -12776,8 +12777,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!(err instanceof HttpError)) return false;
     if (err.status === 404) return true;
     if (err.status !== 409) return false;
-    const details = (err.details ?? {}) as { reason?: unknown; invalidOrgChain?: unknown };
+    const details = (err.details ?? {}) as { code?: unknown; reason?: unknown; invalidOrgChain?: unknown };
     return (
+      details.code === "agent_not_assignable" ||
       details.invalidOrgChain === true ||
       (typeof details.reason === "string" && PERMANENT_ISSUE_MONITOR_OWNER_REFUSAL_REASONS.has(details.reason))
     );
@@ -12831,6 +12833,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const reusedRecoveryIssue =
         recoveryIssue !== null && recoveryIssue.originFingerprint !== recoveryFingerprint;
       if (!recoveryIssue) {
+        const recoveryAssigneeAgentId = await assertAssignableAgent(
+          db,
+          input.claimed.companyId,
+          input.claimed.assigneeAgentId,
+          { kind: "work" },
+        ).then(
+          () => input.claimed.assigneeAgentId,
+          (err: unknown) => {
+            if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
+            throw err;
+          },
+        );
         recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
           title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
           description: monitorRecoveryComment({
@@ -12844,7 +12858,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           parentId: input.claimed.id,
           projectId: input.claimed.projectId,
           goalId: input.claimed.goalId,
-          assigneeAgentId: input.claimed.assigneeAgentId,
+          assigneeAgentId: recoveryAssigneeAgentId,
           originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
           originId: input.claimed.id,
           originFingerprint: recoveryFingerprint,
@@ -13148,10 +13162,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(issues)
         .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
         .where(eq(issues.id, input.claimed.id));
-      // Unlike a normal fire, which clears on a client error, a recovery refused for a
-      // transient reason (paused or budget-blocked owner) defers: the monitor stays armed
-      // and a later tick retries. Permanent owner refusals never reach this point.
+      // Unlike a normal fire, which clears on a client error, a recovery refused with a
+      // client error defers: the monitor stays armed and a later tick retries. Permanent
+      // owner refusals are handled inside the recovery and complete the clear instead.
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+        const details = (err.details ?? {}) as { code?: unknown; reason?: unknown };
+        logger.warn(
+          {
+            issueId: input.claimed.id,
+            status: err.status,
+            code: details.code ?? null,
+            reason: details.reason ?? null,
+            error: err.message,
+          },
+          "issue monitor recovery deferred",
+        );
         return { outcome: "skipped" as const, reason: "recovery_deferred" };
       }
       throw err;

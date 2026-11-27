@@ -29,6 +29,7 @@ import {
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { activityService } from "../services/activity.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 import { applyIssueExecutionPolicyTransition, buildIssueMonitorClearedPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, setIssueExecutionPolicyMonitorScheduledBy } from "../services/issue-execution-policy.ts";
 
@@ -871,9 +872,14 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       await rearm(issueId, "assignee", monitor);
       await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
       const wakeRowsBeforeDeferral = (await allWakeups(agentId)).length;
+      const warn = vi.spyOn(logger, "warn");
 
       await heartbeat.tickTimers(recoveryTickAt);
       await heartbeat.tickTimers(new Date("2026-04-11T13:01:30.000Z"));
+      const deferralLogs = warn.mock.calls.filter((call) => call[1] === "issue monitor recovery deferred");
+      warn.mockRestore();
+      expect(deferralLogs).toHaveLength(2);
+      expect(deferralLogs[0]![0]).toMatchObject({ issueId, status: 409, reason: "paused" });
       expect(await allWakeups(agentId)).toHaveLength(wakeRowsBeforeDeferral);
       const deferred = await readIssue(issueId);
       expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
@@ -978,6 +984,55 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(await exhaustionRows(issueId)).toHaveLength(1);
       expect(await recoveryWakeups(agentId)).toHaveLength(wakeRowsAfterRecovery);
     });
+
+    it.each(["owner_terminated", "ancestor_terminated"] as const)(
+      "create_recovery_issue with a permanently unassignable owner (%s) opens an unassigned recovery issue and clears once",
+      async (scenario) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        if (scenario === "owner_terminated") {
+          await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+        } else {
+          const managerId = randomUUID();
+          await db.insert(agents).values({
+            id: managerId,
+            companyId,
+            name: "Terminated Manager",
+            role: "engineer",
+            status: "terminated",
+            adapterType: "process",
+            adapterConfig: {},
+            permissions: {},
+          });
+          seededAgentIds.add(managerId);
+          await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, agentId));
+        }
+
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+
+        const recoveryIssues = await db
+          .select()
+          .from(issues)
+          .then((rows) => rows.filter((row) => row.companyId === companyId && row.originId === issueId));
+        expect(recoveryIssues).toHaveLength(1);
+        expect(recoveryIssues[0]).toMatchObject({ parentId: issueId, assigneeAgentId: null, originKind: "stranded_issue_recovery" });
+
+        const issue = await readIssue(issueId);
+        expect(issue.monitorNextCheckAt).toBeNull();
+        expect(issue.executionState).toMatchObject({
+          monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+        });
+        expect(issue.executionState).toHaveProperty("monitor.exhaustionRecoveredAt");
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.details).toMatchObject({
+          recoveryPolicy: "create_recovery_issue",
+          recoveryOutcome: "recovery_issue_created",
+        });
+      },
+    );
 
     it.each([
       ["escalate_to_board", "issue_comments", ""],
