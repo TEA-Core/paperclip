@@ -5,7 +5,7 @@ interface StoredPathResolution {
   path: string;
   missing: boolean;
   uncertain: boolean;
-  followedSymlink: boolean;
+  dangling: boolean;
   scopeTouched: boolean;
 }
 
@@ -21,7 +21,7 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
   if (!/(?:^|\/)\.\.(?:\/|$)/.test(candidate)) {
     try {
       const resolved = await realpath(candidate);
-      return { path: resolved, missing: false, uncertain: false, followedSymlink: false, scopeTouched: inScope(resolved) };
+      return { path: resolved, missing: false, uncertain: false, dangling: false, scopeTouched: inScope(resolved) };
     } catch {
       // Missing suffixes may hide a symlink target.
     }
@@ -30,11 +30,13 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
   let resolved = path.parse(candidate).root;
   let missing = false;
   let uncertain = false;
-  let followedSymlink = false;
+  let dangling = false;
+  const targetFloors: number[] = [];
   let scopeTouched = inScope(resolved);
   let hops = 0;
   while (pending.length > 0) {
     const part = pending.pop()!;
+    while (targetFloors.length > 0 && pending.length < targetFloors[targetFloors.length - 1]!) targetFloors.pop();
     if (!part || part === ".") continue;
     if (part === "..") {
       resolved = path.dirname(resolved);
@@ -46,7 +48,6 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
     try {
       const info = await lstat(next);
       if (info.isSymbolicLink()) {
-        followedSymlink = true;
         if (++hops > 40) {
           resolved = next;
           uncertain = true;
@@ -54,15 +55,19 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
         }
         const target = await readlink(next);
         if (path.isAbsolute(target)) resolved = path.parse(target).root;
+        targetFloors.push(pending.length);
         pending.push(...target.split(path.sep).reverse());
         continue;
       }
     } catch (error) {
-      if (absent(error)) missing = true;
+      if (absent(error)) {
+        missing = true;
+        if (targetFloors.length > 0) dangling = true;
+      }
       else uncertain = true;
     }
     resolved = next;
   }
-  return { path: resolved, missing, uncertain, followedSymlink, scopeTouched };
+  return { path: resolved, missing, uncertain, dangling, scopeTouched };
 }
 

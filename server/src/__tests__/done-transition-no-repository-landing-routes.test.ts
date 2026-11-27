@@ -7,7 +7,7 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, is, sql } from "drizzle-orm";
+import { and, eq, inArray, is, isNull, sql } from "drizzle-orm";
 import { getTableConfig, PgTable } from "drizzle-orm/pg-core";
 import * as dbExports from "@paperclipai/db";
 import {
@@ -1158,27 +1158,76 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       }
     }, 60_000);
 
-    it("never makes overlapping ordinary writers on one path refuse each other", async () => {
+    it("admits beside a foreign live run and workspace on a missing sibling under a symlinked managed-root spelling", async () => {
       const fixture = await reviewFixture();
+      const spelling = path.join(home, `managed-spelling-${randomUUID()}`);
+      symlinkSync(path.dirname(fixture.worktree), spelling);
+      const missingSibling = path.join(spelling, `${path.basename(fixture.worktree)}-gone`, "nested");
+      const otherCompany = await insertCompany(`SPELL${seedSequence}`);
+      const otherProject = randomUUID();
+      await db.insert(projects).values({ id: otherProject, companyId: otherCompany, name: "Spelled", status: "active" });
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Spelled writer"),
+        status: "running", contextSnapshot: { cwd: missingSibling, paperclipWorkspaces: [{ worktreePath: missingSibling }] } }).returning();
+      const [workspace] = await db.insert(executionWorkspaces).values({ companyId: otherCompany, projectId: otherProject, name: "Spelled tree",
+        mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree", status: "active",
+        cwd: missingSibling, providerRef: missingSibling }).returning();
+      try {
+        const read = await request(app).get(`/api/issues/${fixture.identifier}/review-entry-blockers`)
+          .set("x-test-actor", JSON.stringify({ type: "board", source: "session", userId: "cloud-user-1", companyIds: [fixture.companyId] }));
+        expect(read.status, JSON.stringify(read.body)).toBe(200);
+        expect(read.body).toEqual([]);
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run!.id));
+        await db.update(executionWorkspaces).set({ status: "archived", closedAt: new Date() }).where(eq(executionWorkspaces.id, workspace!.id));
+        rmSync(spelling, { force: true });
+      }
+    });
+
+    it("still refuses a dangling in-scope link target under the same symlinked managed-root spelling", async () => {
+      const fixture = await reviewFixture();
+      const spelling = path.join(home, `managed-spelling-${randomUUID()}`);
+      symlinkSync(path.dirname(fixture.worktree), spelling);
+      const dangling = path.join(path.dirname(fixture.worktree), `dangling-${randomUUID()}`);
+      symlinkSync(path.join(fixture.worktree, "never-created"), dangling);
+      const otherCompany = await insertCompany(`DANG${seedSequence}`);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: otherCompany, agentId: await insertAgent(otherCompany, "Dangling writer"),
+        status: "running", contextSnapshot: { cwd: path.join(spelling, path.basename(dangling), "child") } }).returning();
+      try {
+        const response = await request(app).patch(`/api/issues/${fixture.identifier}`).send(fixture.body);
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.code).toBe("review_entry_workspace_unverified");
+        await noAcceptedEntry(fixture.issueId);
+      } finally {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run!.id));
+        rmSync(dangling, { force: true });
+        rmSync(spelling, { force: true });
+      }
+    });
+
+    it.each(["the same company", "different companies"])("never makes overlapping ordinary writers on one path in %s refuse each other", async (scope) => {
+      const fixture = await reviewFixture();
+      const secondCompany = scope === "the same company" ? fixture.companyId : await insertCompany(`OVER${seedSequence}`);
+      const secondAgent = scope === "the same company" ? fixture.rulerAgentId : await insertAgent(secondCompany, "Overlapping writer");
       const first = fixture.worktree;
       const second = `${fixture.worktree}-opposite`;
       mkdirSync(second);
       let release!: () => void;
       const proceed = new Promise<void>((resolve) => { release = resolve; });
       const ready: Promise<void>[] = [];
-      const writers = [[first, second], [second, first]].map(([a, b]) => {
+      const writers = ([[first, second, fixture.companyId, fixture.rulerAgentId], [second, first, secondCompany, secondAgent]] as const)
+        .map(([a, b, companyId, agentId]) => {
         let opened!: () => void;
         ready.push(new Promise<void>((resolve) => { opened = resolve; }));
         return db.transaction(async (tx) => {
           await tx.execute(sql`SET LOCAL statement_timeout = '2s'`);
-          await tx.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
-            status: "queued", contextSnapshot: { cwd: a } });
-          await tx.insert(workspaceOperations).values({ companyId: fixture.companyId, phase: "sync", cwd: a, status: "running" });
+          await tx.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", contextSnapshot: { cwd: a } });
+          await tx.insert(workspaceOperations).values({ companyId, phase: "sync", cwd: a, status: "running" });
           opened();
           await proceed;
-          await tx.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.rulerAgentId,
-            status: "queued", contextSnapshot: { cwd: b } });
-          await tx.insert(workspaceOperations).values({ companyId: fixture.companyId, phase: "sync", cwd: b, status: "running" });
+          await tx.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", contextSnapshot: { cwd: b } });
+          await tx.insert(workspaceOperations).values({ companyId, phase: "sync", cwd: b, status: "running" });
           return "written";
         }).catch((error: unknown) => `refused: ${String(error)}`);
       });
@@ -1190,10 +1239,18 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         release();
       }
       expect(await Promise.all(writers)).toEqual(["written", "written"]);
+      const companies = [...new Set([fixture.companyId, secondCompany])];
+      const runs = await db.select({ cwd: sql<string>`${heartbeatRuns.contextSnapshot}->>'cwd'` }).from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.companyId, companies), eq(heartbeatRuns.status, "queued")));
+      const operations = await db.select({ cwd: workspaceOperations.cwd }).from(workspaceOperations)
+        .where(and(inArray(workspaceOperations.companyId, companies), isNull(workspaceOperations.finishedAt)));
+      for (const rows of [runs, operations]) {
+        expect(rows.map((row) => row.cwd).sort()).toEqual([first, first, second, second].sort());
+      }
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
-        .where(and(eq(heartbeatRuns.companyId, fixture.companyId), eq(heartbeatRuns.status, "queued")));
+        .where(and(inArray(heartbeatRuns.companyId, companies), eq(heartbeatRuns.status, "queued")));
       await db.update(workspaceOperations).set({ status: "succeeded", finishedAt: new Date() })
-        .where(eq(workspaceOperations.companyId, fixture.companyId));
+        .where(inArray(workspaceOperations.companyId, companies));
     });
 
     it.each(["own company", "another company"])("scopes a valid broad ancestor to %s", async (scope) => {
@@ -1281,7 +1338,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       ["nonexistent descendant through a symlink", (worktree: string) => {
         symlinkSync(worktree, `${worktree}-descendant-link`);
         return path.join(`${worktree}-descendant-link`, "missing");
-      }, "review_entry_workspace_unverified"],
+      }, "review_entry_workspace_busy"],
       ["nonexistent sibling", (worktree: string) => path.join(`${worktree}-missing`, "sub"), null],
     ] as const)("judges a foreign run's %s path by its existing ancestor", async (_label, runPath, code) => {
       const fixture = await reviewFixture();

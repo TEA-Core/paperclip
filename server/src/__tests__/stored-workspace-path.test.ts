@@ -19,7 +19,7 @@ describe("resolveStoredPath", () => {
 
   it("follows a symlink before consuming a later dot-dot and missing suffix", async () => {
     expect(await resolveStoredPath(`${alias}/../future//child/./`)).toMatchObject({
-      path: path.join(tree, "future", "child"), missing: true, uncertain: false, followedSymlink: true,
+      path: path.join(tree, "future", "child"), missing: true, uncertain: false, dangling: false,
     });
   });
 
@@ -27,7 +27,7 @@ describe("resolveStoredPath", () => {
     const dangling = path.join(root, "dangling");
     symlinkSync(path.join(tree, "missing"), dangling);
     expect(await resolveStoredPath(`${dangling}/child`)).toMatchObject({
-      path: path.join(tree, "missing", "child"), missing: true, followedSymlink: true,
+      path: path.join(tree, "missing", "child"), missing: true, dangling: true,
     });
   });
 

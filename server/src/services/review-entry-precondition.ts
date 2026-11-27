@@ -220,7 +220,7 @@ function containsPath(parent: string, candidate: string) {
 async function worktreePathRelation(candidate: unknown, own: PhysicalWorkspace, managedRoot: string) {
   if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return null;
   const resolved = await resolveStoredPath(candidate, managedRoot);
-  if (resolved.uncertain || resolved.missing && resolved.followedSymlink) {
+  if (resolved.uncertain || resolved.dangling) {
     return resolved.scopeTouched ? "unverified" : null;
   }
   if (!resolved.missing) {
