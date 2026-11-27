@@ -48,6 +48,11 @@ import {
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
 import {
+  BOARD_LANDING_PROOF_SOURCE,
+  loadAttachedBoardLandingProof,
+  verifyBoardLandingProof,
+} from "./board-landing-proof.js";
+import {
   fetchOpenPullRequests,
   GITHUB_GRAPHQL_URL,
   isAnchoredCardPullRequest,
@@ -477,10 +482,19 @@ export function resolveDoneTierDeclarationSources(
  */
 export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
 
-interface LandingHeadProof {
-  head: string;
-  source: "remote" | "worktree";
-}
+type LandingHeadProof =
+  | { head: string; source: "remote" | "worktree" }
+  // SUP-25193: a board-attached merged-PR proof. `head` is the PR merge commit;
+  // no execution-workspace branch is involved, so it is re-verified at the close
+  // boundary against GitHub instead of re-measuring a branch head.
+  | {
+    head: string;
+    source: typeof BOARD_LANDING_PROOF_SOURCE;
+    proofActivityId: string;
+    pullRequestNumber: number;
+    repoUrl: string;
+    baseRef: string;
+  };
 
 export interface DoneTransitionGuardResult {
   allowed: boolean;
@@ -560,6 +574,15 @@ export function unpaidLandingDebt() {
 type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
   "executionWorkspaceId" | "projectWorkspaceId" | "projectId" | "statusVersion"> & { deliveryRequirement: string };
 
+/** Bound close-boundary I/O. A timeout rejects, and the caller treats that as unverified. */
+function withLandingDeadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("landing proof re-verification timed out")), GITHUB_BASE_COMPARE_TIMEOUT_MS);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
 /** Prepare outside the close transaction; finalize only while holding the issue row lock. */
 export async function prepareLandingDebtClose(
   db: Db,
@@ -590,13 +613,48 @@ export async function prepareLandingDebtClose(
         code: "done_transition_missing_delivery", issueId: issue.id,
       });
       if (outstanding.length === 0) return;
+      const proof = result.landingProof;
+      if (proof?.source === BOARD_LANDING_PROOF_SOURCE) {
+        // SUP-25193: re-verify the board-attached merged-PR proof at this close
+        // boundary, on the locked repo binding. The attach call alone never
+        // discharges debt; only this accepted close does.
+        if (closeStatusVersion === undefined) {
+          throw conflict("Landing proof could not be bound to this close; retry the close.", {
+            code: "done_transition_missing_delivery", issueId: issue.id,
+          });
+        }
+        let verifiedHead: string | null = null;
+        try {
+          const attached = await withLandingDeadline(loadAttachedBoardLandingProof(tx, issue));
+          if (attached?.activityId === proof.proofActivityId) {
+            const verified = await withLandingDeadline(verifyBoardLandingProof(tx, {
+              id: issue.id, companyId: issue.companyId, projectId: locked.projectId,
+              projectWorkspaceId: locked.projectWorkspaceId, executionWorkspaceId: locked.executionWorkspaceId,
+            }, attached.evidence));
+            if (verified.ok && verified.proof.repoUrl === proof.repoUrl && verified.proof.baseRef === proof.baseRef) {
+              verifiedHead = verified.proof.mergeCommitSha;
+            }
+          }
+        } catch { verifiedHead = null; /* Failed and timed-out rechecks cannot discharge debt. */ }
+        if (verifiedHead !== proof.head) throw conflict("Board landing proof changed or could not be re-verified; retry the close.", {
+          code: "done_transition_missing_delivery", issueId: issue.id,
+        });
+        await tx.update(activityLog).set({
+          details: sql`${activityLog.details} || jsonb_build_object(
+            'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+            'closeStatusVersion', ${closeStatusVersion}::int,
+            'landingProof', jsonb_build_object('head', ${proof.head}::text, 'source', ${proof.source}::text,
+              'repoUrl', ${proof.repoUrl}::text, 'baseRef', ${proof.baseRef}::text,
+              'pullRequestNumber', ${proof.pullRequestNumber}::int, 'proofActivityId', ${proof.proofActivityId}::text))`,
+        }).where(debtWhere);
+        return;
+      }
       // Positive probes require an execution branch. Lock that binding through
       // commit so an in-place repo/base/branch update cannot invalidate the proof.
       const [workspace] = locked.executionWorkspaceId ? await tx.select().from(executionWorkspaces)
         .where(and(eq(executionWorkspaces.id, locked.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
         .for("share") : [];
       const binding = result.landingContext;
-      const proof = result.landingProof;
       if (!workspace || !binding || !proof || closeStatusVersion === undefined ||
         workspace.repoUrl !== binding.repoUrl || workspace.baseRef !== binding.defaultRef ||
         workspace.branchName !== binding.branch ||
@@ -6076,12 +6134,15 @@ async function evaluateDoneTransitionGuardCore(
   // ADR-103 M3.6: out-parameter the census the core already computed, so the
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
-  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext },
+  // `quiet` evaluates without writing audit rows (the SUP-25193 attach preflight).
+  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext; quiet?: boolean },
   // SUP-24429: the requirement stored before the close request; undefined when
   // the caller's request does not change it.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
   landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
+  const writeAudit: typeof writeAuditLog = observer?.quiet ? async () => {} : writeAuditLog;
+  const writeSkippedAudit: typeof writeGuardSkippedAuditLog = observer?.quiet ? async () => {} : writeGuardSkippedAuditLog;
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
     reason,
@@ -6122,7 +6183,7 @@ async function evaluateDoneTransitionGuardCore(
     if (recovered !== null) {
       reviewLadder = recovered;
       if (recovered.satisfied) {
-        void writeAuditLog(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
+        void writeAudit(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
           reason: "review_ladder_recovered_from_decisions",
           completedStageIds: recovered.completedStageIds,
           skippedStageIds: recovered.skippedStageIds,
@@ -6234,7 +6295,7 @@ async function evaluateDoneTransitionGuardCore(
   // gated at the children and the parent would close ungated. Fail closed
   // here, in the same pre-network zone as mechanism C.
   if (mechanismA !== null && mechanismA.count >= 2) {
-    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+    void writeAudit(db, issue, "issue.done_transition_null_policy_refused", {
       reason: "ungated_decomposed_parent",
       ladderedChildCount: mechanismA.count,
       ladderedChildIdentifiers: mechanismA.identifiers,
@@ -6270,7 +6331,7 @@ async function evaluateDoneTransitionGuardCore(
   // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
   // Runs in the same pre-network zone as mechanisms A and C.
   if (ladderShape !== null) {
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+    void writeAudit(db, issue, "issue.done_transition_ladder_shape_refused", {
       reason: "adr072_close_ladder_shape_incomplete",
       missingStageLabels: ladderShape.missingStageLabels,
       outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
@@ -6396,7 +6457,7 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
-    void writeAuditLog(db, issue, "issue.done_transition_override", {
+    void writeAudit(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
@@ -6491,7 +6552,7 @@ async function evaluateDoneTransitionGuardCore(
   );
   if (staleOpenUnverifiable.length > 0) {
     prSkipReason = appendSkipReason(prSkipReason, `stale_open_unverifiable:${staleOpenUnverifiable.length}`);
-    void writeAuditLog(db, issue, "issue.done_transition_guard_failed_open", {
+    void writeAudit(db, issue, "issue.done_transition_guard_failed_open", {
       reason: `stale_open_unverifiable:${staleOpenUnverifiable.length}`,
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
@@ -6545,7 +6606,7 @@ async function evaluateDoneTransitionGuardCore(
       if (refused.length > 0) {
         const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
         const refusedNames = refused.map((p) => p.displayName).join(", ");
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
           reason: refusalToken,
           skipReason: refusalToken,
           prs: refusedNames,
@@ -6572,7 +6633,7 @@ async function evaluateDoneTransitionGuardCore(
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)
       // closes must still land the PRs first.
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
@@ -6603,7 +6664,7 @@ async function evaluateDoneTransitionGuardCore(
         skipReason: prSkipReason,
       };
     }
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `open_linked_prs:${openPrs.length}`,
       skipReason: `open_linked_prs:${openPrs.length}`,
       prs: prNames,
@@ -6722,7 +6783,7 @@ async function evaluateDoneTransitionGuardCore(
         // ref (unresolvable/stale on the remote) or a transient API state, not
         // the deliverable branch. Never report this as branch-absent.
         if (decisionCarried) {
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `compare_404_base_ref_unresolvable_decision_carried:${branch}`,
             skipReason: prSkipReason,
             branch,
@@ -6800,7 +6861,7 @@ async function evaluateDoneTransitionGuardCore(
           // approval that arms the merge must not be blocked by the unpushed
           // branch it is approving (SUP-13207/13290 precedent); a plain close
           // still lands the deliverable first.
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `branch_absent_decision_carried:${branch}`,
             skipReason: `branch_absent_decision_carried:${branch}`,
             branch,
@@ -6828,7 +6889,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        await writeGuardSkippedAuditLog(db, issue, {
+        await writeSkippedAudit(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
@@ -6946,7 +7007,7 @@ async function evaluateDoneTransitionGuardCore(
       // Same deadlock shape as the open-linked-PR block above, firing when the
       // open PR is unlinked/unhydrated: the approval that arms the merge must
       // not be blocked by the unmerged branch it is approving (SUP-13207).
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
         skipReason: appendSkipReason(
           foreignToken,
@@ -7052,7 +7113,7 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: "foreign_workspace_branch",
       skipReason: foreignToken,
       branch,
@@ -7128,7 +7189,7 @@ async function evaluateDoneTransitionGuardCore(
     // Same deadlock shape as the open-linked-PR block above, firing when the
     // open PR is unlinked/unhydrated: the approval that arms the merge must
     // not be blocked by the unmerged branch it is approving (SUP-13207).
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       skipReason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       branch,
@@ -7166,6 +7227,27 @@ async function evaluateDoneTransitionGuardCore(
 }
 
 /**
+ * SUP-25193: why a board-attached landing proof could not change this card's
+ * close outcome, or null when it could. The proof only answers outstanding
+ * landing debt; it never overrides a core guard refusal such as a measured
+ * ahead-of-base or foreign execution branch. Writes no audit rows.
+ */
+export async function boardLandingProofCloseBlocker(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
+  landingDebtOwed: boolean,
+): Promise<string | null> {
+  if (!landingDebtOwed) {
+    return "the card owes no repository landing debt, so a landing proof cannot change its close";
+  }
+  const core = await evaluateDoneTransitionGuardCore(db, issue, null, false, { quiet: true }, undefined, true);
+  if (!core.allowed) {
+    return `the done guard refuses this close for a reason a landing proof does not answer: ${core.reason}`;
+  }
+  return null;
+}
+
+/**
  * ADR-103 M3: the exported entry point. Runs the guard core, then records the
  * M3.6 exclusion audit on a successful close whose laddered-child count fell
  * below the `>= 2` threshold only because of carve-out exclusions. The census
@@ -7184,6 +7266,10 @@ export async function evaluateDoneTransitionGuard(
   // is record_only too; omitted means the request did not change the requirement.
   storedDeliveryRequirement?: IssueDeliveryRequirement | null,
   landingDebtOwed = false,
+  // SUP-25193: only a board close may present a board-attached merged-PR landing
+  // proof. Every other door (agent closes, the landing backstop) leaves it off, so
+  // no agent close path accepts more evidence than it did before.
+  options: { acceptBoardLandingProof?: boolean } = {},
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext } = {};
   const result = await evaluateDoneTransitionGuardCore(
@@ -7196,10 +7282,37 @@ export async function evaluateDoneTransitionGuard(
     landingDebtOwed,
   );
   if (landingDebtOwed && result.landingVerified) result.landingContext = observer.landingContext;
+  let boardProofRefusal: string | null = null;
+  if (landingDebtOwed && result.allowed && !result.landingVerified && options.acceptBoardLandingProof) {
+    const attached = await loadAttachedBoardLandingProof(db, issue);
+    if (attached) {
+      const fields = await loadTier1RepoFields(db, issue);
+      const verified = await verifyBoardLandingProof(db, { id: issue.id, companyId: issue.companyId, ...fields }, attached.evidence);
+      if (verified.ok) {
+        return {
+          ...result,
+          landingVerified: true,
+          landingContext: observer.landingContext,
+          landingProof: {
+            head: verified.proof.mergeCommitSha,
+            source: BOARD_LANDING_PROOF_SOURCE,
+            proofActivityId: attached.activityId,
+            pullRequestNumber: verified.proof.pullRequestNumber,
+            repoUrl: verified.proof.repoUrl,
+            baseRef: verified.proof.baseRef,
+          },
+          reason: `${result.reason}; landing verified by the board-attached merged PR ` +
+            `${verified.proof.owner}/${verified.proof.repo}#${verified.proof.pullRequestNumber}`,
+        };
+      }
+      boardProofRefusal = `The board-attached landing proof failed re-verification (${verified.code}: ${verified.reason}).`;
+    }
+  }
   if (landingDebtOwed && result.allowed && !result.landingVerified) {
     return {
       ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",
-      reason: "Repository landing debt remains: no successful repository landing proof was obtained.",
+      reason: "Repository landing debt remains: no successful repository landing proof was obtained." +
+        (boardProofRefusal ? ` ${boardProofRefusal}` : ""),
       remedy:
         "Verify landing via a probe-able repository and branch or a merged PR, then retry the close; reclassification and board tier-form bypass do not waive landing debt. If landing cannot be verified, cancel the issue instead.",
     };

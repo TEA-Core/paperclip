@@ -48,6 +48,13 @@ import {
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
+  BOARD_LANDING_PROOF_ACTION,
+  BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
+  boardLandingProofIneligibility,
+  loadAttachedBoardLandingProof,
+  verifyBoardLandingProof,
+} from "../services/board-landing-proof.js";
+import {
   activityLog,
   agentSessionGoalActions,
   agentTaskSessions,
@@ -106,6 +113,7 @@ import {
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
+  attachIssueLandingProofSchema,
   runnerGoalActionRequestSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
@@ -217,7 +225,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
-import { redactIssueCommentBody } from "../services/issues.js";
+import { recordedLostFutureMonitorCheck, redactIssueCommentBody } from "../services/issues.js";
 import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
 import {
@@ -296,6 +304,7 @@ import {
 } from "../services/plan-review-context.js";
 import {
   countLadderedChildren,
+  boardLandingProofCloseBlocker,
   evaluateDoneTransitionGuard,
   prepareLandingDebtClose,
   evaluateDoneTierDeclaration,
@@ -5696,6 +5705,8 @@ export function issueRoutes(
       decisionCarried,
       storedDeliveryRequirement,
       debt.owed,
+      // SUP-25193: a board-attached landing proof counts only on a board close.
+      { acceptBoardLandingProof: boardActor },
     );
     // `locked` is the row the terminal write just returned: that UPDATE holds the
     // issue row lock until commit, so the debt rows read here are serialized.
@@ -14375,6 +14386,186 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
+  // SUP-25193: board-only landing proof. A delivered card whose completed review
+  // stage names only a user, and which records no deliveryIdentity, has no other
+  // way to prove its landing, so landing debt from an earlier record_only
+  // reclassification blocks `done` for good. The board names the merged PR; the
+  // server verifies it against GitHub and records it. Attaching discharges
+  // nothing: a later board close re-verifies the proof and discharges the debt
+  // atomically with the accepted close (prepareLandingDebtClose). Agents are refused.
+  router.post("/issues/:id/landing-proof", validate(attachIssueLandingProofSchema), async (req, res) => {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing || !(await assertIssueReadAllowed(req, res, existing))) return;
+    const decision = await decideIssueAccess(req, existing, "issue:mutate");
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    const body = req.body as {
+      owner: string; repo: string; pullRequestNumber: number;
+      mergeCommitSha?: string; headSha?: string; reason: string;
+    };
+    const refusalDetails = {
+      issueId: existing.id,
+      identifier: existing.identifier ?? null,
+      owner: body.owner,
+      repo: body.repo,
+      pullRequestNumber: body.pullRequestNumber,
+    };
+    const ineligible = boardLandingProofIneligibility(existing);
+    if (ineligible) {
+      res.status(409).json({
+        error: `Landing proof refused: ${ineligible}`,
+        code: "landing_proof_not_applicable",
+        details: { ...refusalDetails, reason: ineligible },
+      });
+      return;
+    }
+    const landingDebtOwed = (await prepareLandingDebtClose(db, existing)).owed;
+    const cannotClose = await boardLandingProofCloseBlocker(db, existing, landingDebtOwed);
+    if (cannotClose) {
+      res.status(409).json({
+        error: `Landing proof refused: ${cannotClose}`,
+        code: "landing_proof_cannot_close",
+        details: { ...refusalDetails, reason: cannotClose },
+      });
+      return;
+    }
+    const verified = await verifyBoardLandingProof(db, existing, body);
+    if (!verified.ok) {
+      res.status(422).json({
+        error: `Landing proof refused: ${verified.reason}`,
+        code: verified.code,
+        details: { ...refusalDetails, reason: verified.reason },
+      });
+      return;
+    }
+    const proof = verified.proof;
+    const actor = getActorInfo(req);
+    const outcome = await db.transaction(async (tx) => {
+      const [locked] = await tx.select().from(issueRows)
+        .where(and(eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId)))
+        .for("update");
+      const lockedIneligible = locked ? boardLandingProofIneligibility(locked) : "the card no longer exists";
+      if (lockedIneligible) return { kind: "ineligible" as const, reason: lockedIneligible };
+      if (
+        locked!.projectId !== existing.projectId ||
+        locked!.projectWorkspaceId !== existing.projectWorkspaceId ||
+        locked!.executionWorkspaceId !== existing.executionWorkspaceId
+      ) {
+        return { kind: "ineligible" as const, reason: "the card's repository binding changed during verification; retry" };
+      }
+      // Replaying the same verified evidence returns the recorded proof and writes nothing.
+      const latest = await loadAttachedBoardLandingProof(tx as unknown as Db, existing);
+      if (
+        latest &&
+        latest.evidence.owner === proof.owner &&
+        latest.evidence.repo === proof.repo &&
+        latest.evidence.pullRequestNumber === proof.pullRequestNumber &&
+        latest.evidence.mergeCommitSha === proof.mergeCommitSha &&
+        latest.evidence.headSha === proof.headSha
+      ) {
+        return { kind: "replayed" as const, activityId: latest.activityId };
+      }
+      const activity = await logActivityInTransaction(tx as unknown as Db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        boardApiKeyId: actor.boardApiKeyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+        action: BOARD_LANDING_PROOF_ACTION,
+        entityType: "issue",
+        entityId: existing.id,
+        issueId: existing.id,
+        details: {
+          identifier: existing.identifier ?? null,
+          owner: proof.owner,
+          repo: proof.repo,
+          pullRequestNumber: proof.pullRequestNumber,
+          prUrl: proof.prUrl,
+          mergeCommitSha: proof.mergeCommitSha,
+          headSha: proof.headSha,
+          headRef: proof.headRef,
+          headRepoFullName: proof.headRepoFullName,
+          baseRef: proof.baseRef,
+          repoUrl: proof.repoUrl,
+          repositoryId: proof.repositoryId,
+          repositoryNodeId: proof.repositoryNodeId,
+          possession: proof.possession,
+          reason: body.reason,
+          verifiedAt: new Date().toISOString(),
+          landingDebtOwed,
+          // Discharge happens only on the accepted close, never here.
+          landingDebtDischarged: false,
+        },
+      });
+      // The SUP-23031 possession shape: a pull_request work product carrying the
+      // merge commit and head. Existing recorded values are never overwritten.
+      const externalId = `${proof.owner}/${proof.repo}#${proof.pullRequestNumber}`;
+      const [product] = await tx.select().from(issueWorkProducts).where(and(
+        eq(issueWorkProducts.companyId, existing.companyId),
+        eq(issueWorkProducts.issueId, existing.id),
+        eq(issueWorkProducts.type, "pull_request"),
+        eq(issueWorkProducts.externalId, externalId),
+      ));
+      if (product) {
+        const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+        await tx.update(issueWorkProducts).set({
+          metadata: {
+            ...metadata,
+            mergeCommitSha: metadata.mergeCommitSha ?? proof.mergeCommitSha,
+            headSha: metadata.headSha ?? proof.headSha,
+            landingProofActivityId: activity.id,
+          },
+          updatedAt: new Date(),
+        }).where(eq(issueWorkProducts.id, product.id));
+      } else {
+        await tx.insert(issueWorkProducts).values({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          type: "pull_request",
+          provider: "github",
+          externalId,
+          title: `PR #${proof.pullRequestNumber} ${proof.owner}/${proof.repo}`,
+          url: proof.prUrl,
+          status: "merged",
+          reviewState: "none",
+          isPrimary: false,
+          healthStatus: "unknown",
+          metadata: {
+            prNumber: proof.pullRequestNumber,
+            repository: `${proof.owner}/${proof.repo}`,
+            mergeCommitSha: proof.mergeCommitSha,
+            headSha: proof.headSha,
+            landingProofActivityId: activity.id,
+            // Never counts as prior evidence that this PR is the card's delivery.
+            source: BOARD_LANDING_PROOF_WORK_PRODUCT_SOURCE,
+          },
+        });
+      }
+      return { kind: "attached" as const, activityId: activity.id };
+    });
+    if (outcome.kind === "ineligible") {
+      res.status(409).json({
+        error: `Landing proof refused: ${outcome.reason}`,
+        code: "landing_proof_not_applicable",
+        details: { ...refusalDetails, reason: outcome.reason },
+      });
+      return;
+    }
+    res.status(outcome.kind === "attached" ? 201 : 200).json({
+      issueId: existing.id,
+      identifier: existing.identifier ?? null,
+      proofActivityId: outcome.activityId,
+      replayed: outcome.kind === "replayed",
+      proof,
+      landingDebtOwed,
+      landingDebtDischarged: false,
+      next: "Close the card with a board PATCH {\"status\":\"done\"}; the close re-verifies this proof and discharges any landing debt atomically.",
+    });
+  });
+
   router.post(
     "/issues/:id/recovery-actions/resolve",
     validate(resolveIssueRecoveryActionSchema),
@@ -21851,6 +22042,7 @@ export function issueRoutes(
       actorRunId: actor.agentId ? actor.runId : null,
       actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorAgentApiKeyId: actor.agentApiKeyId ?? null,
       boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       ...(expectedUpdatedAtRaw !== undefined
         ? { expectedUpdatedAt: new Date(expectedUpdatedAtRaw) }
@@ -23349,7 +23541,11 @@ export function issueRoutes(
           recoveryPolicy: nextMonitor.recoveryPolicy,
         },
       });
-    } else if (!nextMonitor.nextCheckAt && previousMonitor.nextCheckAt) {
+    } else if (
+      !nextMonitor.nextCheckAt &&
+      previousMonitor.nextCheckAt &&
+      !recordedLostFutureMonitorCheck(issue)
+    ) {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -25545,6 +25741,8 @@ export function issueRoutes(
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId ?? null,
+          boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
         },
         // SUP-17552: a final-stage escalation approval closes the card (the
         // guard above already allowed it); a non-final stage still only advances
@@ -26024,6 +26222,9 @@ export function issueRoutes(
                       userId:
                         actor.actorType === "user" ? actor.actorId : null,
                       runId: actor.runId,
+                      agentApiKeyId: actor.agentApiKeyId ?? null,
+                      boardApiKeyId:
+                        actor.actorType === "user" ? actor.boardApiKeyId : null,
                     },
                     deferredPostCommit: rejectDeferredPostCommit,
                     skipStatusCompare: true,
@@ -27486,7 +27687,9 @@ export function issueRoutes(
           ? { workflowControlledAssignment: true }
           : {}),
         actorAgentId: actor.agentId ?? null,
+        actorRunId: actor.agentId ? actor.runId ?? null : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        actorAgentApiKeyId: actor.agentApiKeyId ?? null,
         boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
       };
 

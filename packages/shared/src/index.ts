@@ -1,3 +1,4 @@
+export { futureMonitorClearedActivitySchema, issueActivityResponseSchema } from "./validators/activity.js";
 export { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema, type ComposioAppSetupInput, type ComposioAppSetupResult, type ComposioAppAccountInput, type ComposioAppAccount, type ComposioAppSnapshot, type ComposioAppSyncState, type ComposioAppsResponse } from "./composio-app-setup.js";
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
@@ -2015,6 +2016,8 @@ export {
   issueExecutionStateSchema,
   gitCommitShaSchema,
   GIT_COMMIT_SHA_WIRE_PATTERN,
+  attachIssueLandingProofSchema,
+  type AttachIssueLandingProof,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
   issueReviewRequestSchema,
