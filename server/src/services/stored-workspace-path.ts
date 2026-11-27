@@ -70,4 +70,3 @@ export async function resolveStoredPath(candidate: string, scopeRoot?: string): 
   }
   return { path: resolved, missing, uncertain, dangling, scopeTouched };
 }
-

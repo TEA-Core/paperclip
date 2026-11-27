@@ -52,4 +52,3 @@ export function reviewEntryReceiptRetained(subject: "Company" | "Issue" | "Docum
     { code: "review_entry_receipt_retained", receiptId },
   );
 }
-
