@@ -939,6 +939,8 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
+An issue event payload can carry issue content. The host delivers an `issue.*` event in full only to a plugin that can read the issue, by the same check as `issues.get`, which requires the `issues.read` capability. A plugin that cannot read the issue receives only the payload's metadata: identifiers (`id`, `identifier`, and keys ending in `Id`, `Ids`, `Identifier`, `Identifiers` or `Key`), timestamps, counters, states and enums, and the top-level `title` (the issue's own title, or the document title on `issue.document.*`). Every other field, such as `description`, the comment `bodySnippet` or an annotation `quote`, is withheld, and nested objects keep only their own metadata keys. Issue summary entries (`addedReferencedIssues`, `blockedByIssues` and the like) keep `id` and `identifier` without `title`. The same rule applies to `agent.run.*` events and to `agents.sessions.event` notifications for a run whose issue is known (`issueId`, else the run's context): a plugin without `issues.read` receives only their metadata. Run output of a run with no issue, such as the plugin's own session, is delivered unchanged. A plugin that can read issues receives every event unchanged.
+
 ### 16.1 Event Filtering
 
 Plugins may provide an optional filter when subscribing to events. The filter is evaluated by the host before dispatching to the worker, so filtered-out events never cross the process boundary.
