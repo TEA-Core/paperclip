@@ -65,3 +65,15 @@ export function agentWorkDeliveryBoardOnlyError() {
 export function declaresExternalPullWorkDelivery(runtimeConfig: unknown): boolean {
   return parseAgentWorkDelivery({ runtimeConfig: parseObject(runtimeConfig) }) === "external_pull";
 }
+
+/**
+ * A hire approval payload declares `external_pull` either at the top level or
+ * under `requestedAgentConfig`, the two shapes activation copies onto the agent.
+ */
+export function hireApprovalPayloadDeclaresExternalPull(payload: unknown): boolean {
+  const record = parseObject(payload);
+  return (
+    declaresExternalPullWorkDelivery(record.runtimeConfig) ||
+    declaresExternalPullWorkDelivery(parseObject(record.requestedAgentConfig).runtimeConfig)
+  );
+}

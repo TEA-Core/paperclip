@@ -384,6 +384,45 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("stillborn backlog: exempt parked cards do not starve an ordinary agent's card out of the candidate window", async () => {
+    const fleet = await seedFleet();
+    const createdAt = new Date(Date.now() - 120_000);
+    await db.insert(issues).values(
+      Array.from({ length: 100 }, (_, index) => ({
+        id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        companyId: fleet.companyId,
+        title: `Parked external card ${index}`,
+        status: "backlog",
+        priority: "high",
+        assigneeAgentId: fleet.externalAgentId,
+        createdAt,
+      })),
+    );
+    const ordinaryIssueId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    await db.insert(issues).values({
+      id: ordinaryIssueId,
+      companyId: fleet.companyId,
+      title: "Stillborn ordinary card",
+      status: "backlog",
+      priority: "high",
+      assigneeAgentId: fleet.coderId,
+      createdAt,
+    });
+    const { svc } = makeSweep();
+
+    const first = await svc.reconcileStillbornAssignedBacklog();
+    const second = await svc.reconcileStillbornAssignedBacklog();
+
+    expect([...first.issueIds, ...second.issueIds]).toEqual([ordinaryIssueId]);
+    expect((await issueRow(ordinaryIssueId))?.status).toBe("blocked");
+    const parked = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.assigneeAgentId, fleet.externalAgentId));
+    expect(parked).toHaveLength(100);
+    expect(parked.every((row) => row.status === "backlog")).toBe(true);
+  });
+
   it("stillborn backlog: still escalates a parked card of an ordinary invoked agent", async () => {
     const fleet = await seedFleet();
     const issueId = await seedBacklogCard(fleet.companyId, fleet.coderId);

@@ -1630,6 +1630,7 @@ export function recoveryService(
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let undispatchableAssignedScanCursor: string | null = null;
+  let stillbornAssignedBacklogScanCursor: string | null = null;
   // Two-cycle confirmation counter (SUP-14565): issueId -> number of sweep
   // cycles the card has been observed with the undispatchable-assigned
   // condition true. Per service instance, so a control-plane restart counts
@@ -13180,20 +13181,32 @@ export function recoveryService(
     // does not fire against cards still being filed (create → assign → promote).
     const graceCutoff = new Date(Date.now() - STILLBORN_ASSIGNED_BACKLOG_GRACE_MS);
 
-    const candidates = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.status, "backlog"),
-          sql`${issues.assigneeAgentId} is not null`,
-          visibleIssueCondition(),
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-          lt(issues.createdAt, graceCutoff),
-        ),
-      )
-      .orderBy(asc(issues.id))
-      .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
+    const queryCandidates = (afterIssueId: string | null) =>
+      db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "backlog"),
+            sql`${issues.assigneeAgentId} is not null`,
+            visibleIssueCondition(),
+            opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+            lt(issues.createdAt, graceCutoff),
+            afterIssueId ? gt(issues.id, afterIssueId) : undefined,
+          ),
+        )
+        .orderBy(asc(issues.id))
+        .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
+
+    let candidates = await queryCandidates(stillbornAssignedBacklogScanCursor);
+    if (candidates.length === 0 && stillbornAssignedBacklogScanCursor) {
+      stillbornAssignedBacklogScanCursor = null;
+      candidates = await queryCandidates(null);
+    }
+    stillbornAssignedBacklogScanCursor =
+      candidates.length === STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT
+        ? candidates[candidates.length - 1]!.id
+        : null;
 
     for (const candidate of candidates) {
       const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_stillborn_assigned_backlog", async () => {
