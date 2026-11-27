@@ -342,116 +342,6 @@ export function subtractOpenCodeSessionTotals(
 }
 
 /**
- * Add a run's usage to the session totals it started from: the session's
- * cumulative totals this run's charge accounts for. A missing base is zero.
- */
-function addOpenCodeSessionTotals(
-  base: OpenCodeSessionTotals | null,
-  run: OpenCodeSessionTotals,
-): OpenCodeSessionTotals {
-  if (!base) return run;
-  return {
-    usage: {
-      inputTokens: base.usage.inputTokens + run.usage.inputTokens,
-      cachedInputTokens: base.usage.cachedInputTokens + run.usage.cachedInputTokens,
-      outputTokens: base.usage.outputTokens + run.usage.outputTokens,
-    },
-    costUsd:
-      run.costUsd === null
-        ? base.costUsd
-        : base.costUsd === null
-          ? run.costUsd
-          : base.costUsd + run.costUsd,
-  };
-}
-
-/**
- * One run's hold on the charge record of the OpenCode session it resumed.
- *
- * Two runs of one agent with no task key can resume the same session at
- * once. Each reads its own pre-run baseline, but the session's cumulative
- * totals grow with both runs' turns, so "cumulative minus own baseline" would
- * charge the shared growth to both runs. The record holds the cumulative
- * session totals any run was already charged for; a run charges only what
- * lies beyond both its own baseline and that record, then raises the record.
- */
-export type OpenCodeSessionChargeLease = {
-  /** Cumulative session totals already charged to any run, or null. */
-  charged(): OpenCodeSessionTotals | null;
-  /** Raise the record to these cumulative totals, field by field. */
-  recordCharged(totals: OpenCodeSessionTotals): void;
-  /** End this run's hold; the session's record ends with its last hold. */
-  release(): void;
-};
-
-export type OpenCodeSessionChargeLedger = {
-  /** Open a lease before the run reads its pre-run baseline. */
-  open(sessionId: string): OpenCodeSessionChargeLease;
-};
-
-/**
- * A session's record lives only while one of its runs is in flight, so runs
- * that do not overlap never share one, and a session whose cumulative usage
- * was reset cannot hide a later run's usage behind an old record.
- */
-export function createOpenCodeSessionChargeLedger(): OpenCodeSessionChargeLedger {
-  const sessions = new Map<string, { leases: number; charged: OpenCodeSessionTotals | null }>();
-  return {
-    open(sessionId) {
-      let entry = sessions.get(sessionId);
-      if (!entry) {
-        entry = { leases: 0, charged: null };
-        sessions.set(sessionId, entry);
-      }
-      entry.leases += 1;
-      const held = entry;
-      let released = false;
-      return {
-        charged: () => held.charged,
-        recordCharged: (totals) => {
-          held.charged = mergeOpenCodeSessionTotals(held.charged, totals);
-        },
-        release: () => {
-          if (released) return;
-          released = true;
-          held.leases -= 1;
-          if (held.leases === 0) sessions.delete(sessionId);
-        },
-      };
-    },
-  };
-}
-
-/**
- * The ledger every serve run in this server process shares. Adapters execute
- * in the server process, and a lease is read and raised in one synchronous
- * call, so two runs cannot both charge the same session growth.
- */
-export const openCodeSessionChargeLedger = createOpenCodeSessionChargeLedger();
-
-/**
- * Charge only the part of this run's usage that no overlapping run on the
- * same session was charged for already, and record what this run accounts
- * for. `baseline` is the session's totals before this run (null: zero).
- */
-function chargeOnce(
-  run: OpenCodeSessionTotals,
-  baseline: OpenCodeSessionTotals | null,
-  lease: OpenCodeSessionChargeLease | null | undefined,
-  issues: string[],
-): OpenCodeSessionTotals {
-  if (!lease) return run;
-  const charged = lease.charged();
-  lease.recordCharged(addOpenCodeSessionTotals(baseline, run));
-  if (!charged) return run;
-  const credit = subtractOpenCodeSessionTotals(charged, baseline);
-  const creditTokens = credit.usage.inputTokens + credit.usage.cachedInputTokens + credit.usage.outputTokens;
-  if (creditTokens === 0 && !credit.costUsd) return run;
-  issues.push("session usage already charged to an overlapping run on this session was not charged again");
-  return subtractOpenCodeSessionTotals(run, credit);
-}
-
-/**
  * Reconcile this run's usage from the serve transport's durable session state.
  *
  * The cumulative session totals minus the pre-run baseline (read from
@@ -468,13 +358,7 @@ function chargeOnce(
  * or a resume whose baseline payload lacked counters, where the cumulative
  * total would silently include prior runs — the validated per-step sums stand
  * in. They cover only this run's steps, but a dropped `step_finish` can
- * under-report them, so they are never marked complete. With no usage at all
- * the run is charged zero, flagged incomplete, and says so; no charge is
- * invented.
- *
- * A run that holds a `chargeLease` (it resumed a session other runs may be
- * using) charges only the usage beyond what an overlapping run on that
- * session was already charged for (see OpenCodeSessionChargeLease).
+ * under-report them, so they are never marked complete.
  *
  * A zero cost with nonzero tokens means the model is unpriced, not free: the
  * cost is reported as null so the ledger marks it unpriced instead of $0.00.
@@ -491,12 +375,9 @@ export function reconcileOpenCodeRunUsage(input: {
   stepCostUsd: number;
   /** Step counters the fallback refused (see readOpenCodeStepUsage). */
   stepUsageIssues?: string[];
-  /** This run's hold on the resumed session's shared charge record. */
-  chargeLease?: OpenCodeSessionChargeLease | null;
 }): OpenCodeRunUsageReconciliation {
   const finalRecord = input.sessionUsageFinal ?? null;
   const cumulative = mergeOpenCodeSessionTotals(input.sessionUsage, finalRecord);
-  // A fresh session starts at zero; a resumed one needs its pre-run reading.
   const baselineUsable = !input.resumedSession || input.sessionUsageBaseline !== null;
   const stepIssues = input.stepUsageIssues ?? [];
   if (cumulative && baselineUsable) {
@@ -518,11 +399,10 @@ export function reconcileOpenCodeRunUsage(input: {
           ? input.stepCostUsd > 0 ? input.stepCostUsd : null
           : Math.max(costUsd, input.stepCostUsd);
     }
-    const charge = chargeOnce({ usage, costUsd }, input.sessionUsageBaseline, input.chargeLease, issues);
-    const tokens = charge.usage.inputTokens + charge.usage.cachedInputTokens + charge.usage.outputTokens;
+    const tokens = usage.inputTokens + usage.cachedInputTokens + usage.outputTokens;
     return {
-      usage: charge.usage,
-      costUsd: charge.costUsd !== null && charge.costUsd === 0 && tokens > 0 ? null : charge.costUsd,
+      usage,
+      costUsd: costUsd !== null && costUsd === 0 && tokens > 0 ? null : costUsd,
       usageBasis: "per_run",
       source: "session_usage",
       complete,
@@ -532,27 +412,14 @@ export function reconcileOpenCodeRunUsage(input: {
   const reason = cumulative
     ? "resumed session has no pre-run usage baseline; step sums used"
     : "session reported no usage; step sums used";
-  const issues = [reason, ...stepIssues];
   const stepTokens =
     input.stepUsage.inputTokens + input.stepUsage.cachedInputTokens + input.stepUsage.outputTokens;
-  if (stepTokens === 0 && input.stepCostUsd === 0) {
-    issues.push("no usage was reported by the session or its steps; the run is charged zero");
-  }
-  // The step sums are this run's own steps. Only a known starting point lets
-  // them be placed on the session's cumulative scale the lease records.
-  const charge = chargeOnce(
-    { usage: input.stepUsage, costUsd: input.stepCostUsd },
-    input.sessionUsageBaseline,
-    baselineUsable ? input.chargeLease : null,
-    issues,
-  );
-  const tokens = charge.usage.inputTokens + charge.usage.cachedInputTokens + charge.usage.outputTokens;
   return {
-    usage: charge.usage,
-    costUsd: charge.costUsd === 0 && tokens > 0 ? null : charge.costUsd,
+    usage: input.stepUsage,
+    costUsd: input.stepCostUsd === 0 && stepTokens > 0 ? null : input.stepCostUsd,
     usageBasis: "per_run",
     source: "step_finish",
     complete: false,
-    issues,
+    issues: [reason, ...stepIssues],
   };
 }
