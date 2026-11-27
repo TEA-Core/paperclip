@@ -31,6 +31,7 @@ import { activityService } from "../services/activity.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
+import { issueService } from "../services/issues.ts";
 import { applyIssueExecutionPolicyTransition, buildIssueMonitorClearedPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, setIssueExecutionPolicyMonitorScheduledBy } from "../services/issue-execution-policy.ts";
 
 const recoveryActionHook = vi.hoisted(() => ({
@@ -1185,6 +1186,102 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         expect(queuedRecoveryIssueWakeups.length).toBeLessThanOrEqual(1);
         expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
         expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    // The per-exhaustion claim does not live on the recovery issue: deleting that issue
+    // while the completion keeps failing must not let a retry create a second one.
+    it("create_recovery_issue: a recovery issue deleted during a persistent completion failure is not created again", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'sup23786 injected completion fault'; end $$;
+        create trigger sup23786_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        const [created] = await db.select().from(issues).where(eq(issues.originId, issueId));
+        expect(created).toBeDefined();
+        expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 1 });
+
+        await issueService(db).remove(created!.id);
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 0 });
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+          ),
+        );
+      }
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      await heartbeat.drainActiveRunExecutions();
+      const effects = await recoveryEffects(issueId, agentId, companyId);
+      expect(effects).toMatchObject({ exhaustions: 1, recoveryIssues: 0 });
+      expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+    });
+
+    // A later, separate exhaustion of the same monitor is a new episode even when it
+    // reuses the same schedule time and clear reason: it gets its own recovery.
+    it.each(["wake_owner", "create_recovery_issue", "escalate_to_board"] as const)(
+      "%s: exhaustion, recovery, re-arm and a second exhaustion at the same schedule run a second recovery",
+      async (recoveryPolicy) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        const first = await recoveryEffects(issueId, agentId, companyId);
+        expect(first.exhaustions).toBe(1);
+        await db.update(issues).set({ status: "done" }).where(eq(issues.originId, issueId));
+
+        // The board starts a new epoch with a higher bound; attempt 2 fires normally.
+        await rearm(issueId, "board", { maxAttempts: 2, recoveryPolicy });
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+        expect((await exhaustionRows(issueId))).toHaveLength(1);
+
+        // The owner's exhausted re-arm reuses the same nextCheckAt; it exhausts again
+        // with the same clear reason.
+        await rearm(issueId, "assignee", { maxAttempts: 2, recoveryPolicy });
+        expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(2);
+        expect(rows.map((row) => (row.details as Record<string, unknown>).nextCheckAt)).toEqual([rearmCheckAt, rearmCheckAt]);
+        expect(rows.map((row) => (row.details as Record<string, unknown>).clearReason)).toEqual([
+          "max_attempts_exhausted",
+          "max_attempts_exhausted",
+        ]);
+        const second = await recoveryEffects(issueId, agentId, companyId);
+        if (recoveryPolicy === "wake_owner") {
+          expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(2);
+          expect(rows.map((row) => (row.details as Record<string, unknown>).recoveryOutcome)).toEqual([
+            "owner_wake_queued",
+            "owner_wake_queued",
+          ]);
+        } else if (recoveryPolicy === "create_recovery_issue") {
+          expect(second.recoveryIssues).toBe(2);
+          expect(rows.map((row) => (row.details as Record<string, unknown>).recoveryOutcome)).toEqual([
+            "recovery_issue_created",
+            "recovery_issue_created",
+          ]);
+        } else {
+          expect(second.comments).toBe(2);
+        }
       },
     );
 

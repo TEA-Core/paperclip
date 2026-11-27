@@ -84,6 +84,8 @@ export const issues = pgTable(
     monitorWakeRequestedAt: timestamp("monitor_wake_requested_at", { withTimezone: true }),
     monitorLastTriggeredAt: timestamp("monitor_last_triggered_at", { withTimezone: true }),
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
+    // Completed monitor exhaustions; the next exhaustion's recovery claim episode is this + 1.
+    monitorExhaustionCount: integer("monitor_exhaustion_count").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
     executionWorkspaceId: uuid("execution_workspace_id")

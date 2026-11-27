@@ -177,6 +177,7 @@ import {
   issueApprovals,
   issueAttachments,
   issueComments,
+  issueMonitorRecoveryClaims,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -12583,6 +12584,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
     monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
     monitorAttemptCount: issues.monitorAttemptCount,
+    monitorExhaustionCount: issues.monitorExhaustionCount,
     monitorNotes: issues.monitorNotes,
     monitorScheduledBy: issues.monitorScheduledBy,
   };
@@ -12605,6 +12607,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorWakeRequestedAt: Date | null;
     monitorLastTriggeredAt: Date | null;
     monitorAttemptCount: number | null;
+    monitorExhaustionCount: number | null;
     monitorNotes: string | null;
     monitorScheduledBy: string | null;
   }
@@ -12714,10 +12717,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  // The recovery issue records its exhaustion in `originFingerprint` and is created on
-  // its own connection, so it survives a failed completion transaction. Any status and
-  // visibility counts: a recovery issue that was resolved while the completion kept
-  // failing still is this exhaustion's effect and must not be opened a second time.
+  // The recovery issue records its exhaustion episode in `originFingerprint` and is
+  // created on its own connection. The episode claim records the issue right after it
+  // is created; this lookup covers only a failure between those two writes.
   async function findIssueMonitorRecoveryIssueForExhaustion(
     claimed: IssueMonitorDispatchRow,
     recoveryFingerprint: string,
@@ -12738,9 +12740,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  // The idempotency key of a recovery wake names one exhaustion (issue, clear reason,
-  // claimed schedule). A queued or coalesced row with that key means an earlier attempt
-  // at this same exhaustion already delivered the wake, so a retry must not send it again.
+  // The idempotency key of a recovery wake names one exhaustion episode (issue, clear
+  // reason, claimed schedule, episode). A queued or coalesced row with that key means an
+  // earlier attempt at this same episode already delivered the wake, so a retry must not
+  // send it again.
   async function issueMonitorRecoveryWakeAlreadySent(input: {
     companyId: string;
     agentId: string;
@@ -12785,10 +12788,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  type IssueMonitorRecoveryClaim = typeof issueMonitorRecoveryClaims.$inferSelect;
+
+  // The claim for one exhaustion episode is inserted (insert-or-skip on the unique
+  // issue + episode key) in its own transaction before the recovery effect, so it
+  // survives a failed completion transaction and a deleted recovery issue.
+  async function claimIssueMonitorRecoveryEpisode(input: {
+    claimed: IssueMonitorDispatchRow;
+    episode: number;
+    clearReason: IssueExecutionMonitorClearReason;
+    recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
+  }): Promise<IssueMonitorRecoveryClaim> {
+    const [inserted] = await db
+      .insert(issueMonitorRecoveryClaims)
+      .values({
+        companyId: input.claimed.companyId,
+        issueId: input.claimed.id,
+        exhaustionEpisode: input.episode,
+        clearReason: input.clearReason,
+        scheduledAt: input.claimed.monitorNextCheckAt!,
+        recoveryPolicy: input.recoveryPolicy,
+      })
+      .onConflictDoNothing({
+        target: [issueMonitorRecoveryClaims.issueId, issueMonitorRecoveryClaims.exhaustionEpisode],
+      })
+      .returning();
+    if (inserted) return inserted;
+    const [existing] = await db
+      .select()
+      .from(issueMonitorRecoveryClaims)
+      .where(
+        and(
+          eq(issueMonitorRecoveryClaims.issueId, input.claimed.id),
+          eq(issueMonitorRecoveryClaims.exhaustionEpisode, input.episode),
+        ),
+      )
+      .limit(1);
+    return existing!;
+  }
+
+  // Records on the claim the part of the effect that committed outside the completion
+  // transaction, immediately after it committed.
+  async function recordIssueMonitorRecoveryClaim(
+    claimId: string,
+    patch: Partial<Pick<IssueMonitorRecoveryClaim, "recoveryOutcome" | "recoveryIssueId" | "recoveryWakeQueued">>,
+  ) {
+    await db.update(issueMonitorRecoveryClaims).set(patch).where(eq(issueMonitorRecoveryClaims.id, claimId));
+  }
+
   async function performIssueMonitorRecovery(input: {
     tx: Db;
     postCommitPublications: ActivityPublication[];
     claimed: IssueMonitorDispatchRow;
+    claim: IssueMonitorRecoveryClaim;
     scheduledAtIso: string;
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
@@ -12801,6 +12853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
+    const episodeKey = `${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}:${input.claim.exhaustionEpisode}`;
     const reviewPathLost =
       input.claimed.status === "in_review" &&
       (await issuesSvc
@@ -12826,90 +12879,114 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (input.recoveryPolicy === "create_recovery_issue") {
-      const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}`;
-      let recoveryIssue =
-        (await findIssueMonitorRecoveryIssueForExhaustion(input.claimed, recoveryFingerprint)) ??
-        (await findOpenIssueMonitorRecoveryIssue(input.claimed));
-      const reusedRecoveryIssue =
-        recoveryIssue !== null && recoveryIssue.originFingerprint !== recoveryFingerprint;
-      if (!recoveryIssue) {
-        const recoveryAssigneeAgentId = await assertAssignableAgent(
-          db,
-          input.claimed.companyId,
-          input.claimed.assigneeAgentId,
-          { kind: "work" },
-        ).then(
-          () => input.claimed.assigneeAgentId,
-          (err: unknown) => {
-            if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
-            throw err;
-          },
-        );
-        recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
-          title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
-          description: monitorRecoveryComment({
-            issue: input.claimed,
-            clearReason: input.clearReason,
-            recoveryPolicy: input.recoveryPolicy,
-            nextAttemptCount: input.nextAttemptCount,
-          }),
-          status: "todo",
-          priority: "high",
-          parentId: input.claimed.id,
-          projectId: input.claimed.projectId,
-          goalId: input.claimed.goalId,
-          assigneeAgentId: recoveryAssigneeAgentId,
-          originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
-          originId: input.claimed.id,
-          originFingerprint: recoveryFingerprint,
-          billingCode: input.claimed.billingCode,
+      const recoveryFingerprint = `issue_monitor:${input.clearReason}:${input.scheduledAtIso}:${input.claim.exhaustionEpisode}`;
+      let recoveryIssueId = input.claim.recoveryIssueId;
+      let recoveryIssue: typeof issues.$inferSelect | null = null;
+      let reusedRecoveryIssue: boolean;
+      if (recoveryIssueId) {
+        // This episode's recovery issue already exists, or existed: the claim keeps its
+        // id after the issue is resolved or deleted, so it is never opened again.
+        recoveryIssue = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, recoveryIssueId))
+          .then((rows) => rows[0] ?? null);
+        reusedRecoveryIssue = input.claim.recoveryOutcome === "recovery_issue_reused";
+      } else {
+        recoveryIssue =
+          (await findIssueMonitorRecoveryIssueForExhaustion(input.claimed, recoveryFingerprint)) ??
+          (await findOpenIssueMonitorRecoveryIssue(input.claimed));
+        reusedRecoveryIssue = recoveryIssue !== null && recoveryIssue.originFingerprint !== recoveryFingerprint;
+        if (!recoveryIssue) {
+          const recoveryAssigneeAgentId = await assertAssignableAgent(
+            db,
+            input.claimed.companyId,
+            input.claimed.assigneeAgentId,
+            { kind: "work" },
+          ).then(
+            () => input.claimed.assigneeAgentId,
+            (err: unknown) => {
+              if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
+              throw err;
+            },
+          );
+          recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
+            title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
+            description: monitorRecoveryComment({
+              issue: input.claimed,
+              clearReason: input.clearReason,
+              recoveryPolicy: input.recoveryPolicy,
+              nextAttemptCount: input.nextAttemptCount,
+            }),
+            status: "todo",
+            priority: "high",
+            parentId: input.claimed.id,
+            projectId: input.claimed.projectId,
+            goalId: input.claimed.goalId,
+            assigneeAgentId: recoveryAssigneeAgentId,
+            originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+            originId: input.claimed.id,
+            originFingerprint: recoveryFingerprint,
+            billingCode: input.claimed.billingCode,
+          });
+        }
+        recoveryIssueId = recoveryIssue.id;
+        await recordIssueMonitorRecoveryClaim(input.claim.id, {
+          recoveryIssueId,
+          recoveryOutcome: reusedRecoveryIssue ? "recovery_issue_reused" : "recovery_issue_created",
         });
       }
 
       // The recovery issue is the effect; waking its assignee is best effort. A paused or
       // budget-blocked assignee must not undo or repeat the issue creation, and a recovery
-      // issue already resolved or hidden needs no wake.
+      // issue already resolved, hidden or deleted needs no wake.
       const recoveryIssueOpen =
-        recoveryIssue.hiddenAt === null && recoveryIssue.status !== "done" && recoveryIssue.status !== "cancelled";
-      let recoveryWakeQueued = false;
-      const recoveryWakeKey = `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
-      if (
-        recoveryIssue.assigneeAgentId &&
-        (await issueMonitorRecoveryWakeAlreadySent({
-          companyId: input.claimed.companyId,
-          agentId: recoveryIssue.assigneeAgentId,
-          idempotencyKey: recoveryWakeKey,
-        }))
-      ) {
-        recoveryWakeQueued = true;
-      } else if (recoveryIssueOpen && recoveryIssue.assigneeAgentId) {
-        try {
-          recoveryWakeQueued = Boolean(
-            await enqueueWakeup(recoveryIssue.assigneeAgentId, {
-              source: "automation",
-              triggerDetail: "system",
-              reason: "issue_monitor_recovery_issue",
-              idempotencyKey: recoveryWakeKey,
-              payload: withRecoveryContext(
-                { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
-                "status_only",
-              ),
-              requestedByActorType: input.actorType,
-              requestedByActorId: input.actorId,
-              contextSnapshot: withRecoveryContext(
-                {
-                  issueId: recoveryIssue.id,
-                  sourceIssueId: input.claimed.id,
-                  source: "issue.monitor.recovery_issue",
-                  wakeReason: "issue_monitor_recovery_issue",
-                },
-                "status_only",
-              ),
-            }),
-          );
-        } catch (err) {
-          if (!(err instanceof HttpError && err.status >= 400 && err.status < 500)) throw err;
+        recoveryIssue !== null &&
+        recoveryIssue.hiddenAt === null &&
+        recoveryIssue.status !== "done" &&
+        recoveryIssue.status !== "cancelled";
+      let recoveryWakeQueued = input.claim.recoveryWakeQueued === true;
+      const recoveryWakeKey = `issue-monitor-recovery-issue:${episodeKey}`;
+      const recoveryAssigneeAgentId = recoveryIssue?.assigneeAgentId ?? null;
+      if (!recoveryWakeQueued && recoveryAssigneeAgentId) {
+        if (
+          await issueMonitorRecoveryWakeAlreadySent({
+            companyId: input.claimed.companyId,
+            agentId: recoveryAssigneeAgentId,
+            idempotencyKey: recoveryWakeKey,
+          })
+        ) {
+          recoveryWakeQueued = true;
+        } else if (recoveryIssueOpen) {
+          try {
+            recoveryWakeQueued = Boolean(
+              await enqueueWakeup(recoveryAssigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_monitor_recovery_issue",
+                idempotencyKey: recoveryWakeKey,
+                payload: withRecoveryContext(
+                  { issueId: recoveryIssueId, sourceIssueId: input.claimed.id },
+                  "status_only",
+                ),
+                requestedByActorType: input.actorType,
+                requestedByActorId: input.actorId,
+                contextSnapshot: withRecoveryContext(
+                  {
+                    issueId: recoveryIssueId,
+                    sourceIssueId: input.claimed.id,
+                    source: "issue.monitor.recovery_issue",
+                    wakeReason: "issue_monitor_recovery_issue",
+                  },
+                  "status_only",
+                ),
+              }),
+            );
+          } catch (err) {
+            if (!(err instanceof HttpError && err.status >= 400 && err.status < 500)) throw err;
+          }
         }
+        if (recoveryWakeQueued) await recordIssueMonitorRecoveryClaim(input.claim.id, { recoveryWakeQueued });
       }
 
       await logActivityInTransactionBestEffort(input.tx, {
@@ -12924,8 +13001,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         entityId: input.claimed.id,
         details: {
           ...details,
-          recoveryIssueId: recoveryIssue.id,
-          recoveryIdentifier: recoveryIssue.identifier,
+          recoveryIssueId,
+          recoveryIdentifier: recoveryIssue?.identifier ?? null,
           recoveryIssueReused: reusedRecoveryIssue,
           recoveryWakeQueued,
         },
@@ -12936,7 +13013,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (input.recoveryPolicy === "escalate_to_board") {
-      // Pure database writes: they commit or roll back with the completion transaction.
+      // Pure database writes: they commit or roll back with the completion transaction,
+      // so a retry after a failed completion writes them once again, never twice.
+      await input.tx
+        .update(issueMonitorRecoveryClaims)
+        .set({ recoveryOutcome: "escalated_to_board" })
+        .where(eq(issueMonitorRecoveryClaims.id, input.claim.id));
       await input.tx.insert(issueComments).values({
         companyId: input.claimed.companyId,
         issueId: input.claimed.id,
@@ -12963,71 +13045,80 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { recoveryOutcome: "escalated_to_board" as const };
     }
 
-    const ownerWakeKey = `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
-    const ownerWakeAlreadySent = await issueMonitorRecoveryWakeAlreadySent({
-      companyId: input.claimed.companyId,
-      agentId: input.claimed.assigneeAgentId!,
-      idempotencyKey: ownerWakeKey,
-    });
-    const wakeResult = ownerWakeAlreadySent ? true : await (async () => {
-      const owner = await getAgent(input.claimed.assigneeAgentId!);
-      if (owner) {
-        const budgetBlock = await budgets.getInvocationBlock(input.claimed.companyId, owner.id, {
-          issueId: input.claimed.id,
-          projectId: input.claimed.projectId,
-        });
-        if (budgetBlock) {
-          throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
-        }
-        const invokability = await getAgentInvokability(owner);
-        if (!invokability.invokable && invokability.reason === "paused") {
-          throw conflict(invokability.message, { status: owner.status, reason: invokability.reason });
-        }
-      }
-      return enqueueWakeup(input.claimed.assigneeAgentId!, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "issue_monitor_recovery",
+    // The owner wake commits outside the completion transaction. Once the claim records
+    // its outcome, a retry of this episode reports that outcome and does not wake again.
+    let wakeOutcome: "owner_wake_queued" | "owner_wake_not_queued";
+    if (input.claim.recoveryOutcome === "owner_wake_queued" || input.claim.recoveryOutcome === "owner_wake_not_queued") {
+      wakeOutcome = input.claim.recoveryOutcome;
+    } else {
+      const ownerWakeKey = `issue-monitor-recovery:${episodeKey}`;
+      const ownerWakeAlreadySent = await issueMonitorRecoveryWakeAlreadySent({
+        companyId: input.claimed.companyId,
+        agentId: input.claimed.assigneeAgentId!,
         idempotencyKey: ownerWakeKey,
-        payload: withRecoveryContext(
-          {
-            issueId: input.claimed.id,
-            monitorAttemptCount: input.nextAttemptCount,
-            monitorNotes: input.claimed.monitorNotes ?? null,
-            clearReason: input.clearReason,
-            serviceName: input.monitor?.serviceName ?? null,
-            timeoutAt: input.monitor?.timeoutAt ?? null,
-            maxAttempts: input.monitor?.maxAttempts ?? null,
-            ...(reviewPathContext ?? {}),
-          },
-          "status_only",
-        ),
-        requestedByActorType: input.actorType,
-        requestedByActorId: input.actorId,
-        contextSnapshot: withRecoveryContext(
-          {
-            issueId: input.claimed.id,
-            source: "issue.monitor.recovery",
-            wakeReason: "issue_monitor_recovery",
-            monitorAttemptCount: input.nextAttemptCount,
-            monitorNotes: input.claimed.monitorNotes ?? null,
-            clearReason: input.clearReason,
-            serviceName: input.monitor?.serviceName ?? null,
-            timeoutAt: input.monitor?.timeoutAt ?? null,
-            maxAttempts: input.monitor?.maxAttempts ?? null,
-            ...(reviewPathContext ?? {}),
-          },
-          "status_only",
-        ),
       });
-    })().catch((err: unknown) => {
-      if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
-      throw err;
-    });
+      const wakeResult = ownerWakeAlreadySent ? true : await (async () => {
+        const owner = await getAgent(input.claimed.assigneeAgentId!);
+        if (owner) {
+          const budgetBlock = await budgets.getInvocationBlock(input.claimed.companyId, owner.id, {
+            issueId: input.claimed.id,
+            projectId: input.claimed.projectId,
+          });
+          if (budgetBlock) {
+            throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
+          }
+          const invokability = await getAgentInvokability(owner);
+          if (!invokability.invokable && invokability.reason === "paused") {
+            throw conflict(invokability.message, { status: owner.status, reason: invokability.reason });
+          }
+        }
+        return enqueueWakeup(input.claimed.assigneeAgentId!, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_monitor_recovery",
+          idempotencyKey: ownerWakeKey,
+          payload: withRecoveryContext(
+            {
+              issueId: input.claimed.id,
+              monitorAttemptCount: input.nextAttemptCount,
+              monitorNotes: input.claimed.monitorNotes ?? null,
+              clearReason: input.clearReason,
+              serviceName: input.monitor?.serviceName ?? null,
+              timeoutAt: input.monitor?.timeoutAt ?? null,
+              maxAttempts: input.monitor?.maxAttempts ?? null,
+              ...(reviewPathContext ?? {}),
+            },
+            "status_only",
+          ),
+          requestedByActorType: input.actorType,
+          requestedByActorId: input.actorId,
+          contextSnapshot: withRecoveryContext(
+            {
+              issueId: input.claimed.id,
+              source: "issue.monitor.recovery",
+              wakeReason: "issue_monitor_recovery",
+              monitorAttemptCount: input.nextAttemptCount,
+              monitorNotes: input.claimed.monitorNotes ?? null,
+              clearReason: input.clearReason,
+              serviceName: input.monitor?.serviceName ?? null,
+              timeoutAt: input.monitor?.timeoutAt ?? null,
+              maxAttempts: input.monitor?.maxAttempts ?? null,
+              ...(reviewPathContext ?? {}),
+            },
+            "status_only",
+          ),
+        });
+      })().catch((err: unknown) => {
+        if (isPermanentIssueMonitorOwnerRefusal(err)) return null;
+        throw err;
+      });
+      // enqueueWakeup returns null when it skipped the wake (e.g. the owner does not accept
+      // on-demand wakes). Never record or report a queued wake that was not queued.
+      wakeOutcome = wakeResult ? "owner_wake_queued" : "owner_wake_not_queued";
+      await recordIssueMonitorRecoveryClaim(input.claim.id, { recoveryOutcome: wakeOutcome });
+    }
 
-    // enqueueWakeup returns null when it skipped the wake (e.g. the owner does not accept
-    // on-demand wakes). Never record or report a queued wake that was not queued.
-    if (!wakeResult) return { recoveryOutcome: "owner_wake_not_queued" as const };
+    if (wakeOutcome === "owner_wake_not_queued") return { recoveryOutcome: "owner_wake_not_queued" as const };
 
     await logActivityInTransactionBestEffort(input.tx, {
       companyId: input.claimed.companyId,
@@ -13063,20 +13154,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // SUP-23786: the recovery effect runs first and the clear + the single
     // `issue.monitor_exhausted` row commit afterwards, in one transaction, with an
     // outcome derived from what the effect actually did. A failing effect rolls
-    // back, releases the claim and leaves the monitor armed so the next tick
+    // back, releases the dispatch claim and leaves the monitor armed so the next tick
     // retries; it is never cleared with the recovery lost. A per-issue advisory
     // lock serialises overlapping claims of the same due monitor, and the
     // claimed-schedule check inside it means the loser writes and runs nothing.
     //
-    // A retry after a completion failure must not repeat an effect. The board
-    // comment and every recovery activity row are written on this transaction,
-    // so they commit or roll back with the clear and the exhaustion row. The
-    // effects that cannot join it (the recovery issue and the wakes) are
-    // idempotent per exhaustion: the recovery issue this exhaustion opened is
-    // found by its origin fingerprint in any status, so a resolved one is never
-    // opened again; another open recovery issue is reused; and a wake whose
-    // per-exhaustion idempotency key is already queued is not sent again.
-    // Realtime publications wait until the transaction commits.
+    // A retry after a completion failure must not repeat an effect. Before the
+    // effect, the run claims the exhaustion episode in its own transaction
+    // (`issue_monitor_recovery_claims`, unique per issue and episode). The
+    // episode is the issue's `monitorExhaustionCount` + 1; this transaction
+    // increments the count, so a later, separate exhaustion gets a new claim.
+    // An effect that commits outside this transaction (the recovery issue, the
+    // wakes) is recorded on the claim right after it commits, and a retry of the
+    // same episode replays the recorded effect instead of running it again. The
+    // claim does not reference the recovery issue, so deleting that issue never
+    // erases it. The board comment and every recovery activity row are written
+    // on this transaction, so they commit or roll back with the clear and the
+    // exhaustion row. Realtime publications wait until the transaction commits.
     const postCommitPublications: ActivityPublication[] = [];
     try {
       const result = await db.transaction(async (tx) => {
@@ -13084,7 +13178,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`select pg_advisory_xact_lock(hashtextextended(${`issue-monitor-exhaustion:${input.claimed.id}`}, 0))`,
         );
         const [current] = await tx
-          .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+          .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorExhaustionCount: issues.monitorExhaustionCount })
           .from(issues)
           .where(eq(issues.id, input.claimed.id))
           .limit(1);
@@ -13096,10 +13190,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { outcome: "skipped" as const, reason: "monitor_rearmed" };
         }
 
+        const claim = await claimIssueMonitorRecoveryEpisode({
+          claimed: input.claimed,
+          episode: current.monitorExhaustionCount + 1,
+          clearReason: input.clearReason,
+          recoveryPolicy: input.recoveryPolicy,
+        });
         const recovery = await performIssueMonitorRecovery({
           tx: tx as unknown as Db,
           postCommitPublications,
           claimed: input.claimed,
+          claim,
           scheduledAtIso: input.scheduledAtIso,
           nextAttemptCount: input.nextAttemptCount,
           clearReason: input.clearReason,
@@ -13125,6 +13226,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // stops the owner agent from re-arming; board-armed state is unchanged.
               exhaustionRecovered: input.monitor?.scheduledBy === "assignee",
             }),
+            monitorExhaustionCount: sql`${issues.monitorExhaustionCount} + 1`,
             updatedAt: input.now,
           })
           .where(eq(issues.id, input.claimed.id));
