@@ -242,7 +242,7 @@ function scopeIncludesId(ids: string[], id: string | null | undefined) {
 }
 
 function isSimpleAssignableAgentStatus(status: string | null | undefined) {
-  return status !== "pending_approval" && status !== "terminated";
+  return status !== "pending_approval" && status !== "terminated" && status !== "deleted";
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

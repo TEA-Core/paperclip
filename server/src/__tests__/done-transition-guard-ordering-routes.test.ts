@@ -1,8 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq, and } from "drizzle-orm";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { eq, and, asc, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -28,7 +32,17 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
+import { projectRoutes } from "../routes/projects.js";
+import { companyService } from "../services/companies.js";
+import { prunePluginLogs } from "../services/plugin-log-retention.js";
+import { detachIssuesFromClosedExecutionWorkspace } from "../services/execution-workspaces.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import * as hardenedGit from "../services/hardened-git-probe.js";
+import * as githubFetch from "../services/github-fetch.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { buildDiscoveryQuery, selectLandingCandidates } from "../services/done-close-landing-backstop.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -138,6 +152,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       next();
     });
     app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", agentRoutes(db));
+    app.use("/api", projectRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -732,6 +748,34 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
         comment:
           "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+  });
+
+  it("decision-only override allows a Tier 0 close with open linked PRs", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("DECISIONONLY");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 275, state: "open", draft: false },
+    ]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        doneTransitionOverride: {
+          disposition: "decision-only-no-repository-deliverable",
+          reason: "The recorded decision has no repository deliverable.",
+        },
+        comment: "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1886,6 +1930,772 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
       expect(audit).toHaveLength(1);
+    });
+  });
+  describe("durable repository landing debt", () => {
+    const board = () => {
+      currentActor = { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" } as Express.Request["actor"];
+    };
+    const landing = (aheadBy = 0) => {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => new Response(
+        JSON.stringify(url.includes("/compare/") ? { ahead_by: aheadBy } : []), { status: 200 },
+      ));
+    };
+    const debtRows = (id: string) => db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, id), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+    )).orderBy(asc(activityLog.createdAt));
+    const patch = (id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
+    async function flip(id: string) {
+      const response = await patch(id, { deliveryRequirement: "record_only" });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    }
+
+    it.each(["agentId", "runId"] as const)("preserves unassigned issue debt through the agent-delete route (%s linkage)", async (link) => {
+      const { companyId, issueId, agentId } = await seedIssue("DELETE");
+      board();
+      await flip(issueId);
+      // Existing pre-marker debt must survive without the newer redundant marker.
+      await db.delete(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.repository_landing_debt"),
+      ));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "completed" });
+      await db.update(activityLog).set({
+        actorType: "agent", actorId: agentId,
+        agentId: link === "agentId" ? agentId : null, runId: link === "runId" ? runId : null,
+      }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+      const deleted = await request(app).delete(`/api/agents/${agentId}`);
+      expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
+      const closed = await patch(issueId, { status: "done" });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(409);
+      expect(closed.body.code).toBe("done_transition_missing_delivery");
+      const debt = await debtRows(issueId);
+      expect(debt).toHaveLength(1);
+      expect(debt[0]).toMatchObject({ actorType: "agent", actorId: agentId, agentId: link === "agentId" ? agentId : null, runId: link === "runId" ? runId : null });
+      expect(debt[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it("refuses a missing reclassification audit until verified landing discharges its independent marker", async () => {
+      const { issueId } = await seedIssue("MISSING");
+      board();
+      await flip(issueId);
+      await db.delete(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+      ));
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      landing();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      mockGetByName.mockResolvedValue(null);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+    });
+
+    it.each(["project", "project workspace", "workspace detach", "work product", "description", "comment", "document", "retention"] as const)(
+      "retains debt after %s cleanup", async (cleanup) => {
+        const { companyId, issueId, projectId, projectWorkspaceId, executionWorkspaceId } = await seedIssue("CLEANUP");
+        board();
+        await flip(issueId);
+        if (cleanup === "description" || cleanup === "comment" || cleanup === "document") {
+          const settings = instanceSettingsService(db);
+          const { enableExternalObjects } = await settings.getExperimental();
+          onTestFinished(async () => { await settings.updateExperimental({ enableExternalObjects }); });
+          await settings.updateExperimental({ enableExternalObjects: true });
+        }
+        let response: request.Response | undefined;
+        const mentions = (kind: "description" | "comment" | "document") => db.select().from(externalObjectMentions).where(and(
+          eq(externalObjectMentions.sourceIssueId, issueId), eq(externalObjectMentions.sourceKind, kind),
+        ));
+        const note = "Delivery: https://github.com/TEA-Core/paperclip/pull/404";
+        if (cleanup === "workspace detach") {
+          await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+          await detachIssuesFromClosedExecutionWorkspace(db, { companyId, executionWorkspaceId });
+          expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionWorkspaceId).toBeNull();
+        }
+        if (cleanup === "project") {
+          // A linked issue's project FK restricts deletion. Exercise the lawful
+          // cascade when only its execution-workspace link still names the project.
+          await db.update(issues).set({ projectId: null }).where(eq(issues.id, issueId));
+          response = await request(app).delete(`/api/projects/${projectId}`);
+        }
+        if (cleanup === "project workspace") response = await request(app).delete(`/api/projects/${projectId}/workspaces/${projectWorkspaceId}`);
+        if (cleanup === "work product") {
+          const [product] = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+          response = await request(app).delete(`/api/work-products/${product!.id}`);
+        }
+        if (cleanup === "description") {
+          expect((await patch(issueId, { description: note })).status).toBe(200);
+          await vi.waitFor(async () => expect(await mentions("description")).toHaveLength(1));
+          response = await patch(issueId, { description: "" });
+        }
+        if (cleanup === "comment") {
+          const comment = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: note });
+          expect(comment.status).toBe(201);
+          await vi.waitFor(async () => expect(await mentions("comment")).toHaveLength(1));
+          response = await request(app).delete(`/api/issues/${issueId}/comments/${comment.body.id}`);
+        }
+        if (cleanup === "document") {
+          const document = await request(app).put(`/api/issues/${issueId}/documents/cleanup-note`)
+            .send({ format: "markdown", body: note });
+          expect(document.status, JSON.stringify(document.body)).toBe(201);
+          await vi.waitFor(async () => expect(await mentions("document")).toHaveLength(1));
+          response = await request(app).delete(`/api/issues/${issueId}/documents/cleanup-note`);
+        }
+        if (cleanup === "retention") await prunePluginLogs(db, 0);
+        else if (cleanup !== "workspace detach") expect(response?.status, JSON.stringify(response?.body)).toBe(200);
+        if (cleanup === "description" || cleanup === "comment" || cleanup === "document") {
+          await vi.waitFor(async () => expect(await mentions(cleanup)).toEqual([]));
+        }
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        const closed = await patch(issueId, { status: "done" });
+        expect(closed.status, JSON.stringify(closed.body)).toBe(409);
+        expect(closed.body.code).toBe("done_transition_missing_delivery");
+      },
+    );
+
+    it.each(["issue", "company"] as const)("allows %s removal only with the owing issue gone", async (scope) => {
+      const { companyId, issueId } = await seedIssue("GONE");
+      board();
+      await flip(issueId);
+      if (scope === "company") expect((await companyService(db).remove(companyId))?.id).toBe(companyId);
+      else {
+        const removed = await request(app).delete(`/api/issues/${issueId}`);
+        expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+      }
+      expect(await db.select().from(issues).where(eq(issues.id, issueId))).toEqual([]);
+      expect((await patch(issueId, { status: "done" })).status).toBe(404);
+    });
+
+    it.each(["recovery", "approval-comment", "escalation"] as const)(
+      "%s refuses unpaid debt before board bypass and preserves its pending state",
+      async (door) => {
+        const fixture = await seedIssue("DOOR");
+        const { companyId, issueId, agentId } = fixture;
+        board();
+        await flip(issueId);
+        let close: () => PromiseLike<request.Response>;
+        if (door === "recovery") {
+          await db.insert(issueRecoveryActions).values({
+            companyId, sourceIssueId: issueId, kind: "missing_disposition", status: "active",
+            ownerType: "agent", ownerAgentId: agentId, cause: "successful_run_missing_issue_disposition",
+            fingerprint: `debt:${issueId}`, evidence: {}, nextAction: "Close after landing.",
+          });
+          close = () => request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+            .send({ outcome: "restored", sourceIssueStatus: "done" });
+        } else {
+          const stageId = randomUUID();
+          const participant = { type: "user" as const, userId: "local-board", agentId: null };
+          await db.update(issues).set({
+            status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board",
+            executionPolicy: { stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [participant] }] },
+            executionState: {
+              status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+              currentParticipant: participant, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+              returnAssignee: { type: "agent", agentId, userId: null },
+            },
+          }).where(eq(issues.id, issueId));
+          if (door === "approval-comment") {
+            close = () => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "kind: review\ndecision: approved\nLooks good." });
+          } else {
+            const interaction = await issueThreadInteractionService(db).create(
+              { id: issueId, companyId },
+              {
+                kind: "request_confirmation", title: "Review round cap", resolverPolicy: "human_only",
+                continuationPolicy: "wake_assignee", idempotencyKey: `review-escalation:${issueId}:${stageId}:1`,
+                payload: { version: 1, prompt: "Approve review?", acceptLabel: "Approve", rejectLabel: "Reject" },
+              },
+              { userId: "local-board" },
+            );
+            close = () => request(app).post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`).send({});
+          }
+        }
+        const refused = await close();
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(stored?.status).not.toBe("done");
+        // The same door succeeds once real repository compare evidence exists.
+        landing();
+        const accepted = await close();
+        expect(accepted.status, JSON.stringify(accepted.body)).toBe(door === "approval-comment" ? 201 : 200);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("done");
+      },
+    );
+
+    it.each(["flip-first", "close-first"] as const)("serializes %s on the issue row", async (order) => {
+      const { issueId } = await seedIssue("RACE");
+      board();
+      landing();
+      // This package targets pre-ES2024 Promise typings.
+      let entered!: () => void;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { entered = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      mockAddComment.mockImplementationOnce(async (...args: unknown[]) => {
+        entered();
+        await released;
+        return realAddCommentRef.current!(...args);
+      });
+      const flipBody = { deliveryRequirement: "record_only" };
+      const closeBody = { status: "done", comment: "Close with verified landing." };
+      const first = patch(issueId, order === "flip-first" ? flipBody : closeBody).then((response) => response);
+      await held;
+      const second = patch(issueId, order === "flip-first" ? closeBody : flipBody).then((response) => response);
+      try {
+        await vi.waitFor(async () => {
+          const waiting = await db.execute(sql`select 1 from pg_stat_activity
+            where datname = current_database() and cardinality(pg_blocking_pids(pid)) > 0`);
+          expect(waiting.length).toBeGreaterThan(0);
+        });
+      } finally { release(); }
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status, JSON.stringify(a.body)).toBe(200);
+      expect(b.status, JSON.stringify(b.body)).toBe(order === "flip-first" ? 409 : 200);
+      const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(stored?.status).toBe(order === "flip-first" ? "todo" : "done");
+      expect((await debtRows(issueId))[0]?.details?.landingCheckOwed).toBe(order === "flip-first");
+    });
+
+    it("retains old unpaid debt across reopen and status-version changes, including backstop discovery", async () => {
+      const { issueId } = await seedIssue("REOPEN");
+      board();
+      await flip(issueId);
+      await db.update(activityLog).set({
+        createdAt: new Date("2020-01-01"),
+        details: sql`${activityLog.details} || '{"closeStatusVersion":1}'::jsonb`,
+      })
+        .where(eq(activityLog.entityId, issueId));
+      // Legacy done state with unpaid debt is fixture data, not a lawful close.
+      await db.update(issues).set({ status: "done", statusVersion: 41 }).where(eq(issues.id, issueId));
+      const now = new Date();
+      const rows = await buildDiscoveryQuery(db, new Date(now.getTime() - 86_400_000), now);
+      expect(selectLandingCandidates(rows, now, now).map((row) => row.issue.id)).toContain(issueId);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it("does not settle legacy debt through a repeated done PATCH", async () => {
+      const { issueId, companyId } = await seedIssue("LEGACYREPEAT");
+      board();
+      // Pre-marker legacy state: done without a recorded verified close.
+      await db.update(issues).set({ status: "done", deliveryRequirement: "record_only" })
+        .where(eq(issues.id, issueId));
+      await db.insert(activityLog).values({
+        companyId, actorType: "user", actorId: "cloud-user-1",
+        action: "issue.delivery_requirement_reclassified", entityType: "issue", entityId: issueId,
+        details: { landingCheckOwed: true }, createdAt: new Date("2020-01-01"),
+      });
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      const [audit] = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated"),
+      ));
+      expect(audit?.details?.status).toBe("done");
+      expect((audit?.details?._previous as Record<string, unknown> | undefined)?.status).toBeUndefined();
+      const now = new Date();
+      const candidates = selectLandingCandidates(await buildDiscoveryQuery(db, new Date(0), now), new Date(0), now);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      const close = await patch(issueId, { status: "done" });
+      expect(close.status, JSON.stringify(close.body)).toBe(409);
+      expect(close.body.code).toBe("done_transition_missing_delivery");
+      expect(candidates.map((row) => row.issue.id)).toContain(issueId);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+    });
+
+    it("keeps a legacy flip-back settled after verified landing, backstop discovery, and reopen/reclose", async () => {
+      const { issueId } = await seedIssue("LEGACY");
+      board();
+      await flip(issueId);
+      // Pre-deploy debt has no disposition. Flip back before a real verified close.
+      await db.update(activityLog).set({
+        createdAt: new Date("2020-01-01"),
+        details: sql`${activityLog.details} - 'landingDebtDisposition'`,
+      }).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      landing();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+      // Preserve a settled historical row in its pre-deploy shape.
+      await db.update(activityLog).set({ details: sql`${activityLog.details} - 'landingDebtDisposition'` })
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified")));
+      expect((await patch(issueId, { deliveryRequirement: "record_only" })).status).toBe(200);
+      const now = new Date();
+      const rows = await buildDiscoveryQuery(db, new Date(now.getTime() - 86_400_000), now);
+      expect(selectLandingCandidates(rows, now, now).map((row) => row.issue.id)).not.toContain(issueId);
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      mockGetByName.mockResolvedValue(null);
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBeUndefined();
+      const afterClose = new Date();
+      const afterRows = await buildDiscoveryQuery(db, new Date(0), afterClose);
+      expect(selectLandingCandidates(afterRows, new Date(0), afterClose).map((row) => row.issue.id)).not.toContain(issueId);
+    });
+
+    it.each(["repoUrl", "baseRef"] as const)("refuses debt discharge when the bound workspace %s changes during the probe", async (field) => {
+      const { issueId, executionWorkspaceId } = await seedIssue("BINDING");
+      board();
+      await flip(issueId);
+      landing();
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          await db.update(executionWorkspaces).set({
+            [field]: field === "repoUrl" ? "https://github.com/TEA-Core/other" : "other-base",
+          }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        }
+        return new Response(JSON.stringify(url.includes("/compare/") ? { ahead_by: 0 } : []), { status: 200 });
+      });
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it.each([false, true])("requires merged-PR evidence for the current branch head (matches=%s)", async (matches) => {
+      const { issueId, defaultRef } = await seedIssue("HEAD");
+      board();
+      await flip(issueId);
+      landing(2);
+      mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+        url.includes("/compare/") ? { ahead_by: 2 } :
+          url.includes("state=closed") ? [{
+            merged: true, number: 404, base: { ref: defaultRef },
+            head: { sha: matches ? "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" : "1".repeat(40) },
+          }] : [],
+      ), { status: 200 }));
+      expect((await patch(issueId, { status: "done" })).status).toBe(matches ? 200 : 409);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(matches ? "discharged" : "outstanding");
+    });
+
+    it("does not substitute a project default for an unmeasured null execution base", async () => {
+      const { issueId, executionWorkspaceId, projectWorkspaceId, projectId, repoUrl, defaultRef } = await seedIssue("NULLBASE");
+      await db.update(issues).set({ projectId, projectWorkspaceId }).where(eq(issues.id, issueId));
+      await db.update(projectWorkspaces).set({ repoUrl, defaultRef }).where(eq(projectWorkspaces.id, projectWorkspaceId));
+      await db.update(executionWorkspaces).set({ baseRef: null }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      board();
+      await flip(issueId);
+      landing();
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      await db.update(executionWorkspaces).set({ baseRef: defaultRef }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("discharged");
+    });
+
+    it("does not certify a later head using an earlier moving-branch compare", async () => {
+      const { issueId } = await seedIssue("PINNED");
+      const head = "b".repeat(40);
+      board();
+      await flip(issueId);
+      landing();
+      const fetch = vi.spyOn(githubFetch, "ghFetch").mockImplementation(async (url) => new Response(JSON.stringify(
+        url.includes("/commits/") ? { sha: head } :
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) ? 1 : 0 } : [],
+      ), { status: 200 }));
+      try {
+        const response = await patch(issueId, { status: "done" });
+        expect(response.status).toBe(409);
+        expect(response.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+
+    it.each(
+      (["ahead-zero", "merged-pr"] as const).flatMap((mode) =>
+        (["unchanged", "moved", "unavailable", "expired"] as const).map((change) => [mode, change] as const)),
+    )("rechecks the verified remote delivery head at close (%s, %s)", async (mode, change) => {
+      const { issueId, branchName, defaultRef, repoUrl } = await seedIssue("HEADRACE");
+      const head = "a".repeat(40);
+      let measured = false;
+      let lockedLookups = 0;
+      board();
+      await flip(issueId);
+      landing();
+      const deadline = new AbortController();
+      const timeout = change === "expired" ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal) : null;
+      const fetch = vi.spyOn(githubFetch, "ghFetch").mockImplementation(async (url) => {
+        if (url.includes("/commits/")) {
+          if (measured) lockedLookups++;
+          if (measured && change === "unavailable") throw new Error("head lookup unavailable");
+          // A response completing at expiry must not leave an accepted head behind.
+          if (measured && change === "expired") deadline.abort(new Error("head deadline expired"));
+          return new Response(JSON.stringify({ sha: measured && change === "moved" ? "b".repeat(40) : head }), { status: 200 });
+        }
+        return new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: mode === "ahead-zero" ? 0 : 1 } :
+            url.includes("state=closed") ? [{ merged: true, number: 404, base: { ref: defaultRef }, head: { sha: head } }] : [],
+        ), { status: 200 });
+      });
+      mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+        const result = await realEvaluateGuardRef.current!(...args);
+        measured = result.landingVerified === true;
+        return result;
+      });
+      try {
+        const response = await patch(issueId, { status: "done" });
+        const accepted = change === "unchanged";
+        expect(response.status, JSON.stringify(response.body)).toBe(accepted ? 200 : 409);
+        expect(lockedLookups).toBeGreaterThan(0);
+        const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(stored?.status).toBe(accepted ? "done" : "todo");
+        const debt = (await debtRows(issueId))[0]?.details;
+        expect(debt?.landingDebtDisposition).toBe(accepted ? "discharged" : "outstanding");
+        if (accepted) expect(debt?.landingProof).toEqual({
+          head, source: "remote", repoUrl, baseRef: defaultRef, branch: branchName,
+        });
+        else expect(response.body.code).toBe("done_transition_missing_delivery");
+      } finally {
+        fetch.mockRestore();
+        timeout?.mockRestore();
+      }
+    });
+
+    it("refuses close when the shared deadline expires during App credential resolution", async () => {
+      const { issueId } = await seedIssue("AUTHDEADLINE");
+      board();
+      await flip(issueId);
+      landing();
+      const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+      const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+      let measured = false;
+      let reached = false;
+      let rejectPending: ((reason: Error) => void) | undefined;
+      let response: { status: number; body: { code?: string } } | undefined;
+      mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+        const result = await realEvaluateGuardRef.current!(...args);
+        measured = result.landingVerified === true;
+        return result;
+      });
+      mockGetByName.mockImplementation(async (_company, name) =>
+        name === "GITHUB_APP_PRIVATE_KEY" ? (measured ? { id: "app-key" } : null) : { id: "pat" });
+      mockResolveSecretValue.mockImplementation(async (_company, id) => id === "app-key" ? pem : "test-token");
+      const deadline = new AbortController();
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        if (!String(url).endsWith("/app/installations")) throw new Error(`Unexpected App request: ${url}`);
+        reached = true;
+        return new Promise<Response>((_resolve, reject) => {
+          rejectPending = reject;
+          if (init?.signal?.aborted) reject(init.signal.reason);
+          else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      });
+      const closing = patch(issueId, { status: "done" }).then((value) => { response = value; });
+      try {
+        await vi.waitFor(() => expect(reached).toBe(true));
+        deadline.abort(new Error("close deadline expired"));
+        await vi.waitFor(() => expect(response?.status).toBe(409));
+        expect(response?.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        rejectPending?.(new Error("test cleanup"));
+        await closing;
+        fetch.mockRestore();
+        timeout.mockRestore();
+      }
+    });
+
+    it.each(["search", "detail", "compare"] as const)("refuses close when the carrier deadline expires during %s", async (stage) => {
+      const { issueId, executionWorkspaceId, defaultRef } = await seedIssue("CARRIERDEADLINE");
+      await db.update(executionWorkspaces).set({ branchName: "shared-carrier" })
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      board();
+      await flip(issueId);
+      landing(1);
+      const carrierHead = "c".repeat(40);
+      const deadline = new AbortController();
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      let reached = false;
+      let rejectPending: ((reason: Error) => void) | undefined;
+      let response: { status: number; body: { code?: string } } | undefined;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const search = url.includes("/search/issues");
+        const detail = url.endsWith("/pulls/404");
+        const compare = url.includes(`/compare/${carrierHead}...`);
+        if ((stage === "search" && search) || (stage === "detail" && detail) || (stage === "compare" && compare)) {
+          reached = true;
+          return new Promise<Response>((_resolve, reject) => {
+            rejectPending = reject;
+            if (init?.signal?.aborted) reject(init.signal.reason);
+            else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          });
+        }
+        return new Response(JSON.stringify(
+          search ? { total_count: 1, items: [{ number: 404 }] } :
+            detail ? { merged: true, base: { ref: defaultRef }, head: { sha: carrierHead } } :
+              url.includes("/compare/") ? { ahead_by: compare ? 0 : 1 } : [],
+        ), { status: 200 });
+      });
+      const closing = patch(issueId, { status: "done" }).then((value) => { response = value; });
+      try {
+        await vi.waitFor(() => expect(reached).toBe(true));
+        deadline.abort(new Error("carrier deadline expired"));
+        await vi.waitFor(() => expect(response?.status).toBe(409));
+        expect(response?.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        rejectPending?.(new Error("test cleanup"));
+        await closing;
+        timeout.mockRestore();
+      }
+    });
+
+    it.each(["unchanged", "moved", "unavailable", "detached-before", "detached-after", "detached-matching"] as const)("rechecks the verified local carrier head at close (%s)", async (change) => {
+      const { issueId, identifier, executionWorkspaceId, repoUrl } = await seedIssue("LOCALRACE");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-head-race-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        git("commit", "--allow-empty", "-qm", "base");
+        git("checkout", "-qb", "shared-carrier");
+        git("commit", "--allow-empty", "-qm", `Implement ${identifier}`);
+        const head = git("rev-parse", "HEAD");
+        const advanceBranchBehindDetachedHead = () => {
+          git("commit", "--allow-empty", "-qm", `Undelivered later work for ${identifier}`);
+          git("checkout", "--detach", head);
+        };
+        if (change === "detached-before") advanceBranchBehindDetachedHead();
+        if (change === "detached-matching") git("checkout", "--detach", head);
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: "shared-carrier", baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) ? 0 : 1 } :
+            url.includes("/search/issues") ? { total_count: 1, items: [{ number: 404 }] } :
+              url.endsWith("/pulls/404") ? { merged: true, base: { ref: "main" }, head: { sha: head } } : [],
+        ), { status: 200 }));
+        mockEvaluateDoneTransitionGuard.mockImplementation(async (...args) => {
+          const result = await realEvaluateGuardRef.current!(...args);
+          if (result.landingVerified && change === "moved") git("commit", "--allow-empty", "-qm", "Undelivered later work");
+          if (result.landingVerified && change === "detached-after") advanceBranchBehindDetachedHead();
+          if (result.landingVerified && change === "unavailable") rmSync(cwd, { recursive: true, force: true });
+          return result;
+        });
+        const response = await patch(issueId, { status: "done" });
+        const accepted = change === "unchanged" || change === "detached-matching";
+        expect(response.status, JSON.stringify(response.body)).toBe(accepted ? 200 : 409);
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe(accepted ? "done" : "todo");
+        const debt = (await debtRows(issueId))[0]?.details;
+        expect(debt?.landingDebtDisposition).toBe(accepted ? "discharged" : "outstanding");
+        if (accepted) expect(debt?.landingProof).toEqual({
+          head, source: "worktree", repoUrl, baseRef: "main", branch: "shared-carrier",
+        });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it.each(
+      (["shared", "absent", "own"] as const).flatMap((path) =>
+        ([401, 403, 500, 502, "network", "non-Error", "malformed JSON", "missing SHA"] as const)
+          .map((failure) => [path, failure] as const)),
+    )("refuses %s carrier-head lookup failure (%s) without closing or discharging debt", async (path, failure) => {
+      const { issueId, identifier, branchName, executionWorkspaceId } = await seedIssue("LOOKUP");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-head-failure-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      const branch = path === "shared" ? "shared-carrier" : branchName;
+      const runGit = hardenedGit.runHardenedGit;
+      const localHead = vi.spyOn(hardenedGit, "runHardenedGit").mockImplementation((args, options) => {
+        // Attribution still uses real Git. A later local-head failure forces the
+        // remote fallback at both carrier call sites, including the compare-404 catch.
+        if (args[1] === cwd && args[2] === "show-ref" && args[5] === `refs/heads/${branch}`) {
+          return Promise.reject(new Error("local head unavailable"));
+        }
+        return runGit(args, options);
+      });
+      const remote = vi.spyOn(githubFetch, "ghFetch");
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        git("commit", "--allow-empty", "-qm", "base");
+        git("checkout", "-qb", branch);
+        git("commit", "--allow-empty", "-qm", `Implement ${identifier}`);
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: branch, baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        let headLookups = 0;
+        remote.mockImplementation((url: string) => {
+          if (url.endsWith(`/commits/${encodeURIComponent(branch)}`)) {
+            headLookups++;
+            if (failure === "network") return Promise.reject(new Error("network unavailable"));
+            if (failure === "non-Error") throw "non-Error transport failure";
+            return Promise.resolve(new Response(
+              failure === "malformed JSON" ? "not JSON" : "{}",
+              { status: typeof failure === "number" ? failure : 200 },
+            ));
+          }
+          return Promise.resolve(new Response(JSON.stringify(url.includes("/compare/") ? { ahead_by: 1 } : []), {
+            status: path === "absent" && (url.includes("/compare/") || url.includes("/git/ref/heads/")) ? 404 : 200,
+          }));
+        });
+        const refused = await patch(issueId, { status: "done" });
+        // A wrong mock URL must not silently turn every variant into missing-SHA coverage.
+        expect(headLookups).toBeGreaterThan(0);
+        expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+        expect(refused.body.code).toBe("done_transition_missing_delivery");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+      } finally {
+        localHead.mockRestore();
+        remote.mockRestore();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it.each([false, true])("checks attributable shared-branch work against carrier contents (landed=%s)", async (landed) => {
+      const { issueId, identifier, executionWorkspaceId } = await seedIssue("CARRIER");
+      const cwd = mkdtempSync(join(tmpdir(), "landing-debt-carrier-"));
+      const git = (...args: string[]) => execFileSync("git", args, {
+        cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      }).trim();
+      try {
+        git("init", "-q", "--initial-branch=main");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Landing test");
+        writeFileSync(join(cwd, "delivery.txt"), "base\n");
+        git("add", "delivery.txt");
+        git("commit", "-qm", "base");
+        const base = git("rev-parse", "HEAD");
+        git("checkout", "-qb", "shared-carrier");
+        writeFileSync(join(cwd, "delivery.txt"), "delivered content\n");
+        git("commit", "-qam", `Implement ${identifier}`);
+        const head = git("rev-parse", "HEAD");
+        await db.update(executionWorkspaces).set({
+          cwd, providerRef: cwd, branchName: "shared-carrier", baseRef: "main",
+        }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        board();
+        await flip(issueId);
+        landing(1);
+        mockGhFetch.mockImplementation(async (url: string) => new Response(JSON.stringify(
+          url.includes("/compare/") ? { ahead_by: url.endsWith(`...${head}`) && landed ? 0 : 1 } :
+            url.includes("/search/issues") ? { total_count: 1, items: [{ number: 404 }] } :
+              url.endsWith("/pulls/404") ? { merged: true, base: { ref: "main" }, head: { sha: landed ? head : base } } : [],
+        ), { status: 200 }));
+        expect((await patch(issueId, { status: "done" })).status).toBe(landed ? 200 : 409);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe(landed ? "discharged" : "outstanding");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps a fresh post-deploy flip on an open card owed even after a delayed older-close audit", async () => {
+      const { issueId, companyId } = await seedIssue("FRESH");
+      board();
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      await flip(issueId);
+      // A real status transition qualifies for the legacy cutoff, but cannot settle explicit debt.
+      await db.insert(activityLog).values({
+        companyId, actorType: "user", actorId: "local-board", action: "issue.updated", entityType: "issue",
+        entityId: issueId, details: { status: "done", _previous: { status: "todo" } }, createdAt: new Date(Date.now() + 1_000),
+      });
+      mockGetByName.mockResolvedValue(null);
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("done_transition_missing_delivery");
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+      expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+    });
+
+    it("names the exit when landing cannot be verified", async () => {
+      const { issueId } = await seedIssue("EXIT");
+      board();
+      await flip(issueId);
+      mockGetByName.mockResolvedValue(null);
+      const refused = await patch(issueId, { status: "done" });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(JSON.stringify(refused.body)).toMatch(/probe-able repository[\s\S]*cancel/);
+    });
+
+    it("rolls debt discharge back with a failed close and discharges only on verified commit", async () => {
+      const { issueId } = await seedIssue("ATOMIC");
+      board();
+      await flip(issueId);
+      landing();
+      // Refuse at COMMIT, after the discharge UPDATE actually ran.
+      await db.execute(sql`create function test_reject_debt_close() returns trigger language plpgsql as $$
+        begin
+          if exists (select 1 from activity_log where entity_id = NEW.id::text
+            and action = 'issue.delivery_requirement_reclassified'
+            and details->>'landingDebtDisposition' = 'discharged') then
+            raise exception 'injected post-discharge rollback';
+          end if;
+          return NEW;
+        end $$`);
+      await db.execute(sql`create constraint trigger test_reject_debt_close after update on issues
+        deferrable initially deferred for each row when (NEW.status = 'done')
+        execute function test_reject_debt_close()`);
+      try {
+        const failed = await patch(issueId, { status: "done" });
+        expect(failed.status, JSON.stringify(failed.body)).toBe(500);
+        expect((await debtRows(issueId))[0]?.details?.landingDebtDisposition).toBe("outstanding");
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("todo");
+      } finally {
+        await db.execute(sql`drop trigger test_reject_debt_close on issues`);
+        await db.execute(sql`drop function test_reject_debt_close()`);
+      }
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect((await debtRows(issueId))[0]?.details).toMatchObject({
+        landingCheckOwed: true, landingDebtDisposition: "discharged", closeStatusVersion: 1,
+      });
+      expect((await patch(issueId, { status: "todo" })).status).toBe(200);
+      expect((await patch(issueId, { deliveryRequirement: "repository_delivery" })).status).toBe(200);
+      await flip(issueId);
+      mockGetByName.mockResolvedValue(null);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+      expect((await debtRows(issueId)).filter((row) => row.details?.landingDebtDisposition === "outstanding")).toHaveLength(1);
+    });
+
+    it("preserves genuine record-only board close and its audited tier bypass", async () => {
+      const { issueId } = await seedIssue("RECORD");
+      await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, issueId));
+      board();
+      expect((await patch(issueId, { status: "done" })).status).toBe(200);
+      expect(await debtRows(issueId)).toEqual([]);
+      await vi.waitFor(async () => {
+        const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+        expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(true);
+        expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
+      });
+    });
+    it("refuses a board close after a separate record-only reclassification", async () => {
+      const { issueId } = await seedIssue("DEBT");
+      currentActor = { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" } as Express.Request["actor"];
+      const flip = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryRequirement: "record_only" });
+      expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+      const close = await request(app).patch(`/api/issues/${issueId}`).send({ status: "done" });
+      expect(close.status, JSON.stringify(close.body)).toBe(409);
+      expect(close.body.code).toBe("done_transition_missing_delivery");
+      const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(stored?.status).toBe("todo");
+      const audit = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.delivery_requirement_reclassified"),
+      ));
+      expect(audit[0]?.details).toMatchObject({ landingCheckOwed: true });
+      expect(audit[0]?.details?.landingDebtDisposition).not.toBe("discharged");
     });
   });
 });

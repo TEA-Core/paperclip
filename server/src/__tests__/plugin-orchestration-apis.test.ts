@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -31,6 +31,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -66,6 +68,10 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-orchestration-");
     db = createDb(tempDb.connectionString);
+    const [identity] = await db.execute<{ port: number }>(sql`select inet_server_port() as port`);
+    expect(identity.port).toBe(Number(new URL(tempDb.connectionString).port));
+    expect(identity.port).not.toBe(54329);
+    console.info(`Plugin orchestration private Postgres port: ${identity.port}`);
   }, 20_000);
 
   function isHeartbeatRunDependentFkError(error: unknown) {
@@ -211,6 +217,249 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
   });
 
+  it("does not store a plugin-claimed run of another agent as the origin run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin forged origin",
+      status: "todo",
+      assigneeAgentId: victimAgentId,
+      actorAgentId: agentId,
+      actorRunId: victimRunId,
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    // A plugin can only claim a run; it does not authenticate it. A claimed
+    // run of another agent is never stored as the ownership proof.
+    expect(stored?.originRunId).toBeNull();
+  });
+
+  it("does not store a plugin-claimed victim agent+run pair as the origin run (J1)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin forged origin via matching pair",
+      status: "todo",
+      assigneeAgentId: victimAgentId,
+      // The plugin supplies BOTH sides of the earlier check: the victim
+      // agent as actor and the victim's live run as actor run.
+      actorAgentId: victimAgentId,
+      actorRunId: victimRunId,
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    // A plugin does not authenticate an agent run; a plugin-supplied
+    // actorRunId is never stored as the card's ownership proof, even when
+    // the named run really belongs to the named agent.
+    expect(stored?.originRunId).toBeNull();
+    expect(await findLiveIssueExecutionHolder(db, companyId, issue.id)).toBeNull();
+  });
+
+  it("does not store a plugin update originRunId as the ownership proof", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unassigned card",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix(companyId)}-1`,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await services.issues.update({
+      companyId,
+      issueId,
+      patch: {
+        assigneeAgentId: victimAgentId,
+        originRunId: victimRunId,
+        actorAgentId: victimAgentId,
+        actorRunId: victimRunId,
+      },
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // A plugin update can name any run. The supplied originRunId is never
+    // stored, so the named run does not become the holder and does not
+    // defer the assignee's wakes.
+    expect(stored?.originRunId).toBeNull();
+    expect(stored?.executionRunId).toBeNull();
+    expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+  });
+
+  it("creates plugin task suggestions without importing a supplied run's issue scope", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const parentId = randomUUID();
+    const otherIssueId = randomUUID();
+    const otherRunId = randomUUID();
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Suggestion parent", status: "todo" },
+      { id: otherIssueId, companyId, title: "Other task", status: "todo", assigneeAgentId: agentId },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId, companyId, agentId, status: "running",
+      invocationSource: "assignment", contextSnapshot: { issueId: otherIssueId },
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const interaction = await services.issues.createInteraction({
+      companyId, issueId: parentId, authorAgentId: agentId,
+      interaction: {
+        kind: "suggest_tasks", continuationPolicy: "wake_assignee",
+        sourceRunId: otherRunId,
+        payload: { version: 1, tasks: [{ clientKey: "child", title: "Suggested child", assigneeAgentId: agentId }] },
+      },
+    });
+    const [stored] = await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interaction.id));
+    expect(stored).toMatchObject({ issueId: parentId, status: "pending", sourceRunId: null });
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id: parentId, companyId, projectId: null, goalId: null, status: "todo" },
+      interaction.id, {}, { userId: "local-board" },
+    );
+    const childId = accepted.createdIssues[0]!.id;
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    expect(child).toMatchObject({ parentId, assigneeAgentId: agentId, originRunId: null });
+    expect(await findLiveIssueExecutionHolder(db, companyId, childId)).toBeNull();
+  });
+
+  it.each(["new", "legacy"] as const)("does not store a %s plugin interaction sourceRunId as the child's origin proof", async (provenance) => {
+    const { companyId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    const parentId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix(companyId)}-1`,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const created = await services.issues.createInteraction({
+      companyId,
+      issueId: parentId,
+      authorAgentId: victimAgentId,
+      interaction: {
+        kind: "suggest_tasks",
+        continuationPolicy: "wake_assignee",
+        sourceRunId: victimRunId,
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "child", title: "Forged child", assigneeAgentId: victimAgentId }],
+        },
+      },
+    });
+    if (provenance === "legacy") {
+      // A pending pre-upgrade row retained the plugin's claimed run/agent pair.
+      await db.update(issueThreadInteractions)
+        .set({ sourceRunId: victimRunId })
+        .where(eq(issueThreadInteractions.id, created.id));
+    }
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id: parentId, companyId, projectId: null, goalId: null, status: "in_progress" },
+      created.id,
+      {},
+      { userId: "local-board" },
+    );
+    const childId = accepted.createdIssues[0]?.id;
+    expect(childId).toBeTruthy();
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId!));
+    const holder = await findLiveIssueExecutionHolder(db, companyId, childId!);
+    expect({ originRunId: child?.originRunId, holderRunId: holder?.runId ?? null })
+      .toEqual({ originRunId: null, holderRunId: null });
+  });
+
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();
@@ -251,7 +500,10 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(stored?.billingCode).toBe("mission:alpha");
     expect(stored?.assigneeAgentId).toBe(agentId);
     expect(stored?.createdByAgentId).toBe(agentId);
-    expect(stored?.originRunId).toBe(originRunId);
+    // A plugin-supplied actor run is audit attribution only, never the
+    // stored ownership proof (J1): the host holds no authenticated run
+    // for a plugin call, so plugin creates record no origin run.
+    expect(stored?.originRunId).toBeNull();
 
     const [relation] = await db
       .select()

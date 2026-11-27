@@ -61,7 +61,7 @@ function jsonValue(value: unknown): PaperclipJsonValue {
 }
 
 function activeAgentStatus(status: string): "active" | "inactive" {
-  return ["paused", "terminated", "pending_approval", "error"].includes(status)
+  return ["paused", "terminated", "deleted", "pending_approval", "error"].includes(status)
     ? "inactive"
     : "active";
 }

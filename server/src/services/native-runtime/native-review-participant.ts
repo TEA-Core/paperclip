@@ -11,6 +11,7 @@ import {
 import { and, eq, isNull, or } from "drizzle-orm";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { canonicalizeStoredResolverPolicy } from "../issue-thread-interaction-resolution.js";
+import { runIsIssueAuthor } from "../issue-execution-lease.js";
 
 export type NativeReviewAssignmentContext = {
   nativeReviewInteractionId: string;
@@ -387,7 +388,11 @@ export async function claimNativeReviewExecutionLock(db: Db, input: {
   claimedAt: Date;
 }): Promise<boolean> {
   return db.transaction(async (tx) => {
-    const issue = await tx.select({ id: issues.id }).from(issues).where(and(
+    const issue = await tx.select({
+      id: issues.id,
+      assigneeAgentId: issues.assigneeAgentId,
+      executionRunId: issues.executionRunId,
+    }).from(issues).where(and(
       eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
     )).for("update").limit(1).then((rows) => rows[0]);
     if (!issue || !await getNativeReviewAssignment(tx as unknown as Db, input)) return false;
@@ -400,14 +405,38 @@ export async function claimNativeReviewExecutionLock(db: Db, input: {
     if (!run || !["queued", "running"].includes(run.status) || !admitted || !expected
       || admitted.nativeReviewInteractionId !== expected.nativeReviewInteractionId
       || admitted.nativeReviewDecisionId !== expected.nativeReviewDecisionId) return false;
+    // An authenticated review participant takes over the card, not the
+    // author's unrelated run. Never displace a normal issue-scoped worker.
+    let adoptedAuthorRunId: string | null = null;
+    if (issue.executionRunId && issue.executionRunId !== input.runId) {
+      const [holder] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.id, issue.executionRunId),
+      ));
+      const holderIssueId = typeof holder?.contextSnapshot?.issueId === "string"
+        ? holder.contextSnapshot.issueId.trim()
+        : null;
+      if (
+        holder?.status === "running" &&
+        holder.agentId === issue.assigneeAgentId &&
+        holder.agentId !== input.agentId &&
+        !holderIssueId &&
+        await runIsIssueAuthor(tx as unknown as Db, input.companyId, input.issueId, holder.id)
+      ) adoptedAuthorRunId = holder.id;
+    }
     const claimed = await tx.update(issues).set({
       executionRunId: input.runId,
+      checkoutRunId: adoptedAuthorRunId ? null : undefined,
       executionAgentNameKey: input.agentNameKey,
       executionLockedAt: input.claimedAt,
       updatedAt: input.claimedAt,
     }).where(and(
       eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
-      or(isNull(issues.executionRunId), eq(issues.executionRunId, input.runId)),
+      or(
+        isNull(issues.executionRunId),
+        eq(issues.executionRunId, input.runId),
+        adoptedAuthorRunId ? eq(issues.executionRunId, adoptedAuthorRunId) : undefined,
+      ),
     )).returning({ id: issues.id });
     return claimed.length === 1;
   });

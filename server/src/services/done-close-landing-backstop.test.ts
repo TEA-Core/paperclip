@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createDb, issues } from "@paperclipai/db";
+import { createDb, issueChildCarrierAttributions, issues } from "@paperclipai/db";
 import {
   classifyPullRequestLanding,
   createDoneCloseLandingBackstopService,
@@ -123,6 +123,7 @@ type DbState = {
   decisionRows?: Array<Record<string, unknown>>;
   /** Company memberships of the users who decided, read by the authority guard (default none). */
   memberRows?: Array<Record<string, unknown>>;
+  childCarrierRows?: Array<Record<string, unknown>>;
 };
 
 /**
@@ -133,13 +134,18 @@ type DbState = {
  */
 function makeDb(state: DbState) {
   return {
+    // These fixtures have no descendants; the owner gate's recursive query is empty.
+    execute: vi.fn().mockResolvedValue([]),
     select: vi.fn((cols?: Record<string, unknown>) => {
       // The guard reads the issue without a projection before resolving its
       // execution workspace; preserve the table distinction in this fake DB.
       if (cols === undefined) {
         return {
           from: (table: unknown) => ({
-            where: () => Promise.resolve(table === issues
+            // Child-carrier attribution lookup (`readCurrent`): this card has none.
+            where: () => table === issueChildCarrierAttributions
+              ? Object.assign(Promise.resolve(state.childCarrierRows ?? []), { limit: () => Promise.resolve(state.childCarrierRows ?? []) })
+              : Promise.resolve(table === issues
               ? [{
                   projectId: state.deliveryIdentity?.projectId ?? null,
                   projectWorkspaceId: state.deliveryIdentity?.projectWorkspaceId ?? null,
@@ -174,7 +180,7 @@ function makeDb(state: DbState) {
       if ("branchName" in cols) {
         return {
           from: () => ({
-            where: () => Promise.resolve(state.workspaceRows ?? []),
+            where: () => Object.assign(Promise.resolve(state.workspaceRows ?? []), { limit: () => Promise.resolve(state.workspaceRows ?? []) }),
           }),
         };
       }
@@ -185,7 +191,7 @@ function makeDb(state: DbState) {
         return {
           from: () => ({
             where: () =>
-              Promise.resolve([
+              Object.assign(Promise.resolve([
                 {
                   identifier: state.deliveryIdentity?.identifier ?? null,
                   projectId: state.deliveryIdentity?.projectId ?? null,
@@ -193,7 +199,11 @@ function makeDb(state: DbState) {
                   executionWorkspaceId: state.deliveryIdentity?.executionWorkspaceId ?? null,
                   executionState: state.issueExecutionState ?? null,
                 },
-              ]),
+              ]), { limit: () => Promise.resolve([{
+                identifier: state.deliveryIdentity?.identifier ?? null,
+                executionWorkspaceId: state.deliveryIdentity?.executionWorkspaceId ?? null,
+                executionState: state.issueExecutionState ?? null,
+              }]) }),
           }),
         };
       }
@@ -234,6 +244,14 @@ function makeDb(state: DbState) {
               ]),
           }),
         };
+      }
+      if ("childIssueId" in cols && !("ancestorIssueId" in cols)) {
+        return { from: () => ({ where: () => Promise.resolve(
+          (state.childCarrierRows ?? []).filter((row) => row.ancestorIssueId === (state.sweptIssueId ?? ISSUE)),
+        ) }) };
+      }
+      if ("ancestorIssueId" in cols && "childIssueId" in cols) {
+        return { from: () => ({ where: () => Promise.resolve(state.childCarrierRows ?? []) }) };
       }
       // Company-wide PR-scoped read (new) returns every sibling's landing row for
       // the PR; a reverted per-issue read is narrowed to this card's own rows.
@@ -1752,6 +1770,29 @@ describe("createDoneCloseLandingBackstopService", () => {
 
         expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
         expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123", { expectedHeadOid: LIVE_SHA, beforeAttempt: expect.any(Function) });
+      });
+
+      it("never re-enqueues a done child attribution even when the carrier head is already approved", async () => {
+        const service = armingFixture();
+        armingState.childCarrierRows = [{
+          childIssueId: ISSUE, ancestorIssueId: "44444444-4444-4444-8444-444444444444",
+          owner: "paperclipai", repo: "paperclip", pullRequestNumber: 514,
+          branchName: "SUP-carrier", headSha: LIVE_SHA, state: "current",
+        }];
+        armingState.deliveryIdentity = { identifier: "SUP-13326", executionWorkspaceId: "child-workspace" };
+        armingState.workspaceRows = [{ id: "child-workspace", branchName: "SUP-13326-own",
+          sourceIssueId: ISSUE, repoUrl: "https://github.com/paperclipai/paperclip" }];
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          linkedPr({ number: 514, nodeId: "PRNode_abc123", headRefName: "SUP-carrier", displayName: "paperclipai/paperclip#514" }),
+        ]);
+        const result = await service.sweep();
+        expect(result.reenqueued).toBe(0);
+        expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+        expect(result.deferred).toBe(1);
+        expect(result.escalated).toBe(0);
+        expect(result.unarmable).toEqual([]);
+        expect(mockUpdate).not.toHaveBeenCalled();
+        expect(mockAddComment).not.toHaveBeenCalled();
       });
 
       it("does not arm when the PR head moved between the authorization and the arm", async () => {

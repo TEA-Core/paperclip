@@ -155,7 +155,7 @@ Invariant: every business record belongs to exactly one company.
 - `role` text not null
 - `title` text null
 - `icon` text null
-- `status` enum: `active | paused | idle | running | error | pending_approval | terminated`
+- `status` enum: `active | paused | idle | running | error | pending_approval | terminated | deleted`
 - `reports_to` uuid fk `agents.id` null
 - `capabilities` text null
 - `adapter_type` text; built-ins include `process`, `http`, `claude_local`, `codex_local`, `gemini_local`, `opencode_local`, `pi_local`, `cursor`, `hermes_local`, `hermes_gateway`, and `openclaw_gateway`
@@ -174,7 +174,7 @@ Invariants:
 
 - agent and manager must be in same company
 - no cycles in reporting tree
-- `terminated` agents cannot be resumed
+- `terminated` and `deleted` agents cannot be resumed (`deleted` is the tombstone left by agent delete: comments, activity, runs and sessions are kept, the row is anonymized)
 
 ## 7.3 `agent_api_keys`
 
@@ -276,6 +276,94 @@ retain their titles and default to no generation request.
 - `completed_at` timestamptz null
 - `cancelled_at` timestamptz null
 - `hidden_at` timestamptz null
+
+Repository landing debt survives a change from `repository_delivery` to
+`record_only` while an issue is open. The reclassification activity row records
+`landingCheckOwed` and an outstanding/discharged disposition. Every existing-issue
+done door, including automatic reconciliation backstops, rechecks that debt under
+the issue-row lock and discharges it only in the transaction that accepts a close
+with positive repository landing evidence. The proof's repository, base, and
+branch binding is locked and checked before discharge. Merged-PR evidence must
+cover the checked delivery head; an older merge on the same branch is insufficient.
+Every positive debt-bearing proof records its immutable delivery head and source.
+Before discharge, the close transaction rechecks that same remote or worktree
+branch head under the issue/workspace locks; a detached checkout's HEAD is not
+the branch proof. GitHub App credential requests and the remote head lookup share
+one 15-second deadline. Local branch probes are bounded to 15 seconds.
+Mismatch, expiry, or lookup failure refuses the close. The discharged marker
+retains the head and repository/base/branch evidence. Database locks do not freeze
+external Git refs. Carrier search, PR-detail requests, and content comparisons
+also share one 15-second deadline.
+Reopening and status-version changes never waive unpaid debt. The landing backstop
+includes debt-bearing record-only cards without expiring the obligation.
+A legacy reclassification row without a disposition, older than the issue's latest
+accepted done transition, is settled history: it is ignored on read, never
+rewritten. The close audit must record a non-done `_previous.status`; a repeated
+done write is not a transition and cannot settle legacy debt. A later close audit
+cannot settle explicit outstanding debt. A debt-bearing issue with no probe-able
+repository/branch or merged PR is refused fail-closed; the refusal names the exits
+(verify landing, or cancel).
+An unavailable or malformed carrier-head lookup remains unverified and produces
+the same HTTP 409 delivery refusal, including auth errors and rejected requests;
+it must not escape as HTTP 500 or authorize a close.
+Board tier-form bypass and delivery overrides cannot discharge this debt;
+genuine record-only cards without debt retain their existing close behavior.
+An owing reclassification also writes a system-owned
+`issue.repository_landing_debt` marker linked to its source audit ID, without
+agent/run foreign keys. A missing source event cannot make that outstanding marker
+debt-free. Agent cleanup detaches actor/run foreign keys rather than deleting
+landing-debt or accepted-done audit evidence. Company deletion removes the owing
+issue and its evidence in one transaction. No-repository close rechecks use a
+monotonic 15-second budget, so wall-clock adjustments do not cause false timeouts.
+
+Board landing proof (SUP-25193). Some delivered cards have no other landing proof.
+Such a card is not done or cancelled. Its execution workflow is completed, at
+least one completed review stage names only users, and it records no
+`deliveryIdentity`. For such a card a board actor may call
+`POST /api/issues/:id/landing-proof` with one merged pull request in the card's
+project repository, its merge or head commit, and a reason. An agent key is
+refused with 403, including the assignee or the lease holder. The proof is
+debt-only. It answers outstanding repository landing debt and never overrides
+another done-guard refusal, such as an execution-workspace branch ahead of base
+with no merged PR or a foreign branch. When the card owes no landing debt, or the
+done guard refuses the close for such another reason, the call is refused 409
+`landing_proof_cannot_close` and nothing is recorded. The server verifies
+the proof live against GitHub before it records anything. The PR must be merged,
+the supplied sha must match the PR, the repository must be the card's project
+repository, and the merge commit must be contained in the card's control-plane
+base branch. The live repository identity must be the card's repository. GitHub
+must resolve the name to the same full name, so a renamed or transferred
+repository is refused. The PR's base repository must carry the same immutable
+repository id. The attach records that id, and the close re-checks it
+(`landing_proof_repo_identity_mismatch`). The PR must be this card's own
+delivery, shown by evidence the board wrote. A `pull_request` work product on
+the card counts only when its create and update activity rows all name a board
+user, and the work product the attach creates never counts. The merge sweep's
+merge record (a `system` `pr-delivery` update to status `merged`) does not count
+against a board link; any other non-board update does. A board user's comment on
+the card that names the PR also links it. A head or merge commit recorded on
+such a board-written work product also ties the PR, when that commit is the PR
+head or merge commit or is one of the PR's own commits. Evidence an
+agent can write does not count: an agent can link a PR to its own card, and the
+active run writes the card's delivery identity, so a link or comment from an
+agent, a server fan-out row and `executionState.deliveredHeadSha` are not ties.
+A head branch name is not a tie, because any pull request can carry the card
+identifier in its branch name. Otherwise the call is refused
+`landing_proof_not_card_delivery`. The close re-checks this tie
+too.
+A failed check is a typed 4xx refusal. `landing_proof_not_on_base` means a
+readable compare showed the merge commit outside the base branch. A network
+error, a non-OK GitHub answer or an unresolvable base branch is
+`landing_proof_unverifiable`, which may succeed on retry. A success records an
+`issue.landing_proof_attached` activity row and a `pull_request` work product.
+The call is idempotent for retries: the same evidence again returns 200 with
+`replayed: true` and writes nothing.
+Attaching discharges no debt. Only a board close accepts the proof. That close
+re-verifies the latest attached proof on its door, and again under the issue-row
+lock with the same 15-second bound. The debt rows are discharged in the
+transaction that accepts the close, with source `board_merged_pr`, the merge
+commit, the PR number and the proof activity ID. Agent and backstop close doors
+do not accept the proof.
 
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
 the approving decision to its certified pull request and head, including when
@@ -611,6 +699,7 @@ Allowed transitions:
 - `running -> paused` (requires cancel flow)
 - `paused -> idle`
 - `* -> terminated` (board only, irreversible)
+- `* -> deleted` (board only, irreversible; tombstone, evidence rows kept)
 
 ## 8.2 Issue Status
 
@@ -644,6 +733,7 @@ V1 non-terminal liveness rule:
 - the source fingerprint, source-attempt count, next due time, source owner, and return owner persist in the recovery action; startup and periodic reconciliation resume that exact lineage without duplicate wakes, fold it when a current typed wait appears, and reschedule or escalate an expired action that has no live scheduled run
 - source-attempt exhaustion opens one board-owned source-scoped recovery action without changing the source assignee and without waking a substitute agent; the board explicitly chooses whether to repair, retry the original owner, reassign, or resolve
 - an active recovery action counts as a live source or blocker-chain path only while its owner has a live run, queued wake, scheduled retry, typed wait, or explicit board escalation; source and blocker projections consume the same nested recovery-path result
+- a board-accepted recovery carrier park is a separate lawful nonterminal stop: an exact source/action/decision binding plus a manual pause hold; it preserves source escalation and real blocker facts, stops exact-action automation, and requires explicit board release without source repair or wake (see `doc/execution-semantics.md`)
 - when Paperclip cannot safely infer the next action, it surfaces the problem through visible blocked/recovery work instead of silently completing or reassigning work
 - explicit recovery actions are the liveness primitive; source-scoped actions are the default form, issue-backed recovery is a fallback for independent repair work or safety boundaries, and comments alone are evidence rather than a healthy liveness path
 - recovery-action ownership is separate from source-task ownership: automatic repair and board escalation preserve both source assignee fields; reassignment requires an explicit board decision or a policy-defined serious failure

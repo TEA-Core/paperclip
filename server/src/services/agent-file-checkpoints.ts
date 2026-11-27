@@ -20,11 +20,19 @@ export function checkpointBaseline(snapshot: DirectorySnapshot): AgentFileManife
 }
 export async function cachedAgentFileManifest(root: string): Promise<AgentFileManifest> {
   const filename = path.join(path.dirname(root), "file-sync", "canonical-manifest.json");
-  const previous = await fs.readFile(filename, "utf8").then(s => JSON.parse(s) as AgentFileManifest).catch(() => undefined);
+  const parent = path.dirname(filename);
+  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  // Do not inherit the agents group into controller metadata, or allow peers
+  // to replace it through directory write permission under umask 002.
+  const stat = await fs.stat(parent);
+  await fs.chmod(parent, stat.mode & 0o750);
+  const previous = await fs.lstat(filename).then(info =>
+    info.isFile() && info.nlink === 1 && !(info.mode & 0o022) && info.uid === process.geteuid?.()
+      ? fs.readFile(filename, "utf8").then(s => JSON.parse(s) as AgentFileManifest)
+      : undefined).catch(() => undefined);
   const { manifest } = await captureAgentFiles(root, previous, undefined, false);
-  await fs.mkdir(path.dirname(filename), { recursive: true });
   const temporary = `${filename}.${randomUUID()}`;
-  try { await fs.writeFile(temporary, JSON.stringify(manifest)); await fs.rename(temporary, filename); }
+  try { await fs.writeFile(temporary, JSON.stringify(manifest), { mode: 0o600, flag: "wx" }); await fs.rename(temporary, filename); }
   finally { await fs.rm(temporary, { force: true }); }
   return manifest;
 }

@@ -3764,7 +3764,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       ?? null;
     if (!assigneeAgentId) return null;
     const assigneeStatus = agentStatusById.get(assigneeAgentId) ?? null;
-    if (assigneeStatus === "pending_approval" || assigneeStatus === "terminated") {
+    if (assigneeStatus === "pending_approval" || assigneeStatus === "terminated" || assigneeStatus === "deleted") {
       warnings.push(
         `${subjectLabel} assignee ${assigneeSlug} is ${assigneeStatus}; imported work was left unassigned.`,
       );

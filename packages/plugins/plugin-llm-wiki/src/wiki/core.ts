@@ -378,6 +378,7 @@ type WritePageInput = {
   allowShrink?: boolean;
   summary?: string | null;
   sourceRefs?: unknown;
+  create?: boolean | null;
   operationId?: string | null;
   writer?: "agent_tool" | "board_ui" | "plugin_internal";
 };
@@ -2028,6 +2029,11 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const path = assertPagePath(input.path);
   assertPageWriteAllowed(path, input.writer);
   const current = await readCurrentWithHash(ctx, input.companyId, path, space);
+  if (current.hash == null && input.create !== true) {
+    throw new Error(
+      `Refusing to create ${path}: the page does not exist in this wiki space. Re-read the space and confirm the path; pass create=true if creation is intended.`,
+    );
+  }
   assertNoNewRedactionPlaceholders(input.contents, current.contents, path);
   assertExpectedHash(input.expectedHash, current.hash, path);
   // Only callers that explicitly identify as the agent tool take a caller-supplied full body that may be a stale or
@@ -3691,6 +3697,7 @@ export async function distillPaperclipProjectPage(ctx: PluginContext, input: Pap
       summary: `Paperclip distillation ${patch.operationType} from ${bundle.sourceHash}`,
       sourceRefs: patch.sourceRefs,
       writer: "plugin_internal",
+      create: patch.currentHash == null,
     });
     await upsertPageBinding(ctx, {
       companyId: input.companyId,
@@ -4207,6 +4214,7 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
     sourceRefs: input.querySessionId ? [{ querySessionId: input.querySessionId }] : [],
     operationId: operation.operationId,
     writer: "plugin_internal",
+    create: true,
   });
   const affectedPage = {
     path,
@@ -4305,6 +4313,17 @@ export async function registerWikiTools(ctx: PluginContext) {
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_write_page")?.parametersSchema ?? { type: "object" },
   }, async (params: unknown): Promise<ToolResult> => {
     const input = params as ToolParams;
+    // Guard against misspelled/renamed fields silently dropping data (e.g. a
+    // "tags" field that writeWikiPage would ignore while the caller believes
+    // it was persisted).
+    const knownFields = new Set([
+      "companyId", "wikiId", "spaceSlug", "path", "contents", "expectedHash", "allowShrink", "summary", "sourceRefs", "create",
+    ]);
+    for (const key of Object.keys(input)) {
+      if (!knownFields.has(key)) {
+        throw new Error(`Unknown wiki_write_page field "${key}"; the tool accepts ${[...knownFields].join(", ")}`);
+      }
+    }
     const result = await writeWikiPage(ctx, {
       companyId: requireString(input.companyId, "companyId"),
       wikiId: stringField(input.wikiId),
@@ -4316,6 +4335,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       writer: "agent_tool",
       summary: stringField(input.summary),
       sourceRefs: input.sourceRefs,
+      create: input.create === true,
     });
     return { content: `Wrote ${result.path}`, data: result };
   });
@@ -4430,6 +4450,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       allowShrink: input.allowShrink === true,
       writer: "agent_tool",
       summary: "Update index",
+      create: true,
     });
     return { content: "Updated wiki/index.md", data: result };
   });

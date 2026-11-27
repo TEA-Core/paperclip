@@ -1,4 +1,6 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import type { RecoveryCarrierParkBinding } from "@paperclipai/shared";
+import { sql } from "drizzle-orm";
+import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -14,6 +16,7 @@ export const issueTreeHolds = pgTable(
     status: text("status").notNull().default("active"),
     reason: text("reason"),
     releasePolicy: jsonb("release_policy").$type<Record<string, unknown>>(),
+    recoveryCarrierPark: jsonb("recovery_carrier_park").$type<RecoveryCarrierParkBinding>(),
     createdByActorType: text("created_by_actor_type").notNull().default("system"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
     createdByUserId: text("created_by_user_id"),
@@ -35,5 +38,8 @@ export const issueTreeHolds = pgTable(
       table.status,
     ),
     companyStatusModeIdx: index("issue_tree_holds_company_status_mode_idx").on(table.companyId, table.status, table.mode),
+    activeParkActionIdx: uniqueIndex("issue_tree_holds_active_park_action_idx")
+      .on(table.companyId, sql`(${table.recoveryCarrierPark} ->> 'recoveryActionId')`)
+      .where(sql`${table.status} = 'active' and ${table.mode} = 'pause' and ${table.recoveryCarrierPark} is not null`),
   }),
 );

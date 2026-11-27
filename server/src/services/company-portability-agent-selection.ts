@@ -14,7 +14,7 @@ export function resolvePortableExportAgentSelection<T extends ExportAgentCandida
   includeAgents: boolean,
 ): { agents: T[]; warnings: string[] } {
   const warnings: string[] = [];
-  const liveAgentRows = allAgentRows.filter((agent) => agent.status !== "terminated");
+  const liveAgentRows = allAgentRows.filter((agent) => agent.status !== "terminated" && agent.status !== "deleted");
   const builtInAgentRows = liveAgentRows.filter((agent) => readBuiltInAgentMarker(agent.metadata));
   const portableAgentRows = liveAgentRows.filter((agent) => !readBuiltInAgentMarker(agent.metadata));
 

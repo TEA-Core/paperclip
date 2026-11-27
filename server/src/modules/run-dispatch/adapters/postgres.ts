@@ -141,6 +141,7 @@ type LoadStalenessFactsInput = {
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
   runCreatedAt?: Date | null;
+  retryOfRunId?: string | null;
   worktreeExecutionCutoff?: Date | null;
 };
 type CancelSuppressedRetryInput = {
@@ -678,6 +679,7 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       runCreatedAt: input.runCreatedAt ?? null,
+      retryOfRunId: input.retryOfRunId ?? null,
       worktreeExecutionCutoff: input.worktreeExecutionCutoff ?? null,
       hasActiveExecutionLease: Boolean(liveLease && issue?.executionRunId === liveLease.runId),
       hasActiveCheckoutLease: Boolean(liveLease && issue?.checkoutRunId === liveLease.runId),
@@ -1109,6 +1111,7 @@ export function createPostgresRunDispatchAdapter(
         contextSnapshot,
         scheduledRetryReason: run.scheduledRetryReason,
         runCreatedAt: run.createdAt,
+        retryOfRunId: run.retryOfRunId,
         worktreeExecutionCutoff,
       },
       now,

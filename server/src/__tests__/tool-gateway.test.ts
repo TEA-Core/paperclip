@@ -1635,6 +1635,50 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     });
   });
 
+  it("retries a local stdio write after its pre-spawn credential version is restored", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const secret = await secretService(db).create(company.id, {
+      name: "Retry token", key: `retry_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted", value: "fixture-retry-token",
+    });
+    const refs = [{ secretId: secret.id, versionSelector: "latest" as const, configPath: "env.RETRY_TOKEN", required: true }];
+    const local = await createLocalStdioMcpTool(db, company.id, {
+      applicationKey: "local-credential-retry", toolName: "write_note",
+      riskLevel: "write", envKeys: ["RETRY_TOKEN"], credentialSecretRefs: refs,
+    });
+    const profile = await allowToolsForAgent(db, company.id, agent.id, []);
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id, profileId: profile.id, selectorType: "catalog_entry",
+      effect: "include", catalogEntryId: local.catalogEntry.id,
+    });
+    await db.update(connectionGrants).set({
+      credentialSecretRefs: refs.map((ref) => ({ ...ref, versionSelector: 999999 })),
+    }).where(eq(connectionGrants.connectionId, local.connection.id));
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const call = () => gateway.executeTool({
+      sessionToken: session.token,
+      tool: expectedConnectedToolName({ applicationKey: "local-credential-retry", connectionId: local.connection.id, toolName: "write_note" }),
+      parameters: { message: "retry after credential recovery" },
+    });
+    await expect(call()).rejects.toThrow();
+    const [failed] = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id));
+    expect(failed).toMatchObject({ status: "failed", errorCode: "local_stdio_missing_secret" });
+    expect(failed.startedAt).toBeNull();
+    await db.update(connectionGrants).set({ credentialSecretRefs: refs })
+      .where(eq(connectionGrants.connectionId, local.connection.id));
+    // Credential repair also restores the connection's tool-discovery health.
+    await db.update(toolConnections).set({ healthStatus: "ok", lastError: null, healthMessage: null })
+      .where(eq(toolConnections.id, local.connection.id));
+    await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 6 * 60_000) })
+      .where(eq(toolInvocations.id, failed.id));
+    await expect(call()).resolves.toMatchObject({
+      status: "completed", result: { content: "local:retry after credential recovery" },
+    });
+  });
+
   it("passes only approved env values to local stdio MCP processes", async () => {
     const previousDatabaseUrl = process.env.DATABASE_URL;
     process.env.DATABASE_URL = "postgres://server-secret.example/paperclip";
@@ -5809,5 +5853,39 @@ rl.on("line", (line) => {
     expect(
       await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, company.id)),
     ).toEqual([]);
+  });
+
+  it("retries a remote call that failed before dispatch, once its credentials return and the replay window passes", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await startFakeRemoteMcpServer(({ body }) => ({
+      body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "stored" }] } },
+    }));
+    try {
+      const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, { url: remote.url });
+      const toolName = expectedConnectedToolName({
+        applicationKey: application.applicationKey,
+        connectionId: connection.id,
+        toolName: catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [toolName]);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const call = () => gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: { key: "k", value: "v" } });
+      const toolCalls = () => remote.requests.filter((request) => request.body?.method === "tools/call").length;
+
+      // No organization grant: credential resolution fails before any request.
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, connection.id));
+      await expect(call()).rejects.toMatchObject({ reasonCode: "organization_authorization_required" });
+      expect(toolCalls()).toBe(0);
+
+      await db.update(connectionGrants).set({ status: "active" }).where(eq(connectionGrants.connectionId, connection.id));
+      await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 6 * 60_000) }).where(eq(toolInvocations.companyId, company.id));
+      await expect(call()).resolves.toMatchObject({ status: "completed" });
+      expect(toolCalls()).toBe(1);
+    } finally {
+      await remote.close();
+    }
   });
 });
