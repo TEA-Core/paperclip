@@ -1,6 +1,10 @@
 import type { SetIssueTitle } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
+  ParkRecoveryCarrier,
+  ReleaseRecoveryCarrierPark,
+  RecoveryCarrierParkCandidate,
+  RecoveryCarrierParkBinding,
   AcceptedPlanDecompositionSummary,
   AskUserQuestionsAnswer,
   Approval,
@@ -305,6 +309,12 @@ export const issuesApi = {
       `/issues/${id}/tree-control/preview`,
       data,
     ),
+  recoveryCarrierParkCandidate: (id: string) =>
+    api.get<RecoveryCarrierParkCandidate | null>(`/issues/${id}/recovery-carrier-park/candidate`),
+  parkRecoveryCarrier: (id: string, data: ParkRecoveryCarrier) =>
+    api.post<{ hold: IssueTreeHold; created: boolean }>(`/issues/${id}/recovery-carrier-park`, data),
+  releaseRecoveryCarrierPark: (id: string, holdId: string, data: ReleaseRecoveryCarrierPark) =>
+    api.post<IssueTreeHold>(`/issues/${id}/recovery-carrier-park/${holdId}/release`, data),
   createTreeHold: (id: string, data: CreateIssueTreeHold) =>
     api.post<{ hold: IssueTreeHold; preview: IssueTreeControlPreview }>(
       `/issues/${id}/tree-holds`,
@@ -338,6 +348,7 @@ export const issuesApi = {
         isRoot: boolean;
         mode: "pause";
         reason: string | null;
+        recoveryCarrierPark?: RecoveryCarrierParkBinding | null;
         releasePolicy: {
           strategy: "manual" | "after_active_runs_finish";
           note?: string | null;

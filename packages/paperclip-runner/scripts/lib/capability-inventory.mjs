@@ -46,6 +46,7 @@ const legacyMcpFoldTargets = {
   paperclipGetIssue: "eval:se-get-issue-01",
   paperclipGetHeartbeatContext: "eval:hb-context-01",
   paperclipListComments: "eval:se-get-issue-01",
+  paperclipListIssueActivity: "eval:se-get-issue-01",
   paperclipGetComment: "eval:hb-wake-comment-01",
   paperclipListIssueApprovals: "eval:ap-board-approval-01",
   paperclipListDocuments: "eval:dp-base-revision-01",

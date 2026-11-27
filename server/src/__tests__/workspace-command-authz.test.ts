@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import type { Request } from "express";
 import {
+  assertNoAgentExecutionWorkspaceIdentityMutation,
   collectExecutionWorkspaceCommandPaths,
+  collectExecutionWorkspaceIdentityPaths,
   collectIssueWorkspaceCommandPaths,
   collectProjectExecutionWorkspaceCommandPaths,
   collectProjectWorkspaceCommandPaths,
@@ -56,6 +59,18 @@ describe("workspace host-command mutation detection", () => {
     },
   ])("detects $name", ({ actual, expected }) => {
     expect(actual()).toContain(expected);
+  });
+
+  it("treats the execution workspace baseRef as agent-immutable identity", () => {
+    expect(collectExecutionWorkspaceIdentityPaths({ baseRef: "origin/main" })).toEqual(["baseRef"]);
+    const agentReq = { actor: { type: "agent" } } as unknown as Request;
+    expect(() =>
+      assertNoAgentExecutionWorkspaceIdentityMutation(agentReq, collectExecutionWorkspaceIdentityPaths({ baseRef: "origin/main" })),
+    ).toThrow(/baseRef/);
+    const boardReq = { actor: { type: "board" } } as unknown as Request;
+    expect(() =>
+      assertNoAgentExecutionWorkspaceIdentityMutation(boardReq, collectExecutionWorkspaceIdentityPaths({ baseRef: "origin/main" })),
+    ).not.toThrow();
   });
 
   it("ignores descriptive runtime entries without a command field", () => {

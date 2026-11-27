@@ -215,7 +215,7 @@ export function runnerPrpCoordinator(
           binding.run.completionContractSha256 ||
         binding.issue.assigneeAgentId !== input.agentId ||
         binding.issue.executionRunId !== input.runId ||
-        ["paused", "terminated", "pending_approval", "error"].includes(
+        ["paused", "terminated", "deleted", "pending_approval", "error"].includes(
           binding.agent.status,
         )
       ) {

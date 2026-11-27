@@ -514,7 +514,14 @@ export async function withDirectoryMergeLock<T>(
   }
 }
 
-async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<void> {
+async function keepGroup(filename: string, gid: number, targetPath: string): Promise<void> {
+  await fs.chown(filename, -1, gid).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPERM" && error.code !== "EINVAL") throw error;
+    console.warn(`[paperclip] Could not keep group ${gid} on restored file ${targetPath}: ${error.code}`);
+  });
+}
+
+async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry, newDirectoryMode?: number): Promise<void> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
 
@@ -527,6 +534,9 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
       await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
     }
     await fs.mkdir(targetPath, { recursive: true });
+    // A new entry takes the target parent's group, never the incoming tree's.
+    await keepGroup(targetPath, (await fs.stat(path.dirname(targetPath))).gid, targetPath);
+    if (newDirectoryMode !== undefined) await fs.chmod(targetPath, newDirectoryMode);
     return;
   }
 
@@ -539,14 +549,18 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   // An interrupted restore must not leave a truncated current file. Keep the
   // incoming tree until its owner records success; exact retries deduplicate.
   const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  const existing = await fs.lstat(targetPath).catch(() => null);
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
     });
+    // Atomic replacement must retain the destination's group, not inherit the
+    // incoming tree's group or the canonical parent directory's default. A new
+    // file takes the target parent's group.
+    await keepGroup(temporary, existing?.isFile() ? existing.gid : (await fs.stat(path.dirname(targetPath))).gid, targetPath);
     await fs.chmod(temporary, entry.mode);
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
-    const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
@@ -663,6 +677,8 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
+  /** Mode for directories the merge creates; defaults to mkdir's umask mode. */
+  newDirectoryMode?: number;
 }): Promise<void> {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
@@ -691,7 +707,7 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         for (const [relative, entry] of orderedEntries(source)) {
           if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry, input.newDirectoryMode);
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }

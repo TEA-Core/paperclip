@@ -27,6 +27,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
+import { activityService } from "../services/activity.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
@@ -159,7 +160,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review" | "blocked";
+    issueStatus?: "backlog" | "todo" | "in_progress" | "in_review" | "blocked";
     unassigned?: boolean;
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -171,7 +172,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     const monitorAttemptCount = input?.monitorAttemptCount ?? 0;
-    const monitor = {
+    const monitor: Record<string, unknown> = {
       nextCheckAt: nextCheckAt.toISOString(),
       notes: "Check deploy",
       scheduledBy: "assignee",
@@ -291,6 +292,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+    expect(activity).not.toContain("issue.monitor_unfireable");
   });
 
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {
@@ -807,7 +809,14 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         expect(issue.monitorWakeRequestedAt).toBeNull();
         expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
         expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
-        expect(await activityActions(issueId)).toEqual([]);
+        // Untouched, but not silent: the issue activity names why it cannot fire.
+        const rows = await activityService(db).forIssue(issueId);
+        expect(rows.map((row) => row.action)).toEqual(["issue.monitor_unfireable"]);
+        expect(rows[0]?.details).toMatchObject({
+          reason: "no_assignee_agent",
+          recoveryPolicy,
+          nextCheckAt: nextCheckAt.toISOString(),
+        });
       },
     );
 
@@ -829,6 +838,150 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(wakeup?.reason).toBe("issue_monitor_due");
       expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
       expect(await activityActions(issueId)).toContain("issue.monitor_triggered");
+    });
+  });
+
+  describe("due monitor the dispatcher cannot select", () => {
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    async function readIssue(issueId: string) {
+      return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function unfireableRows(issueId: string) {
+      // Read through the same service the issue activity API returns.
+      const rows = await activityService(db).forIssue(issueId);
+      return rows.filter((row) => row.action === "issue.monitor_unfireable");
+    }
+
+    it("records one unfireable row for a released, unassigned todo issue and keeps the monitor armed", async () => {
+      // SUP-25284 shape: an agent release moved the issue to todo and dropped
+      // the assignee, leaving the wake_owner monitor scheduled.
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      const heartbeat = heartbeatService(db);
+
+      const first = await heartbeat.tickTimers(tickAt);
+      expect(first.enqueued).toBe(0);
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ actorType: "system", actorId: "heartbeat_scheduler", entityType: "issue" });
+      expect(rows[0]?.details).toMatchObject({
+        status: "todo",
+        assigneeAgentId: null,
+        nextCheckAt: nextCheckAt.toISOString(),
+        attemptCount: 0,
+        notes: "Check deploy",
+        recoveryPolicy: "wake_owner",
+        reason: "status_not_dispatchable",
+        reasons: ["status_not_dispatchable"],
+        source: "scheduled",
+      });
+
+      // Detection only: no wake, no recovery action, schedule unchanged.
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+      expect(issue.monitorAttemptCount).toBe(0);
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+
+      // A later tick does not repeat the report for the same schedule.
+      await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000));
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+    });
+
+    it("reports a re-armed schedule again once it comes due", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.tickTimers(tickAt);
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+
+      const rearmedAt = new Date("2026-04-11T13:30:00.000Z");
+      await db.update(issues).set({ monitorNextCheckAt: rearmedAt }).where(eq(issues.id, issueId));
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:00:00.000Z"));
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(2);
+      expect(rows.map((row) => (row.details as { nextCheckAt?: string }).nextCheckAt)).toContain(rearmedAt.toISOString());
+    });
+
+    it("records an assigned todo issue without waking its agent", async () => {
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "todo" });
+
+      await heartbeatService(db).tickTimers(tickAt);
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.details).toMatchObject({ status: "todo", reason: "status_not_dispatchable" });
+      expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    });
+
+    it("does not repeat the report for a schedule stored with sub-millisecond precision", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      await db.execute(sql`update issues set monitor_next_check_at = '2026-04-11T12:30:00.123456Z' where id = ${issueId}`);
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.tickTimers(tickAt);
+      await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000));
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.details).toMatchObject({ nextCheckAt: "2026-04-11T12:30:00.123Z" });
+    });
+
+    it("writes exactly one row per due monitor when two ticks overlap", async () => {
+      const issueIds: string[] = [];
+      for (let index = 0; index < 30; index += 1) {
+        const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+        issueIds.push(issueId);
+      }
+      const first = heartbeatService(db);
+      const second = heartbeatService(db);
+
+      await Promise.all([first.tickTimers(tickAt), second.tickTimers(tickAt)]);
+      // A later tick picks up anything the skipped overlapping tick left.
+      await first.tickTimers(new Date(tickAt.getTime() + 30_000));
+
+      const rows = await db
+        .select({ entityId: activityLog.entityId })
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.monitor_unfireable"));
+      const counts = new Map<string, number>();
+      for (const row of rows) counts.set(row.entityId, (counts.get(row.entityId) ?? 0) + 1);
+      expect(rows).toHaveLength(issueIds.length);
+      for (const issueId of issueIds) expect(counts.get(issueId)).toBe(1);
+    });
+
+    it("does not report a fireable monitor whose wake claim is still fresh", async () => {
+      // Eligible and due, but the scheduler claimed it a minute ago: an
+      // in-flight wake, not an unfireable monitor.
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "in_progress" });
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: new Date(tickAt.getTime() - 60_000) })
+        .where(eq(issues.id, issueId));
+
+      const result = await heartbeatService(db).tickTimers(tickAt);
+
+      expect(result.enqueued).toBe(0);
+      expect(await unfireableRows(issueId)).toHaveLength(0);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+    });
+
+    it("records nothing before the schedule comes due", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+
+      await heartbeatService(db).tickTimers(new Date("2026-04-11T12:29:00.000Z"));
+
+      expect(await unfireableRows(issueId)).toHaveLength(0);
     });
   });
 });
