@@ -338,7 +338,9 @@ repository id. The attach records that id, and the close re-checks it
 (`landing_proof_repo_identity_mismatch`). The PR must be this card's own
 delivery, shown by evidence the board wrote. A `pull_request` work product on
 the card counts only when its create and update activity rows all name a board
-user, and the work product the attach creates never counts. A board user's
+user, and the work product the attach creates never counts. The merge sweep's
+merge record (a `system` `pr-delivery` update to status `merged`) does not count
+against a board link; any other non-board update does. A board user's
 comment on the card that names the PR also links it. A head or merge commit
 recorded on such a board-written work product also ties the PR, when that commit
 is the PR head or merge commit or is one of the PR's own commits. Evidence an

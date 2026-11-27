@@ -647,6 +647,39 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       await expectRefusedNotCardDelivery(card.issueId, await attach(card.issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE })));
     });
 
+    async function boardLinkOpenPrThenPrDeliveryUpdate(status: "merged" | "ready_for_review") {
+      const card = await seedStuckCard({ boardLinkedPr: null });
+      const linked = await request(app).post(`/api/issues/${card.issueId}/work-products`).send({
+        type: "pull_request", provider: "github", title: "Delivery PR", url: `https://github.com/${OWNER}/${REPO}/pull/506`,
+        status: "ready_for_review",
+      });
+      expect(linked.status, JSON.stringify(linked.body)).toBe(201);
+      await db.update(issueWorkProducts).set({ status }).where(eq(issueWorkProducts.id, linked.body.id));
+      await db.insert(activityLog).values({
+        companyId: card.companyId, actorType: "system", actorId: "pr-delivery", agentId: null,
+        action: "issue.work_product_updated", entityType: "issue", entityId: card.issueId,
+        details: {
+          workProductId: linked.body.id, type: "pull_request", provider: "github",
+          externalId: `${OWNER}/${REPO}#506`, prNumber: 506, status,
+          ...(status === "merged" ? { mergeCommitSha: LINKED_MERGE } : {}),
+        },
+      });
+      await reclassifyRecordOnly(card.issueId);
+      return card;
+    }
+
+    it("keeps a board link after the merge sweep records the PR's merge", async () => {
+      const { issueId } = await boardLinkOpenPrThenPrDeliveryUpdate("merged");
+      const attached = await attach(issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE }));
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(attached.body.proof.possession).toMatchObject({ kind: "linked_work_product" });
+    });
+
+    it("refuses a board link that pr-delivery re-delivery rewrote", async () => {
+      const { issueId } = await boardLinkOpenPrThenPrDeliveryUpdate("ready_for_review");
+      await expectRefusedNotCardDelivery(issueId, await attach(issueId, goodProof({ pullRequestNumber: 506, mergeCommitSha: LINKED_MERGE })));
+    });
+
     it.each([
       ["an agent", "agent" as const],
       ["the server's carrier fan-out", "system" as const],

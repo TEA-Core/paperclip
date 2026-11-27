@@ -318,7 +318,12 @@ const WORK_PRODUCT_WRITE_ACTIONS = ["issue.work_product_created", "issue.work_pr
 async function boardWrittenWorkProductIds(db: Db, issue: { id: string; companyId: string }, productIds: string[]) {
   if (productIds.length === 0) return new Set<string>();
   const rows = await db
-    .select({ action: activityLog.action, actorType: activityLog.actorType, details: activityLog.details })
+    .select({
+      action: activityLog.action,
+      actorType: activityLog.actorType,
+      actorId: activityLog.actorId,
+      details: activityLog.details,
+    })
     .from(activityLog)
     .where(and(
       eq(activityLog.companyId, issue.companyId),
@@ -331,6 +336,12 @@ async function boardWrittenWorkProductIds(db: Db, issue: { id: string; companyId
   for (const row of rows) {
     const id = typeof row.details?.workProductId === "string" ? row.details.workProductId : null;
     if (!id || !productIds.includes(id)) continue;
+    const mergeRecord =
+      row.action === "issue.work_product_updated" &&
+      row.actorType === "system" &&
+      row.actorId === "pr-delivery" &&
+      row.details?.status === "merged";
+    if (mergeRecord) continue;
     if (row.actorType !== "user") tainted.add(id);
     else if (row.action === "issue.work_product_created") created.add(id);
   }
