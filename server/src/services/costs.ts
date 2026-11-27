@@ -162,10 +162,23 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         getMonthlySpendTotal(db, { companyId }),
       ]);
 
+      // The cached monthly totals are 32-bit integer columns. A total above
+      // the column limit would make the update throw after the event was
+      // stored and skip budget evaluation, so it is saturated at the limit and
+      // the saturation is recorded. Budget evaluation sums cost_events itself.
+      const saturated: Array<{ scope: "agent" | "company"; field: "spentMonthlyCents"; value: number; storedAs: number }> = [];
+      const saturate = (scope: "agent" | "company", value: number) => {
+        if (value <= COST_EVENT_COST_CENTS_LIMIT) return value;
+        saturated.push({ scope, field: "spentMonthlyCents", value, storedAs: COST_EVENT_COST_CENTS_LIMIT });
+        return COST_EVENT_COST_CENTS_LIMIT;
+      };
+      const agentSpentMonthlyCents = saturate("agent", agentMonthSpend);
+      const companySpentMonthlyCents = saturate("company", companyMonthSpend);
+
       await db
         .update(agents)
         .set({
-          spentMonthlyCents: agentMonthSpend,
+          spentMonthlyCents: agentSpentMonthlyCents,
           updatedAt: new Date(),
         })
         .where(eq(agents.id, agent.id));
@@ -173,10 +186,28 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       await db
         .update(companies)
         .set({
-          spentMonthlyCents: companyMonthSpend,
+          spentMonthlyCents: companySpentMonthlyCents,
           updatedAt: new Date(),
         })
         .where(eq(companies.id, companyId));
+
+      if (saturated.length > 0) {
+        logger.error(
+          { companyId, costEventId: event.id, agentId: event.agentId, saturated },
+          "cached monthly spend exceeded storable range and was saturated",
+        );
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "cost-ledger",
+          action: "cost_event.spent_monthly_saturated",
+          entityType: "cost_event",
+          entityId: event.id,
+          agentId: event.agentId,
+          runId: event.heartbeatRunId,
+          details: { saturated },
+        });
+      }
 
       await budgets.evaluateCostEvent(event);
 

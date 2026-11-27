@@ -406,7 +406,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         windowEnd: end,
         thresholdType,
         amountLimit: policy.amount,
-        amountObserved,
+        // amount_observed is a 32-bit integer column; an observed spend above
+        // it would make the insert throw and abort cost-event evaluation.
+        amountObserved: Math.min(amountObserved, 2_147_483_647),
         status: "open",
         approvalId: approval?.id ?? null,
       })

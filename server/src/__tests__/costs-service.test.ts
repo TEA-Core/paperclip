@@ -9,6 +9,9 @@ import {
   companies,
   agents,
   activityLog,
+  approvals,
+  budgetIncidents,
+  budgetPolicies,
   costEvents,
   financeEvents,
   heartbeatRunEvents,
@@ -448,6 +451,9 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(budgetIncidents);
+    await db.delete(approvals);
+    await db.delete(budgetPolicies);
     await db.delete(financeEvents);
     await db.delete(costEvents);
     await db.delete(activityLog);
@@ -581,6 +587,76 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
         { field: "costCents", value: "3000000000", storedAs: COST_EVENT_COST_CENTS_LIMIT, reason: "out_of_range" },
       ],
     });
+  });
+
+  it("saturates cached monthly spend at the int limit instead of failing, and still evaluates budgets", async () => {
+    const { companyId, agentId } = await seedCostAgent();
+    const cancelWorkForScope = vi.fn(async () => {});
+    const costsWithHooks = costService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 1_000,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+    const occurredAt = new Date();
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5",
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      outputTokens: 1,
+      costCents: 1_234,
+      occurredAt,
+    });
+
+    const event = await costsWithHooks.createEvent(companyId, {
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5",
+      inputTokens: 10,
+      cachedInputTokens: 0,
+      outputTokens: 10,
+      costCents: 3_000_000_000,
+      occurredAt,
+    });
+
+    expect(event.costCents).toBe(COST_EVENT_COST_CENTS_LIMIT);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+    expect(agent?.spentMonthlyCents).toBe(COST_EVENT_COST_CENTS_LIMIT);
+    expect(company?.spentMonthlyCents).toBe(COST_EVENT_COST_CENTS_LIMIT);
+
+    const [saturation] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "cost_event.spent_monthly_saturated"));
+    expect(saturation?.entityId).toBe(event.id);
+    expect(saturation?.details).toEqual({
+      saturated: [
+        { scope: "agent", field: "spentMonthlyCents", value: 2_147_484_881, storedAs: COST_EVENT_COST_CENTS_LIMIT },
+        { scope: "company", field: "spentMonthlyCents", value: 2_147_484_881, storedAs: COST_EVENT_COST_CENTS_LIMIT },
+      ],
+    });
+
+    const incidents = await db.select().from(budgetIncidents).where(eq(budgetIncidents.scopeId, agentId));
+    const hardIncidents = incidents.filter((incident) => incident.thresholdType === "hard");
+    expect(hardIncidents).toEqual([
+      expect.objectContaining({ status: "open", amountObserved: COST_EVENT_COST_CENTS_LIMIT }),
+    ]);
+    expect(agent?.status).toBe("paused");
+    expect(cancelWorkForScope).toHaveBeenCalledWith({ companyId, scopeType: "agent", scopeId: agentId });
   });
 
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {
