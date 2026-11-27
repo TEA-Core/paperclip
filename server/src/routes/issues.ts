@@ -3077,7 +3077,8 @@ export const BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS = 60;
  *   1. this PATCH closes the issue: it was not terminal before (`wasClosed` false), the new
  *      status is done/cancelled, and the caller is a user;
  *   2. the newest non-system, non-deleted comment on the thread is the comment an
- *      `issue.board_stage_override` activity row of this issue recorded (`details.commentId`),
+ *      `issue.board_stage_override` or `issue.board_stage_reconciled` activity row of this issue
+ *      recorded (`details.commentId`),
  *      and that row is inside the window — a comment posted since keeps the close note visible;
  *   3. that comment was authored by the same user as the closing request; and
  *   4. the closing note — trimmed and redacted exactly as `addComment` stores it — is
@@ -3126,7 +3127,7 @@ export async function findBoardStageOverrideEchoComment(
       and(
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, input.issueId),
-        eq(activityLog.action, "issue.board_stage_override"),
+        inArray(activityLog.action, ["issue.board_stage_override", "issue.board_stage_reconciled"]),
         sql`${activityLog.details} ->> 'commentId' = ${latest.id}`,
         sql`${activityLog.createdAt} > now() - (${BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS}::int * interval '1 second')`,
       ),

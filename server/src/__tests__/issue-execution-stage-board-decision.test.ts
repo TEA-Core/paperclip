@@ -596,6 +596,40 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       expect(rows[0]!.id).toBe(approved.body.commentId);
     });
 
+    it("a reconciled stage approval and the closing PATCH carrying the same note write one comment", async () => {
+      const { companyId, issueId } = await seedIssue();
+      currentActor = boardActor(companyId);
+      await db.insert(issueExecutionDecisions).values({
+        id: "c2000000-0000-4000-8000-000000000001",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "approved",
+        body: "prior board approval",
+        createdByRunId: null,
+      });
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      expect(approved.body.reconciled).toBe(true);
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: note });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(true);
+      expect(closed.body.deduplicatedFromCommentId).toBe(approved.body.commentId);
+      expect(closed.body.comment).toBeNull();
+
+      const rows = await userComments(issueId);
+      expect(rows.map((r) => r.body)).toEqual([note]);
+    });
+
     it("a closing PATCH with a different note still appends beside the stage decision note", async () => {
       const { companyId, issueId } = await seedIssue();
       currentActor = boardActor(companyId);
