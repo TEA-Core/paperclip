@@ -10,6 +10,7 @@ import {
   externalObjectMentions,
   externalObjects,
   issueExecutionDecisions,
+  issueWorkProducts,
   issueDeliveryReceiptLinks,
   issueDeliveryReceipts,
   issues,
@@ -3588,6 +3589,20 @@ export type DecisionHeadResolution =
         displayName: string;
         headRefName: string | null;
       }>;
+      /**
+       * SUP-25478: set only by preflightFinalDelivery on a `no-pr` refusal when
+       * every `pull_request` work product of the card is MERGED and the primary
+       * one's recorded `metadata.mergeCommitSha` is proven on the card's base
+       * branch. The final-delivery preflight then admits the verdict with no
+       * certified head (merged before the verdict); no other caller reads it.
+       */
+      mergedBeforeVerdict?: { mergeCommitSha: string; workProduct: string; baseRef: string };
+      /**
+       * SUP-25478: a remedy specific to this refusal, used by the final-delivery
+       * preflight instead of its generic open-PR remedy when the generic one
+       * cannot be satisfied (every work product is already merged).
+       */
+      remedy?: string;
     };
 
 /**
@@ -3878,6 +3893,11 @@ const finalDeliveryLiveSchema = z.object({
  * stands unless exactly one card-owned draft mention is live-merged and passes
  * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
+ *
+ * SUP-25478: when the mention fallback finds no merged carrier, a card whose
+ * pull_request work products are all MERGED with a proven recorded merge
+ * commit on the primary returns the no-pr refusal tagged
+ * `mergedBeforeVerdict` (resolveMergedBeforeVerdictLanding).
  */
 export async function preflightFinalDelivery(
   db: Db, companyId: string, issueId: string, identifier: string,
@@ -3901,8 +3921,94 @@ export async function preflightFinalDelivery(
       return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
     }
     if (carrier.kind === "unresolvable") return carrier;
+    return resolveMergedBeforeVerdictLanding(db, companyId, issueId, resolved);
   }
   return resolved;
+}
+
+/**
+ * SUP-25478: merged-first landing. A delivery flow that merges every PR before
+ * the final review stage arms leaves no open PR, so the decision-head resolver
+ * and the SUP-22346 mention fallback both end in `no-pr`. The card's own
+ * `pull_request` work products are then the delivery record. When every one is
+ * MERGED and the primary carries a full 40-hex `metadata.mergeCommitSha` that
+ * the GitHub compare proves on the card's recorded base branch, the `no-pr`
+ * refusal is returned with `mergedBeforeVerdict` set, and the final-delivery
+ * preflight admits the verdict with no certified head. No work product, or any
+ * work product that is not merged, returns the refusal unchanged. A merged set
+ * with no single primary, no recorded merge commit, or a merge commit that is
+ * not proven on base keeps refusing, with a remedy that names the gap.
+ */
+async function resolveMergedBeforeVerdictLanding(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+): Promise<DecisionHeadResolution> {
+  const products = await db
+    .select({
+      title: issueWorkProducts.title,
+      externalId: issueWorkProducts.externalId,
+      status: issueWorkProducts.status,
+      isPrimary: issueWorkProducts.isPrimary,
+      metadata: issueWorkProducts.metadata,
+    })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, companyId),
+        eq(issueWorkProducts.issueId, issueId),
+        eq(issueWorkProducts.type, "pull_request"),
+      ),
+    );
+  if (products.length === 0 || products.some((product) => product.status !== "merged")) return refusal;
+  const primaries = products.filter((product) => product.isPrimary);
+  const primary = primaries.length === 1 ? primaries[0]! : products.length === 1 ? products[0]! : null;
+  if (!primary) {
+    return {
+      ...refusal,
+      remedy:
+        "every linked pull_request work product is MERGED, but no single primary work product names the delivery. " +
+        "Mark the delivering pull_request work product primary, record its merge commit as metadata.mergeCommitSha, " +
+        "then submit the final verdict again. Do not open a replacement PR.",
+    };
+  }
+  const label = primary.externalId ?? primary.title;
+  const recorded = primary.metadata?.mergeCommitSha;
+  const mergeCommitSha = typeof recorded === "string" ? recorded.trim().toLowerCase() : "";
+  if (!/^[0-9a-f]{40}$/.test(mergeCommitSha)) {
+    return {
+      ...refusal,
+      remedy:
+        `every linked pull_request work product is MERGED, but the primary work product ${label} has no recorded ` +
+        "metadata.mergeCommitSha (a full 40-hex merge commit SHA). Record its merge commit as metadata.mergeCommitSha, " +
+        "then submit the final verdict again. Do not open a replacement PR.",
+    };
+  }
+  const unproven = (why: string): DecisionHeadResolution => ({
+    ...refusal,
+    remedy:
+      `every linked pull_request work product is MERGED, but merge commit ${mergeCommitSha} recorded as ` +
+      `metadata.mergeCommitSha on ${label} is not proven on the card's base branch (${why}). ` +
+      "Check that the recorded SHA landed on that branch, then submit the final verdict again.",
+  });
+  const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  const baseRef = await resolveCardDeliveryBaseRef(db, companyId, issueId);
+  if (!identity.repo || !baseRef) return unproven("no delivery repository or base branch is recorded for this card");
+  const { owner, repo } = identity.repo;
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  for (let i = 0; i < candidates.length; i++) {
+    const verified = await verifyMergedPullRequestOnBaseBranch(
+      candidates[i]!.token, owner, repo, baseRef, mergeCommitSha, { requireVerifiedBranch: true },
+    );
+    if (verified.outcome === "auth-failed") {
+      if (i < candidates.length - 1) continue;
+      return unproven(`GitHub returned HTTP ${verified.status}`);
+    }
+    if (verified.outcome !== "proven") return unproven(verified.reason);
+    return { ...refusal, mergedBeforeVerdict: { mergeCommitSha, workProduct: label, baseRef } };
+  }
+  return unproven("no credential resolves the delivery repository");
 }
 
 /**

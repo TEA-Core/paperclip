@@ -867,6 +867,143 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
+  describe("merged-first landing: every PR work product merged before the final verdict (SUP-25478)", () => {
+    const MERGE_SHA = "5248066639ab65daa2883012ae82d181a0b6430b";
+    const OTHER_MERGE_SHA = "e".repeat(40);
+    const HEAD_SHA = "d".repeat(40);
+    type Product = { number: number; status: string; isPrimary: boolean; metadata: Record<string, unknown> };
+
+    // An agent reviewer holds the final stage and closes with a structured Tier 1
+    // landedAtTip declaration, so the real tier guard runs before the preflight.
+    async function mergedFirstReview(fixture: Awaited<ReturnType<typeof pendingDelivery>>, products: Product[]) {
+      const reviewer = await seedAgent(db, fixture.company.id);
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: fixture.company.id, agentId: reviewer.id, status: "running",
+        contextSnapshot: { issueId: fixture.issue.id },
+      }).returning();
+      const initial = await fixture.read();
+      const participant = { type: "agent", agentId: reviewer.id, userId: null };
+      await db.update(issues).set({
+        assigneeAgentId: reviewer.id, assigneeUserId: null,
+        executionPolicy: {
+          mode: "normal", commentRequired: true,
+          stages: [{ id: fixture.stageId, type: "review", approvalsNeeded: 1, participants: [participant] }],
+        },
+        executionState: { ...initial.executionState, currentParticipant: participant },
+      }).where(eq(issues.id, fixture.issue.id));
+      for (const product of products) {
+        await db.insert(issueWorkProducts).values({
+          companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
+          externalId: `TEA-Core/paperclip#${product.number}`, title: `PR #${product.number} TEA-Core/paperclip`,
+          url: `https://github.com/TEA-Core/paperclip/pull/${product.number}`, status: product.status,
+          reviewState: "none", isPrimary: product.isPrimary, healthStatus: "unknown", metadata: product.metadata,
+        });
+      }
+      // Every named commit is on the base branch.
+      const served = github.getMockImplementation()!;
+      github.mockImplementation(async (input, init) =>
+        String(input).includes("/compare/") ? Response.json({ status: "behind", ahead_by: 0 }) : served(input, init));
+      const app = createApp(db, agentActor(fixture.company, reviewer, run!.id));
+      return {
+        approve: (mergeCommit: string) => request(app).patch(`/api/issues/${fixture.issue.id}`).send({
+          status: "done",
+          comment: "Final review approved: every delivery PR is merged and CI is green at tip.",
+          doneTier: {
+            tier: "tier1",
+            reason: "Delivery merged before this review stage armed; landing verified at the base tip.",
+            landing: { mode: "landedAtTip", mergeCommit },
+          },
+        }),
+      };
+    }
+
+    const merged = (number: number, isPrimary: boolean, metadata: Record<string, unknown>): Product =>
+      ({ number, status: "merged", isPrimary, metadata: { mergedAt: "2026-11-27T16:16:00Z", ...metadata } });
+
+    it("records the final verdict and skips the arm when every PR work product merged first", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ]);
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      const state = stored.executionState as Record<string, any>;
+      expect(state).toMatchObject({ completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved" });
+      expect(state.approvalStatus.finalDeliveryUncertified).toEqual({
+        decisionId: state.lastDecisionId,
+        reason: expect.stringMatching(new RegExp(`^merged-before-verdict: .*${MERGE_SHA}.*TEA-Core/paperclip#4412.*main`)),
+        mergeCommitSha: MERGE_SHA,
+      });
+      expect(state.approvalStatus.approvedHeadSha).toBeUndefined();
+      expect(state.approvalStatus.finalDelivery).toBeUndefined();
+      expect(state.approvalStatus.publishSkipped).toMatchObject({
+        reason: expect.stringContaining(`status:skipped:merged-before-verdict: `),
+        headSha: null,
+      });
+      expect(state.approvalStatus.publishSkipped.reason).toContain(MERGE_SHA);
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    });
+
+    it("still refuses when the merged primary carries no recorded mergeCommitSha", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { headSha: HEAD_SHA })]);
+
+      const response = await review.approve(HEAD_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        reason: expect.stringContaining("no-pr"),
+        remedy: expect.stringContaining("has no recorded metadata.mergeCommitSha"),
+      });
+      expect(response.body.details.remedy).not.toContain("provide one OPEN");
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("keeps the normal certified arm path when an open PR resolves", async () => {
+      const fixture = await pendingDelivery();
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })]);
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      const approvalStatus = (stored.executionState as Record<string, any>).approvalStatus;
+      expect(approvalStatus.finalDeliveryUncertified).toBeUndefined();
+      expect(approvalStatus.finalDelivery).toMatchObject({ number: 42, headSha: fixture.pr.head.sha });
+      expect(fixture.writes).toHaveLength(1);
+    });
+
+    it("keeps refusing when open and merged PR work products are mixed", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        { number: 4413, status: "open", isPrimary: false, metadata: { headSha: HEAD_SHA } },
+      ]);
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        reason: expect.stringContaining("no-pr"),
+        remedy: expect.stringContaining("provide one OPEN, non-draft owned PR"),
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+  });
+
   it("allows a final approval with an accepted merged-elsewhere override when no linked PR resolves (SUP-21498)", async () => {
     const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
     const response = await fixture.approve({

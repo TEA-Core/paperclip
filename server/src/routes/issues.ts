@@ -4985,7 +4985,27 @@ export function issueRoutes(
         };
         return;
       }
-      const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
+      // SUP-25478: every pull_request work product merged before the final
+      // verdict, and the primary's recorded merge commit is proven on the
+      // card's base branch. The verdict is recordable post-merge; the decision
+      // certifies no head, and the post-commit hook records the arm as
+      // skipped merged-before-verdict with that merge commit as evidence.
+      if (decisionId && verdict.mergedBeforeVerdict && verdict.reason.startsWith("no-pr:")) {
+        const { mergeCommitSha, workProduct, baseRef } = verdict.mergedBeforeVerdict;
+        patch.executionState = {
+          ...rawState,
+          approvalStatus: {
+            ...prior,
+            finalDeliveryUncertified: {
+              decisionId,
+              reason: `merged-before-verdict: every linked pull_request work product merged before the final verdict; merge commit ${mergeCommitSha} recorded on ${workProduct} is on base branch ${baseRef}`,
+              mergeCommitSha,
+            },
+          },
+        };
+        return;
+      }
+      const remedy = `Delivery owner ${deliveryOwnerIssueId}: ${verdict.remedy ?? "provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again."} ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
       });
@@ -5189,7 +5209,10 @@ export function issueRoutes(
     // (and claim or invalidate receipts for) a live head the preflight never saw.
     const uncertifiedReason = readUncertifiedFinalDelivery(candidate.executionState);
     if (uncertifiedReason !== undefined) {
-      const msg = `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason})`;
+      // SUP-25478: a merged-first landing names its own skip and merge commit.
+      const msg = uncertifiedReason.startsWith("merged-before-verdict:")
+        ? `status:skipped:${uncertifiedReason}`
+        : `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason})`;
       try {
         await svc.addComment(issue.id, `[Merge-arming] ${msg}`, {}, { authorType: "system" });
       } catch (commentErr) {
