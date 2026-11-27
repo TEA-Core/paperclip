@@ -4317,6 +4317,7 @@ describe("issue execution policy routes", () => {
       const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
       const attributionKeys = new Set([
         "actorAgentId",
+        "actorAgentApiKeyId",
         "actorRunId",
         "actorRunStopId",
         "actorUserId",

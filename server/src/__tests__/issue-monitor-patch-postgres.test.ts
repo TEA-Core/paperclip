@@ -12,6 +12,11 @@ import type * as IssueServiceModule from "../services/issues.js";
 import type * as HeartbeatModule from "../services/heartbeat.js";
 import type { EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -173,6 +178,195 @@ describePostgres("monitor PATCH persisted authorization", () => {
       .send(spelling === "alias" ? { monitor } : { executionPolicy: { monitor } });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect((await stored(issue.id)).monitorNextCheckAt).toEqual(new Date(monitor.nextCheckAt));
+  });
+
+  it.each(["done", "cancelled"])("records a future verification lost when closing as %s", async (status) => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { ...monitor, recoveryPolicy: "wake_owner", notes: "Verify deployment tomorrow" } },
+      monitorNextCheckAt: new Date(monitor.nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status,
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      actorType: "agent", actorId: actor.agentId, agentId: actor.agentId, runId: actor.runId,
+      details: {
+        previousNextCheckAt: monitor.nextCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+        notes: "Verify deployment tomorrow",
+      },
+    });
+  });
+
+  it.each(["done", "cancelled"])("clears a past-due watchdog on %s without a disposition", async (status) => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    const nextCheckAt = "2020-01-01T00:00:00.000Z";
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { nextCheckAt, recoveryPolicy: "wake_owner" } },
+      monitorNextCheckAt: new Date(nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status,
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]!.details).toEqual({
+      identifier: issue.identifier,
+      previousNextCheckAt: nextCheckAt,
+      reason: status,
+      notes: null,
+    });
+  });
+
+  it("writes one clear row when a future check is armed between the close read and the row lock", async () => {
+    const { issue, actor, run } = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-11-04T09:00:00Z") })
+      .where(eq(heartbeatRuns.id, run.id));
+    const pastDueCheckAt = "2020-01-01T00:00:00.000Z";
+    await db.update(issues).set({
+      deliveryRequirement: "record_only",
+      executionPolicy: { monitor: { nextCheckAt: pastDueCheckAt, recoveryPolicy: "wake_owner" } },
+      monitorNextCheckAt: new Date(pastDueCheckAt),
+    }).where(eq(issues.id, issue.id));
+    interleave.afterRead = async () => {
+      await db.update(issues).set({
+        executionPolicy: { monitor: { ...monitor, recoveryPolicy: "wake_owner" } },
+        monitorNextCheckAt: new Date(monitor.nextCheckAt),
+      }).where(eq(issues.id, issue.id));
+    };
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
+      status: "done",
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
+    });
+    const clears = (await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id)))
+      .filter((row) => row.action === "issue.monitor_cleared");
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.monitorNextCheckAt).toBeNull();
+    expect(clears).toHaveLength(1);
+    expect(clears[0]!.details).toMatchObject({
+      previousNextCheckAt: monitor.nextCheckAt,
+      reason: "cleared_by_close_future_check",
+    });
+  });
+
+  it("records a future verification lost when a review approval comment closes the issue", async () => {
+    const { issue, approver } = await seed();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: approver.id,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+      deliveryRequirement: "record_only",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: approver.id }] }],
+        monitor: { ...monitor, recoveryPolicy: "wake_owner", notes: "Verify deployment tomorrow" },
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: approver.id },
+        returnAssignee: { type: "agent", agentId: issue.assigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+      monitorNextCheckAt: new Date(monitor.nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const [approverRun] = await db.insert(heartbeatRuns).values({
+      companyId: issue.companyId, agentId: approver.id, status: "running",
+      startedAt: new Date("2026-11-04T09:00:00Z"), contextSnapshot: { issueId: issue.id },
+    }).returning();
+    const approverActor: Express.Request["actor"] = {
+      type: "agent", agentId: approver.id, companyId: issue.companyId,
+      runId: approverRun!.id, source: "agent_jwt",
+    };
+    const res = await request(await appFor(approverActor)).post(`/api/issues/${issue.id}/comments`).send({
+      body: "## Review: APPROVED\n\nClosed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const closed = await stored(issue.id);
+    expect(closed.status).toBe("done");
+    expect(closed.monitorNextCheckAt).toBeNull();
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    const clears = rows.filter((row) => row.action === "issue.monitor_cleared");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      actorType: "agent", actorId: approver.id, agentId: approver.id, runId: approverRun!.id,
+      details: {
+        previousNextCheckAt: monitor.nextCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+        notes: "Verify deployment tomorrow",
+      },
+    });
+  });
+
+  it.each([
+    { label: "future", nextCheckAt: monitor.nextCheckAt, recorded: true },
+    { label: "past-due", nextCheckAt: "2020-01-01T00:00:00.000Z", recorded: false },
+  ])("service callers that close with a $label monitor record only a lost future check", async ({ nextCheckAt, recorded }) => {
+    const { issue } = await seed();
+    const policy = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt, recoveryPolicy: "wake_owner" } });
+    await db.update(issues).set({
+      executionPolicy: policy ? { ...policy } : null,
+      monitorNextCheckAt: new Date(nextCheckAt),
+    }).where(eq(issues.id, issue.id));
+    const current = await stored(issue.id);
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: current,
+      policy: normalizeIssueExecutionPolicy(current.executionPolicy ?? null),
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId: "board-user" },
+    });
+    const updated = await issueService(db).update(issue.id, {
+      ...transition.patch,
+      status: "cancelled",
+      actorUserId: "board-user",
+    });
+    expect(updated?.status).toBe("cancelled");
+    expect(updated?.monitorNextCheckAt).toBeNull();
+    const clears = (await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id)))
+      .filter((row) => row.action === "issue.monitor_cleared");
+    if (!recorded) {
+      expect(clears).toEqual([]);
+      return;
+    }
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      actorType: "user", actorId: "board-user", agentId: null, runId: null,
+      details: {
+        previousNextCheckAt: nextCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+      },
+    });
   });
 
   it.each([

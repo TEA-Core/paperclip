@@ -316,6 +316,55 @@ landing-debt or accepted-done audit evidence. Company deletion removes the owing
 issue and its evidence in one transaction. No-repository close rechecks use a
 monotonic 15-second budget, so wall-clock adjustments do not cause false timeouts.
 
+Board landing proof (SUP-25193). Some delivered cards have no other landing proof.
+Such a card is not done or cancelled. Its execution workflow is completed, at
+least one completed review stage names only users, and it records no
+`deliveryIdentity`. For such a card a board actor may call
+`POST /api/issues/:id/landing-proof` with one merged pull request in the card's
+project repository, its merge or head commit, and a reason. An agent key is
+refused with 403, including the assignee or the lease holder. The proof is
+debt-only. It answers outstanding repository landing debt and never overrides
+another done-guard refusal, such as an execution-workspace branch ahead of base
+with no merged PR or a foreign branch. When the card owes no landing debt, or the
+done guard refuses the close for such another reason, the call is refused 409
+`landing_proof_cannot_close` and nothing is recorded. The server verifies
+the proof live against GitHub before it records anything. The PR must be merged,
+the supplied sha must match the PR, the repository must be the card's project
+repository, and the merge commit must be contained in the card's control-plane
+base branch. The live repository identity must be the card's repository. GitHub
+must resolve the name to the same full name, so a renamed or transferred
+repository is refused. The PR's base repository must carry the same immutable
+repository id. The attach records that id, and the close re-checks it
+(`landing_proof_repo_identity_mismatch`). The PR must be this card's own
+delivery, shown by evidence the board wrote. A `pull_request` work product on
+the card counts only when its create and update activity rows all name a board
+user, and the work product the attach creates never counts. The merge sweep's
+merge record (a `system` `pr-delivery` update to status `merged`) does not count
+against a board link; any other non-board update does. A board user's comment on
+the card that names the PR also links it. A head or merge commit recorded on
+such a board-written work product also ties the PR, when that commit is the PR
+head or merge commit or is one of the PR's own commits. Evidence an
+agent can write does not count: an agent can link a PR to its own card, and the
+active run writes the card's delivery identity, so a link or comment from an
+agent, a server fan-out row and `executionState.deliveredHeadSha` are not ties.
+A head branch name is not a tie, because any pull request can carry the card
+identifier in its branch name. Otherwise the call is refused
+`landing_proof_not_card_delivery`. The close re-checks this tie
+too.
+A failed check is a typed 4xx refusal. `landing_proof_not_on_base` means a
+readable compare showed the merge commit outside the base branch. A network
+error, a non-OK GitHub answer or an unresolvable base branch is
+`landing_proof_unverifiable`, which may succeed on retry. A success records an
+`issue.landing_proof_attached` activity row and a `pull_request` work product.
+The call is idempotent for retries: the same evidence again returns 200 with
+`replayed: true` and writes nothing.
+Attaching discharges no debt. Only a board close accepts the proof. That close
+re-verifies the latest attached proof on its door, and again under the issue-row
+lock with the same 15-second bound. The debt rows are discharged in the
+transaction that accepts the close, with source `board_merged_pr`, the merge
+commit, the PR number and the proof activity ID. Agent and backstop close doors
+do not accept the proof.
+
 For a terminal approval, `execution_state.approvalStatus.finalDelivery` binds
 the approving decision to its certified pull request and head, including when
 the decision comes from a final-stage escalation. Publish outcomes retain this
