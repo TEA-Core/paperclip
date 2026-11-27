@@ -3704,6 +3704,91 @@ Duplicate headings receive stable suffixes.
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(true);
   });
 
+  it("rejects unknown wiki_write_page fields before any write", async () => {
+    const harness = createTestHarness({ manifest });
+    const path = "wiki/concepts/unknown-fields.md";
+    const files = new Map<string, string>([[path, "# Existing\n"]]);
+    const writes: string[] = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push(relativePath);
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: "# Rewritten\n",
+        tags: ["typo-field"],
+      }),
+    ).rejects.toThrow('Unknown wiki_write_page field "tags"');
+
+    expect(writes).toHaveLength(0);
+    expect(files.get(path)).toBe("# Existing\n");
+  });
+
+  it("refuses to create a missing page without create=true and creates it explicitly with create=true", async () => {
+    const harness = createTestHarness({ manifest });
+    const path = "wiki/concepts/brand-new.md";
+    const files = new Map<string, string>();
+    const writes: string[] = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push(relativePath);
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: "# Brand New\n",
+      }),
+    ).rejects.toThrow(`Refusing to create ${path}: the page does not exist`);
+    expect(writes).toHaveLength(0);
+
+    const created = await harness.executeTool<{
+      data?: { previousHash: string | null; hash: string; status: string };
+    }>("wiki_write_page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path,
+      contents: "# Brand New\n",
+      create: true,
+    });
+    expect(created.data?.status).toBe("ok");
+    expect(created.data?.previousHash).toBeNull();
+    expect(files.get(path)?.trimEnd()).toBe("# Brand New");
+
+    // Once the page exists, updates need no create flag: CAS semantics are
+    // unchanged for existing pages.
+    const updated = await harness.executeTool<{ data?: { previousHash: string | null } }>("wiki_write_page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path,
+      contents: "# Brand New v2\n",
+    });
+    expect(updated.data?.previousHash).toBe(created.data?.hash);
+    expect(files.get(path)?.trimEnd()).toBe("# Brand New v2");
+  });
+
   it("rejects wiki_write_page carrying new redaction placeholders before the hash CAS and any write", async () => {
     const harness = createTestHarness({ manifest });
     const original = "# Report\n\nThe gateway was called as live-root bearer of the cluster.\n";

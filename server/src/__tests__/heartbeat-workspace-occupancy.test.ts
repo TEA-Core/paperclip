@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -43,6 +43,7 @@ import {
 import { executionFailureRetryCount } from "../services/execution-recovery-attempt.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { legacyExecutionNeedsReconciliation } from "../services/legacy-execution-recovery.js";
+import { issueService } from "../services/issues.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -374,7 +375,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     occupantIssueId: string;
     contenderAgentId: string;
     contenderIssueId: string;
-  }) {
+  }, options: { occupantLeavesIssueOpen?: boolean } = {}) {
     const occupantStarted = deferred<{ executionWorkspaceId: string; cwd: string; branchName: string }>();
     const occupantMayFinish = deferred<void>();
     releaseGates.push(() => occupantMayFinish.resolve());
@@ -388,6 +389,11 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
           branchName: call.branchName!,
         });
         await occupantMayFinish.promise;
+        // An open issue after a successful run gets a disposition-repair wake that would keep
+        // holding the workspace; close it so releasing the occupant really frees the worktree.
+        if (!options.occupantLeavesIssueOpen) {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.occupantIssueId));
+        }
       }
       return {
         exitCode: 0,
@@ -521,6 +527,275 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     expect(contenderCalls).toHaveLength(1);
     expect(contenderCalls[0]?.executionWorkspaceId).toBe(occupantWorkspace.executionWorkspaceId);
     expect(contenderCalls[0]?.cwd).toBe(occupantWorkspace.cwd);
+  }, 90_000);
+
+  async function waitForOccupancySuccessorOf(contenderRunId: string) {
+    return waitFor(
+      async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.retryOfRunId, contenderRunId),
+            eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+          ))
+          .then((rows) => rows[0] ?? null),
+      10_000,
+      "the deferred contender's successor run",
+    );
+  }
+
+  /** Releases the occupant, then drives the successor through the scheduler tick by hand. */
+  async function promoteSuccessorAfterOccupantFinishes(
+    heartbeat: Heartbeat,
+    occupant: { occupantRunId: string; releaseOccupant: () => void },
+    successorRunId: string,
+  ) {
+    occupant.releaseOccupant();
+    await waitForRunToFinish(heartbeat, occupant.occupantRunId);
+    await waitForHeartbeatIdle(db);
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(Date.now() - 60_000), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successorRunId));
+    await heartbeat.promoteDueScheduledRetries();
+    for (let tick = 0; tick < 3; tick += 1) await heartbeat.resumeQueuedRuns();
+  }
+
+  async function insertRunningCheckoutCandidate(companyId: string, agentId: string, issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+    return runId;
+  }
+
+  // SUP-24883: stranded recovery coalesced into a queued occupancy successor and
+  // rewrote its retry_of_run_id to its own id. The claim's lineage walk can never
+  // resolve that, so the run neither dispatched nor ended, and as the issue's
+  // execution holder it refused every checkout until the 24 h queue-age bound.
+  it("cancels a queued successor whose retry lineage points at itself and frees the issue lock", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedSharedWorkspaceTargets(db, repoRoot);
+    const heartbeat = heartbeatService(db);
+
+    const occupant = await runContenderAgainstOccupiedWorkspace(heartbeat, seeded);
+    const successor = await waitForOccupancySuccessorOf(occupant.contenderRunId);
+
+    // The rows as the corrupt coalesce left them.
+    await db
+      .update(heartbeatRuns)
+      .set({ retryOfRunId: successor.id, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successor.id));
+    await db
+      .update(issues)
+      .set({ executionRunId: successor.id, executionLockedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, seeded.contenderIssueId));
+
+    await promoteSuccessorAfterOccupantFinishes(heartbeat, occupant, successor.id);
+
+    const settled = await heartbeat.getRun(successor.id);
+    const lock = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.contenderIssueId))
+      .then((rows) => rows[0]!);
+    const nextRunId = await insertRunningCheckoutCandidate(
+      seeded.companyId,
+      seeded.contenderAgentId,
+      seeded.contenderIssueId,
+    );
+    const checkout = await issueService(db)
+      .checkout(seeded.contenderIssueId, seeded.contenderAgentId, ["in_progress"], nextRunId)
+      .then(
+        (issue) => ({ checkoutRunId: issue.checkoutRunId }),
+        (error: { status?: number }) => ({ rejectedStatus: error.status ?? null }),
+      );
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, nextRunId));
+
+    expect({
+      status: settled?.status,
+      errorCode: settled?.errorCode,
+      startedAt: settled?.startedAt,
+      lockHeldBySuccessor: lock.executionRunId === successor.id,
+      checkout,
+    }).toEqual({
+      status: "cancelled",
+      errorCode: "retry_lineage_invalid",
+      startedAt: null,
+      lockHeldBySuccessor: false,
+      checkout: { checkoutRunId: nextRunId },
+    });
+    const successorAdapterCalls = adapterExecute.mock.calls.filter((call) =>
+      readAdapterCall(call[0]).issueId === seeded.contenderIssueId,
+    );
+    expect(successorAdapterCalls).toHaveLength(0);
+  }, 90_000);
+
+  // A longer lineage cycle is not cured by the self-reference rule; the claim's
+  // stale return must at least say why, once, instead of skipping in silence.
+  it("records one warning per run when the atomic claim cannot resolve the retry lineage", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedSharedWorkspaceTargets(db, repoRoot);
+    const heartbeat = heartbeatService(db);
+
+    const occupant = await runContenderAgainstOccupiedWorkspace(heartbeat, seeded);
+    const successor = await waitForOccupancySuccessorOf(occupant.contenderRunId);
+
+    // successor -> partner -> successor: both links are automatic system continuations.
+    const partnerWakeId = randomUUID();
+    const partnerRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: partnerWakeId,
+      companyId: seeded.companyId,
+      agentId: seeded.contenderAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      payload: { issueId: seeded.contenderIssueId },
+      status: "completed",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      runId: partnerRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: partnerRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.contenderAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "cancelled",
+      wakeupRequestId: partnerWakeId,
+      retryOfRunId: successor.id,
+      contextSnapshot: {
+        issueId: seeded.contenderIssueId,
+        taskId: seeded.contenderIssueId,
+        wakeReason: "issue_continuation_needed",
+      },
+      createdAt: new Date(successor.createdAt.getTime() - 1_000),
+      finishedAt: new Date(),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ retryOfRunId: partnerRunId, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successor.id));
+
+    await promoteSuccessorAfterOccupantFinishes(heartbeat, occupant, successor.id);
+
+    const warnings = await db
+      .select({ level: heartbeatRunEvents.level, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.runId, successor.id),
+        sql`${heartbeatRunEvents.payload} ->> 'claimStaleReason' is not null`,
+      ));
+    // Free the lane so the shared teardown does not wait on the parked run.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successor.id));
+
+    expect(warnings).toEqual([
+      {
+        level: "warn",
+        payload: expect.objectContaining({
+          claimStaleReason: "retry_lineage_unresolved",
+          issueId: seeded.contenderIssueId,
+        }),
+      },
+    ]);
+  }, 90_000);
+
+  it("keeps the workspace occupied by the occupant's disposition-repair run when the occupant leaves its issue open (upstream #13888)", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedSharedWorkspaceTargets(db, repoRoot);
+    const heartbeat = heartbeatService(db);
+
+    const { occupantWorkspace, contenderRunId, releaseOccupant, occupantRunId } =
+      await runContenderAgainstOccupiedWorkspace(heartbeat, seeded, { occupantLeavesIssueOpen: true });
+
+    const repairStarted = deferred<string | null>();
+    const repairMayFinish = deferred<void>();
+    releaseGates.push(() => repairMayFinish.resolve());
+    adapterExecute.mockImplementation(async (input) => {
+      if (readAdapterCall(input).issueId === seeded.occupantIssueId) {
+        repairStarted.resolve(readAdapterCall(input).executionWorkspaceId);
+        await repairMayFinish.promise;
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Workspace occupancy test run.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    releaseOccupant();
+    await waitForRunToFinish(heartbeat, occupantRunId);
+    expect(await repairStarted.promise).toBe(occupantWorkspace.executionWorkspaceId);
+
+    const repairRun = await waitFor(
+      async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.agentId, seeded.occupantAgentId),
+            eq(heartbeatRuns.status, "running"),
+          ))
+          .then((rows) =>
+            rows.find((row) =>
+              (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_disposition_repair",
+            ) ?? null),
+      10_000,
+      "the occupant's running disposition-repair run",
+    );
+    expect(repairRun.id).not.toBe(occupantRunId);
+    const successor = await waitFor(
+      async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.retryOfRunId, contenderRunId),
+            eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+          ))
+          .then((rows) => rows[0] ?? null),
+      10_000,
+      "the deferred contender's successor run",
+    );
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(Date.now() - 60_000), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successor.id));
+    await heartbeat.promoteDueScheduledRetries();
+    await heartbeat.resumeQueuedRuns();
+    const deferredAgain = await waitForRunToFinish(heartbeat, successor.id, 30_000);
+    expect(deferredAgain).toMatchObject({
+      status: "cancelled",
+      errorCode: "execution_workspace_occupied",
+    });
+    expect(
+      adapterExecute.mock.calls.filter((call) => readAdapterCall(call[0]).issueId === seeded.contenderIssueId),
+    ).toHaveLength(0);
+
+    repairMayFinish.resolve();
+    await waitForHeartbeatIdle(db);
   }, 90_000);
 
   // Fold 2c / occupancy-retry-count (operator ruling 2026-09-16). Upstream #13075
@@ -820,7 +1095,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         delayMs: 1_000,
       });
 
-      // One real failure, then two workspace_busy waits.
+      // One real failure, then two workspace_busy waits (waits are counted per reason and spend no failure budget).
       const firstRetry = await insertContenderRun(seeded, {
         status: "cancelled",
         errorCode: "workspace_busy",
@@ -829,14 +1104,14 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         resultJson: workspaceWait,
       });
       const busy = await scheduled(await heartbeat.scheduleBoundedRetry(firstRetry, busyRetry(1)));
-      expect(busy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 2 });
+      expect(busy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 1 });
       expect(busy.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
       await db
         .update(heartbeatRuns)
         .set({ status: "cancelled", errorCode: "workspace_busy", resultJson: workspaceWait })
         .where(eq(heartbeatRuns.id, busy.id));
       const busyAgain = await scheduled(await heartbeat.scheduleBoundedRetry(busy.id, busyRetry(2)));
-      expect(busyAgain).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 3 });
+      expect(busyAgain).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 2 });
       expect(busyAgain.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
       await failBeforeProvider(busyAgain.id);
       expect(executionFailureRetryCount(await readRun(busyAgain.id))).toBe(1);
@@ -859,7 +1134,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
       const busyAfterOccupancy = await scheduled(
         await heartbeat.scheduleBoundedRetry(occupancyWait, busyRetry(5)),
       );
-      expect(busyAfterOccupancy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 6 });
+      expect(busyAfterOccupancy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 1 });
       expect(busyAfterOccupancy.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
     }, 60_000);
 

@@ -58,3 +58,39 @@ export interface RunDispatchWriter {
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>>;
 }
+
+/**
+ * Keyset position of a listed run. `createdAtText` is the database's own text
+ * form of `created_at` (microsecond precision with offset), so the next page
+ * compares against the exact stored value; a JavaScript Date would truncate it
+ * to milliseconds and re-select every run sharing that millisecond.
+ */
+export type ExpiredQueuedRunCursor = { createdAtText: string; runId: string };
+
+export type ListExpiredQueuedRunsInput = {
+  /** Runs created at or before this instant are past the queued-run age bound. */
+  createdAtOrBefore: Date;
+  /** Retry alarms due at or before this instant; a run with a later alarm is not listed. */
+  now: Date;
+  limit: number;
+  /** Only runs ordered strictly after this (created_at, id) position. */
+  after?: ExpiredQueuedRunCursor;
+};
+
+export type ExpiredQueuedRunCandidate = DueRetryRun & { cursor: ExpiredQueuedRunCursor };
+
+export type ExpireQueuedRunInput = {
+  runId: string;
+  companyId: string;
+  now: Date;
+};
+
+/**
+ * The queued-run age bound: lists issue-bound runs still `queued` past the
+ * bound and terminalizes one under the same issue -> run locks the claim and
+ * stale-run gates take.
+ */
+export interface QueuedRunExpiry {
+  listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<ExpiredQueuedRunCandidate[]>;
+  expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome>;
+}

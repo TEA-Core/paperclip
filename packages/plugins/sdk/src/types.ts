@@ -37,6 +37,7 @@ import type {
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
   CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   PluginIssueOriginKind,
   IssueSurfaceVisibility,
   PluginManagedAgentResolution,
@@ -143,6 +144,7 @@ export type {
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
   CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   PluginIssueOriginKind,
   IssueSurfaceVisibility,
   Agent,
@@ -1423,6 +1425,31 @@ export interface PluginIssueAttachmentContent {
 }
 
 /**
+ * The issue fields a plugin may write through `ctx.issues.update`. The host
+ * forwards only these keys; every other key in a patch is dropped.
+ */
+export type PluginIssueUpdatePatch = Partial<Pick<
+  Issue,
+  | "title"
+  | "description"
+  | "status"
+  | "priority"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "billingCode"
+  | "originKind"
+  | "originId"
+  | "originRunId"
+  | "requestDepth"
+  | "executionWorkspaceId"
+  | "executionWorkspacePreference"
+>> & {
+  blockedByIssueIds?: string[];
+  labelIds?: string[];
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+};
+
+/**
  * `ctx.issues` — read and mutate issues plus comments.
  *
  * Requires:
@@ -1485,26 +1512,7 @@ export interface PluginIssuesClient {
   }): Promise<Issue>;
   update(
     issueId: string,
-    patch: Partial<Pick<
-      Issue,
-      | "title"
-      | "description"
-      | "status"
-      | "priority"
-      | "assigneeAgentId"
-      | "assigneeUserId"
-      | "billingCode"
-      | "originKind"
-      | "originId"
-      | "originRunId"
-      | "requestDepth"
-      | "executionWorkspaceId"
-      | "executionWorkspacePreference"
-    >> & {
-      blockedByIssueIds?: string[];
-      labelIds?: string[];
-      executionWorkspaceSettings?: Record<string, unknown> | null;
-    },
+    patch: PluginIssueUpdatePatch,
     companyId: string,
     actor?: PluginIssueMutationActor,
   ): Promise<Issue>;
@@ -1568,7 +1576,7 @@ export interface PluginIssuesClient {
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
-    interaction: CreateIssueThreadInteraction,
+    interaction: CreateIssueThreadInteractionInput,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<IssueThreadInteraction>;
@@ -1580,7 +1588,7 @@ export interface PluginIssuesClient {
   ): Promise<SuggestTasksInteraction>;
   askUserQuestions(
     issueId: string,
-    interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "ask_user_questions" }>, "kind">,
+    interaction: Omit<Extract<CreateIssueThreadInteractionInput, { kind: "ask_user_questions" }>, "kind">,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<AskUserQuestionsInteraction>;

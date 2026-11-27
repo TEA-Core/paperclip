@@ -64,14 +64,31 @@ const describePages = (raw) => {
   return "I found these recent pages: " + content.replace(/^Pages: /, "") + ".";
 };
 const issueId = process.env.PAPERCLIP_TASK_ID ?? (await api("/heartbeat-runs/" + process.env.PAPERCLIP_RUN_ID)).contextSnapshot.issueId;
+// These record-only tasks close on an actual current-run API read-back, not a repository landing.
+const finish = async (message) => {
+  const path = "/issues/" + issueId + "/comments";
+  await api(path, "POST", { body: message });
+  const observed = new Date().toISOString();
+  const comments = await api(path);
+  if (!comments.some(comment => comment.body === message && comment.createdByRunId === process.env.PAPERCLIP_RUN_ID)) {
+    throw new Error("Current run's result comment was not read back");
+  }
+  const closed = await api("/issues/" + issueId, "PATCH", {
+    status: "done",
+    doneTier: {
+      tier: "tier2",
+      probeEvidence: "record-only probe \`GET /api" + path + "\` target " + base + path + " observed " + observed + " result: pass current run's result comment was read back",
+    },
+  });
+  if (closed.status !== "done") throw new Error("Connection review task did not close");
+};
 const interactions = await api("/issues/" + issueId + "/interactions");
 const review = interactions.find(i => i.payload?.toolAction);
 if (review?.status === "pending") { console.log("Still waiting for the existing review; no retry."); process.exit(0); }
 if (review && review.status !== "pending") {
   const result = review.result?.toolAction;
   const message = review.status === "rejected" ? "Review declined. No pages were read." : result?.status === "failed" ? "Read failed: " + result.errorMessage : ["expired", "cancelled"].includes(review.status) ? "The review expired or was cancelled. No pages were read." : describePages(result?.resultSummary);
-  await api("/issues/" + issueId + "/comments", "POST", { body: message });
-  await api("/issues/" + issueId, "PATCH", { status: "done" });
+  await finish(message);
   console.log(message);
   process.exit(0);
 }
@@ -88,8 +105,7 @@ if (!call.ok) {
   console.log("Waiting for human review. No retry.");
   process.exit(0);
 }
-await api("/issues/" + issueId + "/comments", "POST", { body: describePages(result.result) });
-await api("/issues/" + issueId, "PATCH", { status: "done" });
+await finish(describePages(result.result));
 `;
 }
 
@@ -149,7 +165,6 @@ for (const journey of [
         .getByPlaceholder("https://example.com/actions")
         .fill(provider.url);
       await page.getByRole("button", { name: "Continue", exact: true }).click();
-      await page.getByRole("button", { name: "Save and continue" }).click();
       await page.getByRole("button", { name: /Check link/i }).click();
       await expect(
         page.getByRole("heading", { name: /is ready/i }),
@@ -190,6 +205,7 @@ for (const journey of [
           data: {
             title: "Read recent pages",
             status: "in_progress",
+            deliveryRequirement: "record_only",
             assigneeAgentId: agent.id,
           },
         }),
@@ -288,6 +304,13 @@ for (const journey of [
               ? "Read failed"
               : "Roadmap",
         );
+      await expect
+        .poll(
+          async () =>
+            (await json<{ status: string }>(await request.get(`/api/issues/${issue.id}`))).status,
+          { timeout: 45_000 },
+        )
+        .toBe("done");
       const replies = await json<Array<{ body: string; authorAgentId: string | null; createdByRunId: string | null }>>(await request.get(`/api/issues/${issue.id}/comments`));
       const reply = replies.find(comment => comment.authorAgentId === agent.id)!;
       expect(reply.createdByRunId).toBeTruthy();
@@ -331,6 +354,7 @@ for (const journey of [
             data: {
               title: "Read pages with different arguments",
               status: "in_progress",
+              deliveryRequirement: "record_only",
               assigneeAgentId: agent.id,
             },
           }),
@@ -348,6 +372,13 @@ for (const journey of [
             { timeout: 45_000 },
           )
           .toContain("Roadmap");
+        await expect
+          .poll(
+            async () =>
+              (await json<{ status: string }>(await request.get(`/api/issues/${later.id}`))).status,
+            { timeout: 45_000 },
+          )
+          .toBe("done");
         expect(calls()).toBe(2);
         expect(
           await json<unknown[]>(

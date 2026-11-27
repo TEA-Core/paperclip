@@ -10,6 +10,8 @@ import {
   createApprovalObjectSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
+  issueActivityResponseSchema,
+  refineIssueUpdateMonitorAliasConflict,
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
@@ -24,8 +26,11 @@ export interface ToolDefinition {
   name: string;
   description: string;
   schema: z.ZodObject;
+  outputSchema?: z.ZodObject;
   execute: (input: Record<string, unknown>) => Promise<{
     content: Array<{ type: "text"; text: string }>;
+    structuredContent?: Record<string, unknown>;
+    isError?: boolean;
   }>;
 }
 
@@ -34,17 +39,24 @@ function makeTool<TSchema extends z.ZodRawShape>(
   description: string,
   schema: z.ZodObject<TSchema>,
   execute: (input: z.infer<typeof schema>) => Promise<unknown>,
+  outputSchema?: z.ZodObject,
 ): ToolDefinition {
   return {
     name,
     description,
     schema,
+    ...(outputSchema ? { outputSchema } : {}),
     execute: async (input) => {
       try {
         const parsed = schema.parse(input);
-        return formatTextResponse(await execute(parsed));
+        const value = await execute(parsed);
+        if (outputSchema) {
+          const structuredContent = outputSchema.parse(value);
+          return { ...formatTextResponse(structuredContent), structuredContent };
+        }
+        return formatTextResponse(value);
       } catch (error) {
-        return formatErrorResponse(error);
+        return { ...formatErrorResponse(error), ...(outputSchema ? { isError: true } : {}) };
       }
     },
   };
@@ -134,12 +146,16 @@ const createIssueToolSchema = z.object({
 
 // Attribution stays off the advertised tool surface — it is create-only, so offering it would
 // invite callers to attempt a mutation the server discards.
+// SUP-21447: fail closed on the same top-level monitor alias conflict the
+// PATCH route enforces, so the adapter and the route agree: `monitor` alone
+// is forwarded as the alias, `executionPolicy` alone passes through, and a
+// body carrying both never leaves the adapter.
 const updateIssueToolSchema = z.object({
   issueId: issueIdSchema,
 }).merge(updateIssueObjectSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
-}));
+})).superRefine(refineIssueUpdateMonitorAliasConflict);
 
 const checkoutIssueToolSchema = z.object({
   issueId: issueIdSchema,
@@ -370,6 +386,15 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         const qs = params.toString();
         return client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/comments${qs ? `?${qs}` : ""}`);
       },
+    ),
+    makeTool(
+      "paperclipListIssueActivity",
+      "List issue activity, including the prior schedule, recovery policy, actor and reason when closing clears a future verification check",
+      z.object({ issueId: issueIdSchema }),
+      async ({ issueId }) => ({
+        items: await client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/activity`),
+      }),
+      z.object({ items: issueActivityResponseSchema }),
     ),
     makeTool(
       "paperclipGetComment",

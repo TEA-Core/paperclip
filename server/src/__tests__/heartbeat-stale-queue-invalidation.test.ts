@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -11,6 +13,8 @@ import {
   createDb,
   documentRevisions,
   documents,
+  environmentLeases,
+  nativeRunFinalizations,
   heartbeatRuns,
   issueComments,
   issueDocuments,
@@ -27,6 +31,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -35,6 +40,9 @@ import {
 import { bindNativeReviewCommitterWakeToRun } from "../services/native-runtime/native-review-participant.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
+import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -194,21 +202,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // A table poll for "queued" or "running" rows cannot see a wakeup promise
+    // that has not yet written its run row. The shared drain helper awaits
+    // both in-flight wakeup promises and in-flight run executions first, then
+    // re-checks the run table, so a late writer cannot still be in flight when
+    // the TRUNCATE below runs.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await cleanupHeartbeatInvalidationFixture(db, heartbeat);
   });
 
@@ -325,6 +324,108 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     });
   }
+
+  it.each([
+    { name: "assignments", sameIssue: true, first: "assignment", second: "assignment" },
+    { name: "unrelated tasks", sameIssue: false, first: "assignment", second: "assignment" },
+    { name: "assignment then direct comment", sameIssue: true, first: "assignment", second: "direct" },
+    { name: "direct comment then assignment", sameIssue: true, first: "direct", second: "assignment" },
+    { name: "assignment then queued comment", sameIssue: true, first: "assignment", second: "queued" },
+    { name: "queued comment then assignment", sameIssue: true, first: "queued", second: "assignment" },
+    { name: "queued comments", sameIssue: true, first: "queued", second: "queued" },
+  ])("serializes issue claims without serializing unrelated work: $name", async ({ sameIssue, first, second }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ maxConcurrentRuns: 2 });
+    const firstIssueId = randomUUID();
+    const secondIssueId = sameIssue ? firstIssueId : randomUUID();
+    for (const id of new Set([firstIssueId, secondIssueId])) {
+      await db.insert(issues).values({ id, companyId, title: "Concurrent assignment", status: "todo", assigneeAgentId: agentId });
+    }
+    async function queue(issueId: string, kind: string) {
+      const commentId = kind === "assignment" ? null : randomUUID();
+      if (commentId) await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorUserId: "local-board", body: "Continue this task." });
+      const queued = await seedQueuedRun({ companyId, agentId, issueId,
+        wakeReason: commentId ? "issue_commented" : "issue_assigned",
+        invocationSource: commentId ? "automation" : "assignment",
+        contextExtras: commentId ? { wakeCommentIds: [commentId], wakeCommentId: commentId } : {},
+      });
+      if (kind === "queued") await db.update(agentWakeupRequests).set({
+        payload: withQueuedCommentIdsInWakePayload({ issueId }, [commentId!]),
+      }).where(eq(agentWakeupRequests.id, queued.wakeupRequestId));
+    }
+    await queue(firstIssueId, first);
+    await queue(secondIssueId, second);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let onAdapterEntered!: () => void;
+    const adapterEntered = new Promise<void>((resolve) => { onAdapterEntered = resolve; });
+    mockAdapterExecute.mockImplementation(async () => {
+      onAdapterEntered();
+      await gate;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Assignment finished.", provider: "test", model: "test-model" };
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await adapterEntered;
+      const runs = await db.select().from(heartbeatRuns);
+      const running = runs.filter((run) => run.status === "running");
+      expect(running).toHaveLength(sameIssue ? 1 : 2);
+      expect(runs.filter((run) => run.status === "queued")).toHaveLength(sameIssue ? 1 : 0);
+      for (const run of running) {
+        const [issue] = await db.select().from(issues).where(eq(issues.id, (run.contextSnapshot as { issueId: string }).issueId));
+        expect(issue.executionRunId).toBe(run.id);
+      }
+    } finally {
+      release();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
+  it.each(["active_lease", "pending_cleanup", "failed_cleanup", "finalizer_lease", "workspace_finalization",
+    "retained_ready", "retained_missing_receipt", "retained_failed", "retained_wrong_policy"])(
+    "waits for durable cleanup from another controller: %s", async (pending) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), previousId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Remote cleanup", status: "todo", assigneeAgentId: agentId });
+      await db.insert(heartbeatRuns).values({ id: previousId, companyId, agentId,
+        status: "succeeded", runtimeMode: "native", nativeIssueId: issueId,
+        invocationSource: "assignment", contextSnapshot: { issueId }, finishedAt: new Date() });
+      await db.update(issues).set({ executionRunId: previousId }).where(eq(issues.id, issueId));
+      const leaseId = randomUUID();
+      const retained = pending.startsWith("retained_");
+      const hasLease = retained || ["active_lease", "pending_cleanup", "failed_cleanup"].includes(pending);
+      if (hasLease) await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId,
+        heartbeatRunId: previousId, provider: "daytona",
+        status: retained ? "retained" : pending === "pending_cleanup" ? "pending_cleanup" : "released",
+        leasePolicy: pending === "retained_wrong_policy" ? "retain_on_failure" : retained ? "reuse_by_environment" : "ephemeral",
+        releasedAt: retained || pending === "active_lease" ? null : new Date(),
+        cleanupStatus: ["retained_ready", "retained_wrong_policy"].includes(pending) ? "success"
+          : ["failed_cleanup", "retained_failed"].includes(pending) ? "failed" : null });
+      await db.insert(nativeRunFinalizations).values({ runId: previousId, companyId, issueId,
+        phase: pending === "workspace_finalization" ? "workspace_finalizing" : "committed",
+        leaseOwner: pending === "finalizer_lease" ? "another-controller" : null });
+      const next = await seedQueuedRun({ companyId, agentId, issueId, wakeReason: "issue_assigned", invocationSource: "assignment" });
+      mockAdapterExecute.mockImplementation(async () => {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+          summary: "Task completed", provider: "test", model: "test-model" };
+      });
+      // No in-memory executor exists in this service. Durable ownership alone
+      // must fence a second controller until cleanup settles. A verified warm
+      // retention receipt is already a settled boundary and allows continuation.
+      await heartbeat.resumeQueuedRuns();
+      if (pending !== "retained_ready") {
+        expect((await heartbeat.getRun(next.runId))?.status).toBe("queued");
+        expect(mockAdapterExecute).not.toHaveBeenCalled();
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(previousId);
+        if (hasLease) await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, leaseId));
+        await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, previousId));
+        await heartbeat.resumeQueuedRuns();
+      }
+      await heartbeat.drainActiveRunExecutions();
+      expect((await heartbeat.getRun(next.runId))?.status).toBe("succeeded");
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("skips generic timer wakes with no actionable assigned work before adapter execution", async () => {
     const { agentId } = await seedCompanyAndAgent({
@@ -898,6 +999,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       params.includes(fixture.interactionId));
 
     await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    await faultedHeartbeat.drainActiveRunExecutions();
     await waitForCondition(async () => {
       const run = await readRunState(ordinary.runId);
       return run?.status !== "queued" && run?.status !== "running";
@@ -984,6 +1086,98 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.status).toBe("cancelled");
     expect(run?.errorCode).toBe("issue_assignee_changed");
     expect(countExecuteCallsForRun(clone.runId)).toBe(0);
+  });
+
+  it.each(["review", "approval"] as const)("starts the current %s participant without waiting for the issue-less author", async (stageType) => {
+    const fixture = await seedNativeReviewFixture({ queuedRunCount: 0 });
+    const authorRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: authorRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.workerId,
+      invocationSource: "timer",
+      status: "running",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+      startedAt: new Date(),
+    });
+    runningProcesses.set(authorRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+    await db.update(issues).set({
+      originRunId: authorRunId,
+      executionRunId: authorRunId,
+      executionState: {
+        status: "pending", currentStageId: randomUUID(), currentStageIndex: 0,
+        currentStageType: stageType,
+        currentParticipant: { type: "agent", agentId: fixture.reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: fixture.workerId, userId: null },
+        reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    const woken = await heartbeat.wakeup(fixture.reviewerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: { issueId: fixture.issueId },
+      contextSnapshot: { issueId: fixture.issueId, wakeReason: "execution_review_requested" },
+      requestedByActorType: "system",
+      requestedByActorId: "issue.execution_stage",
+    });
+    expect(woken).not.toBeNull();
+    const run = await resumeAndReadRun(woken!.id);
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(woken!.id)).toBe(1);
+    expect((await readRunState(authorRunId))?.status).toBe("running");
+  });
+
+  it("starts a native reviewer while the issue-less author runs and fences the old author", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const authorRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: authorRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.workerId,
+      invocationSource: "timer",
+      status: "running",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+      startedAt: new Date(),
+    });
+    runningProcesses.set(authorRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+    await db.update(issues).set({
+      originRunId: authorRunId,
+      executionRunId: authorRunId,
+    }).where(eq(issues.id, fixture.issueId));
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", companyId: fixture.companyId, agentId: fixture.workerId, runId: authorRunId, source: "agent_jwt" };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1], {}));
+    app.use(errorHandler);
+    let rejectedStatus: number | null = null;
+    let rejectedCheckoutStatus: number | null = null;
+    let executionRunId: string | null = null;
+    let cardTitle: string | null = null;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const rejected = await request(app).patch(`/api/issues/${fixture.issueId}`).send({ title: "Old author write" });
+      rejectedStatus = rejected.status;
+      const checkout = await request(app).post(`/api/issues/${fixture.issueId}/checkout`)
+        .send({ agentId: fixture.workerId, expectedStatuses: ["in_review", "in_progress"] });
+      rejectedCheckoutStatus = checkout.status;
+      const [card] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      executionRunId = card?.executionRunId ?? null;
+      cardTitle = card?.title ?? null;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Review", provider: "test", model: "test-model" };
+    });
+    await heartbeat.resumeQueuedRuns();
+    expect(await waitForCondition(async () => countExecuteCallsForRun(fixture.runId) === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    expect((await readRunState(fixture.runId))?.status).toBe("succeeded");
+    expect((await readRunState(authorRunId))?.status).toBe("running");
+    expect(rejectedStatus).toBe(409);
+    expect(rejectedCheckoutStatus).toBe(409);
+    expect(executionRunId).toBe(fixture.runId);
+    expect(cardTitle).toBe("Native review of completed work");
   });
 
   it("claims a promoted native-review run whose wake receipt reason was rewritten", async () => {
@@ -1482,6 +1676,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       };
 
       await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
       await waitForCondition(async () => {
         const [run, wakeup] = await Promise.all([
           db.select({ status: heartbeatRuns.status })
@@ -2546,48 +2741,64 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       wakeReason: "issue_assigned",
     });
 
-    await heartbeat.resumeQueuedRuns();
+    // Observe the initial handoff before its completed run can trigger an
+    // independent review-path recovery. Then await that execution, not a clock.
+    // The project's ES2023 compiler library does not expose Promise.withResolvers.
+    let finishReviewer!: () => void;
+    const reviewerMayFinish = new Promise<void>((resolve) => { finishReviewer = resolve; });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await reviewerMayFinish;
+      return execute();
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
 
-    const handedOff = await waitForCondition(async () => {
-      const rows = await db
-        .select({ id: heartbeatRuns.id })
+      const handedOff = await waitForCondition(async () => {
+        const rows = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, participantAgentId));
+        return rows.length > 0;
+      }, 10_000);
+      expect(handedOff).toBe(true);
+
+      const staleRun = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(staleRun?.status).toBe("cancelled");
+      expect(staleRun?.errorCode).toBe("issue_review_participant_changed");
+
+      const handoffRuns = await db
+        .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.agentId, participantAgentId));
-      return rows.length > 0;
-    }, 10_000);
-    expect(handedOff).toBe(true);
+      expect(handoffRuns).toHaveLength(1);
+      expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
+        issueId,
+        staleRunHandoffFromRunId: runId,
+        staleRunHandoffErrorCode: "issue_review_participant_changed",
+        staleRunHandoffHops: 1,
+      });
+      finishReviewer();
+      await heartbeat.drainActiveRunExecutions();
 
-    const staleRun = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    expect(staleRun?.status).toBe("cancelled");
-    expect(staleRun?.errorCode).toBe("issue_review_participant_changed");
-
-    const handoffRuns = await db
-      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(handoffRuns).toHaveLength(1);
-    expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
-      issueId,
-      staleRunHandoffFromRunId: runId,
-      staleRunHandoffErrorCode: "issue_review_participant_changed",
-      staleRunHandoffHops: 1,
-    });
-
-    // evaluateQueuedRunStaleness already exempts the current review participant
-    // from the assignee check, so the handoff run is dispatchable, not re-cancelled.
-    const reached = await waitForCondition(async () => {
-      const row = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "succeeded";
-    }, 10_000);
-    expect(reached).toBe(true);
+      // evaluateQueuedRunStaleness already exempts the current review participant
+      // from the assignee check, so the handoff run is dispatchable, not re-cancelled.
+      const reached = await waitForCondition(async () => {
+        const row = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
+          .then((rows) => rows[0] ?? null);
+        return row?.status === "succeeded";
+      }, 10_000);
+      expect(reached).toBe(true);
+    } finally {
+      finishReviewer();
+    }
   });
 
   it("does not enqueue a handoff when a stale cancellation promises no wake", async () => {
@@ -2888,12 +3099,11 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         originCommentIds: [wakeCommentId],
         interactionResolvedAt: new Date().toISOString(), mutation: "interaction", source: `${interactionKind}.resolved`, forceFreshSession: true } });
     await heartbeat.resumeQueuedRuns();
-    expect(await waitForCondition(async () => (await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "succeeded")).toBe(true);
     // Terminal status precedes completion bookkeeping. Drain those writes before
     // afterEach truncates the fixture, otherwise PostgreSQL can deadlock.
-    await heartbeat.waitForRunExecutionDrain(runId);
+    await heartbeat.drainActiveRunExecutions();
+    expect((await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status).toBe("succeeded");
     expect(countExecuteCallsForRun(runId)).toBe(1);
-    await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
 
@@ -2946,14 +3156,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
     await heartbeat.resumeQueuedRuns();
 
-    await waitForCondition(async () => {
-      const run = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .then((rows) => rows[0] ?? null);
-      return run?.status === "succeeded";
-    });
+    await heartbeat.drainActiveRunExecutions();
 
     const run = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })

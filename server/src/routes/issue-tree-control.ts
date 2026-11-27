@@ -7,11 +7,14 @@ import {
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { conflict } from "../errors.js";
+import { recoveryCarrierParkService } from "../services/recovery-carrier-park.js";
 import {
   createIssueTreeHoldSchema,
   isUuidLike,
   previewIssueTreeControlSchema,
   releaseIssueTreeHoldSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -61,6 +64,30 @@ export function issueTreeControlRoutes(
     const root = await issuesSvc.getById(rootIssueId);
     return root;
   }
+
+  router.get("/issues/:id/recovery-carrier-park/candidate", async (req, res) => {
+    assertBoard(req);
+    const carrier = await getAccessibleResource(req, res, resolveRootIssue(req), "Recovery carrier not found");
+    if (!carrier) return;
+    res.json(await recoveryCarrierParkService(db).candidate(carrier.companyId, carrier.id));
+  });
+
+  router.post("/issues/:id/recovery-carrier-park", validate(parkRecoveryCarrierSchema), async (req, res) => {
+    assertBoard(req);
+    const carrier = await getAccessibleResource(req, res, resolveRootIssue(req), "Recovery carrier not found");
+    if (!carrier) return;
+    const result = await recoveryCarrierParkService(db).park(carrier.companyId, carrier.id, req.body, getActorInfo(req));
+    res.status(result.created ? 201 : 200).json(result);
+  });
+
+  router.post("/issues/:id/recovery-carrier-park/:holdId/release", validate(releaseRecoveryCarrierParkSchema), async (req, res) => {
+    assertBoard(req);
+    const carrier = await getAccessibleResource(req, res, resolveRootIssue(req), "Recovery carrier not found");
+    if (!carrier) return;
+    const holdId = req.params.holdId as string;
+    if (!isUuidLike(holdId)) { res.status(400).json({ error: "Invalid hold ID" }); return; }
+    res.json(await recoveryCarrierParkService(db).release(carrier.companyId, carrier.id, holdId, req.body, getActorInfo(req)));
+  });
 
   router.post("/issues/:id/tree-control/preview", validate(previewIssueTreeControlSchema), async (req, res) => {
     assertBoard(req);

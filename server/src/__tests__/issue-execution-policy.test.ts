@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, listCurrentPolicyApprovedStageIds, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stallHoldControlsDiffer, stripMonitorFromExecutionPolicy, type DurableApprovalDecisionRow } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -456,6 +456,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved).not.toBeNull();
     expect(resolved!.stages.length).toBe(1);
@@ -472,6 +473,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved!.stages).toEqual([]);
     expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
@@ -509,6 +511,87 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
     expect(resolvePatchExecutionPolicy({ raw: "nope", currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: null, currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: [1, 2], currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+  });
+});
+
+describe("resolvePatchExecutionPolicy explicit-empty preservation (SUP-22135)", () => {
+  const stageLessPolicy = () =>
+    normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [] }, { preserveEmptyPolicy: true })!;
+
+  it("keeps an explicit `stages: []` round-trip over a stored stage-less policy non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    // Before SUP-22135 the normalizer collapsed the bare-empty body to null,
+    // silently wiping the stored SUP-22098 shape.
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("normal");
+  });
+
+  it("keeps a stage-less partial write (stages key absent) non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("auto");
+  });
+
+  it("still collapses a bare-empty body over a null stored policy (default inheritance unchanged)", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: null,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("still carries the stored ladder forward on stages omission (SUP-15377 unchanged)", () => {
+    const stored = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    expect(resolved!.stages[0]!.id).toBe(stored.stages[0]!.id);
+  });
+
+  it("does not preserve a legacy monitor-only policy without a raw stages key", () => {
+    const stored = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("preserves a stored policy only when the raw stages key was explicitly empty", () => {
+    const stored = normalizeIssueExecutionPolicy(
+      { mode: "normal", monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, stages: [] },
+      { preserveEmptyPolicy: true },
+    )!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
   });
 });
 
@@ -1004,6 +1087,30 @@ describe("issue execution policy transitions", () => {
       lastDecisionId: null,
       lastDecisionOutcome: null,
       changesRequestedCount: 0,
+    });
+
+    it("preserves an untrusted child carrier claim through final-stage approval", () => {
+      const stage = policy.stages.at(-1)!;
+      const participant = stage.participants[0]!;
+      const claim = { prNumber: 653, headSha: "a".repeat(40), claimedAt: "2026-11-22T00:00:00Z" };
+      const actor = participant.type === "agent" ? { agentId: participant.agentId } : { userId: participant.userId };
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: participant.type === "agent" ? participant.agentId : null,
+          assigneeUserId: participant.type === "user" ? participant.userId : null,
+          executionPolicy: policy,
+          executionState: {
+            ...parkedReviewState(), currentStageId: stage.id, currentStageIndex: policy.stages.length - 1,
+            currentStageType: stage.type, currentParticipant: participant,
+            completedStageIds: policy.stages.slice(0, -1).map((entry) => entry.id),
+            childCarrierClaim: claim,
+          },
+        },
+        policy, requestedStatus: "done", requestedAssigneePatch: {}, actor, commentBody: "Approved the exact child contribution.",
+      });
+      expect(result.decision?.outcome).toBe("approved");
+      expect(result.patch.executionState).toMatchObject({ status: "completed", childCarrierClaim: claim });
     });
 
     it("parks blocked without recording any execution decision and leaves the stage armed", () => {
@@ -1578,8 +1685,8 @@ describe("issue execution policy transitions", () => {
         lastDecisionOutcome: "approved",
       };
 
-      it("clears executionState for a non-in_review status (done/cancelled/blocked/in_progress)", () => {
-        for (const status of ["done", "cancelled", "blocked", "in_progress"] as const) {
+      it("clears executionState for a non-terminal status (blocked/in_progress/todo)", () => {
+        for (const status of ["blocked", "in_progress", "todo"] as const) {
           const result = applyIssueExecutionPolicyTransition({
             issue: {
               status: "blocked",
@@ -1596,6 +1703,34 @@ describe("issue execution policy transitions", () => {
             commentBody: "Overriding the stuck review",
           });
           expect(result.patch.executionState).toBeNull();
+          expect(result.decision).toBeUndefined();
+        }
+      });
+
+      it("keeps the completed state on a board done/cancelled close (SUP-24054)", () => {
+        // A successful close leaves nothing stuck to dissolve. The done guard
+        // already read the pre-patch row, so a null here only destroyed the
+        // completed ladder record (completedStageIds, approvalStatus).
+        const approvalStatus = {
+          finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 404, headSha: "a".repeat(40) },
+        };
+        for (const status of ["done", "cancelled"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_progress",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: { ...completedState, approvalStatus },
+            },
+            policy,
+            requestedStatus: status,
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+            commentBody: "Closing the approved card",
+          });
+          expect(result.patch).not.toHaveProperty("executionState");
           expect(result.decision).toBeUndefined();
         }
       });
@@ -1875,6 +2010,372 @@ describe("issue execution policy transitions", () => {
       });
 
       expect(result.patch.executionState).toBeNull();
+    });
+  });
+
+  describe("durable approvals survive a reopen (SUP-24054)", () => {
+    // The SUP-24036 shape: the policy returns to the delivering agent, the
+    // review stage has another participant, a reopen nulled the projection,
+    // and the stage's latest decision row is `approved`. The route resolves
+    // `decidedStageIds` from those rows with listCurrentPolicyApprovedStageIds.
+    function reviewPolicyReturningToCoder() {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+    }
+
+    function coderDoneOnNullState(policy: IssueExecutionPolicy, decidedStageIds?: string[]) {
+      return applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        ...(decidedStageIds ? { decidedStageIds } : {}),
+      });
+    }
+
+    it("leaves the requested done in place when every stage holds a current approval", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy, [policy.stages[0].id]);
+
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.workflowControlledAssignment).toBeUndefined();
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("still arms the stage when no durable approval exists", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        completedStageIds: [],
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("re-arms from the first stage when only some stages are approved", () => {
+      const policy = twoStagePolicy();
+      const [reviewStage] = policy.stages;
+      const result = coderDoneOnNullState(policy, [policy.stages[1].id]);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: reviewStage.id,
+        completedStageIds: [],
+      });
+    });
+
+    it("arms a stage whose latest decision is changes_requested (fail closed)", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const stageId = policy.stages[0].id;
+      const decidedStageIds = listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+        policy,
+        decisions: [
+          { id: "d-1", stageId, stageType: "review", outcome: "approved", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:09:34Z") },
+          { id: "d-2", stageId, stageType: "review", outcome: "changes_requested", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:30:00Z") },
+        ],
+        boardDecisionParticipants: new Map(),
+        closer: { type: "agent", agentId: coderAgentId, userId: null },
+      });
+      expect(decidedStageIds).toEqual([]);
+
+      const result = coderDoneOnNullState(policy, decidedStageIds);
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: stageId });
+    });
+  });
+
+  describe("durable approvals must hold under the current policy (SUP-24054 release-assurance B1/B2)", () => {
+    const otherAgentId = "44444444-4444-4444-8444-444444444444";
+    const boardDeciderUserId = "board-decider";
+    const approvedAt = new Date("2026-11-12T19:09:34Z");
+
+    function ladder(reviewParticipants: Array<{ type: "agent"; agentId: string }> = [{ type: "agent", agentId: qaAgentId }]) {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [
+          { type: "review", participants: reviewParticipants },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+    }
+
+    function row(overrides: Partial<DurableApprovalDecisionRow> & { stageId: string }): DurableApprovalDecisionRow {
+      return {
+        id: `d-${overrides.stageId}-${overrides.actorAgentId ?? overrides.actorUserId ?? "none"}`,
+        stageType: "review",
+        outcome: "approved",
+        actorAgentId: null,
+        actorUserId: null,
+        createdAt: approvedAt,
+        ...overrides,
+      };
+    }
+
+    function approvedIds(input: {
+      policy: IssueExecutionPolicy;
+      decisions: DurableApprovalDecisionRow[];
+      board?: Array<[string, { type: "agent"; agentId: string } | { type: "user"; userId: string } | null]>;
+      issue?: { assigneeAgentId?: string | null; assigneeUserId?: string | null; createdByAgentId?: string | null };
+      closer?: { type: "agent"; agentId: string } | { type: "user"; userId: string };
+    }) {
+      return listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null, ...input.issue },
+        policy: input.policy,
+        decisions: input.decisions,
+        boardDecisionParticipants: new Map(
+          (input.board ?? []).map(([id, principal]) => [
+            id,
+            principal === null ? null : { agentId: null, userId: null, ...principal },
+          ]),
+        ),
+        closer: input.closer ? { agentId: null, userId: null, ...input.closer } : null,
+      });
+    }
+
+    it("counts approvals by current agent and user participants", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("counts a board stage decision recorded for a current participant", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const boardApproval = row({ id: "board-approval", stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview, boardApproval],
+          board: [
+            ["board-review", { type: "agent", agentId: qaAgentId }],
+            ["board-approval", { type: "user", userId: ctoUserId }],
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("drops an approval whose agent is no longer a participant of the stage", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })] })).toEqual([]);
+    });
+
+    it("drops a board stage decision whose participant was replaced, or that names none", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: qaAgentId }]] })).toEqual([]);
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", null]] })).toEqual([]);
+    });
+
+    it("drops a user approval that is neither a participant's nor a board stage decision", () => {
+      const policy = ladder();
+      const [, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops an approval after the stage type was flipped", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops every approval once any decision row names a stage the policy no longer carries", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const removedStageId = "99999999-9999-4999-8999-999999999999";
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+            row({ stageId: removedStageId, outcome: "changes_requested", actorAgentId: otherAgentId }),
+          ],
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the return assignee, matched case-insensitively", () => {
+      // The decider is listed on the stage with exactly its recorded letter
+      // case, so stage membership holds; only the case-folded self-approval
+      // exclusion (the stricter direction) can drop it.
+      const returnAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: returnAgentId,
+        stages: [
+          {
+            type: "review",
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: returnAgentId.toUpperCase() },
+            ],
+          },
+        ],
+      })!;
+      const [review] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: returnAgentId.toUpperCase() })],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("compares stage membership exactly: a decider that matches a participant only by letter case does not count", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId })] })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId.toUpperCase() })] }),
+      ).toEqual([]);
+    });
+
+    it("compares a board stage decision's participant exactly", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: participantId }]] }),
+      ).toEqual([review.id]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: participantId.toUpperCase() }]],
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the current assignee, the delivery author of the done", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })], issue: { assigneeAgentId: qaAgentId } }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          issue: { assigneeAgentId: null, assigneeUserId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a row with no recorded actor", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id })] })).toEqual([]);
+    });
+
+    it("drops an approval by the closer of the done", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: qaAgentId.toUpperCase() })],
+          closer: { type: "agent", agentId: qaAgentId },
+        }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          closer: { type: "user", userId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a board user's own board stage decision when that user closes", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const board: Array<[string, { type: "agent"; agentId: string }]> = [["board-review", { type: "agent", agentId: qaAgentId }]];
+      expect(approvedIds({ policy, decisions: [boardReview], board })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board, closer: { type: "user", userId: boardDeciderUserId } }),
+      ).toEqual([]);
+    });
+
+    it("drops a board stage decision recorded for a self-approval principal's seat", () => {
+      const policy = ladder([
+        { type: "agent", agentId: qaAgentId },
+        { type: "agent", agentId: coderAgentId },
+      ]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: coderAgentId }]],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("keeps re-arm-review behaviour when an approval no longer holds", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+      const [review] = policy.stages;
+      const decidedStageIds = approvedIds({
+        policy,
+        decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })],
+      });
+      const result = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        decidedStageIds,
+      });
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: review.id });
     });
   });
 
@@ -5425,6 +5926,11 @@ describe("approvalStatus preservation across monitor transitions (SUP-16977)", (
 
 describe("raw execution-row agent-id fold agrees with the decision snapshot compare", () => {
   const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  // Agent ids with hex letters: `toUpperCase()` changes them. The suite-wide
+  // agent ids are digit-only, so a case row built from them compares a value
+  // with itself and passes whether or not the fold runs.
+  const seatAgentId = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+  const arbiterAgentId = "f0e1d2c3-b4a5-4968-8776-655443322aab";
   const otherAgentId = "44444444-4444-4444-8444-444444444444";
   type Principal = { type: "agent" | "user"; agentId?: string; userId?: string };
 
@@ -5464,27 +5970,32 @@ describe("raw execution-row agent-id fold agrees with the decision snapshot comp
   }
 
   const cases: Array<{ name: string; read: Principal | string; locked: Principal | string; part: "seat" | "participant" | "arbiter"; same: boolean }> = [
-    { name: "seated agent id differs only in case", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
-    { name: "seated agent is a different agent", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "seated agent id differs only in case", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent(seatAgentId.toUpperCase()), same: true },
+    { name: "seated agent id differs only in mixed case", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent("A1b2C3d4-E5f6-4A7b-8C9d-0E1f2A3b4C5d"), same: true },
+    { name: "seated agent is a different agent", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent(otherAgentId), same: false },
     { name: "seated user id differs only in case", part: "seat", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
-    { name: "policy participant agent id differs only in case", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
-    { name: "policy participant is a different agent", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "policy participant agent id differs only in case", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent(seatAgentId.toUpperCase()), same: true },
+    { name: "policy participant agent id differs only in mixed case", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent("a1B2c3D4-e5F6-4a7B-8c9D-0e1F2a3B4c5D"), same: true },
+    { name: "policy participant is a different agent", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent(otherAgentId), same: false },
     { name: "policy participant user id differs only in case", part: "participant", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
-    { name: "stall arbiter id differs only in case", part: "arbiter", read: ctoAgentId, locked: ctoAgentId.toUpperCase(), same: true },
-    { name: "stall arbiter is a different agent", part: "arbiter", read: ctoAgentId, locked: otherAgentId, same: false },
+    { name: "stall arbiter id differs only in case", part: "arbiter", read: arbiterAgentId, locked: arbiterAgentId.toUpperCase(), same: true },
+    { name: "stall arbiter id differs only in mixed case", part: "arbiter", read: arbiterAgentId, locked: "F0e1D2c3-B4a5-4968-8776-655443322AaB", same: true },
+    { name: "stall arbiter is a different agent", part: "arbiter", read: arbiterAgentId, locked: otherAgentId, same: false },
   ];
 
   it.each(cases)("$name", ({ part, read, locked, same }) => {
     const build = (value: Principal | string) => {
-      if (part === "seat") return { state: stateWithSeat(value as Principal), policy: policyWith([seatedAgent(qaAgentId)], ctoAgentId) };
-      if (part === "participant") return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([value as Principal], ctoAgentId) };
-      return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([seatedAgent(qaAgentId)], value as string) };
+      if (part === "seat") return { state: stateWithSeat(value as Principal), policy: policyWith([seatedAgent(seatAgentId)], arbiterAgentId) };
+      if (part === "participant") return { state: stateWithSeat(seatedAgent(seatAgentId)), policy: policyWith([value as Principal], arbiterAgentId) };
+      return { state: stateWithSeat(seatedAgent(seatAgentId)), policy: policyWith([seatedAgent(seatAgentId)], value as string) };
     };
     const readRow = build(read);
     const lockedRow = build(locked);
 
     // Plain jsonb shapes built by one builder: JSON text equality is deep equality here.
     const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    // Every row compares two different raw rows, so no row can pass without the fold.
+    expect(sameJson(readRow, lockedRow)).toBe(false);
     const foldEqual =
       sameJson(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
       sameJson(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
@@ -5494,12 +6005,27 @@ describe("raw execution-row agent-id fold agrees with the decision snapshot comp
   });
 
   it("folds the seat with trim + lowercase and a policy id with lowercase only", () => {
-    expect(foldExecutionStateAgentIds(stateWithSeat(seatedAgent(` ${qaAgentId.toUpperCase()} `)))).toMatchObject({
-      currentParticipant: { type: "agent", agentId: qaAgentId },
+    expect(foldExecutionStateAgentIds(stateWithSeat(seatedAgent(` ${seatAgentId.toUpperCase()} `)))).toMatchObject({
+      currentParticipant: { type: "agent", agentId: seatAgentId },
     });
-    const policy = foldExecutionPolicyAgentIds(policyWith([seatedAgent(` ${qaAgentId.toUpperCase()} `)], ctoAgentId.toUpperCase())) as ReturnType<typeof policyWith>;
-    expect(policy.stages[0].participants[0]).toMatchObject({ agentId: ` ${qaAgentId} ` });
-    expect(policy.stallEscalation.toAgentId).toBe(ctoAgentId);
+    const policy = foldExecutionPolicyAgentIds(policyWith([seatedAgent(` ${seatAgentId.toUpperCase()} `)], arbiterAgentId.toUpperCase())) as ReturnType<typeof policyWith>;
+    expect(policy.stages[0].participants[0]).toMatchObject({ agentId: ` ${seatAgentId} ` });
+    expect(policy.stallEscalation.toAgentId).toBe(arbiterAgentId);
+  });
+
+  it("folds stallEscalation.toAgentId case in the raw policy row and in the stall-hold controls", () => {
+    const upper = arbiterAgentId.toUpperCase();
+    expect(upper).not.toBe(arbiterAgentId);
+    expect((foldExecutionPolicyAgentIds(policyWith([seatedAgent(seatAgentId)], upper)) as ReturnType<typeof policyWith>).stallEscalation.toAgentId).toBe(arbiterAgentId);
+    // Built without normalization, as a raw stored policy reaches the compare.
+    const raw = (toAgentId: string) => policyWith([seatedAgent(seatAgentId)], toAgentId) as unknown as IssueExecutionPolicy;
+    expect(stallHoldControlsDiffer(raw(arbiterAgentId), raw(upper))).toBe(false);
+    expect(stallHoldControlsDiffer(raw(arbiterAgentId), raw(otherAgentId))).toBe(true);
+  });
+
+  it("stores a normalized stallEscalation.toAgentId in lowercase", () => {
+    const normalized = normalizeIssueExecutionPolicy(policyWith([seatedAgent(seatAgentId)], arbiterAgentId.toUpperCase()));
+    expect(normalized?.stallEscalation?.toAgentId).toBe(arbiterAgentId);
   });
 
   it("leaves user ids and non-execution shapes untouched", () => {
@@ -5507,8 +6033,92 @@ describe("raw execution-row agent-id fold agrees with the decision snapshot comp
     expect(foldExecutionStateAgentIds(userState)).toBe(userState);
     expect(foldExecutionStateAgentIds(null)).toBeNull();
     expect(foldExecutionPolicyAgentIds(undefined)).toBeNull();
-    expect(foldExecutionPolicyAgentIds(policyWith([seatedUser("Board-User")], ctoAgentId))).toMatchObject({
+    expect(foldExecutionPolicyAgentIds(policyWith([seatedUser("Board-User")], arbiterAgentId))).toMatchObject({
       stages: [{ participants: [{ type: "user", userId: "Board-User" }] }],
     });
+  });
+});
+
+// The stale-snapshot compares above fold agent-id case. Authorization compares
+// do not: the actor must be the seat exactly, and the seat must be a configured
+// stage participant exactly. Each test fails if that compare starts to fold.
+describe("actor-versus-seat and stage membership compare principal ids exactly", () => {
+  const memberAgentId = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+  const caseVariant = memberAgentId.toUpperCase();
+  const policy = makePolicy([{ type: "review", participants: [{ type: "agent", agentId: memberAgentId }] }]);
+  const stageId = policy.stages[0].id;
+  const approve = (seatAgentId: string, actorAgentId: string) =>
+    applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: seatAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: seatAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: actorAgentId },
+      commentBody: "Approved.",
+    });
+
+  it("approves when the actor is the seated agent exactly", () => {
+    expect(approve(memberAgentId, memberAgentId).decision).toMatchObject({ outcome: "approved", stageId });
+  });
+
+  it("refuses an actor whose agent id matches the seat only by letter case", () => {
+    expect(caseVariant).not.toBe(memberAgentId);
+    expect(() => approve(memberAgentId, caseVariant)).toThrow("Only the active reviewer or approver can advance");
+  });
+
+  it("does not treat a seat that matches a stage participant only by letter case as a member", () => {
+    // The case-variant agent is seated and is the actor, so only exact stage
+    // membership stands between it and an approval: the stage re-seats the
+    // configured participant and records no decision.
+    const result = approve(caseVariant, caseVariant);
+    expect(result.decision).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBe(true);
+    expect(result.patch.executionState).toMatchObject({ currentParticipant: { type: "agent", agentId: memberAgentId } });
+  });
+
+  it("refuses an actor whose user id matches the seated user only by letter case", () => {
+    const userPolicy = approvalOnlyPolicy();
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: userPolicy,
+          executionState: {
+            status: "pending",
+            currentStageId: userPolicy.stages[0].id,
+            currentStageIndex: 0,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: userPolicy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId.toUpperCase() },
+        commentBody: "Approved.",
+      }),
+    ).toThrow("Only the active reviewer or approver can advance");
   });
 });

@@ -15,6 +15,37 @@ type ConsumedRequestConfirmationResult = RequestConfirmationResult & {
   consumedByRunId?: string | null;
 };
 
+/**
+ * Proof that this process consumed one accepted request_confirmation. Only
+ * `assertConsented` issues one; a copy, a JSON round trip or a reused receipt
+ * does not redeem. A caller hands it to a later authorization door in the same
+ * request so that door does not consume a second confirmation.
+ */
+export type ConsumedChangeConsent = Readonly<{ interactionId: string }>;
+
+type ConsumedChangeConsentBinding = {
+  companyId: string;
+  actorAgentId: string;
+  actorRunId: string;
+  targetKeys: string[];
+};
+
+const issuedChangeConsents = new WeakMap<ConsumedChangeConsent, ConsumedChangeConsentBinding>();
+
+/** Single use: true only for an issued, unredeemed receipt bound to this company, actor, run and target key. */
+export function redeemConsumedChangeConsent(
+  consent: ConsumedChangeConsent,
+  expected: { companyId: string; actorAgentId: string | null | undefined; actorRunId: string | null | undefined; targetKey: string },
+): boolean {
+  const binding = issuedChangeConsents.get(consent);
+  if (!binding) return false;
+  issuedChangeConsents.delete(consent);
+  return binding.companyId === expected.companyId
+    && binding.actorAgentId === expected.actorAgentId
+    && binding.actorRunId === expected.actorRunId
+    && binding.targetKeys.includes(expected.targetKey);
+}
+
 export function agentInstructionsChangeTargetKey(agentId: string) {
   return `agent:${agentId}:instructions`;
 }
@@ -139,16 +170,16 @@ function expandTargetKeysForLegacyCompatibility(targetKeys: string[]) {
   return [...expanded];
 }
 
-export function changeConsentGateService(db: Db) {
+export function changeConsentGateService(db: Db | Parameters<Parameters<Db["transaction"]>[0]>[0]) {
   return {
     assertConsented: async (input: {
       companyId: string;
       actorAgentId: string | null | undefined;
       actorRunId: string | null | undefined;
       targetKeys: string[];
-    }): Promise<boolean> => {
+    }): Promise<ConsumedChangeConsent | null> => {
       const actorAgentId = readNonEmptyString(input.actorAgentId);
-      if (!actorAgentId) return false;
+      if (!actorAgentId) return null;
 
       const actorRunId = readNonEmptyString(input.actorRunId);
       if (!actorRunId) {
@@ -269,7 +300,9 @@ export function changeConsentGateService(db: Db) {
         );
       }
 
-      return true;
+      const receipt: ConsumedChangeConsent = Object.freeze({ interactionId: consumed.id });
+      issuedChangeConsents.set(receipt, { companyId: input.companyId, actorAgentId, actorRunId, targetKeys });
+      return receipt;
     },
   };
 }

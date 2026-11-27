@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -128,14 +128,18 @@ async function seedValidWorktreeSource(
   const issueId = randomUUID();
   const userId = options.userId ?? "user-existing";
   const now = new Date();
-  await db.insert(authUsers).values({
-    id: userId,
-    email: userId === "local-board" ? "local@paperclip.local" : "existing@paperclip.ing",
-    name: userId === "local-board" ? "Board" : "Existing User",
-    emailVerified: true,
-    createdAt: now,
-    updatedAt: now,
-  });
+  // This fixture also seeds a database before the latest migration. Use the
+  // historical columns explicitly so current ORM defaults do not require new
+  // columns that the worktree migration is supposed to add.
+  await db.$client`
+    INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
+    VALUES (
+      ${userId},
+      ${userId === "local-board" ? "Board" : "Existing User"},
+      ${userId === "local-board" ? "local@paperclip.local" : "existing@paperclip.ing"},
+      true, ${now.toISOString()}, ${now.toISOString()}
+    )
+  `;
   if (options.includeCredentialAccount !== false) {
     await db.insert(authAccounts).values({
       id: "credential-existing",
@@ -735,6 +739,77 @@ describe("worktree helpers", () => {
       expect(inspectLegacyDatabase).not.toHaveBeenCalled();
       expect(seedDatabase).not.toHaveBeenCalled();
       expect(readWorktreeSeedManifest(configPath)).toBeNull();
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a legacy-unsafe minimal-no-secrets manifest without reseeding or relabeling it", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-legacy-unsafe-"));
+    try {
+      const configPath = path.join(tempRoot, "config.json");
+      fs.writeFileSync(configPath, `${JSON.stringify(buildSourceConfig())}\n`);
+      const manifestPath = path.join(tempRoot, "seed-manifest.json");
+      const manifestText = JSON.stringify({
+        version: 2,
+        source: { instanceId: "head-source", configPath: path.join(tempRoot, "source", "config.json") },
+        snapshotAt: "2026-11-01T00:00:00.000Z",
+        seedMode: "minimal-no-secrets",
+        migrationRevision: "0142_test.sql",
+        targetInstanceId: "legacy-unsafe-test",
+        phase: "complete",
+        state: "verified",
+        attemptId: "attempt",
+        startedAt: "2026-11-01T00:00:00.000Z",
+        finishedAt: "2026-11-01T00:01:00.000Z",
+        diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-11-01T00:01:00.000Z" }],
+      });
+      fs.writeFileSync(manifestPath, manifestText);
+      const inspectLegacyDatabase = vi.fn();
+      const seedDatabase = vi.fn();
+
+      await expect(ensureWorktreeSeeded({ config: configPath }, { inspectLegacyDatabase, seedDatabase }))
+        .rejects.toThrow(/minimal-no-secrets.*clean generation/s);
+      expect(() => readWorktreeSeedManifest(configPath)).toThrow(/cannot be reused, relabeled, or converted/);
+      expect(seedDatabase).not.toHaveBeenCalled();
+      expect(inspectLegacyDatabase).not.toHaveBeenCalled();
+      expect(fs.readFileSync(manifestPath, "utf8")).toBe(manifestText);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses FIFO, symlinked, initialization and malformed manifests fast without echoing content", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-manifest-refusals-"));
+    try {
+      const configPath = path.join(tempRoot, "config.json");
+      fs.writeFileSync(configPath, `${JSON.stringify(buildSourceConfig())}\n`);
+      const manifestPath = path.join(tempRoot, "seed-manifest.json");
+
+      const canary = `canary${randomBytes(16).toString("hex")}`;
+      fs.writeFileSync(manifestPath, `{ "${canary}": `);
+      let malformedMessage = "";
+      try {
+        readWorktreeSeedManifest(configPath);
+      } catch (error) {
+        malformedMessage = error instanceof Error ? error.message : String(error);
+      }
+      expect(malformedMessage).toMatch(/Refusing worktree seed manifest/);
+      expect(malformedMessage).not.toContain(canary);
+
+      fs.writeFileSync(manifestPath, JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }));
+      expect(() => readWorktreeSeedManifest(configPath)).toThrow(/Refusing worktree seed manifest/);
+
+      fs.rmSync(manifestPath);
+      fs.writeFileSync(path.join(tempRoot, "elsewhere.json"), "{}");
+      fs.symlinkSync(path.join(tempRoot, "elsewhere.json"), manifestPath);
+      expect(() => readWorktreeSeedManifest(configPath)).toThrow(/symbolic link/);
+
+      fs.rmSync(manifestPath);
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      const started = performance.now();
+      expect(() => readWorktreeSeedManifest(configPath)).toThrow(/FIFO/);
+      expect(performance.now() - started).toBeLessThan(2_000);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }

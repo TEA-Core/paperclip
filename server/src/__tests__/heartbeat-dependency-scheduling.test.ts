@@ -452,12 +452,40 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(persistedIntent).toEqual({ status: "coalesced", runId: dependencyRuns[0]!.id });
   });
 
-  it("falls back to the dependent issue's live blocked cycle when the wake snapshot omits blockedTransitionAt", async () => {
+  const HOUR_MS = 60 * 60 * 1000;
+  it.each([
+    {
+      name: "a completed old-key wake from an earlier blocked generation",
+      keyKind: "old" as const,
+      requestedOffsetMs: -30 * 24 * HOUR_MS,
+      updatedOffsetMs: -30 * 24 * HOUR_MS,
+      completedRearmCutoffOffsetMs: null,
+    },
+    {
+      name: "a canonical wake requested in an earlier generation that completed after the re-block",
+      keyKind: "canonical" as const,
+      requestedOffsetMs: -HOUR_MS,
+      updatedOffsetMs: HOUR_MS / 2,
+      completedRearmCutoffOffsetMs: null,
+    },
+    {
+      name: "a same-generation canonical wake older than the supplied re-arm cutoff",
+      keyKind: "canonical" as const,
+      requestedOffsetMs: 60_000,
+      updatedOffsetMs: 120_000,
+      completedRearmCutoffOffsetMs: HOUR_MS,
+    },
+  ])("falls back to the dependent issue's live blocked generation when the wake snapshot omits blockedTransitionAt: $name", async ({
+    keyKind,
+    requestedOffsetMs,
+    updatedOffsetMs,
+    completedRearmCutoffOffsetMs,
+  }) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockerId = randomUUID();
     const blockedIssueId = randomUUID();
-    const blockedTransitionAt = new Date();
+    const blockedTransitionAt = new Date(Date.now() - 2 * HOUR_MS);
 
     await db.insert(companies).values({
       id: companyId,
@@ -502,15 +530,21 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       type: "blocks",
     });
 
-    // A completed OLD-KEY wake from a previous blocked cycle: requested before
-    // the current blockedTransitionAt, so it must not cover the ready state.
-    // The producer (e.g. the liveness backstop) does not stamp
-    // blockedTransitionAt into the wake context snapshot.
+    // A completed wake that must not cover the current ready state: either it
+    // was requested before the current blockedTransitionAt, or it aged past
+    // the re-arm cutoff the producer supplied. The producer (e.g. the liveness
+    // backstop) does not stamp blockedTransitionAt into the wake context
+    // snapshot, so heartbeat must derive the generation from the issue row.
     const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle({
       dependentIssueId: blockedIssueId,
       blockerIssueIds: [blockerId],
     });
-    const previousCycleAt = new Date(blockedTransitionAt.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const canonicalKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerId],
+    });
+    const priorKey = keyKind === "old" ? oldStateKey : canonicalKey;
+    const at = (offsetMs: number) => new Date(blockedTransitionAt.getTime() + offsetMs);
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId,
@@ -525,17 +559,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       },
       status: "completed",
       runId: null,
-      requestedAt: previousCycleAt,
-      finishedAt: previousCycleAt,
+      requestedAt: at(requestedOffsetMs),
+      updatedAt: at(updatedOffsetMs),
+      finishedAt: at(updatedOffsetMs),
       requestedByActorType: "system",
-      requestedByActorId: "previous-cycle-producer",
-      idempotencyKey: oldStateKey,
+      requestedByActorId: "previous-producer",
+      idempotencyKey: priorKey,
     });
 
-    const canonicalKey = buildIssueBlockersResolvedWakeStateKey({
-      dependentIssueId: blockedIssueId,
-      blockerIssueIds: [blockerId],
-    });
     const run = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -548,6 +579,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       idempotencyKey: canonicalKey,
       requestedByActorType: "system",
       requestedByActorId: "backstop-producer",
+      ...(completedRearmCutoffOffsetMs === null
+        ? {}
+        : { completedRearmCutoff: at(completedRearmCutoffOffsetMs) }),
       contextSnapshot: {
         issueId: blockedIssueId,
         taskId: blockedIssueId,
@@ -562,12 +596,40 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     const canonicalRequests = await db.select({
       status: agentWakeupRequests.status,
     }).from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, canonicalKey));
-    expect(canonicalRequests).toHaveLength(1);
-    expect(canonicalRequests[0]).toEqual({ status: "completed" });
+    expect(canonicalRequests).toEqual(
+      keyKind === "old" ? [{ status: "completed" }] : [{ status: "completed" }, { status: "completed" }],
+    );
     const oldKeyRequests = await db.select({
       status: agentWakeupRequests.status,
     }).from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, oldStateKey));
-    expect(oldKeyRequests).toEqual([{ status: "completed" }]);
+    expect(oldKeyRequests).toEqual(keyKind === "old" ? [{ status: "completed" }] : []);
+  });
+
+  it.each(["onboarding", "ordinary", "cancelled"])("dispatches only a verified completed onboarding report: %s", async kind => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), childId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Completion", issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Lead", role: "engineer", status: "active", adapterType: "codex_local",
+      adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Parent", status: kind === "cancelled" ? "cancelled" : "done",
+      originKind: kind === "ordinary" ? "manual" : "onboarding_first_task", assigneeAgentId: agentId, responsibleUserId: "responsible-user" });
+    await db.insert(issues).values({ id: childId, companyId, title: "Saved result", parentId: issueId, status: "done", assigneeAgentId: agentId });
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_children_completed",
+      requestedByActorType: "system", requestedByActorId: "native-status-committer", idempotencyKey: `onboarding-completed:${issueId}`,
+      payload: { issueId, _paperclipWakeContext: { issueId, completedChildIssueId: childId, onboardingCompletion: true } } });
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(result.dispatched).toBe(kind === "onboarding" ? 1 : 0);
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(kind === "onboarding" ? 1 : 0);
+    if (kind === "onboarding") {
+      expect({ status: runs[0].status, errorCode: runs[0].errorCode, error: runs[0].error })
+        .toEqual({ status: "succeeded", errorCode: null, error: null });
+      expect(runs[0].contextSnapshot).toMatchObject({
+        onboardingCompletion: true, chatCompletionUpdates: [expect.objectContaining({ id: childId, status: "done" })],
+      });
+      expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    }
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe(kind === "cancelled" ? "cancelled" : "done");
   });
 
   it("coalesces the native intent when dispatch admission defers behind an active issue run", async () => {

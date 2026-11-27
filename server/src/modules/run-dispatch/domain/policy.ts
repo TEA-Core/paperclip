@@ -121,7 +121,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "retry_lineage_invalid";
 
 export type StalenessDecision =
   | { stale: false }
@@ -142,6 +143,7 @@ export type QueuedRunFacts = {
   /** Armed worktree cutoff; a queued run created before it must not dispatch. */
   worktreeExecutionCutoff?: Date | null;
   runCreatedAt?: Date | null;
+  retryOfRunId?: string | null;
   runId: string;
   runAgentId: string;
   issueId: string;
@@ -162,6 +164,8 @@ export type QueuedRunFacts = {
 
   resumeIntent: boolean;
   wakeCommentIdPresent: boolean;
+  /** Verified from current company-scoped parent/child state immediately before dispatch. */
+  isCompletedOnboardingHandoffWake?: boolean;
 
   /** True when the run's wake or retry reason asks for a continuation the parked-summary check must inspect. */
   continuationParkApplies: boolean;
@@ -569,6 +573,18 @@ export function decideQueuedRunStaleness(
     };
   }
 
+  // SUP-24883: a run cannot be its own retry predecessor. The claim's lineage
+  // walk never resolves that, so the run would hold the issue lock without
+  // ever starting until the queue-age bound above.
+  if (facts.runStatus === "queued" && facts.retryOfRunId === facts.runId) {
+    return {
+      stale: true,
+      errorCode: "retry_lineage_invalid",
+      reason: "Cancelled because the queued run names itself as its retry predecessor",
+      details: { issueId: facts.issueId, retryOfRunId: facts.retryOfRunId },
+    };
+  }
+
   if (facts.isResolvedInteractionContinuation || facts.isConnectionContinuation) {
     const earlyStatus = decideIssueStatus({
       status: facts.issueStatus,
@@ -673,7 +689,10 @@ export function decideQueuedRunStaleness(
   const statusOutcome = decideIssueStatus({
     status: facts.issueStatus,
     requiresInProgress,
-    terminalBypass: facts.resumeIntent || facts.wakeCommentIdPresent,
+    terminalBypass: facts.resumeIntent || facts.wakeCommentIdPresent || (
+      facts.isCompletedOnboardingHandoffWake === true &&
+      facts.wakeReason === "issue_children_completed" && facts.issueStatus === "done"
+    ),
   });
   if (statusOutcome === "terminal") {
     return {

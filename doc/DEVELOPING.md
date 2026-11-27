@@ -6,6 +6,9 @@ This project can run fully in local dev without setting up PostgreSQL manually.
 
 For mode definitions and intended CLI behavior, see `doc/DEPLOYMENT-MODES.md`.
 
+For sandbox file synchronization, lock ownership, and the required upgrade
+procedure from directory locks, see [Workspace restore locks](workspace-restore-locks.md).
+
 Current implementation status:
 
 - canonical model: `local_trusted` and `authenticated` (with `private/public` exposure)
@@ -100,11 +103,115 @@ pnpm build-storybook
 
 These run the `@paperclipai/ui` Storybook on port `6006` and build the static output to `ui/storybook-static/`.
 
+**Composer → New task** includes agent/user/project/task mentions, skill and
+routine slash commands, and populated rich chips on desktop and mobile. Agent
+mentions use the same avatars in suggestions, inserted chips, and the mocked
+creation receipt. The creation stories preserve the original Markdown references;
+they do not create real tasks or run agents.
+
+Use **Components → Agent setup prompt** to review the shared setup handoff:
+hover/focus logo motion, one-click copying with a prompt preview, animated
+confirmation, and manual-copy recovery. Opening the preview copies immediately;
+clicking its trigger again copies without closing. Close and Escape only dismiss;
+the inner copy button remains available for retries and later copies. Stories include Slack and API copy, a compact quick-access placement,
+light and mobile views, and a clipboard paste check. `AgentSetupPrompt` accepts
+the complete `prompt`, `title`, `description`, trigger `label`, and popover
+placement. Use it for prompts handed to an external agent: Slack and GitHub
+connections, MCP configuration help, routine webhook setup, external-agent
+invitations, and task continuation. The **App placements** story collects the
+production controls; **Inside MCP help** exercises the popover inside a dialog.
+Prompt generation can pass `initialCopyStatus` to preserve its automatic copy
+result, and `onCopied` to clear an earlier generation-time clipboard error.
+
+Use **Design explorations → Agent chat sidebar** to review the production secondary
+agent navigation. **Components** covers selection, search, loading, empty results,
+and larger teams. **Pages** puts it beside the production agent chat inside the
+real app shell, including landing, conversation, plan panel, light, and mobile
+views. The plus button opens the existing agent picker; adding an agent creates
+one sidebar entry, and choosing them again reopens the same conversation. The
+**Add and reopen** component story exercises that constraint. Agent selection
+and sending use local fixtures. The live `/chats` and `/chats/:agentRef` routes
+use the same sidebar, picker, landing page, and existing chat surface when the
+Agent Chat experimental setting is enabled.
+
 Use **Chat & Comments → Issue Thread Interactions → Composer Questions Auto Advance**
 to try the paged composer form. A single selection shows a brief checked-state animation before advancing to the
 next question. Reduced-motion mode advances without animation.
 Multi-select and custom answers wait for Next, and the final page waits for
 Submit answers. The adjacent **Verified** story exercises the full flow.
+
+Use **Composer → Interaction above composer** to review the production
+pending-input layout. The stories cover questions, confirmations, checkbox
+choices, item verdicts, suggested tasks, tool reviews, runtime questions, and phone layouts with
+the bottom navigation. The normal message composer remains usable below the
+pending card.
+
+Use **Chat & Comments → Task Chat Unanswered Questions → Test Drive** to
+try a regular task question: dismiss it, reload, reopen its compact feed entry,
+and submit the preserved draft. The composer has no question pending badge.
+The demo uses real thread/form components with fixture response callbacks.
+The Agent Chat stories share the same component fixture.
+
+Use **Composer → New task** to review task creation through the production
+`TaskChatComposer`. The editor, file menu, work modes, assignee/model picker,
+and send control are shared with task chat. An inset bar above the composer uses
+the queued-message container and holds Project on the left. Its searchable picker
+shows project colors. Worktrees sits beside Project when the selected project has
+isolation enabled. Choose a new worktree, reuse an eligible worktree from that
+project, or keep the shared project workspace. Reuse carries the worktree's source
+checkout, including a non-primary checkout. Changing projects clears the
+previous worktree choice. Switching from reuse to a new worktree or the project
+workspace restores the project default checkout. Task creation uses the selected company and has
+no separate heading or settings control.
+Fresh tasks start with an empty request and the last task assignee chosen in that
+company, including a human. If that assignee is unavailable, the CEO is the
+default, or the first eligible agent when the company has no CEO. Explicit launch
+assignees and saved drafts keep their selection. Selecting an assignee never
+inserts a mention. Clicking the assignee opens its searchable list directly;
+model and effort have a separate trigger and appear only for agents whose
+harness supports those settings.
+Fresh tasks also keep the company's last project (including No project); launch
+context and saved drafts take precedence. New projects receive a random palette
+color and become the remembered project. The shared composer remembers the last
+effort within the company and applies it only when the selected model supports
+that level. Explicit task overrides and drafts take precedence. Default model
+labels show the configured or known adapter model, otherwise simply Default.
+Claude defaults supplied by the server's host environment remain Default unless
+the agent explicitly configures the model. Project edits on an existing task
+become the remembered project only after the task update succeeds.
+Clicking or tapping outside either selector dismisses it and preserves the task
+draft and selections. Mobile sheets return focus to the trigger without reopening.
+Stories cover empty and prefilled drafts, remembered, human, and unassigned
+selections, the direct assignee picker, sub-tasks, planning, files, saving,
+retryable failures, creation, light theme, and mobile, plus worktree reuse,
+loading, empty, error, and isolation-disabled states. Story submissions use local
+fixtures and never start an agent.
+
+Use **Composer → Model and effort picker** to review harness-specific model
+choices. Codex uses the curated adapter catalog unless the instance declares
+`PAPERCLIP_ADAPTER_MODELS`; general OpenAI API models are not Codex choices.
+The Paperclip Runner Codex profile shows the same known model effort levels.
+Its selected effort is saved with the run and sent to Codex for each turn.
+When Codex reports that a selected model is not supported with a ChatGPT account,
+the task shows **Model unavailable**, the provider's account restriction, and
+guidance to choose a supported model or clear the task's model override before
+retrying. The run retains this reason even when the runner saves a generic
+failure result.
+When a committed Codex terminal reports `serverOverloaded`, the task displays
+the model capacity error and **Model at capacity** on its scheduled retry card.
+Automatic retries wait one and two minutes, then stop. Use
+**Tasks → Model capacity retry** in Storybook to inspect the waiting state.
+Claude Code uses model-specific effort levels; Haiku has no effort slider.
+Grok uses its adapter's reasoning levels, including for its default model.
+Kimi shows effort only when its agent uses the CLI engine, including with its
+default model, because the default ACP engine ignores effort.
+
+Mobile entity picker sheets use a modal popover so touch scrolling stays inside
+the sheet even when it is portalled outside the new-task dialog. Run
+`pnpm exec playwright test --config tests/e2e/playwright.config.ts tests/e2e/new-task-picker-touch.spec.ts`
+to verify native touch scrolling and selection in both assignee and model lists.
+The test uses a fixed model catalog and a reduced viewport to cover limited
+space while the phone keyboard is open; it does not require a provider login.
 
 The Storybook visual regression suite uses external PNG baselines instead of
 committed screenshots:
@@ -177,10 +284,14 @@ are not automatically deleted and will accumulate until an operator prunes them.
 
 Publishing requires both the original actor and the current rerunner to be
 individual GitHub accounts named in `.github/CODEOWNERS` on the current default
-branch. Comments, teams and email entries do not grant access. Authorization runs
-before the build and again before deployment, including deployment-only reruns.
+branch. Individual accounts from every ownership rule are included, regardless
+of which paths they own. Comments, teams and email entries do not grant access.
+Authorization runs before the build and again before deployment, including
+deployment-only reruns.
 GitHub also requires a CODEOWNER environment approval, so editing authorization
 code on a branch cannot grant AWS access without an authorized reviewer.
+CODEOWNERS membership does not automatically add an account to the environment's
+required reviewers; a configured reviewer must approve each deployment.
 
 The build downloads the public source archive with no GitHub token permissions,
 AWS credentials or repository secrets. Dependency caching and install lifecycle
@@ -244,6 +355,17 @@ issue on the first failure. Reusing an existing worktree is never refused. Set
 disables the guard.
 
 ## Hot-Restart Deploys
+
+During a restart, the board's health, session, and access checks retry temporary
+network/gateway failures and non-JSON API responses every five seconds. A new
+page shows **Reconnecting to Paperclip** with a **Try again** action and waits
+for startup health to become ready. Valid startup metadata remains available to
+sign-in and invitation pages. An already
+open page stays mounted during temporary background failures so unsaved edits
+survive. Successful checks resume the same route and refresh other failed reads;
+this recovery does not reload the browser or replay mutations. Authorization
+failures still require sign-in or an explicit retry. Storybook **App / Connection
+recovery** shows the startup recovery states.
 
 Primary-instance rebuilds that restart `paperclip.service` can request one-shot live-run adoption instead of using the normal graceful shutdown drain. Before restarting the service, write the marker from the newly staged app with the current service PID:
 
@@ -363,6 +485,11 @@ npx paperclipai allowed-hostname dotta-macbook-pro
 ```
 
 ## Test Commands
+
+The [feature map](../feature-map/README.md) is an optional reference for user
+entry points, targeted tests, manual verification recipes, and coverage gaps.
+Its page inventory is a source snapshot. The documented journeys have separate
+verification steps and do not run automatically from the map.
 
 Use the cheap local default unless you are specifically working on browser flows:
 
@@ -733,9 +860,22 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 
 ## Workspace Git Scan Protection
 
-Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Correctness-sensitive runtime guards bypass the result cache.
+Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical buffered scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Streaming snapshot scans have caller-owned sinks, so they use separate jobs in the same queue and are never cached or coalesced. Correctness-sensitive runtime guards bypass the result cache.
 
-Workspace snapshots list ignored paths with `git ls-files --others --ignored --exclude-standard --directory -z` so ignored directory contents do not require a full status walk. Snapshot failures retain their typed cause instead of becoming a non-Git-folder result. During pre-provider setup, scan timeouts and queue saturation use the existing two automatic failure retries with a 30-second delay. Cancellation, output limits, and other Git errors stop with specific recovery guidance. See `doc/execution-semantics.md` for the ownership and retry-budget contract.
+The shared scan subprocess sets `GIT_OPTIONAL_LOCKS=0`, including when a caller supplies an environment. This prevents background `git status` from rewriting the index's stat cache and competing with workspace writers. Git still computes current tracked and untracked changes. Required write locks remain enforced; existing lock files are never removed or treated as stale by a scan. This avoids optional index refresh work but may make later scans repeat stat checks. See Git's [background refresh guidance](https://git-scm.com/docs/git-status#_background_refresh).
+
+Workspace snapshots list ignored paths with `git ls-files --others --ignored --exclude-standard --directory -z` so ignored directory contents do not require a full status walk. Changed, untracked, deleted, and ignored filename lists stream into private SQLite manifests. There is no total filename-list byte limit. The parser and each sink chunk are limited to 64 KiB, and each SQLite connection uses a 1 MiB page cache with disk-backed temporary storage. Records must be complete NUL-delimited UTF-8 paths. Invalid, oversized, or incomplete records fail the scan. Explicit file selection excludes files created after the scan. Buffered browser/guard and referenced-source scan bounds stay unchanged. Snapshot failures retain their typed cause instead of becoming a non-Git-folder result. During pre-provider setup, scan timeouts and queue saturation use the existing two automatic failure retries with a 30-second delay. Cancellation, output limits, and other Git errors stop with specific recovery guidance. See `doc/execution-semantics.md` for the ownership and retry-budget contract.
+
+
+Snapshot scans default to a 30-minute execution deadline, including disk backpressure, rather than the short interactive scan deadline. Set `PAPERCLIP_WORKSPACE_GIT_SNAPSHOT_TIMEOUT_MS` to allow slower storage or larger trees (1 second to 24 hours). Disk capacity, filesystem path limits, Git's own resource use, and this execution budget remain practical limits. Each manifest is admitted with a page allowance equal to one quarter of the available bytes above the host reserve at creation. SQLite enforces that allowance before page allocation, so one snapshot cannot consume all available storage. This is a disk-capacity admission policy, not a fixed filename-list byte or record limit. Nested repository and baseline manifests receive separate allowances from the remaining capacity. Manifest writers also check available disk space before creation and at most every 1 MiB of input thereafter. They stop below a 256 MiB free-space reserve. `PAPERCLIP_WORKSPACE_MANIFEST_MIN_FREE_BYTES` can raise or lower the reserve, with a 64 MiB minimum. Concurrent writers can consume space between checks; filesystem quota and write errors still fail the operation. The scheduler keeps the active slot until the child, pipes, and pending sink write finish. Snapshot failures cancel sibling producers and settle all started producers before removing temporary storage.
+
+Workspace baselines, nested-repository subsets, and merge lookups also use disk-backed manifests. Local archive input uses NUL list files. Deletion replay uploads a NUL manifest and runs bounded argument batches with ancestor symlink checks. Git ignored paths are literal indexed exclusions for staging, baseline capture, and the host merge. Restore transport uses the fixed/configured archive exclusions; it can transfer a remotely created ignored file, but the host merge excludes it. The v2 native recovery descriptor contains manifest references, not file arrays. Recovery checks controller-owned paths and content digests before reading records. Existing v1 descriptors remain readable. Transient manifests are removed on preparation failure and restore completion; native manifests remain until the durable recovery lifecycle is cleaned up.
+
+These bounds apply to application filename storage, not total process memory. Repository metadata scales with the number of managed repositories; directory iteration retains bounded buffers per nesting level. Git, tar, and provider SDKs have their own memory use. Some provider transfer APIs still return entire archive buffers. Legacy v1 recovery and the separately bounded referenced-source ignore resolver retain their older arrays. This change does not claim constant memory for those paths.
+
+Workspace preparation resolves an existing root symlink before reading the snapshot and uses that resolved directory for the rest of the operation. Overlay staging checks the captured root identity and each selected path's ancestors before and after copying. A replaced root or a symlink in an ancestor directory stops staging before upload. A missing source file can be skipped; other source inspection errors stop staging. Selected symlink entries remain symlinks.
+
+Execution-workspace close-readiness and branch-reconciliation status checks allow up to 32 MiB of buffered output. This accommodates nested task worktrees while preserving exact untracked-file counts. Larger output fails the scan and blocks destructive cleanup. Other buffered scan bounds stay unchanged.
 
 The cache intentionally trades up to a few seconds of changed-file freshness for stable server latency. The file browser retains an explicit refresh action, does not start its query while the panel or browser tab is hidden, and presents overloads as retryable failures rather than an empty workspace. A full queue returns `503` with code `workspace_git_scan_saturated`; a scan exceeding its wall-clock limit returns `504` with code `workspace_git_scan_timeout`. Both responses include `Retry-After: 1`.
 
@@ -745,7 +885,8 @@ Environment overrides:
 
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_CONCURRENCY` (default `2`, range `1`–`16`)
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_QUEUE_CAPACITY` (default `32`, range `0`–`1024`)
-- `PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS` (default `8000`, range `100`–`120000`)
+- `PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS` (default `8000`, range `100`–`120000`, buffered scans)
+- `PAPERCLIP_WORKSPACE_GIT_SNAPSHOT_TIMEOUT_MS` (default `1800000`, range `1000`–`86400000`, streaming snapshots)
 - `PAPERCLIP_WORKSPACE_GIT_SCAN_CACHE_TTL_MS` (default `10000`, range `0`–`60000`)
 
 ## Agent Subprocess OOM Priority
@@ -816,7 +957,9 @@ The default `worktree init` still seeds eagerly. A lean worktree (created withou
 
 - `pnpm paperclipai worktree ensure-seeded` performs the deferred seed **exactly once**. It is lock-guarded and idempotent: only a complete `verified` manifest short-circuits it, so it is safe to call repeatedly and from concurrent processes. Managed workspaces derive the source from the control-plane-provided base project workspace when it carries its own `.paperclip/config.json`, and otherwise from the control plane's own registered instance config; either way the workspace's manifest never selects it. Manual worktrees must pass `--from-config`.
 - `paperclipai run` calls `ensureWorktreeSeeded` automatically before doctor/boot. Managed runs transparently seed a lean worktree from their registered base workspace; an unmanaged lean worktree must first run `worktree ensure-seeded --from-config <source-config>`.
-- Managed Paperclip git worktrees default to the repository's `scripts/provision-worktree.sh` when the strategy omits `provisionCommand`, so the isolated config and pending manifest cannot be silently skipped. Runtime startup also runs `scripts/provision-worktree-runtime.sh` automatically when no explicit runtime provision command is configured and the manifest is not verified. Explicitly configured provision commands still take precedence.
+- Managed Paperclip git worktrees default to the repository's `scripts/provision-worktree.sh` when the strategy omits `provisionCommand`. When a registered source config exists, setup creates the isolated config and pending manifest. Runtime startup also runs `scripts/provision-worktree-runtime.sh` automatically when no explicit runtime provision command is configured and the manifest is not verified. Explicitly configured provision commands still take precedence.
+- An environment-configured server may have no local seed config. If neither the base checkout nor the default control-plane instance has one, a fresh worktree prepares its dependencies without creating a development instance. This also applies when `PAPERCLIP_CONFIG` names the default `$PAPERCLIP_HOME/instances/$PAPERCLIP_INSTANCE_ID/config.json` path, as the Docker image does. Setup creates no config, environment file, or seed manifest and does not claim runtime or seed readiness. A later request for a seeded development runtime still needs a canonical registered source config. Once that source exists, provisioning the checkout again creates the development instance normally.
+- A missing custom `PAPERCLIP_CONFIG`, rejected symlink, or non-regular source file still fails setup. An existing worktree with a config, environment file, or seed state also fails if its source disappears; setup never downgrades that instance to a plain checkout. Repair the source before retrying.
 - The built-in deferred seed is recorded as its own terminal `workspace_seed` operation. A zero exit code is not enough for success: the operation succeeds only when `.paperclip/seed-manifest.json` contains complete verified evidence; failed, missing, or malformed manifests produce a failed operation with the seed phase in metadata.
 - Worktrees created before lazy seeding shipped may have neither marker. Paperclip adopts them only after their configured database proves a compatible migration journal and the core Paperclip schema; otherwise managed startup creates a pending manifest and performs the normal verified seed. Manual markerless worktrees must provide `--from-config` so the source remains explicit.
 
@@ -826,13 +969,23 @@ The seed process must own the target embedded PostgreSQL lifecycle for that enti
 
 The seed manifest never grants source-path authority. Its source path and instance are diagnostic assertions derived from the realpath-canonical registered source. Deferred seeding resolves registration independently before taking the seed lock; under that lock it replaces stale source diagnostics from the registered value and then revalidates the manifest before any backup, service stop, spawn, or database mutation. Missing registration, invalid registered paths, source/target identity collisions, target-instance mismatches, and company mismatches fail closed.
 
-**Unverified-seed guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose manifest is pending, running, failed, malformed, or missing required verification evidence and points you at the fix:
+**Unverified-seed guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose manifest is pending, running, failed, or missing required verification evidence and points you at the fix:
 
 ```
 [paperclip] this worktree database is seed-pending. Run `pnpm paperclipai worktree ensure-seeded` before `pnpm dev`.
 ```
 
-This guard (`isWorktreeSeedPending` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty or partially restored database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
+This guard (`resolveWorktreeSeedGate` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty or partially restored database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
+
+The dev-runner, `worktree ensure-seeded`, the runtime-provision decision, `scripts/provision-worktree-runtime.sh` (through `scripts/worktree-state-manifest-check.mjs`), and workspace readiness open `.paperclip/seed-manifest.json` with the bounded reader in `@paperclipai/shared/bounded-state-file`: it refuses symlinks, directories, sockets, devices, FIFOs, hard-linked aliases, and files over 64 KiB without blocking, and its errors never echo manifest content. The directory that holds `.paperclip` is the reader's trusted root: a `.paperclip` or `.paperclip/uid-<uid>` directory that is a symbolic link is refused before the manifest is looked up, so a link cannot make another instance's manifest serve as this worktree's evidence. On Linux the reader walks those directories through open descriptors (`/proc/self/fd`), so a directory swapped for a link after its check is not followed either. The atomic state-file writer in the same module applies the same rule before it writes. The dev-runner prints the refusal reason instead of the seed-pending hint, and none of these readers falls back to a parent source or reseeds automatically on refusal. Refused manifests:
+
+- malformed, non-object, or duplicate-key JSON, or an unknown `version`;
+- a v2 manifest with the retired `minimal-no-secrets` seed mode. That instance may hold parent credentials: retire it and create a clean generation with a new instance and fresh keys. It is never relabeled or converted;
+- a v3 `worktree-initialization` manifest that is not verified for this worktree. The validator in `@paperclipai/shared/worktree-initialization-manifest` accepts a v3 manifest only for the exact initialization policy, the target instance the worktree runs as, a destination schema revision of the reader's own migration lineage, and a `binding` that verifies under the `initialization.key` in the same state directory, with completed validation evidence. A v3 manifest that is pending, running, failed, for another instance, from an unknown or diverged migration chain, or written by hand, edited, or copied from another worktree is refused and never enters the legacy seed path. See [Fresh isolated initialization](#fresh-isolated-initialization).
+
+The runtime-provision decision and the recorded `workspace_seed` evidence read the manifest and the `seed-skip-no-source` marker in the state directory that the server's uid resolves: `.paperclip/uid-<uid>/` when it holds an `.env`, else `.paperclip/`. `scripts/provision-worktree-runtime.sh` runs as that uid and resolves the same directory, so all three use one manifest. A skip marker never outweighs a refused manifest: the decision then runs the provisioner, which reports the refusal, and the evidence counts the marker only when that directory has no manifest. Another uid's scoped state belongs to that uid and does not select or skip the seed command.
+
+Workspace readiness reports a v2 seed as `verified` only for a complete `minimal` or `full` manifest: source, snapshot time, migration revision, target instance, attempt, start and finish times, and a succeeded `complete` diagnostic. A v2 manifest that says `verified` without that evidence reports `failed` with the `seed_manifest_incomplete` failure phase, never `ready`.
 
 Provisioned git worktrees also pause seeded routines that still have enabled schedule triggers in the isolated worktree database by default. This prevents copied daily/cron routines from firing unexpectedly inside the new workspace instance during development without disabling webhook/API-only routines.
 
@@ -856,6 +1009,35 @@ paperclipai worktree env
 # or:
 eval "$(paperclipai worktree env)"
 ```
+
+### Fresh isolated initialization
+
+`worktree init --profile fresh` (and `worktree:make --profile fresh`) creates a new isolated instance that holds no data from a parent instance. Use it when the work needs a Paperclip instance but not a copy of an existing company:
+
+```sh
+paperclipai worktree init --profile fresh
+paperclipai worktree init --profile synthetic-fixture            # fixture: starter
+paperclipai worktree init --profile fresh --force                # replace the current state with a clean generation
+```
+
+The initializer copies no parent secrets. It does not read a parent config, `.env`, secrets key file, or database, and it does not reuse a secret from the inherited process environment. It writes:
+
+- a config built only from literals and destination paths: `local_trusted` on loopback, no `llm` block, telemetry off, automatic backups off, strict `local_encrypted` secrets;
+- a new `.paperclip/.env` with fresh agent JWT, tool-action and decision-signing secrets, and a new 32-byte secrets master key file (`0600` in a `0700` directory);
+- an empty embedded database created from this checkout's migrations. `synthetic-fixture` then inserts the `starter` fixture: one paused company, one paused `process` agent, a goal, a project and two unassigned backlog issues. Every fixture value is a literal in `cli/src/commands/worktree-fresh-init.ts`;
+- a new 32-byte `.paperclip/initialization.key` (0600) for this generation, and a v3 `worktree-initialization` manifest, written atomically after every phase (`destination_validation`, `generation_create`, `schema_migration`, `identity_mint`, `populate`, `validation`). Every manifest carries a `binding`: HMAC-SHA256 under that key over the canonical JSON of all other fields. The terminal `verified` manifest is written last, with validation evidence bound to the same attempt and generation. A failed phase leaves a `failed` manifest with a fixed diagnostic code, never exception text.
+
+The manifest records the instance id and the destination schema: the head revision of the checkout's migration journal and a fingerprint of the migration chain up to it. A reader accepts it only for the instance it runs as (`PAPERCLIP_INSTANCE_ID` from the worktree `.env`), for a revision of the reader's own migration lineage, and when its `binding` verifies under the `initialization.key` next to it. A checkout that later adds migrations still accepts it; a different or edited migration chain refuses it. A hand-written manifest, a manifest edited after it was written, and a manifest copied from another worktree (bound under that worktree's key) are refused.
+
+A verified fresh initialization:
+
+- opens the `pnpm dev` seed gate;
+- makes `worktree ensure-seeded`, `paperclipai run`, the runtime-provision decision and `scripts/provision-worktree-runtime.sh` treat the worktree as initialized. It is never seeded from a parent;
+- reports workspace readiness `failed` with the `seed_manifest_fresh_preview` phase. A fresh preview has no cloned company, issue, or membership, so the managed "Open workspace" login handoff does not apply; open it locally with its own board identity.
+
+The default `worktree init` and managed workspace provisioning still use the clone seed. `--profile` cannot be combined with `--from-config`, `--from-data-dir`, `--preserve-live-work` or `--no-seed`. Existing worktree state is replaced only with `--force`, which removes the earlier config (and its backup), `.env`, markers, initialization key and instance data and creates a new generation with new keys. Before it writes or removes anything, init refuses a `.paperclip` directory, a state file, the `instances` directory or the instance directory that is a symbolic link, so neither a write nor a `--force` removal reaches outside the worktree and its instance directory. `worktree init --force` without `--profile` applies the same check to the files it removes.
+
+Limits: a Git worktree is not a security boundary. A process that runs as the same user can still read parent files, and can read the initialization key and so bind a manifest of its own; the binding stops hand-written, edited and copied manifests, not a same-user process that runs the writer's algorithm. A value that the server inherits from the shell environment still takes precedence over the worktree `.env` at run time, so start a fresh worktree from a shell that does not export parent secrets.
 
 ### Workspace login handoff and readiness
 
@@ -895,6 +1077,8 @@ The workspace UI surfaces `Provisioning database`, `Validating clone`, `Ready`, 
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
 | `--no-seed` | Skip database seeding from the source instance |
 | `--force` | Replace existing repo-local config and isolated instance data |
+| `--profile <profile>` | `fresh` or `synthetic-fixture`: a new instance with no parent data (see [Fresh isolated initialization](#fresh-isolated-initialization)). Omit it to keep the clone seed |
+| `--fixture <id>` | Fixture for `--profile synthetic-fixture` (default: `starter`) |
 
 Examples:
 
@@ -996,6 +1180,8 @@ Managed workspace repair uses this same verified full-reseed contract through `P
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
 | `--no-seed` | Skip database seeding from the source instance |
 | `--force` | Replace existing repo-local config and isolated instance data |
+| `--profile <profile>` | `fresh` or `synthetic-fixture`: a new instance with no parent data |
+| `--fixture <id>` | Fixture for `--profile synthetic-fixture` (default: `starter`) |
 
 Examples:
 
@@ -1021,6 +1207,8 @@ eval "$(npx paperclipai worktree env)"
 ```
 
 For project execution worktrees, Paperclip can also run a project-defined provision command after it creates or reuses an isolated git worktree. Configure this on the project's execution workspace policy (`workspaceStrategy.provisionCommand`). The command runs inside the derived worktree and receives `PAPERCLIP_WORKSPACE_*`, `PAPERCLIP_PROJECT_ID`, `PAPERCLIP_AGENT_ID`, and `PAPERCLIP_ISSUE_*` environment variables so each repo can bootstrap itself however it wants. Concurrent provision commands for the same worktree path run one after another (an in-process lock released when the command exits, never held across the agent run), so two agents woken onto one issue do not race `pnpm install` in the same checkout.
+
+An issue's partial `workspaceStrategy` inherits omitted fields from the enabled project's strategy when both use the same type. For example, an issue can override `baseRef` without losing the project's provision, runtime provision, or teardown commands. An explicit value, including `null` or an empty string, replaces the project value. Clearing a command restores the runtime's usual default behavior; use `provisionCommand: "true"` for an explicit no-op. A different strategy type or a disabled project policy does not supply these defaults. An issue's `existingBranch` pin also excludes the project's `branchTemplate`.
 
 An issue can pin its isolated worktree to an exact pre-existing branch instead of a template-derived one — the contract PR-preparation tasks use. Set the issue's `executionWorkspaceSettings` to `{ "mode": "isolated_workspace", "workspaceStrategy": { "type": "git_worktree", "existingBranch": "<branch>" } }`. The validator requires isolated mode plus a `git_worktree` strategy and rejects `branchTemplate` alongside `existingBranch`. At dispatch the runtime attaches (never creates, renames, fast-forwards, or resets) that branch: it reuses a registered worktree that already has the branch checked out (including legacy `.worktrees/` paths), otherwise it attaches the branch under the managed worktree parent. A missing branch, an occupied worktree path on another branch, or a non-worktree strategy fails closed with a `workspace_validation_failed` error instead of falling back to the shared checkout or a derived branch, and an inherited `reuse_existing` workspace binding on a different branch is ignored in favor of realizing the pinned branch.
 
@@ -1124,6 +1312,11 @@ operator-controlled [runner API tools](runner-api-tools.md) rollout; enabling
 Agent Chat does not enable that API surface. Failed-turn retries restore the
 selected run's user comments so the agent can answer the original request.
 
+An unsaved Agent Chat uses an ephemeral `chat:<agent-id>` view-model ID. Task
+browser polling starts after the first send or upload creates a persisted task
+UUID. Saved chats retain the task browser's company and credential access checks.
+Task browser routes reject malformed task IDs with `404` before querying PostgreSQL.
+
 A native continuation that requires reconciliation shows **Recovery needed**
 with **Inspect run**; inspect the original outcome before resolving its recovery
 hold. A generic retry cannot resolve this incident. The runner's
@@ -1136,6 +1329,35 @@ workspace below the host `HOME` is valid, including the default projectless
 agent workspace. The host `HOME` itself, a directory that contains it, a
 filesystem root, a `CODEX_HOME` overlap, or a canonical path outside the
 assigned workspace is rejected before provider startup.
+
+### Sandbox ACP input delivery
+
+The legacy sandbox process bridge retries recognized Daytona and Cloudflare
+HTTP 502, 503, and 504 failures while writing an input message, with at most
+three attempts and a short backoff.
+Retries keep the message sequence and use separate temporary upload files.
+The remote wrapper discards already-consumed sequences, so a lost provider
+response cannot send the same input bytes twice. Messages remain ordered.
+This does not restart an agent turn or replay a tool call. Authentication and
+shell errors fail immediately; exhausted input delivery closes the bridge and
+records a fixed diagnostic without logging the input payload. Persisting that
+failure diagnostic does not block bridge teardown.
+Run-log finalization closes its write handle and waits for accepted file
+appends before computing the size, hash, and durable copy. Writes submitted
+after finalization starts are ignored; later progress persistence is not part
+of that file-write barrier. If accepted writes remain stalled after three
+seconds, finalization returns unknown size/hash metadata and skips the final
+durable copy so the run can reach a terminal state. A late write cannot restart
+mirroring or produce a claimed verified snapshot.
+Readers still attempt bounded reads when size is unknown. Legacy comment
+attribution retains its existing 2 MB scan limit and allows three seconds per
+log. Storage errors or timeouts preserve any evidence already read and leave
+the comments available without additional derived attribution.
+The read deadline requests cancellation of local file streams, S3 HEAD and GET
+requests, and S3 response streams. The listing stops waiting at the deadline
+even if filesystem I/O delays cancellation. Late results cannot add evidence
+or start another page. Each listing retains its existing batches of eight reads;
+concurrent listings do not skip healthy logs because another listing is busy.
 
 ### Preinstalled remote runner runtime
 
@@ -1154,6 +1376,29 @@ and verifies them without uploading a binary or installing packages. Deploy
 the updated sandbox image with the matching runner qualification changes.
 
 ### Native runner restart recovery
+
+Project discovery through `list_projects` returns up to 50 compact summaries.
+It uses `GET /api/companies/:companyId/projects?view=summary&limit=50&cursor=...`;
+the cursor is optional. The database reads bounded summary projections. Agent
+and run trust boundaries narrow database candidates before per-project access
+checks. Projects with their own authorization policy remain candidates because
+that policy can contribute scope; every result still passes the full access check.
+Only visible projects determine page boundaries and continuations.
+The default project-list API response remains unchanged.
+Use its `nextCursor` as the next call's `cursor` until it is null; `limit` accepts
+1–50. Descriptions include at most 1,000 characters and an explicit truncation
+flag. Full project records remain available through the authorized project API.
+Workspace configuration is excluded from discovery responses so large projects
+cannot overflow the runner's durable tool-result command limit.
+
+When an accepted result survives a shutdown failure, workspace repair uses a
+new assessment for the repaired workspace state. Its status decision and
+assessment reference commit together. Recovery completes from the saved result
+without another provider turn, clears stale successful-run errors, and retains
+the original error in `recoveredExecutionFailure`. Exact-state session cleanup
+recognizes both the legacy `adapter_failed` and current `provider_transport_failed`
+close-failure labels. Process ownership, pending tool outcomes, and checkpoint
+verification still control whether that session can be reused.
 
 Paperclip Runner keeps its heartbeat run, native session, logical runner, and
 provider session identities across server restarts. A coordinated hot restart
@@ -1203,6 +1448,14 @@ that classification finishes.
   conflicting histories, changed profiles, and live or unverifiable owners do.
 
 A resumed sandbox lease can contain a workspace whose provider never started. A new attempt may create its exact session directory only when durable control-plane evidence proves zero connections, zero events, and untouched bootstrap commands, and no backup or remote session directory exists. Directory creation is atomic; partial state or uncertain ownership remains blocked.
+
+Only successful turns retain a live warm provider session. A structured failed
+or cancelled result must retire that session and collect its managed files before
+heartbeat stops the reusable sandbox. A later retry can resume the same sandbox
+without inheriting the stopped provider transport.
+The shared lease-release boundary rechecks the durable run status for recovery
+and ordinary teardown. Successful workspace copy-back alone must not keep a
+failed turn's sandbox running.
 
 Run the credential-free real-process restart suite with:
 
@@ -1329,6 +1582,12 @@ Expected:
 - `/api/health` returns `{"status":"ok"}`
 - `/api/companies` returns a JSON array
 
+On `*.staging.paperclip.app`, the account menu shows the running server's
+short commit SHA below the user's email. Hover over it for the full SHA,
+or follow the link to inspect the commit on GitHub.
+Opening the menu refreshes `/api/health` so the label reflects recent deploys.
+The label is hidden on other hosts and when commit metadata is unavailable.
+
 ## Reset Local Dev Database
 
 To wipe local dev data and start fresh:
@@ -1384,8 +1643,12 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace. Only a row with a recorded merged pull
-  request also has its worktree deleted. Every other archive (shared sessions,
+  archives the execution workspace. By default, only a row with a recorded merged
+  pull request also has its worktree deleted. That deletion accepts a checked-out
+  branch other than the recorded one only when the recorded branch no longer
+  exists locally, HEAD is landed (an ancestor of the base ref, or the `headSha` of
+  the merged pull request) and pushed, and the worktree is clean; otherwise, or on
+  any git error, the row stays `cleanup_failed`. Every other archive (shared sessions,
   rows with no pull request, missing or non-git cwds) changes the database row and
   no work-tree file, and leaves the directory and branch on disk. One live case
   also touches git metadata: a no-PR row whose recorded branch is gone is first
@@ -1398,6 +1661,61 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES=1` (or `true`, `yes`) opts
+  into reclaiming isolated no-PR Git worktrees; default off. Only an attached,
+  recorded branch in a clean worktree whose real path is below the repository's
+  `.paperclip/worktrees/` root is eligible. Empty provider refs, relative paths,
+  `..` components, whitespace/control characters, detached/branchless trees,
+  untracked files, and **all ignored data** keep the record-only behavior. Symlink
+  aliases cannot escape the managed root. The sweep fetches and prunes `origin`
+  and requires the tip to be reachable from those freshly fetched refs before
+  deletion; a failed verification preserves the tree and branch. This fetch runs
+  after cooldown and active-run checks, disables credential prompts, and times out
+  after 60 seconds.
+  Canonical live references equal to or inside the removal target are checked
+  across companies. A shared primary checkout outside the target does not block
+  removal. Duplicate paths are scanned once per check; remote sandbox paths are
+  excluded. An unreadable local holder keeps the candidate without aborting the
+  sweep. Open linked issues block isolated archiving even without runs.
+  Publishers share a host-wide advisory lock; only opt-in reclamation takes its
+  exclusive side and transaction-local table locks across final checks and
+  deletion. Default merged-PR cleanup and record-only archives take no table
+  locks. Contention refuses opt-in cleanup rather than waiting in a conflicting
+  lock order. A Git-worktree allocation that waited for cleanup revalidates its
+  path; metadata-only updates do not acquire the advisory lock.
+  Opt-in removal briefly blocks issue/workspace writes; these locks do not fence
+  arbitrary host file writes.
+  Terminal `cleanup_failed` refusals are reconsidered on later sweep rotations
+  under the same gates, except a refusal because the git worktree changed after
+  delivery was verified: the sweep records it once and reconsiders it only after
+  the row's status or cleanup reason changes. One exception: when the row records
+  a branch and a merged PR, has no escalation yet, and the checked-out branch
+  differs from the recorded branch (a detached HEAD or a failed branch read counts
+  as different; the cleanup gate then checks the branch again), the sweep makes a
+  cleanup attempt under the same gates. The sweep selects that row again on each
+  sweep until the end-of-sweep escalation records its marker; one escalation pass
+  marks at most 100 rows, so with more than 100 stranded rows a row can get an
+  attempt on more than one sweep. By owner decision 2026-11-16, that attempt may remove a
+  stranded worktree only when the cleanup gate proves it landed and clean: a recorded merged PR,
+  the recorded branch absent as a local ref, HEAD landed (an ancestor of the base ref, or equal to
+  the head SHA of a recorded merged PR), 0 commits missing from every remote, no tracked changes,
+  no untracked files, and HEAD equal to the assessed HEAD. The landed-branch acceptance lives in
+  the cleanup gate (#1211); without it the gate refuses and nothing is removed. Every other stranded
+  row is refused and escalated and is never removed. The escalation runs after candidate selection
+  on purpose, so a row this attempt removes is intentionally not escalated. Other refusals are retried at most
+  5 times per archive lifecycle, with a backoff of 10 minutes doubling after each
+  attempt. A `cleanup_failed` row whose reason is the bare `issue_terminal` (a
+  cleanup that kept the directory without a warning) counts as such a refusal. A
+  stranded row gets one system comment on its source issue and one
+  `execution_workspace.issue_terminal_cleanup_escalated` activity row; the
+  escalation and the backfill never write the workspace row and never call a cleanup, removal,
+  release or return function. The escalation re-reads the source issue under the
+  workspace lifecycle lock and skips a reopened issue. Runtime services stay running
+  when the git-state checks refuse the cleanup, because those checks run before the
+  services stop; a refusal raised later, such as a runtime-created local directory
+  that artifact cleanup keeps, comes after the services were stopped.
+  Turning the flag off prevents further widened deletion; it cannot restore
+  directories or runtime-owned branches already removed.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper
   read-only and fetch-free. It changes no file, ref, reflog, index, `FETCH_HEAD`
   or database row, and stops nothing. To classify the record-only archives it
@@ -1408,11 +1726,15 @@ Environment overrides:
   - `archive_record_only`: the row would be archived as a record only, with no
     work-tree change.
   - `not_previewed`: a row with a recorded merged pull request, or a retried
-    `spawn git ENOENT` row, goes through the existing cleanup path. The dry run
+    terminal `cleanup_failed` row, goes through the existing cleanup path. The dry run
     does not preview it (`inherited cleanup path`) and spawns no git command and
     no readiness or cleanup helper for it. It logs these rows before the cooldown
     and active-run checks and counts them in no skip counter, so the dry run's
     skip counters cover previewed rows only and can be lower than the live pass's.
+    With clean-worktree reclamation enabled, potentially reclaimable no-PR rows
+    are also `not_previewed` (fresh remote verification is required). Their
+    read-only local checks run, but no fetch or cleanup does, and they do not
+    count in `wouldArchive`.
   - `clear_reopen_pending`: the live sweep clears a reopen fence and keeps the
     row.
   - `keep`: the row stays as it is. `reason` says why. One exception is not a
@@ -1793,3 +2115,16 @@ disconnected, visible active queries refresh every 15 seconds. This fallback
 stops when the socket opens, the tab is hidden, or the provider unmounts. A
 reconnected socket also refreshes visible queries to recover missed events.
 Run log views retain their existing HTTP polling fallback.
+
+### Company context during hot reload
+
+The company React context retains only its object identity in Vite's per-module
+`hot.data`. Provider values remain in the mounted React tree and keep their normal
+account scope. This lets a refreshed consumer read a provider from the preceding
+module version. Production builds do not use the development cache.
+
+Run `pnpm test:e2e:browser-context` to test this with real Vite modules and
+Chromium. The test starts its own loopback Vite server and mocks API responses;
+it needs no running Paperclip instance or provider credentials. The same spec lives
+in the default `test:e2e` discovery tree, so the existing Chrome CI shards run it
+on pull requests.

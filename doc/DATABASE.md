@@ -117,6 +117,11 @@ If your hosted database requires transaction-pooling-only connections (pgbouncer
 
 The head-release deadline (`POST /issues/:id/merge-arming/release`, `/release-override`) runs each request on its own dedicated connection. On a direct or session-mode connection the deadline ends that session on the server, which cancels the statement or lock wait, rolls back the transaction and frees its locks. With `DATABASE_PREPARED_STATEMENTS=false` (a transaction-mode pooler: startup parameters are rejected and no client maps to one backend) the connection is tracked instead: at the deadline every statement the request started is cancelled with the driver's cancel request and the connection is destroyed, which needs the pooler to forward cancel requests, and the server-side `statement_timeout`/`lock_timeout` are not applied. Board-key authentication of these requests uses its own cancellable connection; the browser-session lookup runs on the session library's pool and is abandoned, not cancelled. See `docs/approval-reconciliation.md`.
 
+All release checks inside the publication transaction, including the child-carrier
+stamp gate, must use that transaction's connection. The request client has one
+connection. A check on its parent client would wait for the connection that the
+publication transaction already holds.
+
 ### Client tuning (optional)
 
 All of these are optional; when unset, the driver defaults apply and behavior is unchanged — typical self-hosted setups need none of them:
@@ -146,7 +151,19 @@ DATABASE_URL=postgres://postgres.[PROJECT-REF]:[PASSWORD]@...5432/postgres \
 
 See [Supabase pricing](https://supabase.com/pricing) for current details.
 
-## Connection loss during a transaction
+## Connection loss and retries
+
+The database client does not replay arbitrary statements after a disconnect.
+PostgreSQL may have committed a statement before the connection loses its
+response. The postgres.js message `write CONNECTION_CLOSED` does not prove
+that the statement was never sent: the driver also uses it when an in-flight
+query loses its connection. SQL text cannot establish replay safety either;
+a `SELECT` can call a function with side effects.
+
+The affected operation fails and a new operation can reconnect through the
+pool. Callers may retry only when the complete operation is idempotent or has
+a durable receipt that prevents duplicate effects. Some transient statement
+failures therefore reach the caller instead of being retried automatically.
 
 When a database connection closes, its transaction fails. Paperclip does not
 replay that transaction. New requests can use a fresh connection from the pool.
@@ -166,6 +183,76 @@ including `CONNECT_TIMEOUT`, at most twice. This retry applies only to the
 idempotent actor synchronization operations, not arbitrary transactions. A
 persistent outage still fails the request after the bounded retries; each
 connection attempt remains subject to the configured database connect timeout.
+
+The dashboard's company lookup, agent and task counts, pending approval count,
+monthly spend, and run activity aggregate each retry these connection errors
+at most twice. The heartbeat run list and base issue lookup by UUID or identifier
+use the same bounded retries. Each callback is read-only and rebuilds its query
+for each attempt. A failed read does not replay completed reads, the budget
+workflow, or issue label and watchdog enrichment. Missing resources,
+authentication errors, and other database errors retain their usual behavior.
+This does not enable general SQL replay or retry a full request.
+
+The task run list also opts its execution-status projection into these bounded
+retries. Each of its four read-only lookups rebuilds only the failed query;
+completed lookups and the separate liveness backfill are not replayed. Projection
+callers that use a transaction retain single-attempt reads. The opt-in is only
+for a pooled database handle outside a transaction.
+
+### Tool invocation replay compatibility
+
+The tool gateway hashes full arguments for derived side-effect replay keys.
+New invocations reserve the unversioned legacy key when it is free and store
+their full, principal-scoped identity in the server-owned
+`arguments_summary.sideEffectReplayKey` JSONB field. The actual invocation,
+including its approval, dispatch and outcome state, lives at that key; there
+is no separate outcome copy to synchronize. If another call owns the legacy
+key, a distinct call uses its full `side_effect:v2:` key.
+
+Run UUIDs use one strict parser before run lookup, gateway context creation,
+derived replay-key construction and legacy receipt ownership checks. Hex case,
+omitted hyphens, hyphens after four-digit groups, matching braces and the
+`urn:uuid:` prefix all map to lowercase `8-4-4-4-12` form. Invalid provided
+run IDs (including arrays, objects, numbers and malformed strings) fail with
+HTTP 400 and code `invalid_run_id` before any database query, replay key or
+dispatch. Null or omitted optional policy/actor context stays unbound.
+Required null run context retains its existing service 403 / HTTP 400 refusal.
+
+Caller-supplied keys have a different contract: within a company, the same
+principal replays its stored outcome even with changed arguments or from a
+later run. They are not argument- or run-scoped. Another principal gets HTTP
+409 `idempotency_key_conflict`; another company has a separate key namespace.
+
+Recording holds a transaction-scoped advisory lock for the full identity
+across both possible storage keys. Releasing a legacy key cannot let two
+retries of one full identity dispatch through different keys.
+
+This needs no column or migration. During mixed-version operation or rollback,
+the pre-change binary finds the legacy row instead of dispatching again.
+It retains its old truncated-argument replay behavior, including null failure
+replays. The new binary checks the marker and principal before replay and
+reports in-progress calls as HTTP 409. An unmarked earlier-build row belonging
+to the same caller and run remains ambiguous: the new binary returns HTTP 409
+without replay or dispatch. Distinct full arguments remain distinct on new
+binaries even when their legacy hashes collide.
+
+If a pre-dispatch denial expires, its legacy row remains in place while a
+successful retry can be recorded at the v2 key. After rollback, the old
+binary can return that stale denial even for identical arguments. This
+response does not prove that the successful retry did not execute.
+
+Failures can expire after five minutes only before dispatch, without a human
+approval decision. A call that might have reached its tool, including a landed
+effect followed by a failure, never expires into automatic dispatch.
+
+## Execution identity row locks
+
+Identity initialization, credential acquisition, and steering reconciliation lock
+the task before its run. These operations use `FOR NO KEY UPDATE`: they change
+identity state, not parent keys. The lock still serializes identity writers and
+blocks concurrent task or run updates. It allows audit inserts to retain their
+foreign-key `KEY SHARE` locks without waiting on identity acquisition. The audit
+foreign keys and their deletion behavior remain enforced.
 
 ## Switching between modes
 
@@ -212,6 +299,38 @@ intentionally instance-scoped rather than company-scoped: an instance has one
 public identity, and the existing unique singleton-key index makes concurrent
 or later attempts to replace it fail closed. The server loads the row before
 constructing URL-dependent runtime services on every boot.
+
+### Unclaimed Cloud warm standby
+
+`PAPERCLIP_CLOUD_WARM_STANDBY=1` is an opt-in control-plane marker for an
+unclaimed warm application. It requires Cloud configuration, a stack identity,
+and runtime identity verification keys. After restoring the durable identity,
+startup checks once for company data. Existing companies or a persisted claim
+keep the application fully active. A failed database check fails startup.
+
+An empty unclaimed application keeps its HTTP server and sandbox plugins ready,
+but skips recurring database work: chat/email delivery, plugin jobs, browser
+cleanup, feedback export, import cleanup, execution reconciliation, heartbeat
+schedules, and automatic backups. Startup migrations, plugin installation, and
+other one-time preparation still run. Normal anonymous health probes return
+`warmStandby: true` without SQL or session lookups. This is application liveness,
+not a current database connectivity check. Other API requests and WebSocket upgrades return 503 until
+the signed claim succeeds. Page and asset requests serve only the static UI
+router, bypassing session, bearer-key, tenant, and other dynamic handlers.
+
+The existing signed claim on `GET /api/health` writes the identity durably before
+normal requests and polling resume. No polling discovers claims and no process
+restart is required. Timers resume on their next normal tick; request-driven
+work can proceed immediately. Claim failure leaves standby intact. A restart
+restores the claim even if provider environment alignment has not completed.
+Deleting a claimed workspace's last company never puts it back into standby.
+
+Deploy support before enabling the marker. Validate idle database transactions
+and health probes, claim/bootstrap latency, recurring work after claim, and a
+restart with stale provider variables on an isolated warm application first.
+Rollback by setting the marker to `0` and restarting. No schema changes are
+required. This mechanism does not sleep claimed workspaces or replace a durable
+scheduler for their background work.
 
 ## Resource membership tables
 
@@ -431,6 +550,41 @@ Hosted AWS provider notes live in [SECRETS-AWS-PROVIDER.md](./SECRETS-AWS-PROVID
 
 Migration `0291_agent_chat.sql` adds conversation identity/state and session generation/boundary columns to `issues`, plus idempotent client request IDs and processed session-boundary generations to `issue_comments`. The company/agent/user unique index resolves concurrent first writes to one issue. A check constraint preserves the assigned-agent identity and prevents terminal conversation status. Comment request IDs are unique per issue and user. There is no separate chat/message store. Provider sessions continue to use `agent_task_sessions`; `/new` removes only the matching conversation session, and session writers fence stale generations against the issue row.
 
+## Resource lifecycle events
+
+`resource_lifecycle_events` records content-free lifecycle hooks in the same
+transaction as the resource change. Hired agents and new projects emit `create`.
+Pending hires emit creation only when `activatePendingApproval` succeeds.
+Rejected hires emit termination without creation. Agents created as terminated
+emit no creation event. Capture is generic and works on self-hosted and managed
+instances; recording an event does not authorize a provider operation.
+
+A partial unique `(company_id, resource_type, resource_id)` index deduplicates
+creation. Each actual agent pause, resume, or termination appends another event,
+including budget actions and generic status updates. The agent row stays locked
+until status and event commit, so concurrent repeat requests emit one hook.
+Project edits and workspace additions, updates, and removals append `update`.
+Repository replacement emits one aggregate update; project creation with repositories
+emits only creation. Project mutations hold the project row lock until their record
+commits. An archive-only change emits nothing and preserves workspace records.
+Termination commits API-key revocation in that same transaction.
+Hire approval and rejection commit with agent activation or termination, so a
+failed event write leaves the decision pending and retryable.
+
+The numeric event ID orders transitions for a resource. Future plugin delivery
+must enforce company scope, preserve resource order, and track acknowledgments
+per plugin. A global high-water mark can skip transactions that have not yet
+committed; it is not a safe delivery cursor. The journal stores only identity,
+action, and timestamps, not repository snapshots, credentials, provider config,
+or resource health. Company deletion cascades to its events. Resource deletion
+retains events, so consumers must revalidate existence and eligibility and load
+current authorized repository data. A termination hook does not authorize
+removing persistent VM or project data.
+
+The migration creates an empty table. It does not scan or backfill existing
+installs. Plugin delivery, retention, retries, and provider integration are
+separate work. This change makes no provider calls and adds no plugin read API.
+
 ## Legacy controller ownership
 
 Legacy run claims atomically record `controller_boot_id`, a database-clock
@@ -441,3 +595,48 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+## Execution ownership reads
+
+The card read (`GET /issues/:id`) and recovery checks decide whether a previous
+legacy run still owns an issue. The query matches a run to an issue by its native
+binding (`native_issue_id`), which takes precedence, or, only when that binding is
+absent, by `context_snapshot->>'issueId'`. It is written as two arms,
+`native_issue_id = $uuid` or `native_issue_id is null and context_snapshot->>'issueId' = $text`,
+so the existing company native issue contract index and the `context_snapshot`
+issue expression index can both serve it. A `coalesce(native_issue_id::text, ...)`
+expression has no index and reads every terminal run of the company. A saved or
+requested text id becomes a uuid only in canonical lowercase spelling, so a
+malformed id matches nothing and never raises a cast error. The ownership read
+selects only the process identity it probes. No migration or index is involved.
+
+## Agent file persistence and legacy revisions
+
+Managed agent files are current filesystem contents, using the same persistent
+instance storage as other workspaces. `agent_instruction_revisions` and
+`agent_instruction_heads` are retained as read-only upgrade input. Their heads
+are adopted once into the managed directory; new saves never append revisions.
+`agent_instruction_working_copies` holds per-run baseline hashes, state, and
+capture receipts. New receipts identify `paperclip.agent-files.v1`; historical
+rows retain the instruction-only format. Completed directory runs discard their
+baseline and private copies. See [Persistent agent files](agent-files.md).
+
+## Large API response snapshots
+
+`assets.byte_size` uses PostgreSQL `bigint` so saved responses and byte ranges can
+exceed 2 GiB. The API and Drizzle mapping continue to expose a JavaScript number;
+response readers validate safe integer offsets. The type-widening migration
+rewrites the asset metadata table and needs an exclusive table lock. File bytes
+remain in local or object storage.
+
+### Runner API response reservations
+
+`runner_api_response_reservations` holds company-scoped API snapshot reservations.
+Before a capture spills, the server locks company admission and counts stored
+`runner-api` assets plus unattached reservations against a 20 GiB default quota.
+A committed asset replaces its reservation in that total. The asset foreign key
+cascades on deletion, while deleting a run sets `run_id` to null so an orphan
+reservation cannot silently disappear. Failed cleanup or an ambiguous storage
+write requires operator reconciliation before an unattached reservation is
+removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
+limits and the operator override.

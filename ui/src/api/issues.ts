@@ -1,5 +1,10 @@
+import type { SetIssueTitle } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
+  ParkRecoveryCarrier,
+  ReleaseRecoveryCarrierPark,
+  RecoveryCarrierParkCandidate,
+  RecoveryCarrierParkBinding,
   AcceptedPlanDecompositionSummary,
   AskUserQuestionsAnswer,
   Approval,
@@ -76,6 +81,11 @@ export type IssueUpdateResponse = Issue & {
 export type ResolveRecoveryActionResponse = {
   issue: Issue;
   recoveryAction: IssueRecoveryAction;
+  /**
+   * The execution decision the resolution recorded, or null when it recorded
+   * none. Absent on an idempotent replay of an earlier resolution.
+   */
+  executionDecision?: { id: string; stageId: string; stageType: string; outcome: string } | null;
 };
 
 export type IssueListFilters = {
@@ -261,6 +271,8 @@ export const issuesApi = {
     api.delete<{ id: string; archivedAt: Date } | { ok: true }>(
       `/issues/${id}/inbox-archive`,
     ),
+  setTitle: (id: string, data: SetIssueTitle) =>
+    api.put<{ id: string; title: string; titleNeedsGeneration: boolean; changed: boolean }>(`/issues/${id}/title`, data),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) => {
@@ -276,6 +288,8 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
+    api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
   resolveRecoveryAction: (
     id: string,
     data: {
@@ -295,6 +309,12 @@ export const issuesApi = {
       `/issues/${id}/tree-control/preview`,
       data,
     ),
+  recoveryCarrierParkCandidate: (id: string) =>
+    api.get<RecoveryCarrierParkCandidate | null>(`/issues/${id}/recovery-carrier-park/candidate`),
+  parkRecoveryCarrier: (id: string, data: ParkRecoveryCarrier) =>
+    api.post<{ hold: IssueTreeHold; created: boolean }>(`/issues/${id}/recovery-carrier-park`, data),
+  releaseRecoveryCarrierPark: (id: string, holdId: string, data: ReleaseRecoveryCarrierPark) =>
+    api.post<IssueTreeHold>(`/issues/${id}/recovery-carrier-park/${holdId}/release`, data),
   createTreeHold: (id: string, data: CreateIssueTreeHold) =>
     api.post<{ hold: IssueTreeHold; preview: IssueTreeControlPreview }>(
       `/issues/${id}/tree-holds`,
@@ -328,6 +348,7 @@ export const issuesApi = {
         isRoot: boolean;
         mode: "pause";
         reason: string | null;
+        recoveryCarrierPark?: RecoveryCarrierParkBinding | null;
         releasePolicy: {
           strategy: "manual" | "after_active_runs_finish";
           note?: string | null;

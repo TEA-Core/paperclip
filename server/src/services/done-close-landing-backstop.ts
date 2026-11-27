@@ -5,6 +5,7 @@ import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
+import { childCarrierStampBlock } from "./child-carrier-attribution.js";
 import {
   createAuthorityGuard,
   openArmRecord,
@@ -28,7 +29,7 @@ import {
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
-import { loadOwnDraftPredicate } from "./done-transition-guard.js";
+import { loadOwnDraftPredicate, unpaidLandingDebt } from "./done-transition-guard.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
 import {
   isSharedCarrierRefusal,
@@ -183,10 +184,12 @@ interface CandidateIssue {
   identifier: string | null;
   assigneeAgentId: string | null;
   unblockDescriptor?: IssueUnblockDescriptor | null;
+  statusVersion?: number;
 }
 
 interface CandidateRow {
   details: Record<string, unknown> | null;
+  landingDebtOwed?: boolean;
   createdAt: Date;
   issue: CandidateIssue;
 }
@@ -293,6 +296,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
   return db
     .select({
       details: activityLog.details,
+      landingDebtOwed: sql<boolean>`coalesce(${unpaidLandingDebt()}, false)`,
       createdAt: activityLog.createdAt,
       issue: {
         id: issues.id,
@@ -302,6 +306,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
         unblockDescriptor: issues.unblockDescriptor,
+        statusVersion: issues.statusVersion,
       },
     })
     .from(activityLog)
@@ -315,17 +320,28 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
     .where(
       and(
         eq(activityLog.entityType, "issue"),
-        ne(issues.deliveryRequirement, "record_only"),
+        // Unpaid reclassification debt survives both the mutable label and
+        // every reopen. Legacy close markers remain additional candidates;
+        // they never discharge the debt row.
+        or(
+          ne(issues.deliveryRequirement, "record_only"),
+          unpaidLandingDebt(),
+          and(
+            sql`${activityLog.details}->>'storedDeliveryRequirement' = 'repository_delivery'`,
+            sql`${activityLog.details}->>'closeStatusVersion' = ${issues.statusVersion}::text`,
+          ),
+        ),
         or(
           and(
             eq(activityLog.action, SKIPPED_ACTION),
             sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
           ),
           eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
+          unpaidLandingDebt(),
         ),
         lte(activityLog.createdAt, discoveryCutoff),
         or(
-          and(eq(issues.status, "done"), gte(activityLog.createdAt, windowStart)),
+          and(eq(issues.status, "done"), or(gte(activityLog.createdAt, windowStart), unpaidLandingDebt())),
           and(
             eq(issues.status, "blocked"),
             sql`${issues.unblockDescriptor}->>'owner' = 'board'`,
@@ -364,12 +380,12 @@ export function selectLandingCandidates(
     const parkedDraft = isBackstopDraftPark(row.issue);
     if (row.issue.status !== "done" && !parkedDraft) return false;
     const createdAt = row.createdAt.getTime();
-    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft)) return false;
+    if (createdAt > discoveryCutoff.getTime() || (createdAt < windowStart.getTime() && !parkedDraft && !row.landingDebtOwed)) return false;
     const details = readRecord(row.details);
     const isDecisionCarried =
       readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
     const isArmingRefused = readString(details?.refusalReason) !== null;
-    return isDecisionCarried || isArmingRefused;
+    return isDecisionCarried || isArmingRefused || row.landingDebtOwed === true;
   });
 }
 
@@ -473,8 +489,15 @@ export function createDoneCloseLandingBackstopService(
     deps: { resolver: ExternalObjectResolver | null; svc: ReturnType<typeof issueService>; graceCutoff: Date },
   ) {
     const issue = row.issue;
-    if (issue.deliveryRequirement === "record_only") return;
     const details = readRecord(row.details);
+    if (
+      issue.deliveryRequirement === "record_only" &&
+      !row.landingDebtOwed &&
+      !(
+        readString(details?.storedDeliveryRequirement) === "repository_delivery" &&
+        details?.closeStatusVersion === issue.statusVersion
+      )
+    ) return;
     // SUP-15953: verdicts (confirmed/failed/escalated) require the full landing
     // grace. A candidate inside the wider re-enqueue window but outside this
     // bound is eligible for the re-enqueue leg ONLY.
@@ -1288,6 +1311,13 @@ export function createDoneCloseLandingBackstopService(
           }
         }
       }
+      // Carrier authority is an owner-controlled wait, never a manual-merge remedy.
+      if (await childCarrierStampBlock(db, issue.companyId, {
+        owner: pr.owner, repo: pr.repo, number: pr.number, headRef: pr.headRefName,
+      }, issue.id)) {
+        counts.deferred += 1;
+        continue;
+      }
 
       // SUP-15953: a candidate inside the widened re-enqueue window but outside
       // the landing-verdict window gets NO verdict yet — including escalation —
@@ -1631,6 +1661,9 @@ export function createDoneCloseLandingBackstopService(
     // The card's authority, captured just before the final read of the head and the approval: a decision
     // reversed, a certificate removed or a reviewer terminated after this point is a difference.
     const guard = await createAuthorityGuard(db, companyId, issueId, { headSha: authorizedHeadSha });
+    const authorityChanged = async () => (await guard.stillHolds()) ?? await childCarrierStampBlock(db, companyId, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, headSha: authorizedHeadSha, headRef: pr.headRefName,
+    }, issueId);
     const again = await reauthorize();
     if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
       logger.info(
@@ -1639,6 +1672,7 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
+    if (await authorityChanged()) return false;
     // The take-back record goes on the card BEFORE the enable call (an arm GitHub accepts is then covered even if this
     // process dies right after); nothing is armed when it cannot be written.
     const armRecord = await openArmRecord(db, companyId, issueId, pr, `${pr.owner}/${pr.repo}#${pr.number}`, nodeId, authorizedHeadSha, guard);
@@ -1650,13 +1684,13 @@ export function createDoneCloseLandingBackstopService(
     const result = await enableAutoMerge(tokenResult.token, nodeId, {
       expectedHeadOid: authorizedHeadSha,
       // Before the first attempt and before every retry.
-      beforeAttempt: () => guard.stillHolds(),
+      beforeAttempt: authorityChanged,
     });
     await armRecord.settleEnable(result);
     if (result.success) {
       // A revocation that committed while the call was in flight could not be seen before it.
       // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
-      const changed = await guard.stillHolds().catch((error) =>
+      const changed = await authorityChanged().catch((error) =>
         `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
       if (changed) {
         const disabled = await disableAutoMerge(tokenResult.token, nodeId);
@@ -1674,6 +1708,13 @@ export function createDoneCloseLandingBackstopService(
       await armRecord.forget();
     }
     if (!result.success) {
+      if (result.mayHaveApplied) {
+        logger.warn(
+          { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
+          "done-close backstop: re-enqueue unconfirmed; the take-back record is retained",
+        );
+        return false;
+      }
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
         "done-close backstop: re-enqueue failed",

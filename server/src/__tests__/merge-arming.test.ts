@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   companies,
   createDb,
   executionWorkspaces,
@@ -17,6 +18,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, isGitHubTokenResolution, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { disarmTiming, retryPendingAutoMergeDisarms } from "../services/auto-merge-disarm.js";
 // The arm gate names the head it is written to. These cases do not model a head read, so an arm that names none is given one;
 // the case about an unbound arm passes `{}` itself and models the read.
 const armMergeOnApproval: typeof armMergeOnApprovalReal = (db, companyId, issueId, decision, pr, options) =>
@@ -160,6 +162,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   let issueId: string;
   let issueIdentifier: string;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const promptDelays = disarmTiming.promptDelaysMs;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-");
@@ -171,6 +174,8 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   });
 
   beforeEach(async () => {
+    // These cases inspect durable recovery targets, not background prompt timers.
+    disarmTiming.promptDelaysMs = [];
     vi.resetAllMocks();
 
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -210,6 +215,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   });
 
   afterEach(async () => {
+    disarmTiming.promptDelaysMs = promptDelays;
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
@@ -800,7 +806,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(result.message).toContain("Resource not accessible by integration");
     });
 
-    it("returns failed:network_error when ghFetch throws", async () => {
+    it("keeps an uncertain arm recoverable when the enable response is lost", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
           headRefName: `${issueIdentifier}-some-branch`,
@@ -811,7 +817,55 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("failed:network_error");
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      const state = row?.executionState;
+      const approval = state && typeof state === "object" && "approvalStatus" in state ? state.approvalStatus : null;
+      if (approval && typeof approval === "object" && "autoMergeDisarm" in approval && approval.autoMergeDisarm) {
+        expect(approval.autoMergeDisarm).toMatchObject({ owner: "TEA-Core", repo: "paperclip", number: 42, nodeId: NODE_ID, headSha: "d".repeat(40) });
+      } else {
+        expect(mockGhFetch.mock.calls.some(([, init]) => String(init?.body).includes("disablePullRequestAutoMerge"))).toBe(true);
+      }
+    });
+
+    it("retains the exact uncertain arm target until a failed disable is later confirmed", async () => {
+      await insertMention(createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+        headRefName: `${issueIdentifier}-some-branch`,
+      }));
+      const grace = disarmTiming.inFlightGraceMs;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      disarmTiming.inFlightGraceMs = 0;
+      let providerEnabled = false;
+      let allowDisable = false;
+      mockGhFetch.mockImplementation(async (_url: string, init?: RequestInit) => {
+        const query = String(JSON.parse(String(init?.body ?? "{}")).query ?? "");
+        if (query.includes("enablePullRequestAutoMerge")) {
+          providerEnabled = true;
+          throw new Error("enable response lost after acceptance");
+        }
+        if (query.includes("disablePullRequestAutoMerge")) {
+          if (!allowDisable) return createMockResponse({ errors: [{ message: "disable forbidden" }] }, false, 403);
+          providerEnabled = false;
+        }
+        return createMockResponse({ data: {} });
+      });
+      try {
+        expect((await armMergeOnApproval(db, companyId, issueId, DECISION)).kind).toBe("failed");
+        expect(await retryPendingAutoMergeDisarms(db)).toMatchObject({ checked: 1, stillArmed: 1 });
+        const [pending] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        expect(pending?.executionState).toMatchObject({ approvalStatus: { autoMergeDisarm: {
+          owner: "TEA-Core", repo: "paperclip", number: 42, nodeId: NODE_ID, headSha: "d".repeat(40),
+        } } });
+        expect(providerEnabled).toBe(true);
+        allowDisable = true;
+        expect(await retryPendingAutoMergeDisarms(db)).toMatchObject({ checked: 1, disabled: 1 });
+        const [settled] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+        expect(settled?.executionState).not.toHaveProperty("approvalStatus.autoMergeDisarm");
+        expect(providerEnabled).toBe(false);
+      } finally {
+        await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
+        disarmTiming.inFlightGraceMs = grace;
+        vi.useRealTimers();
+      }
     });
 
     it("truncation: error message is truncated to 200 chars", async () => {
@@ -2954,3 +3008,92 @@ describeEmbeddedPostgres(
     });
   },
 );
+
+// SUP-24409: PR 1214 no longer adds an arm-time fallback. A PR on the card's own execution-workspace
+// branch whose title and head ref do not name the card (the SUP-24405 / TEA-Core/paperclip#1210 shape)
+// is refused exactly as on base; the support sweep or a hand arm handles it.
+describeEmbeddedPostgres("armMergeOnApproval own-branch PR without a textual owner (SUP-24409, base behaviour)", () => {
+  let db: Db;
+  let companyId: string;
+  let issueId: string;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const OWN_BRANCH = "fm/paperclip-1067-residuals-followup";
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-own-branch-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockResolvedValue(createMockResponse({}));
+    await db.delete(externalObjectMentions);
+    await db.delete(externalObjects);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+
+    const [company] = await db.insert(companies)
+      .values({ name: "Own Branch Company", issuePrefix: "SUP", mergeArmingEnabled: true }).returning();
+    companyId = company!.id;
+    const [project] = await db.insert(projects)
+      .values({ id: randomUUID(), companyId, name: "TEA-Core/paperclip", status: "in_progress" }).returning();
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(), companyId, projectId: project!.id, name: "paperclip", repoUrl: "https://github.com/TEA-Core/paperclip", isPrimary: true,
+    });
+    const [workspace] = await db.insert(executionWorkspaces).values({
+      id: randomUUID(), companyId, projectId: project!.id, mode: "isolated_workspace", strategyType: "git_worktree",
+      name: "card-workspace", status: "active", branchName: OWN_BRANCH, repoUrl: "https://github.com/TEA-Core/paperclip",
+    }).returning();
+    issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, projectId: project!.id, title: "Stamp card", status: "done", identifier: "SUP-24405",
+      executionWorkspaceId: workspace!.id, executionPolicy: EXECUTION_POLICY, executionState: APPROVED_STATE,
+    });
+    await db.insert(issues).values({
+      id: randomUUID(), companyId, title: "Named card", status: "done", identifier: "SUP-24000",
+      executionPolicy: EXECUTION_POLICY, executionState: APPROVED_STATE,
+    });
+  });
+
+  async function mentionPr(title: string) {
+    const obj = createPRExternalObject(companyId, "TEA-Core", "paperclip", 1210, { headRefName: OWN_BRANCH, title });
+    obj.data.headRepoFullName = "TEA-Core/paperclip";
+    const [externalObj] = await db.insert(externalObjects).values(obj).returning();
+    await db.insert(externalObjectMentions).values({
+      companyId, sourceIssueId: issueId, sourceKind: "comment", objectId: externalObj!.id, objectType: "pull_request", providerKey: "github",
+    });
+  }
+
+  it("refuses the PR 1210 shape (title names another card, head is the card's own branch) as not-pr-owner", async () => {
+    await mentionPr("fix(SUP-24000): close PR 1067 executionPolicy PATCH residuals");
+
+    const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+
+    expect(result).toEqual({
+      kind: "skipped",
+      message: "skipped:not-pr-owner: PR 1210 title=[SUP-24000] branch=(none) — none is the transitioning issue",
+    });
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses a PR on the card's own branch whose title names no card as unowned-branch", async () => {
+    await mentionPr("chore: residuals follow-up");
+
+    const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+
+    expect(result).toEqual({
+      kind: "skipped",
+      message: "skipped:unowned-branch: PR title and headRefName do not name a SUP-\\d+ owner",
+    });
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+});

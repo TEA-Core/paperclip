@@ -1,7 +1,15 @@
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
+import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
+import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
+import { executionRetryAccounting } from "../execution-recovery-attempt.js";
+import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
+import {
+  decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
+  LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
+} from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 // `instanceSettingsService` is NOT re-imported here: the fork already imports it
 // further down this same import block (upstream's copy would duplicate it).
@@ -20,6 +28,7 @@ import {
   lt,
   ne,
   not,
+  notExists,
   notInArray,
   or,
   sql,
@@ -62,6 +71,7 @@ import {
   issueWatchdogs,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issueLabels,
   issues,
   labels,
@@ -69,6 +79,7 @@ import {
   nativeRunResults,
   projects,
   statusDecisions,
+  routines,
   unWakeableArchives,
   workAssessments,
 } from "@paperclipai/db";
@@ -82,7 +93,8 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
+import { runRecoverySweepIssue as runIsolatedRecoverySweepIssue, type RecoverySweepName } from "../../lib/recovery-sweep-isolation.js";
+import { isRecoveryActionBoardParked, recoveryActionNotBoardParked } from "../recovery-carrier-park-state.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -115,9 +127,13 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
-  legacyExecutionNeedsReconciliation,
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  OWNER_LIVE_HOLD_RECOVERY_KINDS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
+import {
+  legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
@@ -196,6 +212,9 @@ import {
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
 import {
+  ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
+  findLiveIssueExecutionHolder,
+  listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
 } from "../issue-execution-lease.js";
@@ -209,6 +228,7 @@ import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, resolveCanonicalWikiM
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
+  gateProjectExecutionWorkspacePolicy,
   parseProjectExecutionWorkspacePolicy,
 } from "../execution-workspace-policy.js";
 import {
@@ -225,8 +245,8 @@ import {
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 export const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
-export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
-export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 5 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 15 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 // The evaluation path above only ever files review work; nothing in it terminates
 // a process, and while the owning agent is paused nothing acts on the issue at
@@ -674,6 +694,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 const OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE = "opencode_db_growth_limit";
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  "native_provider_model_rejected",
+  "provider_tool_definition_invalid",
   "adapter_engine_unavailable",
   "agent_not_invokable",
   "agent_not_found",
@@ -827,7 +849,7 @@ export function classifyAdapterFailureForRecovery(
 ): AdapterFailureRecoveryClassification {
   // An engine prerequisite cannot be repaired by asking the same unavailable
   // engine to retry. Use the existing configuration-blocker path.
-  if (latestRun.errorCode === "adapter_engine_unavailable") {
+  if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
     return { kind: "configuration_incomplete" };
   }
   if (
@@ -914,7 +936,7 @@ export function classifyContinuationFailure(
       errorCode,
     };
   }
-  if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
+  if (isAiAuthenticationBlocked(latestRun) || (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode))) {
     return {
       kind: "non_retryable",
       maxAttempts: 0,
@@ -1130,6 +1152,24 @@ export function isBlockedWithoutBlockers(input: { status: string; blockerIssueId
 export function hasUsableUnblockDescriptor(descriptor: IssueUnblockDescriptor | null | undefined): boolean {
   if (descriptor == null) return false;
   return typeof descriptor.action === "string" && descriptor.action.trim().length > 0;
+}
+
+// SUP-24126 — ADR-072 §6 review/approval-stage park. The stage holder parks
+// `blocked` with NO blockedByIssueIds edge (§6 forbids adding one), a usable
+// unblockDescriptor naming the blocker, and the execution stage still
+// `pending` with a `currentStageId`. A zero-blocker heal on this shape wakes the
+// holder, who must exit as a no-op (§6), and a succeeded no-op run is exempt
+// from the re-arm budget, so the wake repeats every re-arm window forever.
+// The park is deliberate and names its own unblock path; only the descriptor
+// plus a live pending stage qualifies. A descriptor with no pending stage, or
+// a pending stage with no descriptor, is NOT a stage park and still heals.
+export function isDescriptorOnlyStagePark(input: {
+  executionState: unknown;
+  unblockDescriptor: IssueUnblockDescriptor | null | undefined;
+}): boolean {
+  if (!hasUsableUnblockDescriptor(input.unblockDescriptor)) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  return state != null && state.status === "pending" && Boolean(state.currentStageId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,6 +1576,9 @@ export async function clearStaleRecoveryReplayHolds(
   return { scanned: rows.length, cleared, issueIds };
 }
 
+const EXHAUSTED_RECOVERY_PARKED = { kind: "parked" } as const;
+const EXHAUSTED_RECOVERY_UNAVAILABLE = { kind: "unavailable" } as const;
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -1543,6 +1586,23 @@ export function recoveryService(
     scheduleRecoveryRetry?: (
       runId: string,
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
+    /** Settle retained explicit retry claims through the queue-first release policy. */
+    settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** Promote wakes held behind a run on one card after its lock is cleared. */
+    promoteDeferredWakesAfterLockClear?: (
+      run: typeof heartbeatRuns.$inferSelect,
+      issueId: string,
+    ) => Promise<void>;
+    /**
+     * Whether a failed or interrupted run has consumed every bounded
+     * transient retry, so `scheduleRecoveryRetry` can no longer produce a
+     * successor for it. Lets the sweeper tell "no retry because the budget
+     * is spent" (escalate) from "no retry because something else owns the
+     * run" (leave alone).
+     */
+    transientRetryBudgetSpent?: (
+      run: typeof heartbeatRuns.$inferSelect,
+    ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     // SUP-15552: optional so the many route-scoped recoveryService(db, { enqueueWakeup })
     // callers are unchanged. When provided, the deferred-wake replay sweep re-drives
@@ -1569,6 +1629,16 @@ export function recoveryService(
   // first-sight again; open recovery actions themselves are persisted and
   // unaffected by the restart.
   const undispatchableAssignedSightCounts = new Map<string, number>();
+
+  async function runRecoverySweepIssue(
+    issue: { id: string; identifier?: string | null },
+    sweep: RecoverySweepName,
+    run: () => Promise<void>,
+  ) {
+    return runIsolatedRecoverySweepIssue(issue, sweep, async () => {
+      await run();
+    });
+  }
 
   async function getAgent(agentId: string, runner: Db = db) {
     return runner
@@ -1726,9 +1796,9 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
-  function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined) {
+  function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined, nowMs = Date.now()) {
     if (!monitorNextCheckAt) return false;
-    return new Date(monitorNextCheckAt).getTime() > Date.now();
+    return new Date(monitorNextCheckAt).getTime() > nowMs;
   }
 
   async function hasOccupiedExecutionWorkspace(
@@ -2522,8 +2592,8 @@ export function recoveryService(
   // the in_progress/D1/D3 park, review-participant recovery,
   // blocked_without_blockers and accepted-interaction continuation sweeps,
   // which are out of scope here and must stay behaviourally unchanged.
-  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null) {
-    return db
+  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null, runner: Db = db) {
+    return runner
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
       .where(
@@ -2728,6 +2798,13 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    /**
+     * Out-parameter: set `retryExhausted` when no successor was queued
+     * because the failed predecessor has spent its bounded transient retry
+     * budget. A null return without it means another authority owns the
+     * run (native runtime, reconciliation) and the caller must leave it.
+     */
+    outcome?: { retryExhausted?: boolean };
   }) {
     if (await isWakeStaticallyRefused(input.issueId, input.agentId)) return null;
 
@@ -2750,7 +2827,7 @@ export function recoveryService(
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
         if (predecessor.runtimeMode === "native") return null;
-        if (legacyExecutionNeedsReconciliation(predecessor)) {
+        if (await legacyExecutionNeedsReconciliationWithEvidence(db, predecessor)) {
           await terminalizeLegacyExecution({
             db,
             run: predecessor,
@@ -2758,8 +2835,19 @@ export function recoveryService(
           });
           return null;
         }
-        if (deps.scheduleRecoveryRetry)
-          return deps.scheduleRecoveryRetry(predecessor.id);
+        if (deps.scheduleRecoveryRetry) {
+          const retry = await deps.scheduleRecoveryRetry(predecessor.id);
+          if (retry) return retry;
+          // A spent budget is the one "no retry" the sweeper must not wait
+          // out: nothing else will ever queue a successor for this run, so
+          // it reports the exhaustion instead of leaving the issue with no
+          // live path (2026-09-25: three deploy restarts in a row spent the
+          // budget and the issue sat in_progress with no run, unescalated).
+          if (input.outcome && deps.transientRetryBudgetSpent?.(predecessor)) {
+            input.outcome.retryExhausted = true;
+          }
+          return null;
+        }
         return null;
       }
     }
@@ -2827,6 +2915,9 @@ export function recoveryService(
       ),
     });
 
+    // enqueueWakeup can coalesce into a live run instead of creating one, and
+    // that run can be the very predecessor named here (SUP-24883). Bind only a
+    // run that has no lineage yet and is not the predecessor itself.
     if (queued && input.retryOfRunId) {
       return db
         .update(heartbeatRuns)
@@ -2834,7 +2925,13 @@ export function recoveryService(
           retryOfRunId: input.retryOfRunId,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, queued.id))
+        .where(
+          and(
+            eq(heartbeatRuns.id, queued.id),
+            isNull(heartbeatRuns.retryOfRunId),
+            ne(heartbeatRuns.id, input.retryOfRunId),
+          ),
+        )
         .returning()
         .then((rows) => rows[0] ?? queued);
     }
@@ -3308,7 +3405,7 @@ export function recoveryService(
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(and(eq(agents.id, run.agentId), notInArray(agents.status, ["paused", "terminated"])));
+      .where(and(eq(agents.id, run.agentId), notInArray(agents.status, ["paused", "terminated", "deleted"])));
   }
 
   const watchdog = createActiveRunWatchdog(db, {
@@ -3432,6 +3529,20 @@ export function recoveryService(
     return result;
   }
 
+  async function promoteDeferredWakesAfterLockClear(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueIds: string[],
+  ) {
+    if (!deps.promoteDeferredWakesAfterLockClear) return;
+    for (const issueId of issueIds) {
+      try {
+        await deps.promoteDeferredWakesAfterLockClear(run, issueId);
+      } catch (err) {
+        logger.error({ err, runId: run.id, issueId }, "failed to promote wakes held behind a cleared lock");
+      }
+    }
+  }
+
   async function terminateSilentActiveRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     cleanup: Awaited<ReturnType<typeof cleanupSourceResolvedRunProcess>>;
@@ -3451,6 +3562,7 @@ export function recoveryService(
       },
     };
 
+    let clearedIssueIds: string[] = [];
     const finalizedRun = await db.transaction(async (tx) => {
       const [updatedRun] = await tx
         .update(heartbeatRuns)
@@ -3489,7 +3601,7 @@ export function recoveryService(
           );
       }
 
-      await tx
+      clearedIssueIds = await tx
         .update(issues)
         .set({
           executionRunId: null,
@@ -3497,7 +3609,9 @@ export function recoveryService(
           executionLockedAt: null,
           updatedAt: input.now,
         })
-        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)));
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)))
+        .returning({ id: issues.id })
+        .then((rows) => rows.map((row) => row.id));
 
       await tx.insert(heartbeatRunWatchdogDecisions).values({
         companyId: input.run.companyId,
@@ -3541,6 +3655,23 @@ export function recoveryService(
     // wedged child is not a reason to make the agent need manual clearing before
     // it can take new work. Paused/terminated agents are left as they are.
     await finalizeAgentAfterSourceResolvedRun(finalizedRun, "cancelled");
+    // This hard-stop clears the lock itself, so the normal release never
+    // promotes the wakes held behind the run. Promote them here.
+    const promotionIssueIds = [...clearedIssueIds];
+    if (!issueIdFromRunContext(finalizedRun.contextSnapshot)) {
+      const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+        companyId: finalizedRun.companyId,
+        runId: finalizedRun.id,
+        agentId: finalizedRun.agentId,
+      }).catch((err) => {
+        logger.error({ err, runId: finalizedRun.id }, "failed to list cards held behind a terminated silent run");
+        return [] as string[];
+      });
+      for (const issueId of unlockedIssueIds) {
+        if (!promotionIssueIds.includes(issueId)) promotionIssueIds.push(issueId);
+      }
+    }
+    await promoteDeferredWakesAfterLockClear(finalizedRun, promotionIssueIds);
     return true;
   }
 
@@ -3637,10 +3768,11 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
     opts?: { evaluateAsAssignee?: boolean },
+    authorizer = authz,
   ): Promise<boolean> {
     const assigneeAgentId = opts?.evaluateAsAssignee ? agentId : issue.assigneeAgentId;
     const assigneeUserId = opts?.evaluateAsAssignee ? null : issue.assigneeUserId;
-    const decision = await authz.decide({
+    const decision = await authorizer.decide({
       actor: { type: "agent", agentId, companyId: issue.companyId },
       action: "issue:comment",
       resource: {
@@ -3669,20 +3801,21 @@ export function recoveryService(
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
+    runner: Db = db,
   ) {
     const candidateIds: string[] = [];
     if (preferredOwnerAgentId) candidateIds.push(preferredOwnerAgentId);
     if (issue.assigneeAgentId) {
-      const assignee = await getAgent(issue.assigneeAgentId);
+      const assignee = await getAgent(issue.assigneeAgentId, runner);
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
     }
     if (issue.createdByAgentId) {
-      const creator = await getAgent(issue.createdByAgentId);
+      const creator = await getAgent(issue.createdByAgentId, runner);
       if (creator?.reportsTo) candidateIds.push(creator.reportsTo);
       candidateIds.push(issue.createdByAgentId);
     }
 
-    const roleCandidates = await db
+    const roleCandidates = await runner
       .select()
       .from(agents)
       .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
@@ -3691,7 +3824,7 @@ export function recoveryService(
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
     const projectPolicy = issue.projectId
-      ? await db
+      ? await runner
           .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
           .from(projects)
           .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId)))
@@ -3702,12 +3835,14 @@ export function recoveryService(
     const seen = new Set<string>();
     const eligible: Array<{ agentId: string; status: string; order: number }> = [];
     let order = 0;
+    const ownerBudgets = budgetService(runner);
+    const ownerAuthorization = authorizationService(runner);
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
-      const candidate = await getAgent(agentId);
+      const candidate = await getAgent(agentId, runner);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
-      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+      const budgetBlock = await ownerBudgets.getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
       });
@@ -3722,14 +3857,14 @@ export function recoveryService(
         projectPolicy: parsedProjectPolicy,
         agentConfig: candidate.adapterConfig,
       })) continue;
-      if (!(await isAgentInvokable(candidate)) || budgetBlock) continue;
+      if (!(await isAgentInvokable(candidate, runner)) || budgetBlock) continue;
       // SUP-17884 C2: an observably-dead agent (K consecutive failed wakes) is
       // not a recovery target even though its `status` may still be invokable.
-      if (await hasConsecutiveWakeFailuresForAgent(candidate.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)) continue;
+      if (await hasConsecutiveWakeFailuresForAgent(candidate.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner)) continue;
       if (
         !(await candidateCanWriteSourceIssue(issue, candidate.id, {
           evaluateAsAssignee: candidate.id === preferredOwnerAgentId,
-        }))
+        }, ownerAuthorization))
       )
         continue;
       eligible.push({ agentId: candidate.id, status: candidate.status, order: order += 1 });
@@ -3970,6 +4105,7 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
+    boardEscalation?: boolean;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
@@ -3989,10 +4125,17 @@ export function recoveryService(
     // cause is already `manual_repair_required` and
     // enqueueSourceScopedStrandedRecoveryWake returns early for it, so no owner
     // was ever woken.
+    //
+    // FOLD s3a: upstream #14046 escalates a stranded issue whose bounded retry
+    // budget is spent to a board-owned action that spawns no run. The fork's
+    // agent-owner reroute would wake the owner again, which is one more
+    // automatic run after the budget said stop, so those callers pass
+    // `boardEscalation` and the action parks on the board as upstream does.
     const ownerAgentId =
-      recoveryCause === "configuration_incomplete" &&
-      readConfigurationIncompletePayload(input.latestRun)?.reason ===
-        SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
+      input.boardEscalation ||
+      (recoveryCause === "configuration_incomplete" &&
+        readConfigurationIncompletePayload(input.latestRun)?.reason ===
+          SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON)
         ? null
         : routing.ownerAgentId;
     const now = new Date();
@@ -4358,9 +4501,35 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
-      source: "recovery.reconcile_stranded_recovery_issue",
-      previousStatus: input.previousStatus,
+    // The caller's snapshot can predate an accepted close. Recheck the status under the
+    // issue-row lock and write through the same transaction so a terminal card is never
+    // parked `blocked` (which would also stamp `blockedTransitionAt` and invite a re-open).
+    const updated = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const [current] = await tx
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+        .for("update")
+        .limit(1);
+      if (!current) return null;
+      if (current.status === "done" || current.status === "cancelled") {
+        logger.info(
+          {
+            issueId: input.issue.id,
+            identifier: input.issue.identifier,
+            status: current.status,
+            previousStatus: input.previousStatus,
+          },
+          "skipping stranded recovery issue escalation: recovery issue is already terminal",
+        );
+        return null;
+      }
+      return blockIssueWithUnresolvedBlockers(db, input.issue, {
+        source: "recovery.reconcile_stranded_recovery_issue",
+        previousStatus: input.previousStatus,
+        tx: txDb,
+      });
     });
     if (!updated) return null;
 
@@ -4795,6 +4964,7 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     fingerprint: string;
     attemptCount: number;
+    legacyEpisode?: LegacyDispositionEpisode;
   }) {
     let active = await recoveryActionsSvc.getActiveForIssue(
       input.issue.companyId,
@@ -4859,9 +5029,9 @@ export function recoveryService(
         type: "bounded_owner_disposition_repair",
         retryAgentId: input.issue.assigneeAgentId,
         attempt: input.attemptCount,
-        maxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+        maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
       },
-      maxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+      maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
       attemptCount: input.attemptCount,
       lastAttemptAt: new Date(),
     });
@@ -4873,9 +5043,15 @@ export function recoveryService(
     action: Awaited<ReturnType<typeof ensureDispositionRepairAction>>;
     fingerprint: string;
     attempt: number;
+    legacyEpisode?: LegacyDispositionEpisode;
   }) {
     const agentId = input.issue.assigneeAgentId;
     if (!agentId) return null;
+    // Preserve the initiating identity on the durable row, including while a
+    // delayed repair is waiting to dispatch. Never substitute the issue owner.
+    const sourceRun = input.latestRun?.id ? await db.select()
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.latestRun.id), eq(heartbeatRuns.companyId, input.issue.companyId)))
+      .limit(1).then(rows => rows[0]) : null;
     const timing = dispositionRepairDelayMs(input.attempt, input.fingerprint);
     const now = new Date();
     const retryAt = new Date(now.getTime() + timing.delayMs);
@@ -4887,14 +5063,19 @@ export function recoveryService(
         wakeReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
         retryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
         source: "issue.deliberate_wait_disposition_repair",
+        executionRetryAccounting: executionRetryAccounting(sourceRun ?? {}),
         retryOfRunId: input.latestRun?.id ?? null,
         recoveryActionId: input.action.id,
         dispositionRepairFingerprint: input.fingerprint,
         dispositionRepairAttempt: input.attempt,
-        dispositionRepairMaxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+        dispositionRepairMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+        ...(input.legacyEpisode ? {
+          legacyDispositionEpisode: { ...input.legacyEpisode, attempt: input.attempt },
+          dispositionRepairSourceRunId: input.latestRun?.id ?? null,
+        } : {}),
         bypassContinuationSummaryPark: true,
         dispositionRepairInstruction:
-          "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate.",
+          input.legacyEpisode ? LEGACY_DISPOSITION_REPAIR_INSTRUCTION : "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate.",
       },
       "normal_model",
     );
@@ -4941,6 +5122,7 @@ export function recoveryService(
             requestedByActorType: "system",
             requestedByActorId: null,
             contextSnapshot: context,
+            ...(input.legacyEpisode ? { issueStateGuard: { statuses: [input.issue.status], assigneeAgentId: agentId } } : {}),
           });
           scheduledRun = enqueuedRun ?? (await findScheduledRun());
           created = Boolean(enqueuedRun);
@@ -4999,6 +5181,7 @@ export function recoveryService(
                 scheduledRetryAt: retryAt,
                 scheduledRetryAttempt: input.attempt,
                 scheduledRetryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
+                responsibleUserId: sourceRun?.responsibleUserId ?? null,
                 contextSnapshot: context,
                 updatedAt: now,
               })
@@ -5033,7 +5216,7 @@ export function recoveryService(
           type: "bounded_owner_disposition_repair",
           retryAgentId: agentId,
           attempt: input.attempt,
-          maxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+          maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           baseBackoffMs: timing.baseDelayMs,
           jitterMs: timing.jitterMs,
           retryAt: retryAt.toISOString(),
@@ -5047,6 +5230,12 @@ export function recoveryService(
         and(
           eq(issueRecoveryActions.id, input.action.id),
           eq(issueRecoveryActions.companyId, input.issue.companyId),
+          // A fast successor can reserve the next slot before enqueue returns.
+          // An older scheduler must not rewind its ledger or resurrect a wait.
+          eq(issueRecoveryActions.status, "active"),
+          eq(issueRecoveryActions.ownerType, "agent"),
+          eq(issueRecoveryActions.fingerprint, input.fingerprint),
+          sql`${issueRecoveryActions.attemptCount} <= ${input.attempt}`,
         ),
       );
 
@@ -5066,7 +5255,7 @@ export function recoveryService(
           ownerAgentId: agentId,
           sourceStateFingerprint: input.fingerprint,
           attempt: input.attempt,
-          maxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+          maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           baseBackoffMs: timing.baseDelayMs,
           jitterMs: timing.jitterMs,
           retryAt: retryAt.toISOString(),
@@ -5200,7 +5389,11 @@ export function recoveryService(
 
       // A queued comment or healthy child cannot establish what the stopped
       // provider already did. Only execution reconciliation can clear this hold.
-      if (requiresExecutionReconciliation(action.cause)) {
+      if (requiresExecutionReconciliation(action.cause)
+        || isNativeWorkspaceExportRepairCause(action.cause)
+        || action.cause === "native_workspace_sync_out_unsafe_archive") {
+        // A queued wake or healthy child does not export this accepted result.
+        // Only its native finalizer or an explicit board disposition can settle it.
         result.skipped += 1;
         continue;
       }
@@ -5248,13 +5441,26 @@ export function recoveryService(
         const safeChildren = healthyChildren.filter((child) => !reachable.has(child.id));
         cyclicChildBlockersSkipped = safeChildren.length !== healthyChildren.length;
         if (safeChildren.length > 0) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([...blockerIds, ...safeChildren.map((child) => child.id)]),
-            ],
+          const blockerWriteAllowed = await db.transaction(async tx => {
+            const [source] = await tx.select({ id: issues.id, status: issues.status }).from(issues).where(and(
+              eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+            )).for("update");
+            const runner = tx as unknown as Db; // Match board acceptance's source lock order.
+            if (!source || source.status === "done" || source.status === "cancelled" ||
+                await isRecoveryActionBoardParked(runner, issue.companyId, action.id)) return false;
+            const blockerIds = (await unresolvedBlockerIssues(runner, issue.companyId, issue.id)).map(row => row.id);
+            await issueService(runner).update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([...blockerIds, ...safeChildren.map((child) => child.id)]),
+              ],
+            });
+            return true;
           });
+          if (!blockerWriteAllowed) {
+            result.skipped += 1;
+            continue;
+          }
         }
       }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
@@ -5335,12 +5541,14 @@ export function recoveryService(
     fingerprint: string;
     attemptCount: number;
     terminalReason: string;
+    legacyEpisode?: LegacyDispositionEpisode;
   }) {
     const action = await ensureDispositionRepairAction({
       issue: input.issue,
       latestRun: input.latestRun,
       fingerprint: input.fingerprint,
       attemptCount: input.attemptCount,
+      legacyEpisode: input.legacyEpisode,
     });
     const now = new Date();
     await db
@@ -5358,7 +5566,7 @@ export function recoveryService(
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
           terminalReason: input.terminalReason,
           sourceAttemptCount: input.attemptCount,
-          sourceMaxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+          sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
         },
         nextAction:
@@ -5392,7 +5600,7 @@ export function recoveryService(
       [
         "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
         "",
-        `- Attempts: ${input.attemptCount}/${DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
+        `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
         `- Terminal reason: \`${input.terminalReason}\``,
         "- Recovery owner: board",
         "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
@@ -5403,15 +5611,25 @@ export function recoveryService(
       {
         authorType: "system",
         presentation: compactRecoveryPresentation(
-          "Recovery: disposition repair escalated — source owner preserved",
+          "Agent needs attention",
         ),
-        metadata: recoveryNoticeMetadata({
-          cause: "deliberate_wait_without_target",
-          latestRun: input.latestRun,
-          recoveryActionId: action.id,
-          previousStatus: input.issue.status,
-          recoveryOwner: null,
-        }),
+        metadata: {
+          ...recoveryNoticeMetadata({
+            cause: "deliberate_wait_without_target",
+            latestRun: input.latestRun,
+            recoveryActionId: action.id,
+            previousStatus: input.issue.status,
+            recoveryOwner: null,
+          }),
+          recovery: {
+            kind: "disposition_repair_escalated",
+            actionId: action.id,
+            attemptCount: input.attemptCount,
+            maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+            reason: input.terminalReason,
+            assigneeAgentId: input.issue.assigneeAgentId,
+          },
+        },
       },
     );
 
@@ -5430,7 +5648,7 @@ export function recoveryService(
         previousStatus: input.issue.status,
         sourceStateFingerprint: input.fingerprint,
         attemptCount: input.attemptCount,
-        maxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
+        maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
         terminalReason: input.terminalReason,
         recoveryActionId: action.id,
         recoveryOwnerAgentId: null,
@@ -5462,10 +5680,88 @@ export function recoveryService(
     return updated;
   }
 
+  async function decidePersistedLegacyContinuation(
+    issue: typeof issues.$inferSelect,
+    runId: string,
+    state: Awaited<ReturnType<typeof collectDispositionRepairSourceState>>,
+    episode: LegacyDispositionEpisode,
+    dispatchRunId?: string,
+  ) {
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId),
+    )).limit(1);
+    if (!run) return { kind: "skip" as const, reason: "missing_run" };
+    const context = parseObject(run.contextSnapshot);
+    if ((readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) !== issue.id) {
+      return { kind: "skip" as const, reason: "invalid_issue_binding" };
+    }
+    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren] = await Promise.all([
+      getAgent(run.agentId),
+      isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+      isInvocationBudgetBlocked(issue, run.agentId),
+      readChatControlRecoveryStop(db, { companyId: issue.companyId, issueId: issue.id, agentId: run.agentId, sourceRunId: run.id }),
+      recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      db.select({ id: routines.id }).from(routines).where(and(eq(routines.companyId, issue.companyId), eq(routines.parentIssueId, issue.id), eq(routines.status, "active"))).limit(1),
+      db.select({ status: agentTaskSessions.goalStatus }).from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, run.agentId), eq(agentTaskSessions.taskKey, issue.id))).limit(1),
+      getLatestIssueRun(issue.companyId, issue.id),
+      hasPersistedDurableWaitPath(issue, run),
+      parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
+    ]);
+    const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
+    return decideLegacyContinuation({
+      run, issue, agent, episode,
+      gates: {
+        stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
+        paused: pause, budgetBlocked: budget,
+        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+        activeExecution: state.hasActiveExecutionPath || latest?.id !== (dispatchRunId ?? run.id),
+        ownedLifecycle: run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted" ||
+          Boolean(readNonEmptyString(context.goalControlRequestId)) || context.resumeSessionGoalHeartbeat === true ||
+          isPluginManagedIssueLifecycle(issue) || routine.length > 0 || workspaceChildren.length > 0 ||
+          Boolean(goal[0]?.status && goal[0].status !== "complete") || Boolean(active && !ownsRepair),
+        conversation: Boolean(issue.conversationAgentId) || isWaitingConversation(issue),
+        agentInvokable: Boolean(agent && await isAgentInvokable(agent) && isHeartbeatWakeOnDemandEnabled(agent)),
+      },
+    });
+  }
+
+  async function legacyRepairDispatchBlock(runId: string): Promise<string | null> {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+    const context = parseObject(run?.contextSnapshot);
+    if (!run || !parseObject(context.legacyDispositionEpisode).id) return null;
+    if (!["queued", "running", "scheduled_retry"].includes(run.status)) return "repair_not_active";
+    const episode = legacyDispositionEpisode(run);
+    // Infrastructure retries retain the successful disposition source even
+    // though their immediate retryOfRunId points at a failed repair attempt.
+    const sourceId = readNonEmptyString(context.dispositionRepairSourceRunId) ?? readNonEmptyString(context.retryOfRunId);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!sourceId || !issueId || episode.attempt < 1 || episode.attempt > episode.maxAttempts) return "invalid_repair_binding";
+    const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, run.companyId))).limit(1);
+    if (!source || source.agentId !== run.agentId || legacyDispositionEpisode(source).id !== episode.id) return "invalid_repair_source";
+    const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
+    if (!issue) return "missing_issue";
+    const state = await collectDispositionRepairSourceState(db, { issue, excludeRunId: run.id, excludeWakeupRequestId: run.wakeupRequestId ?? undefined });
+    // This slot has already been reserved. Check admission for that slot rather
+    // than allocating or charging another repair attempt during dispatch.
+    const decision = await decidePersistedLegacyContinuation(issue, source.id, state, { ...episode, attempt: episode.attempt - 1 }, run.id);
+    return decision.kind === "enqueue" ? null : decision.kind === "skip" ? decision.reason : "repair_exhausted";
+  }
+
+  async function reconcileLegacyContinuation(runId: string) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+    if (!run || run.runtimeMode === "native" || run.status !== "succeeded") return "skipped" as const;
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+    if (!issueId) return "skipped" as const;
+    const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
+    if (!issue) return "skipped" as const;
+    return reconcileDispositionRepair(issue, run, { legacyEpisode: legacyDispositionEpisode(run) });
+  }
+
   async function reconcileDispositionRepair(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
-    options: { historicalAttemptCount?: number } = {},
+    options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
   ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
     const current = await db
       .select()
@@ -5478,7 +5774,12 @@ export function recoveryService(
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
 
-    const dependencyWait = await resolveContinuationWaitingOnReview(current);
+    const episode = options.legacyEpisode ?? (
+      parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
+        ? legacyDispositionEpisode(latestRun) : undefined
+    );
+    const maxAttempts = episode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS;
+    const dependencyWait = episode ? null : await resolveContinuationWaitingOnReview(current);
     if (dependencyWait) {
       await resolveDispositionRepairActionAsCovered(
         current,
@@ -5490,6 +5791,12 @@ export function recoveryService(
     const state = await collectDispositionRepairSourceState(db, {
       issue: current,
     });
+    if (episode) {
+      if (!latestRun) return "skipped";
+      const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
+      if (decision.kind === "skip") return "skipped";
+      state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
+    }
     if (state.hasActiveExecutionPath) return "skipped";
     if (state.hasDurableWaitingPath) {
       await resolveDispositionRepairActionAsCovered(
@@ -5528,14 +5835,18 @@ export function recoveryService(
     // from that consecutive legacy history instead of granting five fresh
     // attempts merely because the recovery-action row did not exist yet.
     const historicalAttempt = Math.min(
-      DISPOSITION_REPAIR_MAX_ATTEMPTS,
-      Math.max(0, Math.floor(options.historicalAttemptCount ?? 0)),
+      maxAttempts,
+      Math.max(episode?.attempt ?? 0, Math.floor(options.historicalAttemptCount ?? 0)),
     );
+    // A source run owns one successor slot. Concurrent checks must not advance
+    // the counter again after another checker reserved that same successor.
+    if (episode && persistedAttempt > episode.attempt) return "skipped";
     const sameFingerprintAttempt = Math.max(
       runAttempt,
       persistedAttempt,
       historicalAttempt,
     );
+    if (episode && (!ownerInvokable || budgetBlocked)) return "skipped";
     if (!ownerInvokable || budgetBlocked) {
       const escalated = await escalateDispositionRepair({
         issue: current,
@@ -5549,13 +5860,14 @@ export function recoveryService(
       return escalated ? "escalated" : "skipped";
     }
 
-    if (sameFingerprintAttempt >= DISPOSITION_REPAIR_MAX_ATTEMPTS) {
+    if (sameFingerprintAttempt >= maxAttempts) {
       const escalated = await escalateDispositionRepair({
         issue: current,
         latestRun,
         fingerprint: state.fingerprint,
         attemptCount: sameFingerprintAttempt,
         terminalReason: "unchanged_source_state_exhausted",
+        legacyEpisode: episode,
       });
       return escalated ? "escalated" : "skipped";
     }
@@ -5566,6 +5878,7 @@ export function recoveryService(
       latestRun,
       fingerprint: state.fingerprint,
       attemptCount: sameFingerprintAttempt,
+      legacyEpisode: episode,
     });
     const scheduled = await scheduleDispositionRepairAttempt({
       issue: current,
@@ -5573,7 +5886,16 @@ export function recoveryService(
       action,
       fingerprint: state.fingerprint,
       attempt: nextAttempt,
+      legacyEpisode: episode,
     });
+    if (!scheduled && episode) {
+      // Admission can reject a stale snapshot under the issue lock. An empty
+      // repair action must not subsequently cause escalation.
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: current.companyId, sourceIssueId: current.id, actionId: action.id,
+        status: "cancelled", outcome: "cancelled", resolutionNote: "repair_admission_rejected",
+      });
+    }
     return scheduled ? "queued" : "skipped";
   }
 
@@ -5587,7 +5909,9 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
+    boardEscalation?: boolean;
   }) {
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, input.issue.companyId, input.issue.id, treeControlSvc)) return null;
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -5620,7 +5944,9 @@ export function recoveryService(
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
       agentInvokability: input.agentInvokability,
+      boardEscalation: input.boardEscalation,
     });
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, routedAction.id)) return null;
     // Recheck the stage and assignee under the issue-row lock and write through
     // the same transaction. A concurrent transition into review cannot be
     // displaced by the earlier sweep snapshot.
@@ -5630,6 +5956,7 @@ export function recoveryService(
         .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
         .for("update").limit(1);
       if (!current) return null;
+      if (await isRecoveryActionBoardParked(txDb, current.companyId, routedAction.id)) return null;
       const pendingState = parseIssueExecutionState(current.executionState);
       const pendingParticipant = pendingState?.currentParticipant;
       // The board may have restored this participant while the stale quota
@@ -6145,6 +6472,7 @@ export function recoveryService(
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
@@ -6563,6 +6891,22 @@ export function recoveryService(
         return;
       }
 
+      if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
+        const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
+        if (source?.runtimeMode !== "native") {
+          const outcome = await reconcileLegacyContinuation(latestRun.id);
+          if (outcome === "queued") {
+            result.continuationRequeued += 1;
+            result.dispositionRepairRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else result.skipped += 1;
+          return;
+        }
+      }
+
       const agent = await getAgent(agentId);
       const agentInvokability: AgentInvokability = agent && agent.companyId === issue.companyId
         ? await getAgentInvokability(agent)
@@ -6849,6 +7193,19 @@ export function recoveryService(
       }
 
       latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // The live-path guard above ran before the awaits in between. A run that
+      // appeared since (an occupancy successor inserted right after its
+      // contender was cancelled) is a live path, and naming it as the retry
+      // predecessor would coalesce the recovery wake into it (SUP-24883).
+      // Same agent scope as that guard.
+      if (
+        latestRun &&
+        (EXECUTION_PATH_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(latestRun.status) &&
+        (issue.status !== "in_review" || latestRun.agentId === agentId)
+      ) {
+        result.skipped += 1;
+        return;
+      }
       const executionRecoverySource =
         issue.status === "in_review"
           ? participantLatestRunForRecovery
@@ -6887,7 +7244,7 @@ export function recoveryService(
               eq(heartbeatRuns.id, executionRecoverySource.id),
             ),
           );
-        if (source && legacyExecutionNeedsReconciliation(source)) {
+        if (source && await legacyExecutionNeedsReconciliationWithEvidence(db, source)) {
           await terminalizeLegacyExecution({
             db,
             run: source,
@@ -7393,6 +7750,7 @@ export function recoveryService(
           return;
         }
 
+        const reviewOutcome: { retryExhausted?: boolean } = {};
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId: participantAgentId,
@@ -7406,10 +7764,36 @@ export function recoveryService(
             reviewRecoveryInstruction:
               "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
           },
+          outcome: reviewOutcome,
         });
         if (queued) {
           result.reviewParticipantRequeued += 1;
           result.issueIds.push(issue.id);
+        } else if (
+          reviewOutcome.retryExhausted &&
+          !(await hasActiveExecutionPath(issue.companyId, issue.id, null))
+        ) {
+          // Same exhaustion as the other lanes: the reviewer run's bounded
+          // retries are spent, so escalate as the review-recovery failure it
+          // is instead of skipping on every sweep with no live path. The
+          // live-path re-read guards the write against a run or wake that
+          // started after the loop's check — for ANY agent, not only the
+          // participant: `blocked` is issue-wide, so another agent still
+          // working the issue must never be blocked under.
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_review",
+            latestRun: participantLatestRun,
+            notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
+            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            boardEscalation: true,
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
         } else {
           result.skipped += 1;
         }
@@ -7489,6 +7873,7 @@ export function recoveryService(
           return;
         }
 
+        const dispatchOutcome: { retryExhausted?: boolean } = {};
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -7496,10 +7881,40 @@ export function recoveryService(
           retryReason: "assignment_recovery",
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
+          outcome: dispatchOutcome,
         });
         if (queued) {
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
+        } else if (
+          dispatchOutcome.retryExhausted &&
+          !(await hasActiveExecutionPath(issue.companyId, issue.id, null))
+        ) {
+          // Same exhaustion as the in_progress lane: the lost dispatch's
+          // bounded retries are spent, so escalate instead of skipping on
+          // every sweep with no live path. The live-path re-read guards the
+          // `blocked` write against a run or wake that started after the
+          // loop's check.
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            boardEscalation: true,
+            notice: {
+              body:
+                "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
+                "but the bounded retry budget is spent and it still has no live execution path. " +
+                "Moving it to `blocked` so it is visible for intervention.",
+              title: "No live execution path",
+              tone: "danger",
+            },
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
         } else {
           result.skipped += 1;
         }
@@ -7533,6 +7948,39 @@ export function recoveryService(
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
           return;
+        }
+
+        // An interrupted corrective run is not evidence that the agent could
+        // not choose a disposition: a graceful server shutdown (a deploy
+        // restart, a lost process) ended the attempt before the agent
+        // finished. The attempt cap counts attempts the agent got to finish,
+        // so give the interrupted run the same bounded transient retry any
+        // interrupted run gets — the retry keeps the handoff context, so it
+        // is still the corrective run — and escalate only once that retry
+        // budget is spent or a finished attempt still leaves no disposition.
+        // Native-runtime corrective runs have no process-loss retry lane
+        // (a graceful shutdown suspends their controller for reattach
+        // instead of interrupting them; other native interruptions are
+        // reconciled by their own finalizer), so the recovery enqueue
+        // returns null for them and they escalate exactly as before.
+        if (latestRun?.status === "interrupted") {
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            return;
+          }
+          const retried = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: "issue.successful_run_handoff_interrupted_retry",
+            retryOfRunId: latestRun.id,
+          });
+          if (retried) {
+            result.successfulRunHandoffRetried += 1;
+            result.issueIds.push(issue.id);
+            return;
+          }
         }
 
         const updated = await escalateStrandedAssignedIssue({
@@ -7762,6 +8210,7 @@ export function recoveryService(
         return;
       }
 
+      const recoveryOutcome: { retryExhausted?: boolean } = {};
       const queued = await enqueueStrandedIssueRecovery({
         issueId: issue.id,
         agentId,
@@ -7769,10 +8218,41 @@ export function recoveryService(
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        outcome: recoveryOutcome,
       });
       if (queued) {
         result.continuationRequeued += 1;
         result.issueIds.push(issue.id);
+      } else if (
+        recoveryOutcome.retryExhausted &&
+        !(await hasActiveExecutionPath(issue.companyId, issue.id, null))
+      ) {
+        // The failed run's bounded transient retries are all spent, so no
+        // successor will ever be queued for it. Escalate rather than skip
+        // on every sweep forever: the issue would otherwise stay
+        // `in_progress` with no run and no path until a person noticed.
+        // The live-path re-read guards the `blocked` write against a run or
+        // wake that started after the loop's check.
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          boardEscalation: true,
+          notice: {
+            body:
+              "Paperclip retried this issue's run after it ended without finishing, but the bounded retry budget " +
+              "is spent and it still has no live execution path. " +
+              "Moving it to `blocked` so it is visible for intervention.",
+            title: "No live execution path",
+            tone: "danger",
+          },
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
       } else {
         result.skipped += 1;
       }
@@ -7875,6 +8355,8 @@ export function recoveryService(
             assigneeAgentId: issues.assigneeAgentId,
             blockedTransitionAt: issues.blockedTransitionAt,
             monitorNextCheckAt: issues.monitorNextCheckAt,
+            executionState: issues.executionState,
+            unblockDescriptor: issues.unblockDescriptor,
             totalCount: sql<number>`count(*) over()::int`,
           })
           .from(issueRelations)
@@ -7892,6 +8374,8 @@ export function recoveryService(
           assigneeAgentId: issues.assigneeAgentId,
           blockedTransitionAt: issues.blockedTransitionAt,
           monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionState: issues.executionState,
+          unblockDescriptor: issues.unblockDescriptor,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -7983,6 +8467,16 @@ export function recoveryService(
           continue;
         }
 
+        // SUP-24126: a descriptor-only ADR-072 §6 stage park is a deliberate
+        // park with no blocker edge, so "zero blockers" is its steady state,
+        // not stranding. Leave it for its named unblock path. Applies only to
+        // the zero-blocker heal: a stage-parked card whose real blockers have
+        // all resolved still takes the normal blockers-resolved wake.
+        if (zeroBlockerHeal && isDescriptorOnlyStagePark(candidate)) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+
         // Zero-blocker heal path: a live recovery action owns the issue, so
         // waking it here would race that path and re-create the re-arm ->
         // re-dead loop. Skip and count instead. An exhausted action does not
@@ -8035,12 +8529,12 @@ export function recoveryService(
               dependentIssueId: candidate.id,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
               blockedTransitionAt: candidate.blockedTransitionAt,
-              // Generation cutoff, not the re-arm window: a COMPLETED canonical
-              // wake only covers the ready state of the blocked cycle it ran in
-              // (updatedAt >= blockedTransitionAt), so a later done → unresolved
-              // → done generation gets its fresh wake. The re-arm-age `cutoff`
-              // stays reserved for recovery eligibility and cap accounting.
-              completedRearmCutoff: candidate.blockedTransitionAt,
+              // Two independent cutoffs: blockedTransitionAt scopes a finished
+              // canonical wake to the generation it was requested in, and the
+              // re-arm-age `cutoff` lets a same-generation wake that aged out
+              // re-arm so the cap and the blocked_without_blockers escalation
+              // still fire.
+              completedRearmCutoff: cutoff,
             });
         if (existingWake) {
           result.existingWakeSkipped += 1;
@@ -8110,6 +8604,13 @@ export function recoveryService(
           }
         }
 
+        // Canonical stable-key rows represent the FULL (dependent,
+        // blocker-set) ready state, so they count by idempotency key ALONE —
+        // the payload's resolved-blocker edge depends on which edge a producer
+        // happened to name for a multi-blocker set, and filtering on it would
+        // omit same-key rows and let wakes exceed the cap. Legacy per-edge keys
+        // keep edge-scoped matching: their key already embeds the resolved
+        // blocker, so an unrelated edge never counts for the current one.
         const legacyWakeKeys = idempotencyKeys.slice(1);
         const stateWakeKeys = idempotencyKeys.slice(0, 1);
         const wakeKeyPredicate = resolvedBlockerIssueId
@@ -8118,12 +8619,7 @@ export function recoveryService(
                 ? [inArray(agentWakeupRequests.idempotencyKey, legacyWakeKeys)]
                 : []),
               ...(stateWakeKeys.length > 0
-                ? [
-                    and(
-                      inArray(agentWakeupRequests.idempotencyKey, stateWakeKeys),
-                      sql`${agentWakeupRequests.payload} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
-                    ),
-                  ]
+                ? [inArray(agentWakeupRequests.idempotencyKey, stateWakeKeys)]
                 : []),
             )
           : inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys);
@@ -8307,11 +8803,10 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
-            // Heartbeat preserves an explicitly supplied completedRearmCutoff
-            // for its own canonical ready-state lookup instead of deriving the
-            // dependent's blockedTransitionAt, so hand it the same generation
-            // cutoff the producer lookup used — never the re-arm-age cutoff.
-            completedRearmCutoff: candidate.blockedTransitionAt,
+            // Heartbeat's own canonical ready-state lookup derives the
+            // generation (blockedTransitionAt) itself; hand it the same
+            // re-arm-age cutoff the producer lookup used.
+            completedRearmCutoff: cutoff,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {
@@ -8920,32 +9415,6 @@ export function recoveryService(
       }
     }
 
-    // A result-less native run may intentionally have no live provider process
-    // while the native finalization coordinator waits to resume the same
-    // provider session. That coordinator, rather than this generic
-    // process-death backstop, owns retryable/resumed attempts. Preserve issue
-    // terminality as the stronger authority, but never interrupt coordinator-
-    // owned recovery merely because the provider process has exited.
-    if (!issueTerminalStatus && processGone && run.runtimeMode === "native") {
-      const coordinator = await db
-        .select({
-          phase: nativeRunFinalizations.phase,
-          resultId: nativeRunFinalizations.resultId,
-          attempt: nativeRunFinalizations.attempt,
-        })
-        .from(nativeRunFinalizations)
-        .where(eq(nativeRunFinalizations.runId, run.id))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      const nativeResumeOwnsRun =
-        coordinator?.resultId === null &&
-        (coordinator.phase === "retryable_failure" ||
-          (coordinator.phase === "observed" && coordinator.attempt > 0));
-      if (nativeResumeOwnsRun) {
-        return { terminalized: false, status: run.status };
-      }
-    }
-
     // Neither authority applies. The run is still live, so leave it alone.
     if (!issueTerminalStatus && !processGone) {
       return { terminalized: false, status: run.status };
@@ -8980,6 +9449,35 @@ export function recoveryService(
           eq(heartbeatRuns.status, "running"),
           eq(heartbeatRuns.runtimeMode, run.runtimeMode),
           nativeRunnerOwnershipNotHeldCondition(),
+          // Provider exit is expected while the native coordinator resumes a
+          // session or copies its completed workspace back. The coordinator
+          // owns those retries, including expired leases and future attempts.
+          // Check at the write so a newly recorded result cannot be orphaned
+          // using the earlier liveness snapshot. Terminal issue status remains
+          // the stronger authority.
+          !issueTerminalStatus && run.runtimeMode === "native"
+            ? notExists(db.select({ runId: nativeRunFinalizations.runId })
+                .from(nativeRunFinalizations).where(and(
+                  eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+                  eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
+                  or(
+                    and(
+                      isNotNull(nativeRunFinalizations.resultId),
+                      inArray(nativeRunFinalizations.phase, [
+                        "observed", "workspace_finalizing", "ready_for_assessment",
+                        "arbitrating", "retryable_failure",
+                      ]),
+                    ),
+                    and(
+                      isNull(nativeRunFinalizations.resultId),
+                      or(
+                        eq(nativeRunFinalizations.phase, "retryable_failure"),
+                        and(eq(nativeRunFinalizations.phase, "observed"), gt(nativeRunFinalizations.attempt, 0)),
+                      ),
+                    ),
+                  ),
+                )))
+            : undefined,
           // Recheck ownership in the write: a controller can renew or claim
           // the run after the liveness read. An old snapshot cannot end a new
           // controller's run, even if that controller's lease later expires.
@@ -9060,12 +9558,16 @@ export function recoveryService(
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks() {
+  async function sweepStaleIssueLocks(opts?: {
+    now?: Date;
+    beforeSilentLockClear?: (input: { runId: string; issueId: string }) => Promise<void>;
+  }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
     };
+    const sweepNow = opts?.now ?? new Date();
 
     const candidates = await db
       .select({
@@ -9096,6 +9598,7 @@ export function recoveryService(
         : [];
     const runStatusById = new Map<string, string>();
     for (const row of runRows) runStatusById.set(row.id, row.status);
+    const runById = new Map(runRows.map(row => [row.id, row]));
 
     // Collect the runs that a non-terminal issue still references. Such a run is
     // the live run of an active issue. A different, terminal issue can also hold
@@ -9146,47 +9649,156 @@ export function recoveryService(
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
-      if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+      if (outcome.terminalized) {
+        result.terminalizedRunIds.push(row.id);
+        // The dead author may also hold wakes on authored cards that carry no
+        // lock stamp; those cards are never cleared below, so promote here.
+        const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+          companyId: row.companyId,
+          runId: row.id,
+          agentId: row.agentId,
+        }).catch((err) => {
+          logger.error({ err, runId: row.id }, "failed to list cards held behind a terminalized author");
+          return [] as string[];
+        });
+        await promoteDeferredWakesAfterLockClear({ ...row, status: outcome.status }, unlockedIssueIds);
+      }
     }
 
-    const isCleanable = (runId: string | null) => {
+    // A stamped hold also lapses when its author has produced no output past
+    // the silence bound and a wake is held behind it: the author may still
+    // have a live in-memory handle, so no terminal path will ever clear it.
+    // A run with recent output is active and never lapses here.
+    const silentRunIds = new Set<string>();
+    for (const row of runRows) {
+      if (row.status !== "running") continue;
+      // The lapse exists for issue-less authors: a run whose recorded
+      // context names a card is that card's live worker, and its lock is
+      // cleared by its own finish, never by this sweep.
+      if (issueIdFromRunContext(row.contextSnapshot)) continue;
+      const lastActivityAt = row.lastOutputAt ?? row.startedAt ?? row.createdAt;
+      if (lastActivityAt && sweepNow.getTime() - new Date(lastActivityAt).getTime() > ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS) {
+        silentRunIds.add(row.id);
+      }
+    }
+    const deferredWakeIssueIds = new Set<string>();
+    if (candidates.length > 0) {
+      const deferredRows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          inArray(agentWakeupRequests.companyId, [...new Set(candidates.map((issue) => issue.companyId))]),
+        ));
+      const candidateIssueIds = new Set(candidates.map((issue) => issue.id));
+      for (const row of deferredRows) {
+        const wakeIssueId = readWakeIssueIdFromPayload(row.payload);
+        if (wakeIssueId && candidateIssueIds.has(wakeIssueId)) deferredWakeIssueIds.add(wakeIssueId);
+      }
+    }
+    // Waiting work behind a silent author is not only a deferred wake: a
+    // successor already promoted to a queued run for the card is held the
+    // same way, and the lapse must reach it too.
+    const waitingIssueIds = new Set(deferredWakeIssueIds);
+    if (candidates.length > 0) {
+      const candidateIssueIds = [...new Set(candidates.map((issue) => issue.id))];
+      const queuedRows = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' in (${sql.join(candidateIssueIds.map((id) => sql`${id}`), sql`, `)})`,
+        ));
+      for (const row of queuedRows) {
+        const queuedIssueId = issueIdFromRunContext(row.contextSnapshot);
+        if (queuedIssueId) waitingIssueIds.add(queuedIssueId);
+      }
+    }
+    const isCleanable = (runId: string | null, issueId?: string) => {
       if (!runId) return true;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(status)) return true;
+      return Boolean(issueId && silentRunIds.has(runId) && waitingIssueIds.has(issueId));
     };
 
     for (const issue of candidates) {
+      const originalOwner = issue.executionRunId ? runById.get(issue.executionRunId) : undefined;
+      // The pre-pass can lose its terminal write to the executor and observe a
+      // newer terminal status. Do not test claim ownership using the old status.
+      const owner = originalOwner ? { ...originalOwner,
+        status: runStatusById.get(originalOwner.id) ?? originalOwner.status } : undefined;
+      if (owner && isExplicitContinuationRetryClaim(issue, owner)) {
+        // A terminal row can still own cleanup and a pending bounded retry.
+        // Re-enter the same policy rather than erasing its exact-owner proof.
+        // That policy handles pending cleanup, newer input, and final denial.
+        await deps.settleExplicitContinuationRetry?.(owner);
+        continue;
+      }
       await runRecoverySweepIssue(issue, "recovery.sweep_stale_issue_locks", async () => {
       if (
-        !isCleanable(issue.checkoutRunId) ||
-        !isCleanable(issue.executionRunId)
+        !isCleanable(issue.checkoutRunId, issue.id) ||
+        !isCleanable(issue.executionRunId, issue.id)
       ) {
         return;
       }
 
-      const updated = await db
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issue.id),
-            issue.checkoutRunId
-              ? eq(issues.checkoutRunId, issue.checkoutRunId)
-              : isNull(issues.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+      const silenceClearRunId = [issue.executionRunId, issue.checkoutRunId].find((runId) => {
+        if (!runId || !silentRunIds.has(runId)) return false;
+        const status = runStatusById.get(runId);
+        return !status || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      });
+      if (silenceClearRunId) {
+        await opts?.beforeSilentLockClear?.({ runId: silenceClearRunId, issueId: issue.id });
+      }
+
+      const updated = await db.transaction(async tx => {
+        const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+        )).for("update");
+        if (!source) return null;
+        if (silenceClearRunId) {
+          const [fresh] = await tx
+            .select({
+              status: heartbeatRuns.status,
+              lastOutputAt: heartbeatRuns.lastOutputAt,
+              startedAt: heartbeatRuns.startedAt,
+              createdAt: heartbeatRuns.createdAt,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, silenceClearRunId));
+          const freshActivityAt = fresh?.lastOutputAt ?? fresh?.startedAt ?? fresh?.createdAt ?? null;
+          const resumed = fresh?.status === "running"
+            && !issueIdFromRunContext(fresh.contextSnapshot)
+            && freshActivityAt != null
+            && sweepNow.getTime() - new Date(freshActivityAt).getTime() <= ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS;
+          if (resumed) return null;
+        }
+        return tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.companyId, issue.companyId),
+              issue.checkoutRunId
+                ? eq(issues.checkoutRunId, issue.checkoutRunId)
+                : isNull(issues.checkoutRunId),
+              issue.executionRunId
+                ? eq(issues.executionRunId, issue.executionRunId)
+                : isNull(issues.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (!updated) return;
 
@@ -9209,7 +9821,77 @@ export function recoveryService(
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // This sweep clears the lock itself, so the normal release never
+      // promotes the wakes held behind the cleared run. Promote them here.
+      const clearedRun = (issue.executionRunId ? runById.get(issue.executionRunId) : undefined)
+        ?? (issue.checkoutRunId ? runById.get(issue.checkoutRunId) : undefined);
+      if (clearedRun) {
+        await promoteDeferredWakesAfterLockClear(
+          { ...clearedRun, status: runStatusById.get(clearedRun.id) ?? clearedRun.status },
+          [updated.id],
+        );
+      }
       });
+    }
+
+    // Every lock clear does not pass through the route's promotion hook
+    // (hook-less service updates, checkout, release, plugin host writes):
+    // those cards are already unlocked, so the candidate pass above never
+    // sees them and a held wake strands forever. Visit unlocked cards that
+    // still hold a deferred wake and promote it when no live holder remains.
+    const unlockedHeldCards = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        originRunId: issues.originRunId,
+      })
+      .from(issues)
+      .where(and(
+        isNull(issues.executionRunId),
+        isNull(issues.checkoutRunId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        sql`exists (
+          select 1 from ${agentWakeupRequests}
+          where ${agentWakeupRequests.companyId} = ${issues.companyId}
+            and ${agentWakeupRequests.status} = 'deferred_issue_execution'
+            and ${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text
+        )`,
+      ));
+    for (const card of unlockedHeldCards) {
+      if (result.issueIds.includes(card.id)) continue;
+      const holder = await findLiveIssueExecutionHolder(db, card.companyId, card.id).catch((err) => {
+        logger.error({ err, issueId: card.id }, "failed to resolve the holder of an unlocked card with a held wake");
+        return null;
+      });
+      if (holder) continue;
+      let promotionRun = card.originRunId
+        ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, card.originRunId)).then((rows) => rows[0] ?? null)
+        : null;
+      if (!promotionRun) {
+        const [wake] = await db
+          .select({ agentId: agentWakeupRequests.agentId })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, card.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${card.id}::text`,
+          ))
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1);
+        if (wake) {
+          promotionRun = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, card.companyId), eq(heartbeatRuns.agentId, wake.agentId)))
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+        }
+      }
+      if (!promotionRun) continue;
+      await promoteDeferredWakesAfterLockClear(promotionRun, [card.id]);
     }
 
     if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
@@ -9272,13 +9954,47 @@ export function recoveryService(
   // never fire; the escalated board-owned recovery action already projects
   // as the board attention/decision-queue item, so the stranded card's
   // dispatchable artifact is that item until an operator assigns an owner.
-  // Returns the armed check time, or null when no monitor was armed.
-  async function armExhaustedBoardMonitor(input: {
+  // Preserve why no monitor was armed; a park or existing monitor is not missing ownership.
+  type ExhaustedBoardMonitorInput = {
     issue: typeof issues.$inferSelect;
     recoveryActionId: string;
     nextCheckAt: Date;
     notes: string;
-  }): Promise<Date | null> {
+    now: Date;
+  };
+
+  type ExhaustedBoardMonitorOutcome =
+    | typeof EXHAUSTED_RECOVERY_PARKED
+    | typeof EXHAUSTED_RECOVERY_UNAVAILABLE
+    | { kind: "stale_action" }
+    | { kind: "live"; checkAt: Date | null; dueAwaitingClaim: boolean }
+    | { kind: "armed"; checkAt: Date };
+  type ExhaustedRecoveryIssueOutcome =
+    | typeof EXHAUSTED_RECOVERY_PARKED
+    | typeof EXHAUSTED_RECOVERY_UNAVAILABLE
+    | { kind: "carrier"; issueId: string };
+
+  async function armExhaustedBoardMonitor(input: ExhaustedBoardMonitorInput): Promise<ExhaustedBoardMonitorOutcome> {
+    return db.transaction(async tx => {
+      const [source] = await tx.select().from(issues).where(and(
+        eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId),
+      )).for("update");
+      if (!source) return EXHAUSTED_RECOVERY_UNAVAILABLE;
+      const runner = tx as unknown as Db; // Retain the source lock through monitor persistence.
+      return armExhaustedBoardMonitorLocked({ ...input, issue: source }, runner);
+    });
+  }
+
+  async function armExhaustedBoardMonitorLocked(input: ExhaustedBoardMonitorInput, db: Db): Promise<ExhaustedBoardMonitorOutcome> {
+    const issuesSvc = issueService(db);
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return EXHAUSTED_RECOVERY_PARKED;
+    const [action] = await db.select({ sourceIssueId: issueRecoveryActions.sourceIssueId,
+      status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, input.issue.companyId), eq(issueRecoveryActions.id, input.recoveryActionId),
+    ));
+    if (!action || action.sourceIssueId !== input.issue.id || action.status !== "escalated" || action.outcome !== "exhausted") {
+      return { kind: "stale_action" };
+    }
     if (
       !isMonitorableIssueShape({
         status: input.issue.status,
@@ -9286,7 +10002,12 @@ export function recoveryService(
         assigneeUserId: input.issue.assigneeUserId,
       })
     ) {
-      return null;
+      return EXHAUSTED_RECOVERY_UNAVAILABLE;
+    }
+    const lockedNow = new Date();
+    const dueAwaitingClaim = isDueSelfArmedBoardMonitor(input.issue, lockedNow);
+    if (hasFutureMonitorCheck(input.issue.monitorNextCheckAt, lockedNow.getTime()) || dueAwaitingClaim) {
+      return { kind: "live", checkAt: input.issue.monitorNextCheckAt, dueAwaitingClaim };
     }
     const normalized = input.issue.executionPolicy
       ? (normalizeIssueExecutionPolicy(input.issue.executionPolicy) ?? undefined)
@@ -9330,7 +10051,7 @@ export function recoveryService(
         { issueId: input.issue.id, recoveryActionId: input.recoveryActionId, clearReason },
         "exhausted recovery monitor re-arm refused: monitor bounds exhausted",
       );
-      return null;
+      return EXHAUSTED_RECOVERY_UNAVAILABLE;
     }
     // Never claim a wake from flat columns the transition did not schedule:
     // if the policy module did not write a monitor check time, nothing was armed.
@@ -9339,10 +10060,10 @@ export function recoveryService(
         { issueId: input.issue.id, recoveryActionId: input.recoveryActionId },
         "exhausted recovery monitor transition scheduled no check; board action remains the decision item",
       );
-      return null;
+      return EXHAUSTED_RECOVERY_UNAVAILABLE;
     }
     await issuesSvc.update(input.issue.id, { ...transition.patch, executionPolicy: policy });
-    return input.nextCheckAt;
+    return { kind: "armed", checkAt: input.nextCheckAt };
   }
 
   // SUP-21344 (review round 2): a non-monitorable exhausted source cannot be
@@ -9387,6 +10108,7 @@ export function recoveryService(
       alreadyLive: 0,
       monitorDueAwaitingClaim: 0,
       noInvokableOwner: 0,
+      staleActionSkipped: 0,
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -9395,6 +10117,7 @@ export function recoveryService(
     const filters = [
       eq(issueRecoveryActions.status, "escalated"),
       eq(issueRecoveryActions.outcome, "exhausted"),
+      recoveryActionNotBoardParked(sql`${issueRecoveryActions.companyId}`, sql`${issueRecoveryActions.id}`),
     ];
     if (opts?.companyId) filters.push(eq(issueRecoveryActions.companyId, opts.companyId));
 
@@ -9445,13 +10168,24 @@ export function recoveryService(
           result.alreadyLive++;
           return;
         }
-        const armedAt = await armExhaustedBoardMonitor({
+        const monitor = await armExhaustedBoardMonitor({
           issue,
           recoveryActionId: action.id,
           nextCheckAt: exhaustedBoardMonitorNextCheckAt(now),
           notes: `Board decision required: recovery action ${action.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+          now,
         });
-        if (armedAt) {
+        if (monitor.kind === "parked") return;
+        if (monitor.kind === "stale_action") {
+          result.staleActionSkipped++;
+          return;
+        }
+        if (monitor.kind === "live") {
+          result.alreadyLive++;
+          if (monitor.dueAwaitingClaim) result.monitorDueAwaitingClaim++;
+          return;
+        }
+        if (monitor.kind === "armed") {
           result.monitorArmed++;
           result.issueIds.push(issue.id);
           result.actionIds.push(action.id);
@@ -9462,13 +10196,14 @@ export function recoveryService(
         // the card with no live wake source.
       }
 
-      const recoveryIssueId = await ensureExhaustedRecoveryIssue({
+      const carrier = await ensureExhaustedRecoveryIssue({
         issue,
         recoveryActionId: action.id,
         existingRecoveryIssueId: action.recoveryIssueId ?? null,
       });
-      if (recoveryIssueId) {
-        if (recoveryIssueId === (action.recoveryIssueId ?? null)) {
+      if (carrier.kind === "parked") return;
+      if (carrier.kind === "carrier") {
+        if (carrier.issueId === (action.recoveryIssueId ?? null)) {
           result.alreadyLive++;
         } else {
           result.recoveryIssueMinted++;
@@ -9488,12 +10223,37 @@ export function recoveryService(
     return result;
   }
 
-  async function ensureExhaustedRecoveryIssue(input: {
+  type ExhaustedRecoveryIssueInput = {
     issue: typeof issues.$inferSelect;
     recoveryActionId: string;
     existingRecoveryIssueId?: string | null;
-  }): Promise<string | null> {
-    if (isStrandedIssueRecoveryIssue(input.issue)) return null;
+  };
+
+  async function ensureExhaustedRecoveryIssue(input: ExhaustedRecoveryIssueInput): Promise<ExhaustedRecoveryIssueOutcome> {
+    const postCommitActions: Array<() => Promise<void>> = [];
+    const result = await db.transaction(async tx => {
+      const [source] = await tx.select().from(issues).where(and(
+        eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId),
+      )).for("update");
+      if (!source) return EXHAUSTED_RECOVERY_UNAVAILABLE;
+      const runner = tx as unknown as Db; // Serialize carrier/action writes with board acceptance.
+      return ensureExhaustedRecoveryIssueLocked({ ...input, issue: source }, runner, postCommitActions);
+    });
+    if (result.kind === "parked") return result;
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return EXHAUSTED_RECOVERY_PARKED;
+    for (const action of postCommitActions) await action();
+    return result;
+  }
+
+  async function ensureExhaustedRecoveryIssueLocked(
+    input: ExhaustedRecoveryIssueInput,
+    db: Db,
+    postCommitActions: Array<() => Promise<void>>,
+  ): Promise<ExhaustedRecoveryIssueOutcome> {
+    const issuesSvc = issueService(db);
+    const instanceSettings = instanceSettingsService(db);
+    if (await isRecoveryActionBoardParked(db, input.issue.companyId, input.recoveryActionId)) return EXHAUSTED_RECOVERY_PARKED;
+    if (isStrandedIssueRecoveryIssue(input.issue)) return EXHAUSTED_RECOVERY_UNAVAILABLE;
 
     const findOpenRecoveryIssue = async () => {
       if (input.existingRecoveryIssueId) {
@@ -9538,6 +10298,7 @@ export function recoveryService(
           and(
             eq(issueRecoveryActions.id, input.recoveryActionId),
             eq(issueRecoveryActions.companyId, input.issue.companyId),
+            recoveryActionNotBoardParked(input.issue.companyId, input.recoveryActionId),
           ),
         );
     };
@@ -9547,10 +10308,11 @@ export function recoveryService(
     ): Promise<boolean> => {
       const ownerAgentId = recoveryIssue.assigneeAgentId;
       if (!ownerAgentId || recoveryIssue.assigneeUserId) return false;
-      if (await hasLiveIssueWake(input.issue.companyId, recoveryIssue.id, ownerAgentId)) {
+      if (await hasLiveIssueWake(input.issue.companyId, recoveryIssue.id, ownerAgentId, db)) {
         return false;
       }
 
+      postCommitActions.push(async () => {
       await deps.enqueueWakeup(ownerAgentId, {
         source: "automation",
         triggerDetail: "system",
@@ -9572,6 +10334,7 @@ export function recoveryService(
           },
           "status_only",
         ),
+      });
       });
       return true;
     };
@@ -9602,11 +10365,32 @@ export function recoveryService(
       if (reusableRecoveryIssue.id !== input.existingRecoveryIssueId) {
         await linkRecoveryIssue(reusableRecoveryIssue.id);
       }
-      return reusableRecoveryIssue.id;
+      return { kind: "carrier", issueId: reusableRecoveryIssue.id };
     }
 
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
-    if (!ownerAgentId) return null;
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, undefined, db);
+    if (!ownerAgentId) return EXHAUSTED_RECOVERY_UNAVAILABLE;
+
+    // The issue write boundary refuses ANY explicit workspace preference on a
+    // project whose policy sets allowIssueOverride=false while isolated
+    // workspaces are on (SUP-13058). Naming `agent_default` there would make
+    // this card un-mintable, which is worse than the inherited-workspace
+    // failure it exists to avoid. Such a project keeps the policy-resolved
+    // workspace (no preference) and relies on the skip flag below; the card
+    // is then not the no-binding exemption shape and keeps every workspace
+    // check, as before this change.
+    const sourceProjectPolicy = input.issue.projectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, input.issue.projectId), eq(projects.companyId, input.issue.companyId)))
+          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null)
+      : null;
+    const overrideDisallowedByProject =
+      gateProjectExecutionWorkspacePolicy(
+        parseProjectExecutionWorkspacePolicy(sourceProjectPolicy),
+        (await instanceSettings.getExperimental()).enableIsolatedWorkspaces === true,
+      )?.allowIssueOverride === false;
 
     const titleSource = input.issue.identifier ?? input.issue.title;
     let recoveryIssue: typeof issues.$inferSelect;
@@ -9624,6 +10408,12 @@ export function recoveryService(
         priority: "high",
         parentId: input.issue.id,
         projectId: input.issue.projectId,
+        // A null projectWorkspaceId is refilled from the project default, and
+        // that binding is itself a git-workspace expectation. agent_default is
+        // the create-time normalization that drops it, so the board card is
+        // not dispatched against the source checkout (SUP-23493). Omitted for a
+        // project that disallows issue-level overrides (see above).
+        ...(overrideDisallowedByProject ? {} : { executionWorkspacePreference: "agent_default" as const }),
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
@@ -9632,6 +10422,12 @@ export function recoveryService(
         // The card records a board decision and never ships code, so its owner
         // must be able to close it without a repository delivery.
         deliveryRequirement: "record_only",
+        // A record-only board card has no adapter workspace of its own. Passing
+        // the source as parentId would otherwise copy that issue's
+        // executionWorkspaceId, including a workspace_validation failure the
+        // next dispatch cannot reuse (SUP-23493). Ordinary parent-child
+        // inheritance is unchanged: this flag is set only on this mint.
+        skipExecutionWorkspaceInheritance: true,
         billingCode: input.issue.billingCode,
       });
     } catch (error) {
@@ -9639,7 +10435,7 @@ export function recoveryService(
       const winningIssue = await findOpenRecoveryIssue();
       if (!winningIssue) throw error;
       if (winningIssue.id !== input.existingRecoveryIssueId) await linkRecoveryIssue(winningIssue.id);
-      return winningIssue.id;
+      return { kind: "carrier", issueId: winningIssue.id };
     }
 
     await linkRecoveryIssue(recoveryIssue.id);
@@ -9657,7 +10453,7 @@ export function recoveryService(
       "minted recovery issue for exhausted non-monitorable recovery action",
     );
 
-    return recoveryIssue.id;
+    return { kind: "carrier", issueId: recoveryIssue.id };
   }
 
   async function reconcileBlockedWithoutBlockers(opts?: {
@@ -9691,6 +10487,34 @@ export function recoveryService(
     const filters = [
       eq(issues.status, "blocked"),
       visibleIssueCondition(),
+      // Protected work must not consume the bounded ordinary-recovery window.
+      // Descendants are discovered now rather than relying on admission members.
+      sql`not exists (
+        with recursive park_ancestors(id, parent_id) as (
+          select ${issues.id}, ${issues.parentId}
+          union
+          select park_parent.id, park_parent.parent_id
+          from ${issues} as park_parent
+          join park_ancestors on park_parent.id = park_ancestors.parent_id
+          where park_parent.company_id = ${issues.companyId}
+        )
+        select 1 from park_ancestors
+        join ${issueTreeHolds} on ${issueTreeHolds.rootIssueId} = park_ancestors.id
+        where ${issueTreeHolds.companyId} = ${issues.companyId}
+          and ${issueTreeHolds.status} = 'active'
+          and ${issueTreeHolds.mode} = 'pause'
+          and ${issueTreeHolds.recoveryCarrierPark} is not null
+      )`,
+      sql`not exists (
+        select 1 from ${issueRecoveryActions}
+        where ${issueRecoveryActions.companyId} = ${issues.companyId}
+          and ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+          and ${issueRecoveryActions.status} in ('active', 'escalated')
+          and not (${recoveryActionNotBoardParked(
+            sql`${issues.companyId}`,
+            sql`${issueRecoveryActions.id}`,
+          )})
+      )`,
     ];
     if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
 
@@ -9780,6 +10604,7 @@ export function recoveryService(
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
+        if (existingAction && await isRecoveryActionBoardParked(db, companyId, existingAction.id)) return;
         // This park has an assignee-owned disposition path, not a generic board
         // escalation or an auto-heal into another suppressed timer run.
         if (existingAction?.kind === TIMER_DISPATCH_PARK_RECOVERY_KIND &&
@@ -9814,51 +10639,68 @@ export function recoveryService(
               .where(eq(issues.id, candidate.id))
               .then((rows) => rows[0] ?? null);
             if (currentIssue) {
-              const armedAt = await armExhaustedBoardMonitor({
+              const monitor = await armExhaustedBoardMonitor({
                 issue: currentIssue,
                 recoveryActionId: existingAction!.id,
                 nextCheckAt: drainNextCheckAt,
                 notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+                now,
               });
+              if (monitor.kind === "parked" || monitor.kind === "stale_action") return;
+              if (monitor.kind === "live") {
+                result.livePathSkipped++;
+                return;
+              }
               // SUP-21344 (review round 2): when the source cannot host a
               // scheduler monitor, the escalated action alone is not a
               // dispatchable artifact. Mint/reuse a durable recovery issue
               // owned by an invokable agent and link it from the action.
-              const recoveryIssueId = armedAt === null
+              const carrier = monitor.kind === "unavailable"
                 ? await ensureExhaustedRecoveryIssue({
                     issue: currentIssue,
                     recoveryActionId: existingAction!.id,
                     existingRecoveryIssueId: existingAction.recoveryIssueId ?? null,
                   })
                 : null;
+              if (carrier?.kind === "parked") return;
+              const armedAt = monitor.kind === "armed" ? monitor.checkAt : null;
+              const recoveryIssueId = carrier?.kind === "carrier" ? carrier.issueId : null;
               // Dedupe by recovery action: once the armed monitor has fired
               // (monitorNextCheckAt cleared), a later pass re-arms it; without
               // this check every re-arm would post another identical comment
               // while the terminal action stays unresolved.
               const drainMarker = `recovery_action:${existingAction!.id}`;
-              const alreadyCommented = await db
-                .select({ body: issueComments.body })
-                .from(issueComments)
-                .where(
-                  and(
+              const reported = await db.transaction(async tx => {
+                const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+                  eq(issues.id, candidate.id), eq(issues.companyId, companyId),
+                )).for("update");
+                const runner = tx as unknown as Db; // Fence the notice's source recency write too.
+                if (!source || await isRecoveryActionBoardParked(runner, companyId, existingAction.id)) return false;
+                const alreadyCommented = await runner
+                  .select({ body: issueComments.body })
+                  .from(issueComments)
+                  .where(and(
                     eq(issueComments.companyId, companyId),
                     eq(issueComments.issueId, candidate.id),
                     eq(issueComments.authorType, "system"),
-                  ),
-                )
-                .then((rows) => rows.some((row) => (row.body ?? "").includes(drainMarker)));
-              if (!alreadyCommented) {
-                await issuesSvc.addComment(
-                  candidate.id,
-                  armedAt
-                    ? `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`
-                    : recoveryIssueId
-                      ? `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${recoveryIssueId} owns the next step.`
-                      : `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`,
-                  {},
-                  { authorType: "system" },
-                );
-              }
+                  ))
+                  .then(rows => rows.some(row => (row.body ?? "").includes(drainMarker)));
+                if (!alreadyCommented) {
+                  await issuesSvc.addComment(
+                    candidate.id,
+                    armedAt
+                      ? `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${armedAt.toISOString()}.`
+                      : recoveryIssueId
+                        ? `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${recoveryIssueId} owns the next step.`
+                        : `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`,
+                    {},
+                    { authorType: "system" },
+                    runner,
+                  );
+                }
+                return true;
+              });
+              if (!reported) return;
             }
           }
           result.exhaustedRecoverySuppressed++;
@@ -11157,6 +11999,32 @@ export function recoveryService(
     return readNonEmptyString(parseObject(action.wakePolicy).type);
   }
 
+  // SUP-24251 (redo of SUP-22273): bound on the live-owner hold below. A held
+  // row is never written, so its `updatedAt` stays fixed and the hold lapses
+  // two live windows after it even when the owner keeps running elsewhere.
+  const OWNER_LIVE_HOLD_MAX_MS = 2 * REVIEW_PARTICIPANT_LIVE_WINDOW_MS;
+
+  // SUP-24251 (redo of SUP-22273): a live owner is not a wedge. True when the
+  // action is a stranded-participant kind and its owner agent (or, on a
+  // board-owned row, the pending participant it was minted for) has a run that
+  // started or finished after `lastAttemptAt` inside the participant live
+  // window, and the hold bound has not lapsed.
+  async function recoveryOwnerRanSinceLastAttempt(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now: Date,
+  ) {
+    const agentId = action.ownerAgentId ?? action.previousOwnerAgentId;
+    if (!agentId || !OWNER_LIVE_HOLD_RECOVERY_KINDS.has(action.kind)) return false;
+    if (action.updatedAt.getTime() + OWNER_LIVE_HOLD_MAX_MS <= now.getTime()) return false;
+    return participantRanSince(
+      db,
+      action.companyId,
+      agentId,
+      action.lastAttemptAt?.getTime() ?? 0,
+      REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+    );
+  }
+
   // Level-triggered backstop for stranded recovery actions.
   //
   // The owner wake fires exactly once, at action creation
@@ -11170,6 +12038,10 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
+  //   - SUP-24251: stranded-participant kinds whose owner (or pending
+  //     participant) ran after `lastAttemptAt` are held: no attempt burn, no
+  //     reroute, no ceiling escalation, until the live window or hold bound
+  //     lapses
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -11191,6 +12063,7 @@ export function recoveryService(
       skippedTerminalSource: 0,
       skippedBackoff: 0,
       skippedPauseHold: 0,
+      skippedOwnerLive: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -11215,20 +12088,27 @@ export function recoveryService(
       await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
-      if (candidate.attemptCount >= effectiveMaxAttempts) {
-        result.maxAttemptsReached += 1;
-        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        return;
-      }
-
       const sourceIssue = await db
         .select()
         .from(issues)
         .where(eq(issues.id, candidate.sourceIssueId))
         .then((rows) => rows[0] ?? null);
-
       // Nothing left to recover: the source issue is gone or already terminal.
-      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
+      const sourceTerminal = !sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled";
+
+      if (candidate.attemptCount >= effectiveMaxAttempts) {
+        // SUP-24251: a live owner holds the ceiling instead of walking the
+        // action to the board. A terminal source has nothing to hold for.
+        if (!sourceTerminal && (await recoveryOwnerRanSinceLastAttempt(candidate, now))) {
+          result.skippedOwnerLive += 1;
+          return;
+        }
+        result.maxAttemptsReached += 1;
+        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        return;
+      }
+
+      if (sourceTerminal) {
         result.skippedTerminalSource += 1;
         return;
       }
@@ -11296,6 +12176,14 @@ export function recoveryService(
           result.skippedBackoff += 1;
           return;
         }
+      }
+
+      // SUP-24251: checked last, so every guard above keeps its precedence,
+      // and before both attempt-burning writes below (the no-owner reroute burn
+      // and the compare-and-swap re-fire).
+      if (await recoveryOwnerRanSinceLastAttempt(candidate, now)) {
+        result.skippedOwnerLive += 1;
+        return;
       }
 
       // `board_escalation` means action creation could not find an invokable
@@ -11466,45 +12354,53 @@ export function recoveryService(
     const boardNextCheckAt = hasExistingFutureMonitor
       ? new Date(sourceIssue.monitorNextCheckAt!)
       : exhaustedBoardMonitorNextCheckAt(now);
-    let armedBoardCheckAt: Date | null = hasExistingFutureMonitor
-      ? boardNextCheckAt
-      : dueSelfArmedBoardMonitor && sourceIssue.monitorNextCheckAt
-        ? new Date(sourceIssue.monitorNextCheckAt)
-        : null;
-    if (!hasExistingFutureMonitor && !dueSelfArmedBoardMonitor) {
-      armedBoardCheckAt = await armExhaustedBoardMonitor({
-        issue: sourceIssue,
-        recoveryActionId: action.id,
-        nextCheckAt: boardNextCheckAt,
-        notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
-      });
-    }
-    // SUP-21344 (review round 2): when the source cannot host a scheduler
-    // monitor, mint/reuse a durable recovery issue owned by an invokable
-    // agent and link it from the action (`recoveryIssueId`), with a wake for
-    // the owner. That issue — not the escalation row — is the dispatchable,
-    // ageing artifact. Null only when no invokable owner exists.
-    const exhaustedRecoveryIssueId = armedBoardCheckAt === null
+    const monitor: ExhaustedBoardMonitorOutcome = hasExistingFutureMonitor || dueSelfArmedBoardMonitor
+      ? { kind: "live", checkAt: sourceIssue.monitorNextCheckAt, dueAwaitingClaim: dueSelfArmedBoardMonitor }
+      : await armExhaustedBoardMonitor({
+          issue: sourceIssue,
+          recoveryActionId: action.id,
+          nextCheckAt: boardNextCheckAt,
+          notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+          now,
+        });
+    if (monitor.kind === "parked" || monitor.kind === "stale_action") return;
+    const armedBoardCheckAt = monitor.kind === "armed" || monitor.kind === "live" ? monitor.checkAt : null;
+    // A live monitor already owns the next step; only unavailability falls back to a carrier.
+    const carrier = monitor.kind === "unavailable"
       ? await ensureExhaustedRecoveryIssue({
           issue: sourceIssue,
           recoveryActionId: action.id,
           existingRecoveryIssueId: action.recoveryIssueId ?? null,
         })
       : null;
+    if (carrier?.kind === "parked") return;
+    const exhaustedRecoveryIssueId = carrier?.kind === "carrier" ? carrier.issueId : null;
 
-    await issuesSvc.addComment(
-      sourceIssue.id,
-      `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
-        "The recovery action is escalated to the board; the source issue status was left untouched. " +
-        "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.\n\n" +
-        (armedBoardCheckAt
-          ? `Board decision item: recovery_action:${action.id} — next board check at ${armedBoardCheckAt.toISOString()}.`
-          : exhaustedRecoveryIssueId
-            ? `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${exhaustedRecoveryIssueId} owns the next step.`
-            : `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`),
-      {},
-      { authorType: "system" },
-    );
+    const reported = await db.transaction(async tx => {
+      const [source] = await tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, sourceIssue.id), eq(issues.companyId, sourceIssue.companyId),
+      )).for("update");
+      const runner = tx as unknown as Db; // Serialize the source comment with board acceptance.
+      if (!source || await isRecoveryActionBoardParked(runner, sourceIssue.companyId, action.id)) return false;
+      await issuesSvc.addComment(
+        sourceIssue.id,
+        `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
+          "The recovery action is escalated to the board; the source issue status was left untouched. " +
+          "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.\n\n" +
+          (armedBoardCheckAt
+            ? `Board decision item: recovery_action:${action.id} — next board check at ${armedBoardCheckAt.toISOString()}.`
+            : monitor.kind === "live"
+              ? `Board decision item: recovery_action:${action.id} — the existing board monitor is awaiting its claim; no new monitor or recovery issue was created.`
+              : exhaustedRecoveryIssueId
+                ? `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Recovery issue ${exhaustedRecoveryIssueId} owns the next step.`
+                : `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed, and no invokable recovery owner is available to own a recovery issue. Assign an invokable agent owner or record an intentional manual resolution.`),
+        {},
+        { authorType: "system" },
+        runner,
+      );
+      return true;
+    });
+    if (!reported) return;
     await logActivity(db, {
       companyId: sourceIssue.companyId,
       actorType: "system",
@@ -11522,7 +12418,7 @@ export function recoveryService(
         attemptCount: action.attemptCount,
         maxAttempts: effectiveMaxAttempts,
         boardMonitorNextCheckAt: armedBoardCheckAt?.toISOString() ?? null,
-        boardMonitorDispatchable: armedBoardCheckAt !== null,
+        boardMonitorDispatchable: monitor.kind === "armed" || monitor.kind === "live",
         recoveryIssueId: exhaustedRecoveryIssueId,
       },
     });
@@ -11765,7 +12661,13 @@ export function recoveryService(
         continue;
       }
 
-      await db.transaction(async (tx) => {
+      const archived = await db.transaction(async (tx) => {
+        const [carrier] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId),
+        )).for("update");
+        const runner = tx as unknown as Db; // Serialize visibility with board park admission.
+        if (!carrier || (await issueTreeControlService(runner)
+          .getActivePauseHoldGate(candidate.companyId, candidate.id))?.recoveryCarrierPark) return false;
         await tx
           .update(issues)
           .set({ hiddenAt: new Date() })
@@ -11776,7 +12678,9 @@ export function recoveryService(
           issueId: candidate.id,
           policy: "stale_in_review_child",
         });
+        return true;
       });
+      if (!archived) continue;
 
       result.archived += 1;
       result.issueIds.push(candidate.id);
@@ -12470,6 +13374,8 @@ export function recoveryService(
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileLegacyContinuation,
+    legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
     reconcileDispatchSuppressionParks,

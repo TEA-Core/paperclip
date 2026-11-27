@@ -393,7 +393,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
     });
 
-    return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
+    return { companyId, reviewerAgentId, implementerAgentId, secondReviewerAgentId, issueId, identifier, firstStageId, secondStageId };
   }
 
   /**
@@ -871,6 +871,124 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(rows).toHaveLength(0);
   });
 
+  it("PATCH: record_only participant close without probe evidence records its decision and audited skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347A", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Reviewed the host repair and its verification record; no consumer probe exists.\n\nkind: review\ndecision: approved",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+    const stateRows = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const state = stateRows[0]?.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string } | null;
+    expect(state?.lastDecisionOutcome).toBe("approved");
+    expect(state?.completedStageIds).toHaveLength(1);
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.stageId).toBe(state?.completedStageIds?.[0]);
+    expect(decisions[0]?.actorAgentId).toBe(reviewerAgentId);
+    expect(decisions[0]?.outcome).toBe("approved");
+    expect(await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId))).toHaveLength(0);
+    const rows = await vi.waitFor(async () => {
+      const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+      if (found.length === 0) throw new Error("waiting for audit row");
+      return found;
+    });
+    expect(rows).toHaveLength(1);
+    expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe("record_only_review_decision");
+    expect((rows[0]?.details as Record<string, unknown>).decisionCarried).toBe(true);
+  });
+
+  it("POST comment: record_only auto-approval without probe evidence records its decision and audited skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347C", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nReviewed the host repair and its verification record; no consumer probe exists." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.actorAgentId).toBe(reviewerAgentId);
+    expect(decisions[0]?.outcome).toBe("approved");
+    const rows = await vi.waitFor(async () => {
+      const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+      if (found.length === 0) throw new Error("waiting for audit row");
+      return found;
+    });
+    expect(rows).toHaveLength(1);
+    expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe("record_only_review_decision");
+    expect((rows[0]?.details as Record<string, unknown>).decisionCarried).toBe(true);
+  });
+
+  it("PATCH: record_only participant close without any comment still refuses (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347D", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
+  it("PATCH: record_only participant close does not convert an unrelated landed-at-tip sha into a skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347E", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+    const unrelatedSha = "deadbeef".repeat(5);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: `Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit ${unrelatedSha}. Liveness unverified.`,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(res.body.error).toContain("does not belong to this issue");
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
+  it("PATCH: record_only board close without a participant decision still refuses mechanism C (SUP-23347)", async () => {
+    const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D23347B", { deliveryRequirement: "record_only" });
+    currentActor = {
+      type: "board",
+      userId: "cloud-user-1",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      runId: randomUUID(),
+    };
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Board close without participant concurrence." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.details.mechanism).toBe("C");
+    expect(res.body.details.decisionCarried).toBe(false);
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
   it("PATCH: a decision-carrying close carrying a verbatim tier line goes through (SUP-14367)", async () => {
     for (const [suffix, tierLine] of [
       [
@@ -1045,6 +1163,445 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     });
   });
 
+  // SUP-25336: one canonical done-tier source per close. These reproduce the
+  // SUP-23944 second request shape (a valid canonical record-only comment plus
+  // prose-only structured probeEvidence) on every structured door. Before the
+  // resolver, the structured input replaced the valid comment declaration and
+  // the close 422'd as done_transition_missing_tier_declaration.
+  describe("done-tier dual-source resolution (SUP-25336)", () => {
+    const RECORD_ONLY_LINE = `Closed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`;
+    const PROSE_ONLY_EVIDENCE = "Re-ran the sweep probe and it passed; the consumption point is healthy.";
+
+    async function seedRecordOnlyClose(prefix: string) {
+      const seeded = await seedIssueAwaitingReview(prefix, { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, seeded.issueId));
+      const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, seeded.issueId);
+      currentActor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+      mockNoOpenPulls();
+      return { ...seeded, runId };
+    }
+
+    async function commentBodies(issueId: string) {
+      const rows = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      return rows.map((row) => row.body ?? "");
+    }
+
+    function expectNoDeliveryCommitLookup() {
+      for (const [url, init] of mockGhFetch.mock.calls) {
+        expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
+        expect(String(url)).not.toContain("/commits/");
+      }
+    }
+
+    function expectDualSourceConflict(res: request.Response) {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_tier_dual_source_conflict");
+      expect(res.body.details).toMatchObject({
+        conflicts: expect.arrayContaining(["sources_not_equivalent"]),
+        sources: {
+          comment: { status: "valid", declarationCount: 1 },
+          structured: { tier: "tier2" },
+        },
+        remedy: expect.stringContaining("Send exactly one done-tier source"),
+      });
+      // The conflict never echoes the probe command.
+      expect(JSON.stringify(res.body)).not.toContain("curl -fsS");
+    }
+
+    it("PATCH: the SUP-23944 shape is refused with the typed conflict and nothing is written", async () => {
+      const { companyId, issueId, identifier } = await seedRecordOnlyClose("D25336A");
+      const before = await statusOf(issueId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Sweep consumed; closing on live probe evidence.\n\n${RECORD_ONLY_LINE}`,
+          doneTier: { tier: "tier2", probeEvidence: PROSE_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      expect(res.body.details.sources.structured.status).toBe("malformed");
+      expect(await statusOf(issueId)).toBe(before);
+      expect(await statusOf(issueId)).not.toBe("done");
+      expect((await commentBodies(issueId)).filter((body) => body.includes("Sweep consumed"))).toHaveLength(0);
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused.map((row) => row.details)).toEqual([
+        expect.objectContaining({
+          code: "done_tier_dual_source_conflict",
+          httpStatus: 422,
+          door: "patch",
+          conflicts: ["structured_declaration_malformed", "sources_not_equivalent"],
+        }),
+      ]);
+    });
+
+    it("PATCH: a conflict never echoes free-text declaration fields in the response or the refusal audit", async () => {
+      const { companyId, issueId, identifier } = await seedRecordOnlyClose("D25336L");
+      const leakyLine =
+        "Closed at Tier 2 (live): record-only probe `probe-cmd` target svc-sk-live-LEAK-target observed 2026-11-04T09:15:00Z result: pass ran curl -H Authorization: Bearer sk-live-LEAK-predicate";
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Sweep consumed.\n\n${leakyLine}`,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused).toHaveLength(1);
+      for (const serialized of [JSON.stringify(res.body), JSON.stringify(refused)]) {
+        expect(serialized).not.toContain("sk-live-LEAK");
+        expect(serialized).not.toContain("Authorization");
+      }
+      expect((await commentBodies(issueId)).filter((body) => body.includes("Sweep consumed"))).toHaveLength(0);
+    });
+
+    it("PATCH: a different record-only observation time is refused, never silently replaced", async () => {
+      const { issueId, identifier } = await seedRecordOnlyClose("D25336B");
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Sweep consumed.\n\n${RECORD_ONLY_LINE}`,
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: RECORD_ONLY_EVIDENCE.replace("2026-11-04T09:15:00Z", "2026-11-04T09:16:00Z"),
+          },
+        });
+      expectDualSourceConflict(res);
+      expect(res.body.details.differingFields).toEqual(["observedStart"]);
+      expect(await statusOf(issueId)).not.toBe("done");
+    });
+
+    it("PATCH: Tier 2 with a reason is still a schema 400", async () => {
+      const { issueId, identifier } = await seedRecordOnlyClose("D25336C");
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: `Sweep consumed.\n\n${RECORD_ONLY_LINE}`,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE, reason: "probe passed" },
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(await statusOf(issueId)).not.toBe("done");
+    });
+
+    it("PATCH: an exactly equivalent dual source closes with the original comment and one declaration", async () => {
+      const { companyId, issueId, identifier, runId } = await seedRecordOnlyClose("D25336D");
+      const comment = `Sweep consumed; closing on live probe evidence.\n\n${RECORD_ONLY_LINE}`;
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const persisted = (await commentBodies(issueId)).filter((body) => body.includes("Sweep consumed"));
+      expect(persisted).toEqual([comment]);
+      expect(persisted[0]!.split("\n").filter((line) => line.startsWith("Closed at Tier"))).toHaveLength(1);
+      expectNoDeliveryCommitLookup();
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows).toHaveLength(1);
+      expect(tier2Rows[0]?.details).toMatchObject({
+        observed: "2026-11-04T09:15:00Z",
+        tierForm: "record-only",
+        closingRunId: runId,
+      });
+    });
+
+    it("PATCH: a comment-only canonical record-only close still closes with no merge head", async () => {
+      const { companyId, issueId, identifier, runId } = await seedRecordOnlyClose("D25336E");
+      const comment = `Sweep consumed.\n\n${RECORD_ONLY_LINE}`;
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      expect((await commentBodies(issueId)).filter((body) => body.includes("Sweep consumed"))).toEqual([comment]);
+      expectNoDeliveryCommitLookup();
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows[0]?.details).toMatchObject({ tierForm: "record-only", closingRunId: runId, observed: "2026-11-04T09:15:00Z" });
+    });
+
+    it("POST comment: auto-approval with the SUP-23944 shape is refused with the typed conflict and nothing is written", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("D25336F", { deliveryRequirement: "record_only" });
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({
+          body: `## Review: APPROVED\n\nShip it.\n\n${RECORD_ONLY_LINE}`,
+          doneTier: { tier: "tier2", probeEvidence: PROSE_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect((await commentBodies(issueId)).filter((body) => body.startsWith("## Review: APPROVED"))).toHaveLength(0);
+      const decisions = await db
+        .select({ body: issueExecutionDecisions.body })
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId));
+      expect(decisions).toHaveLength(0);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused.map((row) => row.details)).toEqual([
+        expect.objectContaining({ code: "done_tier_dual_source_conflict", door: "comment_auto_approval" }),
+      ]);
+    });
+
+    it("POST comment: a conflicting interrupt+approval comment cancels no run and writes nothing", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier, firstStageId, implementerAgentId } =
+        await seedIssueAwaitingReview("D25336I", { deliveryRequirement: "record_only" });
+      const boardParticipant = { type: "user" as const, agentId: null, userId: "cloud-user-1" };
+      const liveRunId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db
+        .update(issues)
+        .set({
+          executionRunId: liveRunId,
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [{ id: firstStageId, type: "review", approvalsNeeded: 1, participants: [boardParticipant] }],
+            returnAssigneeAgentId: implementerAgentId,
+          },
+          executionState: {
+            status: "pending",
+            currentStageId: firstStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: boardParticipant,
+            returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: null,
+            changesRequestedCount: 0,
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({
+          body: `## Review: APPROVED\n\nShip it.\n\n${RECORD_ONLY_LINE}`,
+          interrupt: true,
+          doneTier: { tier: "tier2", probeEvidence: PROSE_ONLY_EVIDENCE },
+        });
+
+      expectDualSourceConflict(res);
+      const runRows = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, liveRunId));
+      expect(runRows[0]?.status).toBe("running");
+      expect(await auditRows(companyId, liveRunId, "heartbeat.cancelled")).toHaveLength(0);
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect((await commentBodies(issueId)).filter((body) => body.startsWith("## Review: APPROVED"))).toHaveLength(0);
+      expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused.map((row) => row.details)).toEqual([
+        expect.objectContaining({ code: "done_tier_dual_source_conflict", door: "comment_auto_approval" }),
+      ]);
+    });
+
+    it("POST comment: auto-approval with an exactly equivalent dual source closes and keeps one declaration", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("D25336G", { deliveryRequirement: "record_only" });
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+      const body = `## Review: APPROVED\n\nShip it.\n\n${RECORD_ONLY_LINE}`;
+
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({ body, doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(await statusOf(issueId)).toBe("done");
+      expect((await commentBodies(issueId)).filter((entry) => entry.startsWith("## Review: APPROVED"))).toEqual([body]);
+      expectNoDeliveryCommitLookup();
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows[0]?.details).toMatchObject({ tierForm: "record-only", closingRunId: runId, observed: "2026-11-04T09:15:00Z" });
+    });
+  });
+
+  describe("record-only pass contradictions", () => {
+    it.each([
+      ["exit_nonzero", "exit 2"],
+      ["exited_nonzero", "exited 2"],
+      ["failed_positive", "failed=1"],
+      ["failed_positive", "failed=1e-400"],
+      ["scanned_zero", "scanned=0"],
+      ["non_clean", "non-clean"],
+      ["failed_closed", "failed closed. All four configured repos shape"],
+      ["refused", "REFUSED"],
+      ["partial_failure", "partial failure"],
+    ])("PATCH refuses %s without a terminal write or green audit", async (marker, prose) => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview(`D25007R${marker.replaceAll("_", "").toUpperCase()}${prose.length}`, { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done",
+        comment: `Closed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}; ${prose}`,
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_record_only_probe_contradiction");
+      expect(res.body.error).toContain(marker);
+      expect(res.body.error).toContain("record-only probe `<probe command>`");
+      const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "done_transition_record_only_probe_contradiction",
+        httpStatus: 422,
+      });
+      expect(res.body.details?.remedy).toContain("Report the non-clean cycle and do not close");
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+
+    it.each(["clean probe", "exit criteria met; exit 0; exited 0; failed=0; scanned=42", "scanned=0.5 failed=0.0", "scanned=1e-400", "anon request refused 401; failed closed on anon request"])(
+      "PATCH closes honest evidence at Tier 2 and records its class: %s",
+      async (prose) => {
+        const { companyId, reviewerAgentId, issueId, identifier } =
+          await seedIssueAwaitingReview(`D25007C${prose.length}`, { deliveryRequirement: "record_only" });
+        await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+        const runId = await seedRun(companyId, reviewerAgentId, issueId);
+        currentActor = agentActor(companyId, reviewerAgentId, runId);
+        mockNoOpenPulls();
+        const probeEvidence = `${RECORD_ONLY_EVIDENCE}; ${prose}`;
+
+        const res = await request(app).patch(`/api/issues/${identifier}`).send({
+          status: "done", doneTier: { tier: "tier2", probeEvidence },
+        });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(await statusOf(issueId)).toBe("done");
+        const rows = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.details).toMatchObject({
+          tierForm: "record-only", probeEvidence, closingRunId: runId,
+        });
+      },
+    );
+
+    it("PATCH still refuses result: fail", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("D25007F", { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done", doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE.replace("result: pass", "result: fail") },
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain("failing predicate (result: fail)");
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+
+    it.each([
+      [1, "scanned=0, failed=4 because required check-run App token was unavailable"],
+      [2, "scan failed closed with exit 2 in all four repos due unavailable GH_CI_ONLY_TOKEN/GH_TOKEN"],
+      [3, "the scan failed closed on all 4 repos because GH_CI_ONLY_TOKEN and GH_TOKEN are unavailable"],
+      [4, "scan failed with exit 2 due to missing check-run App token"],
+      [5, "all four scans exited 2 because the CheckRun App token is unavailable"],
+      [6, "scan executed but failed closed (exit 2; scanned=0, failed=4, check-run App token unavailable)"],
+      [7, "exited 2 with check-run App token unavailable for all four repositories (scan failure recorded, not a clean scan)"],
+    ])("PATCH refuses recurrence case %s: %s", async (index, prose) => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview(`D25007N${index}`, { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockNoOpenPulls();
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done",
+        comment: `Closed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}; ${prose}`,
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_record_only_probe_contradiction");
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    });
+
+    it("PATCH accepts a clean recurrence scan with separate REFUSED-vet lines", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview("D25007NC", { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+      const probeEvidence = RECORD_ONLY_EVIDENCE.replace(
+        "the sweep consumption point served 42 fresh records",
+        "scanned=4 failed=0 matched=29 armed=0 exit 0",
+      );
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({
+        status: "done",
+        comment: `Closed at Tier 2 (live): ${probeEvidence}\n\nVet: REFUSED missing paperclip/approved; exit 1`,
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const rows = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.details).toMatchObject({ tierForm: "record-only", probeEvidence, closingRunId: runId });
+    });
+  });
+
   it("PATCH: record_only close citing an observation predating the closing run is refused as a restatement (SUP-23490)", async () => {
     // The SUP-22817 shape: the closing run started AFTER the cited observation
     // (here 5 minutes after, matching the real restatement), so the cited
@@ -1195,8 +1752,32 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>");
     expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: record_only close whose Tier 2 evidence ends in the Tier 1 marker is refused with done_transition_tier_conflict, structured and comment forms (SUP-24299)", async () => {
+    // Same card and evidence as the accepted close in the SUP-22801 test above;
+    // only the trailing Tier 1 marker differs, so only the conflict refusal can stop it.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+    const conflicted = `${RECORD_ONLY_EVIDENCE}. Liveness unverified.`;
+
+    for (const body of [
+      { status: "done", comment: "Closing.", doneTier: { tier: "tier2", probeEvidence: conflicted } },
+      { status: "done", comment: `Closing.\n\nClosed at Tier 2 (live): ${conflicted}` },
+    ]) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_tier_conflict");
+      expect(String(res.body.error)).toContain("mutually exclusive");
+      expect(String(res.body.details?.remedy)).toContain('remove "Liveness unverified." from the Tier 2 line');
+      expect(await statusOf(issueId)).toBe("in_review");
+    }
+    expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
   });
 
   it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
@@ -1218,11 +1799,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const remedy = String(res.body.details.remedy);
     // The structured record-only form, verbatim.
     expect(remedy).toContain(
-      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
     );
     // The comment form for a record_only card is the record-only grammar...
     expect(remedy).toContain(
-      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>',
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>',
     );
     // ...and the remedy demands no merge head anywhere.
     expect(remedy).not.toContain("post-merge");
@@ -1651,7 +2232,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a0987654321";
+    const headSha = "0123456701234567012345670123456701234567";
     await seedAuthorizedDeliveryReceipt(companyId, issueId, headSha, branchName, 42);
     certifiedDelivery.headSha = headSha;
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -1726,8 +2307,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha42 = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
-    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e";
+    const headSha42 = "89abcdef0123456789abcdef0123456789abcdef";
+    const headSha43 = "fedcba9876543210fedcba9876543210fedcba98";
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
@@ -2120,6 +2701,99 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         closingRunStartedAt: "2026-11-04T09:00:00.000Z",
       });
     });
+
+    it("recovery-action close: the SUP-23944 dual-source shape is refused with the typed conflict before any write (SUP-25336)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D25336R", { deliveryRequirement: "record_only" });
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          resolutionNote: `Sweep consumed.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`,
+          doneTier: { tier: "tier2", probeEvidence: "Re-ran the sweep probe and it passed." },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_tier_dual_source_conflict");
+      expect(await statusOf(issueId)).toBe("in_review");
+      const [action] = await db
+        .select({ status: issueRecoveryActions.status })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(action?.status).toBe("active");
+      const refused = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refused.map((row) => row.details)).toEqual([
+        expect.objectContaining({ code: "done_tier_dual_source_conflict", door: "recovery_action_resolution" }),
+      ]);
+    });
+
+    it("recovery-action close: a repository-delivery dual-source conflict refuses before any GitHub read (SUP-25336 RA F1)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D25336T");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockMergedBranch();
+      // Drive the real final-delivery preflight: it resolves the GitHub token
+      // and reads the provider, so a door that prefetched before resolving the
+      // done-tier sources would show those calls here.
+      certifiedDelivery.useRealPreflight = true;
+      mockGhFetch.mockClear();
+      mockResolveSecretValue.mockClear();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          resolutionNote: `Delivered.\n\nClosed at Tier 2 (live): ${closeBody.doneTier.probeEvidence}`,
+          doneTier: { tier: "tier2", probeEvidence: "GET /api/health returned 200 after the sibling PR landed." },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_tier_dual_source_conflict");
+      // The conflict refuses before the authenticated final-delivery prefetch:
+      // no GitHub request and no credential resolution on this door.
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(mockResolveSecretValue).not.toHaveBeenCalled();
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("recovery-action close: an exactly equivalent dual source closes with the original note (SUP-25336)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D25336S", { deliveryRequirement: "record_only" });
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          resolutionNote: `Sweep consumed.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      for (const [url] of mockGhFetch.mock.calls) {
+        expect(String(url)).not.toContain("/commits/");
+      }
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows[0]?.details).toMatchObject({ tierForm: "record-only", closingRunId: runId, observed: "2026-11-04T09:15:00Z" });
+    });
   });
 
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {
@@ -2385,6 +3059,38 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       });
     });
 
+    it("PATCH: a record_only close refused for a nonexistent cited SHA leaves no allowed guard disposition (SUP-24298)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24298A");
+      await db
+        .update(issues)
+        .set({ executionPolicy: null, executionState: null, deliveryRequirement: "record_only" })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
+      // The refused write is not an allowed transition. Wait for the resolver's own
+      // fire-and-forget row so a late guard row would have landed before this check.
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
+    });
+
     it("PATCH: a close citing only resolvable SHAs still closes (no regression)", async () => {
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525B");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
@@ -2400,6 +3106,16 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
+      // An allowed close the guard did not skip writes no skipped disposition (SUP-24298).
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
       // Exact probe list, restored: two calls, both for the same ref — the
       // Tier 2 origin predicate resolves the named probe head, and the
       // cited-SHA resolver probes the cited commit. A single call cannot
@@ -2493,6 +3209,627 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       // the live default-branch tip, and the cited-SHA resolver probes nothing.
       expect(commitProbeCalls()).toHaveLength(1);
       expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
+    });
+  });
+
+  describe("durable approvals survive a reopen (SUP-24054)", () => {
+    // Replays SUP-24036. The board approved the only stage: a decision row plus
+    // the completed projection, back to the return assignee in_progress (the
+    // shape the board stage-decision route writes). The board closed the card.
+    // A deferred comment wake reopened it with a null executionState, and the
+    // return assignee took it back in_progress and closed it with a Tier 2 done.
+    const TIER2_DONE = {
+      tier: "tier2",
+      probeEvidence:
+        "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: the changed page reads back live.",
+    } as const;
+    const APPROVAL_STATUS = {
+      finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 404, headSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    };
+
+    function boardOwner(companyId: string): Express.Request["actor"] {
+      return {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+    }
+
+    // The board stage-decision route writes the decision row and its
+    // `issue.board_stage_override` activity row in one transaction, so both carry
+    // the same `created_at`; the activity row names the participant decided for.
+    // Decision rows are written first, then the activity rows in the given order.
+    async function recordBoardDecisions(
+      seeded: { companyId: string; issueId: string },
+      outcome: "approved" | "changes_requested",
+      createdAt: Date,
+      entries: Array<{ stageId: string; decidedForAgentId: string }>,
+    ) {
+      await db.transaction(async (tx) => {
+        for (const entry of entries) {
+          await tx.insert(issueExecutionDecisions).values({
+            companyId: seeded.companyId,
+            issueId: seeded.issueId,
+            stageId: entry.stageId,
+            stageType: "review",
+            actorUserId: "cloud-user-1",
+            outcome,
+            body: `board: ${outcome}`,
+            createdAt,
+          });
+        }
+        for (const entry of entries) {
+          await tx.insert(activityLog).values({
+            companyId: seeded.companyId,
+            actorType: "user",
+            actorId: "cloud-user-1",
+            action: "issue.board_stage_override",
+            entityType: "issue",
+            entityId: seeded.issueId,
+            details: {
+              stageId: entry.stageId,
+              stageType: "review",
+              decision: outcome,
+              displacedParticipant: { type: "agent", agentId: entry.decidedForAgentId, userId: null },
+              commentId: null,
+            },
+            createdAt,
+          });
+        }
+      });
+    }
+
+    async function recordBoardDecision(
+      seeded: { companyId: string; issueId: string; firstStageId: string; reviewerAgentId: string },
+      outcome: "approved" | "changes_requested",
+      createdAt: Date,
+    ) {
+      await recordBoardDecisions(seeded, outcome, createdAt, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+    }
+
+    async function seedBoardApprovedCard(issuePrefix: string) {
+      const seeded = await seedIssueAwaitingReview(issuePrefix);
+      await recordBoardDecision(seeded, "approved", new Date("2026-11-12T19:09:34Z"));
+      await db
+        .update(issues)
+        .set({
+          status: "in_progress",
+          assigneeAgentId: seeded.implementerAgentId,
+          executionState: {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: seeded.implementerAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [seeded.firstStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+            monitor: null,
+            changesRequestedCount: 0,
+            approvalStatus: APPROVAL_STATUS,
+          },
+        })
+        .where(eq(issues.id, seeded.issueId));
+      return seeded;
+    }
+
+    async function issueRow(issueId: string) {
+      const rows = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      return rows[0];
+    }
+
+    it("PATCH: the board still closes a stuck completed card, and the close keeps the completed ladder record", async () => {
+      const { companyId, issueId, identifier, firstStageId } = await seedBoardApprovedCard("S24054A");
+      // The SUP-15305 stuck shape: a blocked card whose workflow already completed.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      currentActor = boardOwner(companyId);
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Board close of the approved card." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("done");
+      expect(row?.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [firstStageId],
+        approvalStatus: APPROVAL_STATUS,
+      });
+    });
+
+    it("PATCH: the return assignee's Tier 2 done after a reopen closes on the durable approval, never in_review", async () => {
+      const { companyId, implementerAgentId, issueId, identifier } = await seedBoardApprovedCard("S24054B");
+      mockMergedBranch();
+
+      currentActor = boardOwner(companyId);
+      const boardClose = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Approved and merged; closing." });
+      expect(boardClose.status, JSON.stringify(boardClose.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+
+      // The deferred comment wake reopens the card with a null projection
+      // (the heartbeat reopen writer), then the assignee checks it out.
+      await db.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, issueId));
+
+      currentActor = agentActor(companyId, implementerAgentId, await seedRun(companyId, implementerAgentId, issueId));
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("done");
+      expect(row?.assigneeAgentId).toBe(implementerAgentId);
+      const recovered = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_ladder_recovered_from_decisions");
+          if (found.length === 0) throw new Error("waiting for audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(recovered).toHaveLength(1);
+    });
+
+    it("PATCH: an approval superseded by a later changes_requested still re-arms the stage (fail closed)", async () => {
+      const seeded = await seedBoardApprovedCard("S24054C");
+      const { companyId, reviewerAgentId, implementerAgentId, issueId, identifier, firstStageId } = seeded;
+      await recordBoardDecision(seeded, "changes_requested", new Date("2026-11-12T19:30:00Z"));
+      await db.update(issues).set({ executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, implementerAgentId, await seedRun(companyId, implementerAgentId, issueId));
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Addressed the requested changes." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.assigneeAgentId).toBe(reviewerAgentId);
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: firstStageId });
+      expect(await auditRows(companyId, issueId, "issue.done_transition_ladder_recovered_from_decisions")).toHaveLength(0);
+    });
+
+    // Release-assurance B1/B2: an approval recorded under a policy that was edited
+    // afterwards, or a self-approval, is not a durable approval. The `done` then
+    // re-arms review exactly as it does without durable approvals.
+    type SeededCard = {
+      companyId: string;
+      reviewerAgentId: string;
+      implementerAgentId: string;
+      secondReviewerAgentId: string;
+      issueId: string;
+      identifier: string;
+      firstStageId: string;
+      secondStageId: string;
+    };
+    type PolicyStage = { id: string; type: "review" | "approval"; participants: Array<string | { userId: string }> };
+
+    async function writePolicy(seeded: SeededCard, stages: PolicyStage[]) {
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            returnAssigneeAgentId: seeded.implementerAgentId,
+            stages: stages.map((stage) => ({
+              id: stage.id,
+              type: stage.type,
+              approvalsNeeded: 1,
+              participants: stage.participants.map((participant) =>
+                typeof participant === "string"
+                  ? { type: "agent", agentId: participant, userId: null }
+                  : { type: "user", agentId: null, userId: participant.userId },
+              ),
+            })),
+          },
+        })
+        .where(eq(issues.id, seeded.issueId));
+    }
+
+    async function recordAgentDecision(
+      seeded: SeededCard,
+      decision: { stageId: string; stageType: "review" | "approval"; actorAgentId: string; outcome: "approved" | "changes_requested"; createdAt: Date },
+    ) {
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        stageId: decision.stageId,
+        stageType: decision.stageType,
+        actorAgentId: decision.actorAgentId,
+        outcome: decision.outcome,
+        body: `${decision.outcome}`,
+        createdAt: decision.createdAt,
+      });
+    }
+
+    /** Reopen with a null projection, back in_progress to `assigneeAgentId` (null: unassigned). */
+    async function reopenWithNullState(seeded: SeededCard, assigneeAgentId: string | null) {
+      await db
+        .update(issues)
+        .set({ status: "in_progress", assigneeAgentId, executionState: null })
+        .where(eq(issues.id, seeded.issueId));
+    }
+
+    /** Reopen with a null projection, back to the return assignee in_progress, then its Tier 2 `done`. */
+    async function reopenAndClose(seeded: SeededCard, mockGitHub: () => void = mockMergedBranch) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      currentActor = agentActor(
+        seeded.companyId,
+        seeded.implementerAgentId,
+        await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
+      );
+      mockGitHub();
+      return request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+    }
+
+    /**
+     * `mockMergedBranch`, plus one write that lands on the first GitHub call. The
+     * done guard makes that call after the transition was computed from the
+     * unlocked read and before the write transaction takes the row lock, so the
+     * write models a concurrent change that commits in that window.
+     */
+    function mockMergedBranchWithConcurrentWrite(write: () => Promise<void>) {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      let written = false;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (!written) {
+          written = true;
+          await write();
+        }
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+    }
+
+    async function seedRecoveryAction(seeded: SeededCard, ownerAgentId: string, runId: string) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${seeded.issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        attemptCount: 1,
+        lastAttemptAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    function resolveRecoveryAsDone(seeded: SeededCard) {
+      return request(app)
+        .post(`/api/issues/${seeded.issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Closing after the approved delivery.",
+          doneTier: TIER2_DONE,
+        });
+    }
+
+    async function expectReviewReArmed(
+      seeded: SeededCard,
+      res: request.Response,
+      expected: { stageId: string; assigneeAgentId: string },
+    ) {
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(seeded.issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.assigneeAgentId).toBe(expected.assigneeAgentId);
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: expected.stageId });
+      expect(
+        await auditRows(seeded.companyId, seeded.issueId, "issue.done_transition_ladder_recovered_from_decisions"),
+      ).toHaveLength(0);
+    }
+
+    const APPROVED_AT = new Date("2026-11-12T19:09:34Z");
+
+    it("PATCH: a current participant's approval under the unchanged policy still closes on the durable approval", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054D");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+
+      const res = await reopenAndClose(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(seeded.issueId)).toBe("done");
+      await vi.waitFor(
+        async () => {
+          const found = await auditRows(seeded.companyId, seeded.issueId, "issue.done_transition_ladder_recovered_from_decisions");
+          if (found.length === 0) throw new Error("waiting for audit row");
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it("PATCH: a participant approval does not count after that participant was replaced on the stage", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054E");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: a board stage approval does not count after the participant it decided for was replaced", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054F");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: an approval does not count after the stage type was flipped", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054G");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "approval", participants: [seeded.reviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: an approval does not count after the policy dropped a stage that holds a decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054H", { stageCount: 2 });
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await recordAgentDecision(seeded, {
+        stageId: seeded.secondStageId, stageType: "review", actorAgentId: seeded.secondReviewerAgentId, outcome: "changes_requested",
+        createdAt: new Date("2026-11-12T19:20:00Z"),
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a self-approval by the return assignee does not count, even when it is a stage participant", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054I");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.implementerAgentId] },
+      ]);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.implementerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a later board approval is checked against its own override row, not an earlier one", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054J");
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.secondReviewerAgentId },
+      ]);
+      await recordBoardDecisions(seeded, "approved", new Date("2026-11-12T19:40:00Z"), [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: board approvals on two stages in one instant are each checked against their own stage's override row", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054K", { stageCount: 2 });
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.secondStageId, decidedForAgentId: seeded.secondReviewerAgentId },
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+
+      const res = await reopenAndClose(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(seeded.issueId)).toBe("done");
+    });
+
+    // Release-assurance B3: a durable-approval close re-reads the decision rows
+    // and the execution state under the issue row lock, so a change that commits
+    // between the unlocked read and the write is never overwritten by the close.
+    async function seedParticipantApprovedCard(issuePrefix: string) {
+      const seeded = await seedIssueAwaitingReview(issuePrefix);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      return seeded;
+    }
+
+    async function expectCloseRefusedAsStale(seeded: SeededCard, res: request.Response, expectedStatus: string) {
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code ?? res.body.code).toBe("durable_approval_close_conflict");
+      expect(await statusOf(seeded.issueId)).toBe(expectedStatus);
+    }
+
+    it("PATCH: a durable-approval close does not overwrite a board re-arm that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054L");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(async () => {
+          await db
+            .update(issues)
+            .set({
+              status: "in_review",
+              assigneeAgentId: seeded.reviewerAgentId,
+              executionState: {
+                status: "pending",
+                currentStageId: seeded.firstStageId,
+                currentStageIndex: 0,
+                currentStageType: "review",
+                currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId, userId: null },
+                returnAssignee: { type: "agent", agentId: seeded.implementerAgentId, userId: null },
+                reviewRequest: null,
+                completedStageIds: [],
+                lastDecisionId: null,
+                lastDecisionOutcome: null,
+                monitor: null,
+                changesRequestedCount: 0,
+              },
+            })
+            .where(eq(issues.id, seeded.issueId));
+        }),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_review");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a reviewer changes_requested that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054M");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          recordAgentDecision(seeded, {
+            stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "changes_requested",
+            createdAt: new Date(),
+          }),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a policy edit that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054N");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] }]),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    // Release-assurance B2: the closer of the `done` is a self-approval
+    // principal too, and a board stage decision recorded for the return
+    // assignee's seat is the return assignee's own approval.
+    async function closeAsBoard(seeded: SeededCard) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+      return request(app).patch(`/api/issues/${seeded.identifier}`).send({ status: "done", comment: "Board close." });
+    }
+
+    it("PATCH: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054O");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+
+      const res = await closeAsBoard(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a board user's done does not count its own approval as a user participant", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054P");
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [{ userId: "cloud-user-1" }] }]);
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        stageId: seeded.firstStageId,
+        stageType: "review",
+        actorUserId: "cloud-user-1",
+        outcome: "approved",
+        body: "approved",
+        createdAt: APPROVED_AT,
+      });
+
+      const res = await closeAsBoard(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(seeded.issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: seeded.firstStageId });
+    });
+
+    it("recovery resolve: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054Q");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      await seedRecoveryAction(
+        seeded,
+        seeded.implementerAgentId,
+        await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
+      );
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("recovery resolve: the owner of an unassigned card's recovery action does not close on its own approval", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054R");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] },
+      ]);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.secondReviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await reopenWithNullState(seeded, null);
+      const runId = await seedRun(seeded.companyId, seeded.secondReviewerAgentId, seeded.issueId);
+      await seedRecoveryAction(seeded, seeded.secondReviewerAgentId, runId);
+      currentActor = agentActor(seeded.companyId, seeded.secondReviewerAgentId, runId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("PATCH: a board stage decision recorded for the return assignee's seat does not count", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054S");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.implementerAgentId] },
+      ]);
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.implementerAgentId },
+      ]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
     });
   });
 });

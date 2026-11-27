@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { resolve } from "node:path";
+import { decodeInventory, LEGACY_MCP_ALIAS_COUNT } from "../scripts/lib/capability-inventory.mjs";
 import { validateRows } from "../scripts/generate-capability-contract.mjs";
 
 const phaseDirectory = resolve(import.meta.dirname, "../generated/capability");
@@ -17,13 +18,11 @@ test("generated Capability inventory has full source coverage", async () => {
     readRows("eval-traceability.yaml"),
   ]);
 
-  // FORK DIVERGENCE (fork-only MCP work-session tools, slice 2d): capabilities follows upstream
-  // (154 -> 156 in this slice, the fork adds none), but the tool map is upstream's 42 plus the
-  // fork's three work-session tools (paperclipOpenWorkSession / paperclipHeartbeatWorkSession /
-  // paperclipCloseWorkSession), so 45. Both numbers are the generator's own output, not a guess:
-  // `node scripts/generate-capability-contract.mjs` reproduces 156 / 45 / 106 / 16 exactly.
-  assert.equal(capabilities.length, 156);
-  assert.equal(tools.length, 45);
+  // Skill heading counts follow the generated source contract. MCP aliases use
+  // the shared registry count so each tool is classified in one place.
+  assert.equal(capabilities.length, 162);
+  assert.equal(capabilities.filter(row => row.sourceAnchor.startsWith("skills/paperclip/references/issue-documents.md#")).length, 3);
+  assert.equal(tools.length, LEGACY_MCP_ALIAS_COUNT);
   assert.equal(evals.length, 106);
   assert.equal(new Set(evals.map((row) => row.group)).size, 16);
   for (const row of [...capabilities, ...tools, ...evals]) {
@@ -43,4 +42,27 @@ test("contract validation rejects missing, duplicate, and unclassified entries",
   assert.throws(() => validateRows([{ ...row, sourceAnchor: "" }], "fixture"), /source anchor/);
   assert.throws(() => validateRows([row, { ...row, id: "example:2" }], "fixture"), /duplicate source anchor/);
   assert.throws(() => validateRows([{ ...row, primaryDisposition: "unclassified" }], "fixture"), /valid primary disposition/);
+});
+
+
+test("conversational answer guidance has the same agent-operation classification in both inventories", async () => {
+  const generated = (await readRows("capabilities.yaml")).filter(row => row.heading === "Conversational confirmation answers");
+  const spec = decodeInventory(await readFile(resolve(import.meta.dirname, "../spec/capability/capabilities.yaml"), "utf8")).rows
+    .filter(row => row.title === "Conversational confirmation answers");
+  assert.equal(generated.length, 2);
+  assert.equal(spec.length, 2);
+  for (const row of [...generated, ...spec]) assert.equal(row.primaryDisposition, "always_agent_tool");
+  for (const row of generated) assert.equal(row.semanticOperation, "call_api");
+});
+
+test("both capability inventories cover every declared skill source", async () => {
+  const contract = JSON.parse(await readFile(resolve(import.meta.dirname, "../spec/capability/source-contract.json"), "utf8"));
+  const generated = await readRows("capabilities.yaml");
+  const normative = decodeInventory(await readFile(resolve(import.meta.dirname, "../spec/capability/capabilities.yaml"), "utf8"));
+  assert.deepEqual(normative.generatedFrom, contract.skillSources);
+  for (const source of contract.skillSources) {
+    assert.ok(generated.some(row => row.sourceAnchor.startsWith(`${source}#`)), `Missing generated source ${source}`);
+    assert.ok(normative.rows.some(row => row.sourceAnchor.startsWith(`${source}:`)), `Missing normative source ${source}`);
+  }
+  assert.equal(normative.rows.filter(row => row.sourceAnchor.startsWith("skills/paperclip/references/issue-documents.md:")).length, 3);
 });

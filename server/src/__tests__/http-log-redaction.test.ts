@@ -12,6 +12,22 @@ import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it("redacts inbound MCP OAuth codes, PKCE verifiers, refresh tokens and redirect credentials", async () => {
+    const chunks: string[] = [];
+    const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.post("/mcp/paperclip", (_req, res) => res.status(400).json({ error: "invalid_request" }));
+    app.post("/mcp/oauth/token", (_req, res) => res.status(400).json({ error: "invalid_grant" }));
+    app.get("/mcp/oauth/authorize", (_req, res) => res.redirect("https://client.example/callback?code=redirect-canary"));
+    await request(app).post("/mcp/oauth/token").send({ code: "code-canary", code_verifier: "pkce-canary", refresh_token: "refresh-canary" });
+    await request(app).get("/mcp/oauth/authorize?state=state-canary");
+    await request(app).post("/mcp/paperclip").send({ params: { delivery: { url: "https://receiver.example/callback-path-canary", secret: "whsec_callback-secret-canary" }, _meta: { "ai.paperclip/cloudAuthority": { token: "cloud-authority-canary" } } } });
+    expect(chunks.join("")).not.toMatch(/callback-path-canary|callback-secret-canary|cloud-authority-canary/);
+    expect(chunks.join("")).not.toMatch(/code-canary|pkce-canary|refresh-canary|redirect-canary|state-canary/);
+  });
+
   it.each([
     { method: "POST", path: "/api/routine-triggers/public/private-url-canary/fire" },
     { method: "PUT", path: "/api/routine-triggers/public/private-url-canary/fire" },
@@ -428,6 +444,58 @@ describe("HTTP logger redaction", () => {
     expect(log.res.statusCode).toBe(status);
   });
 
+  it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {
+    const headers = {
+      "X-Paperclip-Cloud-Tenant-Token": "cloud-tenant-token-canary",
+      "X-Paperclip-Cloud-Session-Id": "cloud-session-id-canary",
+      "X-Paperclip-Cloud-Runtime-Identity": "cloud-runtime-identity-canary",
+      "X-Paperclip-Cloud-Control": "cloud-control-canary",
+    };
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.get("/api/companies", (_req, res, next) => {
+      if (status === 403) {
+        next(new HttpError(403, "Cloud tenant authentication required"));
+        return;
+      }
+      if (status === 500) {
+        next(new Error("Synthetic cloud request failure"));
+        return;
+      }
+      res.status(status).json({ status });
+    });
+    app.use(errorHandler);
+
+    const response = await request(app).get("/api/companies").set(headers).expect(status);
+    if (status === 403) {
+      expect(response.body).toEqual({ error: "Cloud tenant authentication required" });
+    } else if (status === 500) {
+      expect(response.body).toEqual({ error: "Internal server error" });
+    }
+
+    const output = chunks.join("");
+    const log = JSON.parse(output.trim());
+    for (const [header, secret] of Object.entries(headers)) {
+      expect(output).not.toContain(secret);
+      expect(log.req.headers[header.toLowerCase()]).toBe("[Redacted]");
+    }
+    expect(log.req.method).toBe("GET");
+    expect(log.req.url).toBe("/api/companies");
+    expect(log.res.statusCode).toBe(status);
+    expect(log.level).toBe(status === 500 ? 50 : status === 403 ? 40 : 30);
+    if (status === 500) {
+      expect(log.errorContext.message).toBe("Synthetic cloud request failure");
+      expect(log.err.message).toBe("Synthetic cloud request failure");
+    }
+  });
+
   it("drops OAuth callback query data from the message and structured request", async () => {
     const chunks: string[] = [];
     const stream = new Writable({
@@ -704,4 +772,91 @@ describe("HTTP logger redaction", () => {
       });
     },
   );
+});
+
+// SUP-25336 (RA F2): a refused close carries caller free text — the close
+// comment, the structured doneTier probeEvidence, a recovery resolution note —
+// that is not a sensitive key. A pasted credential in any of those fields must
+// never reach the 4xx log line, while the surrounding prose stays diagnosable.
+describe("HTTP logger redaction of credential-shaped free text (SUP-25336)", () => {
+  const BEARER = "Bearer abcdef1234567890ABCDEFtoken";
+  // paperclip:allow-security secret-literal: synthetic fixture, not a credential; the test asserts the logger strips it
+  const GITHUB = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+  const OPENAI = "sk-live-9f8e7d6c5b4a39281706aBcDeF";
+  const planted = (label: string) =>
+    `${label}: ran curl -H 'Authorization: ${BEARER}' with ${GITHUB} and ${OPENAI}`;
+
+  function captureApp(handler: express.RequestHandler) {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.patch("/api/issues/:id", handler);
+    app.post("/api/issues/:id/comments", handler);
+    app.post("/api/issues/:id/recovery-actions/resolve", handler);
+    app.use(errorHandler);
+    return { app, chunks };
+  }
+
+  function expectNoCredential(log: string) {
+    expect(log).not.toContain("abcdef1234567890ABCDEFtoken");
+    expect(log).not.toContain(GITHUB);
+    expect(log).not.toContain(OPENAI);
+  }
+
+  it.each([
+    ["PATCH", "/api/issues/SUP-1", { status: "done", comment: planted("comment"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+    ["POST", "/api/issues/SUP-1/comments", { body: planted("body"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+    ["POST", "/api/issues/SUP-1/recovery-actions/resolve", { outcome: "restored", sourceIssueStatus: "done", resolutionNote: planted("resolutionNote"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } }],
+  ])("masks credentials in the request body and refusal reason of a %s %s 422", async (method, path, body) => {
+    const { app, chunks } = captureApp((req, _res, next) => {
+      // A refusal reason that quotes the offending caller line, as the
+      // done-tier evaluator's "Offending line" remedy does.
+      next(new HttpError(422, `Offending line: "${String(req.body.comment ?? req.body.body ?? req.body.resolutionNote)}"`, {
+        code: "done_transition_missing_tier_declaration",
+      }));
+    });
+    const agent = request(app);
+    const res = await (method === "PATCH" ? agent.patch(path) : agent.post(path)).send(body);
+    expect(res.status).toBe(422);
+    const log = chunks.join("");
+    expect(log).toContain("probeEvidence: ran curl");
+    expectNoCredential(log);
+  });
+
+  it("masks credentials in a 4xx body logged without an error context", async () => {
+    const { app, chunks } = captureApp((_req, res) => {
+      res.status(422).json({ error: "refused", code: "done_tier_dual_source_conflict" });
+    });
+    await request(app)
+      .patch("/api/issues/SUP-1")
+      .send({ status: "done", comment: planted("comment"), doneTier: { tier: "tier2", probeEvidence: planted("probeEvidence") } });
+    const log = chunks.join("");
+    expect(log).toContain("comment: ran curl");
+    expectNoCredential(log);
+  });
+
+  it("leaves a non-conflict 4xx response body on a secret-sensitive route unchanged", async () => {
+    const { app, chunks } = captureApp(() => undefined);
+    app.post("/api/chat-endpoints/:id/setup", (_req, _res, next) => {
+      next(new HttpError(422, `Provider rejected ${BEARER} for workspace`, { code: "setup_rejected", hint: `retry with ${OPENAI}` }));
+    });
+    app.use(errorHandler);
+    const res = await request(app)
+      .post("/api/chat-endpoints/ep-1/setup")
+      .send({ label: "workspace" });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({
+      error: `Provider rejected ${BEARER} for workspace`,
+      code: "setup_rejected",
+      details: { code: "setup_rejected", hint: `retry with ${OPENAI}` },
+    });
+    expectNoCredential(chunks.join(""));
+  });
 });

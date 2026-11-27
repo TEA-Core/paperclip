@@ -58,6 +58,7 @@ export function isValidOpenCodeModelId(value: unknown): value is string {
 export const models: Array<{ id: string; label: string }> = [
   { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: DEFAULT_OPENCODE_LOCAL_MODEL },
   { id: "openai/gpt-6-astra", label: "openai/gpt-6-astra" },
+  { id: "openai/gpt-6.1-sol", label: "openai/gpt-6.1-sol" },
   { id: "openai/gpt-6-sol", label: "openai/gpt-6-sol" },
   { id: "openai/gpt-6-luna", label: "openai/gpt-6-luna" },
   { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
@@ -66,6 +67,7 @@ export const models: Array<{ id: string; label: string }> = [
   { id: "anthropic/claude-opus-5-5", label: "anthropic/claude-opus-5-5" },
   { id: "anthropic/claude-opus-5", label: "anthropic/claude-opus-5" },
   { id: "anthropic/claude-fable-5-1", label: "anthropic/claude-fable-5-1" },
+  { id: "anthropic/claude-sonnet-5-5", label: "anthropic/claude-sonnet-5-5" },
   { id: "anthropic/claude-sonnet-5", label: "anthropic/claude-sonnet-5" },
   { id: "google/gemini-3.8-flash", label: "google/gemini-3.8-flash" },
   { id: "xai/grok-4.7", label: "xai/grok-4.7" },
@@ -99,7 +101,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with \`permission=allow\` for all tools and connections; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
-- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty or unparseable output) is treated as V1
+- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty, unparseable or prerelease output) is refused rather than run as V1
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"

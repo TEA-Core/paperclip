@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { evaluateIssueContinuationPath } from "../routes/issues.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -417,7 +418,7 @@ async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
 
-describe.sequential("issue comment reopen routes", () => {
+describe("issue comment reopen routes", () => {
   // `installActor` imports the route module lazily, so without this warm-up the
   // first test pays the one-time transform cost of `routes/issues.js` and its
   // import graph inside vitest's 5s testTimeout. On the loaded serial shard that
@@ -428,7 +429,6 @@ describe.sequential("issue comment reopen routes", () => {
     await import("../routes/issues.js");
     await import("../middleware/index.js");
   });
-
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
@@ -1863,7 +1863,7 @@ describe.sequential("issue comment reopen routes", () => {
         authorType: "user",
         authorizationReason: "allow_board_actor",
         clientRequestId: undefined,
-        mirrorToSlack: true,
+        mirrorToSlack: true, boardApiKeyId: null,
         presentation: {
           kind: "system_notice",
           tone: "warning",
@@ -2839,15 +2839,11 @@ describe.sequential("issue comment reopen routes", () => {
     );
 
     mockHeartbeatService.wakeup.mockClear();
-    mockIssueService.findMentionedAgents.mockClear();
     res = await request(await installActor(createApp(), agentActor(agentB)))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "B replies on B's own issue" });
     expect(res.status).toBe(201);
-    await vi.waitFor(() =>
-      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledOnce(),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     mockIssueService.getById.mockResolvedValue({
@@ -3712,13 +3708,33 @@ describe.sequential("issue comment reopen routes", () => {
         _tx: tx,
       }),
     );
+    // The dependent re-blocked (generation 2) after a completed canonical wake
+    // that was requested in its earlier generation; that wake must not
+    // suppress the comment-path cascade for the current generation.
+    const generationTwoAt = new Date("2026-08-01T15:00:00.000Z");
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
       {
         id: "dependent-1",
         assigneeAgentId: dependentAgentId,
         blockerIssueIds: [issue.id],
+        blockedTransitionAt: generationTwoAt,
       },
     ]);
+    const earlierGenerationWake = {
+      id: "wake-earlier-generation",
+      runId: null,
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: "dependent-1",
+        blockerIssueIds: [issue.id],
+      }),
+      requestedAt: new Date("2026-08-01T14:00:00.000Z"),
+      updatedAt: new Date("2026-08-01T15:30:00.000Z"),
+    };
+    mockDbSelectFrom.mockImplementation(((table: object) =>
+      (table as Record<symbol, unknown>)[Symbol.for("drizzle:Name")] === "agent_wakeup_requests"
+        ? { where: () => Promise.resolve([earlierGenerationWake]), innerJoin: mockDbSelectJoined }
+        : { where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }) as never);
 
     const res = await request(
       await installActor(createApp(), {
@@ -4891,7 +4907,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect(res.status).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
-        expect.objectContaining({ status: "in_progress" }),
+        expect.objectContaining({ status: "in_progress" }), expect.anything(),
       );
     });
 

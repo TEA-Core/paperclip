@@ -1,20 +1,34 @@
+import { realpath } from "node:fs/promises";
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
+  companyMemberships,
   documentRevisions,
   documents,
+  environmentLeases,
+  executionWorkspaceRuntimeLeases,
   executionWorkspaces,
+  externalObjectMentions,
+  heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
+  issueDeliveryReceipts,
   issueDocuments,
   issueExecutionDecisions,
   issueLabels,
   issues,
   issueWorkProducts,
   labels,
+  nativeRunResults,
   projectWorkspaces,
+  toolRuntimeSlots,
+  workspaceOperations,
+  workspaceRuntimeServices,
   type Db,
 } from "@paperclipai/db";
+import { conflict } from "../errors.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { readBuildCommit } from "../build-commit.js";
 import {
@@ -22,16 +36,32 @@ import {
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
+  probeZeroDeltaWorktree,
+  localRefOutsideRemoteBaseRefusal,
   recheckRecordedWorktree,
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { detectEvidence } from "./card-evidence.js";
+import { scanCardEvidence } from "./card-evidence-census.js";
+import {
+  decideZeroDeltaFromForge,
+  githubForgeReader,
+  recheckZeroDeltaForgeAtWrite,
+  ZERO_DELTA_MEASUREMENT_BUDGET,
+  ZERO_DELTA_WRITE_BUDGET,
+} from "./zero-delta-forge-rule.js";
 import {
   resolveGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
+import {
+  BOARD_LANDING_PROOF_SOURCE,
+  loadAttachedBoardLandingProof,
+  verifyBoardLandingProof,
+} from "./board-landing-proof.js";
 import {
   fetchOpenPullRequests,
   GITHUB_GRAPHQL_URL,
@@ -71,11 +101,14 @@ export class GitHubBranchNotFoundError extends Error {
   }
 }
 
+const DECISION_ONLY_NO_REPOSITORY_DELIVERABLE = "decision-only-no-repository-deliverable";
+
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
   "control-plane-operation-no-deliverable",
+  DECISION_ONLY_NO_REPOSITORY_DELIVERABLE,
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -109,6 +142,9 @@ const ADR072_CLOSE_LADDER: {
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+// SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
+export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
+const TIER_0_PREFIX = "Closed at Tier 0 (decision-only):";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -124,12 +160,14 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"' +
+  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+const TIER0_FORM = '"Closed at Tier 0 (decision-only): <reason>"';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -151,9 +189,13 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+// Structured probeEvidence carries the grammar WITHOUT the Tier 2 prefix: the guard
+// composes the prefix itself (SUP-24079).
+export const DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE =
+  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON} (${DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE}); ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
 // so the repository_delivery remedies stay byte-identical.
 export const TIER1_NO_REPOSITORY_FORM =
@@ -162,8 +204,8 @@ export const DONE_TIER_TIER1_NO_REPOSITORY_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } }';
 const NO_REPOSITORY_LANDING_CONDITIONS =
   "accepted only on a record_only issue closed through PATCH /api/issues/{id}, whose own isolated git worktree is clean " +
-  "with zero commits ahead of the project's default branch, with no linked pull request, and with an entry-ruling " +
-  "document on this issue written by someone other than the closer";
+  "with zero commits ahead of the project's default branch (or that has no project and has never had an execution workspace), " +
+  "with no linked pull request, and with an entry-ruling document on this issue written by someone other than the closer";
 
 /** Appended after TIER1_FORM on record_only issues; empty otherwise. */
 export function noRepositoryTier1FormSuffix(issue: { deliveryRequirement?: IssueDeliveryRequirement | null }): string {
@@ -179,37 +221,267 @@ export function noRepositoryStructuredFormSuffix(issue: { deliveryRequirement?: 
     : "";
 }
 
-export function renderDoneTierDeclaration(
-  body: string | null | undefined,
-  declaration: DoneTierDeclaration,
-): string {
-  const current = body ?? "";
-  const lines = current.split(/\r?\n/);
-  const isCanonicalTierDeclaration = (line: string): boolean => {
-    const trimmed = line.trim();
-    return trimmed.startsWith(TIER_2_PREFIX) ||
-      trimmed.startsWith(TIER_1_PREFIX) ||
-      trimmed.startsWith("Closed at Tier 0 (decision-only):");
-  };
-
-  const rendered = declaration.tier === "tier2"
+/** The one canonical comment line a structured `doneTier` declaration renders to. */
+export function renderDoneTierDeclarationLine(declaration: DoneTierDeclaration): string {
+  return declaration.tier === "tier2"
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
       : declaration.landing.mode === "landingDelegated"
         ? `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`
         : "no-repository-landing"} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
-  if (lines.some((line) => line.trim() === rendered)) {
-    return current;
+}
+
+// SUP-25336: refusal code for a close that carries both a comment declaration
+// and a structured `doneTier`, when the two are not exactly the same canonical
+// line, either one is malformed, or the comment holds more than one declaration.
+export const DONE_TIER_DUAL_SOURCE_CONFLICT_CODE = "done_tier_dual_source_conflict";
+
+const DONE_TIER_CANONICAL_PREFIXES = [TIER_2_PREFIX, TIER_1_PREFIX, TIER_0_PREFIX] as const;
+const DONE_TIER_CONFLICT_EXCERPT_LIMIT = 160;
+const TIER1_RENDERED_REST_RE =
+  /^(?:landed-at-tip ([0-9a-f]{7,40})|landing-delegated PR #([1-9][0-9]*) via (\S+)|(no-repository-landing)) — (.*)\. Liveness unverified\.$/i;
+
+type DoneTierSourceTier = "tier0" | "tier1" | "tier2";
+
+export type DoneTierDualSourceConflictReason =
+  | "comment_declaration_ambiguous"
+  | "comment_declaration_malformed"
+  | "structured_declaration_malformed"
+  | "sources_not_equivalent";
+
+export interface DoneTierDualSourceConflict {
+  code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+  message: string;
+  conflicts: DoneTierDualSourceConflictReason[];
+  sources: {
+    comment: {
+      status: "valid" | "malformed" | "ambiguous";
+      declarationCount: number;
+      declarations: Array<{ tier: DoneTierSourceTier; excerpt: string }>;
+    };
+    structured: {
+      status: "valid" | "malformed";
+      tier: "tier1" | "tier2";
+      excerpt: string;
+    };
+  };
+  differingFields: string[];
+  remedy: string;
+}
+
+export type DoneTierSourceResolution =
+  | { ok: true; source: "none" | "comment" | "structured" | "equivalent"; commentBody: string | null }
+  | { ok: false; conflict: DoneTierDualSourceConflict };
+
+function canonicalDeclarationTier(trimmedLine: string): DoneTierSourceTier | null {
+  if (trimmedLine.startsWith(TIER_2_PREFIX)) return "tier2";
+  if (trimmedLine.startsWith(TIER_1_PREFIX)) return "tier1";
+  if (trimmedLine.startsWith(TIER_0_PREFIX)) return "tier0";
+  return null;
+}
+
+const DONE_TIER_COMMAND_REDACTED = "`<command redacted>`";
+
+function redactedDoneTierField(name: string, value: string): string {
+  return `<${name} redacted, ${value.length} chars>`;
+}
+
+// A conflict response never echoes caller free text: a parsed declaration is
+// rebuilt from its structural, enumerated and validated fields only, and every
+// free-text field (and anything unparsed) becomes a length marker.
+function doneTierConflictExcerpt(tier: DoneTierSourceTier, trimmedLine: string): string {
+  const prefix = tier === "tier2" ? TIER_2_PREFIX : tier === "tier1" ? TIER_1_PREFIX : TIER_0_PREFIX;
+  const fields = tier === "tier0" ? null : declarationLineFields(tier, trimmedLine);
+  if (!fields) {
+    const length = trimmedLine.slice(prefix.length).trim().length;
+    return `${prefix} <unparsed evidence redacted, ${length} chars>`;
+  }
+  const rest =
+    fields.form === "record-only"
+      ? `record-only probe ${DONE_TIER_COMMAND_REDACTED} target ${redactedDoneTierField("target", fields.target)} ` +
+        `observed ${fields.observedStart}${fields.observedEnd ? `-${fields.observedEnd}` : ""} ` +
+        `result: ${fields.result} ${redactedDoneTierField("predicate", fields.predicate)}`
+      : fields.form === "merge-head"
+        ? `probe ${DONE_TIER_COMMAND_REDACTED} head ${fields.head} post-merge: ${redactedDoneTierField("postMerge", fields.postMerge)}`
+        : `${fields["landing.mode"] === "landedAtTip"
+          ? `landed-at-tip ${fields["landing.mergeCommit"]}`
+          : fields["landing.mode"] === "landingDelegated"
+            ? `landing-delegated PR #${fields["landing.prNumber"]} via ${redactedDoneTierField("carrier", fields["landing.carrier"])}`
+            : "no-repository-landing"} — ${redactedDoneTierField("reason", fields.reason)}. ${TIER_1_SUFFIX}`;
+  const excerpt = `${prefix} ${rest}`;
+  return excerpt.length > DONE_TIER_CONFLICT_EXCERPT_LIMIT
+    ? `${excerpt.slice(0, DONE_TIER_CONFLICT_EXCERPT_LIMIT - 1)}…`
+    : excerpt;
+}
+
+function containsCanonicalPrefix(text: string): boolean {
+  return DONE_TIER_CANONICAL_PREFIXES.some((prefix) => text.includes(prefix));
+}
+
+// Syntactic only: the evaluator still owns every contextual proof
+// (classification, closing run, calendar, repository).
+function tier2EvidenceFields(evidence: string): Record<string, string> | null {
+  const trimmed = evidence.trim();
+  const recordOnly = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(trimmed);
+  if (recordOnly) {
+    return {
+      form: "record-only",
+      command: recordOnly[1],
+      target: recordOnly[2],
+      observedStart: recordOnly[3],
+      observedEnd: recordOnly[4] ?? "",
+      result: recordOnly[5].toLowerCase(),
+      predicate: recordOnly[6],
+    };
+  }
+  const mergeHead = TIER2_PROBE_SHAPE_RE.exec(trimmed);
+  if (mergeHead) {
+    return {
+      form: "merge-head",
+      command: mergeHead[1],
+      head: mergeHead[2].toLowerCase(),
+      postMerge: mergeHead[3],
+    };
+  }
+  return null;
+}
+
+function declarationLineFields(tier: DoneTierSourceTier, trimmedLine: string): Record<string, string> | null {
+  if (tier === "tier2") {
+    return tier2EvidenceFields(trimmedLine.slice(TIER_2_PREFIX.length));
+  }
+  if (tier === "tier1") {
+    const rest = TIER1_RENDERED_REST_RE.exec(trimmedLine.slice(TIER_1_PREFIX.length).trim());
+    if (!rest) return null;
+    const landing = rest[1]
+      ? { mode: "landedAtTip", mergeCommit: rest[1].toLowerCase() }
+      : rest[2]
+        ? { mode: "landingDelegated", prNumber: rest[2], carrier: rest[3] }
+        : { mode: "noRepositoryLanding" };
+    return { ...Object.fromEntries(Object.entries(landing).map(([k, v]) => [`landing.${k}`, v])), reason: rest[5] };
+  }
+  return null;
+}
+
+function differingDeclarationFields(
+  commentTier: DoneTierSourceTier,
+  commentLine: string,
+  structuredTier: "tier1" | "tier2",
+  renderedLine: string,
+): string[] {
+  if (commentTier !== structuredTier) return ["tier"];
+  const commentFields = declarationLineFields(commentTier, commentLine);
+  const structuredFields = declarationLineFields(structuredTier, renderedLine);
+  if (!commentFields || !structuredFields) return ["declaration"];
+  const keys = new Set([...Object.keys(commentFields), ...Object.keys(structuredFields)]);
+  const differing = [...keys].filter((key) => commentFields[key] !== structuredFields[key]);
+  return differing.length > 0 ? differing : ["declaration"];
+}
+
+/**
+ * SUP-25336: resolve the done-tier declaration sources of one close request
+ * BEFORE anything is rendered or written. The comment and the structured
+ * `doneTier` are parsed independently:
+ * - no structured declaration: the comment is used as-is (comment-only parsing
+ *   stays the evaluator's job, unchanged);
+ * - structured only (the comment holds no line-start canonical declaration):
+ *   the canonical line is appended to the caller's comment;
+ * - both: accepted only when the comment holds exactly one line-start
+ *   canonical declaration, that line is exactly the canonical line rendered
+ *   from the structured object, and the structured object is well formed. The
+ *   original comment is then kept unchanged, so one declaration persists.
+ * Every other dual-source request is a typed conflict. A caller declaration is
+ * never removed to obtain acceptance, and a canonical prefix inside the
+ * structured evidence is never stripped.
+ */
+export function resolveDoneTierDeclarationSources(
+  body: string | null | undefined,
+  declaration: DoneTierDeclaration | null | undefined,
+): DoneTierSourceResolution {
+  const commentBody = body ?? null;
+  if (!declaration) {
+    return { ok: true, source: commentBody && commentBody.trim().length > 0 ? "comment" : "none", commentBody };
+  }
+  const renderedLine = renderDoneTierDeclarationLine(declaration);
+  const commentDeclarations = (commentBody ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .flatMap((line) => {
+      const tier = canonicalDeclarationTier(line);
+      return tier ? [{ tier, line }] : [];
+    });
+  if (commentDeclarations.length === 0) {
+    const current = (commentBody ?? "").trim();
+    return {
+      ok: true,
+      source: "structured",
+      commentBody: current.length > 0 ? `${current}\n\n${renderedLine}` : renderedLine,
+    };
   }
 
-  const withoutCanonicalTierDeclaration = lines
-    .filter((line) => !isCanonicalTierDeclaration(line))
-    .join("\n")
-    .trim();
-  return withoutCanonicalTierDeclaration.length > 0
-    ? `${withoutCanonicalTierDeclaration}\n\n${rendered}`
-    : rendered;
+  const structuredText = declaration.tier === "tier2" ? declaration.probeEvidence : declaration.reason;
+  const structuredMalformed =
+    containsCanonicalPrefix(structuredText) ||
+    (declaration.tier === "tier2" && tier2EvidenceFields(declaration.probeEvidence) === null);
+  const commentMalformed = commentDeclarations.some(
+    ({ tier, line }) => tier !== "tier0" && declarationLineFields(tier, line) === null,
+  );
+  const ambiguous = commentDeclarations.length > 1;
+  // Exact equality with the rendered line also rules out a Tier 0 comment
+  // declaration: structured input never renders Tier 0.
+  const equivalent = !ambiguous && commentDeclarations[0].line === renderedLine;
+  if (equivalent && !structuredMalformed && !commentMalformed) {
+    return { ok: true, source: "equivalent", commentBody };
+  }
+
+  const conflicts: DoneTierDualSourceConflictReason[] = [];
+  if (ambiguous) conflicts.push("comment_declaration_ambiguous");
+  if (commentMalformed) conflicts.push("comment_declaration_malformed");
+  if (structuredMalformed) conflicts.push("structured_declaration_malformed");
+  if (!equivalent) conflicts.push("sources_not_equivalent");
+  const differingFields = ambiguous
+    ? ["declarationCount"]
+    : equivalent
+      ? []
+      : differingDeclarationFields(
+        commentDeclarations[0].tier,
+        commentDeclarations[0].line,
+        declaration.tier,
+        renderedLine,
+      );
+  return {
+    ok: false,
+    conflict: {
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      message:
+        "This close carries a done-tier declaration in the comment and the structured doneTier field, " +
+        `and the two sources do not resolve to one canonical declaration (${conflicts.join(", ")}). ` +
+        "The guard does not choose between two attestations, and nothing was written.",
+      conflicts,
+      sources: {
+        comment: {
+          status: ambiguous ? "ambiguous" : commentMalformed ? "malformed" : "valid",
+          declarationCount: commentDeclarations.length,
+          declarations: commentDeclarations.slice(0, 3).map(({ tier, line }) => ({
+            tier,
+            excerpt: doneTierConflictExcerpt(tier, line),
+          })),
+        },
+        structured: {
+          status: structuredMalformed ? "malformed" : "valid",
+          tier: declaration.tier,
+          excerpt: doneTierConflictExcerpt(declaration.tier, renderedLine),
+        },
+      },
+      differingFields,
+      remedy:
+        "Send exactly one done-tier source: either the canonical declaration line in the comment with no doneTier " +
+        "field, or the structured doneTier field with no canonical declaration line in the comment. A dual-source " +
+        "close is accepted only when the comment holds exactly one declaration line and it equals the line the " +
+        "structured field renders to. probeEvidence excludes the \"Closed at Tier 2 (live): \" prefix.",
+    },
+  };
 }
 
 /**
@@ -220,8 +492,28 @@ export function renderDoneTierDeclaration(
  */
 export type DoneTransitionMechanism = "A" | "C" | "D" | "delivery";
 
+type LandingHeadProof =
+  | { head: string; source: "remote" | "worktree" }
+  // SUP-25193: a board-attached merged-PR proof. `head` is the PR merge commit;
+  // no execution-workspace branch is involved, so it is re-verified at the close
+  // boundary against GitHub instead of re-measuring a branch head.
+  | {
+    head: string;
+    source: typeof BOARD_LANDING_PROOF_SOURCE;
+    proofActivityId: string;
+    pullRequestNumber: number;
+    repoUrl: string;
+    baseRef: string;
+  };
+
 export interface DoneTransitionGuardResult {
   allowed: boolean;
+  /** Positive repository evidence, never a waiver or an unmeasured fail-open. */
+  landingVerified?: boolean;
+  /** Repository binding actually used by the positive landing probe. */
+  landingContext?: IssueRepoContext;
+  /** Immutable head used by the positive proof, rechecked at the close write. */
+  landingProof?: LandingHeadProof;
   reason: string;
   aheadBy: number | null;
   branch: string | null;
@@ -268,6 +560,150 @@ export interface DoneTransitionGuardResult {
 }
 
 /**
+ * Durable audit-row debt: the system-owned marker survives loss of its actor's
+ * reclassification event. Only legacy events without a disposition use the close cutoff.
+ */
+export function unpaidLandingDebt() {
+  return and(
+    inArray(activityLog.action, ["issue.delivery_requirement_reclassified", "issue.repository_landing_debt"]),
+    sql`${activityLog.details}->>'landingCheckOwed' = 'true'`,
+    sql`${activityLog.details}->>'landingDebtDisposition' IS DISTINCT FROM 'discharged'`,
+    sql`(${activityLog.details}->>'landingDebtDisposition' IS NOT NULL OR NOT EXISTS (
+      SELECT 1 FROM activity_log AS done_close
+      WHERE done_close.company_id = ${activityLog.companyId}
+        AND done_close.entity_type = 'issue'
+        AND done_close.entity_id = ${activityLog.entityId}
+        AND done_close.action = 'issue.updated'
+        AND done_close.details->>'status' = 'done'
+        AND done_close.details->'_previous'->>'status' <> 'done'
+        AND done_close.created_at > ${activityLog.createdAt}
+    ))`,
+  );
+}
+
+type LandingDebtCloseRow = Pick<typeof issues.$inferSelect,
+  "executionWorkspaceId" | "projectWorkspaceId" | "projectId" | "statusVersion"> & { deliveryRequirement: string };
+
+/** Bound close-boundary I/O. A timeout rejects, and the caller treats that as unverified. */
+function withLandingDeadline<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("landing proof re-verification timed out")), GITHUB_BASE_COMPARE_TIMEOUT_MS);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/** Prepare outside the close transaction; finalize only while holding the issue row lock. */
+export async function prepareLandingDebtClose(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuard>[1],
+  createDoor = false,
+) {
+  const debtWhere = and(
+    eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"),
+    eq(activityLog.entityId, issue.id), unpaidLandingDebt(),
+  );
+  const debt = createDoor ? [] : await db.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
+  return {
+    owed: debt.length > 0,
+    async finalize(
+      tx: Db,
+      locked: LandingDebtCloseRow,
+      result: DoneTransitionGuardResult,
+      closeStatusVersion = locked.statusVersion,
+    ) {
+      const outstanding = await tx.select({ id: activityLog.id }).from(activityLog).where(debtWhere);
+      if (locked.deliveryRequirement !== issue.deliveryRequirement || (outstanding.length > 0 && (
+        !result.landingVerified ||
+        outstanding.some((row) => !debt.some((checked) => checked.id === row.id)) ||
+        locked.executionWorkspaceId !== issue.executionWorkspaceId ||
+        locked.projectWorkspaceId !== issue.projectWorkspaceId ||
+        locked.projectId !== issue.projectId
+      ))) throw conflict("Landing obligation changed or remains unverified; retry the close.", {
+        code: "done_transition_missing_delivery", issueId: issue.id,
+      });
+      if (outstanding.length === 0) return;
+      const proof = result.landingProof;
+      if (proof?.source === BOARD_LANDING_PROOF_SOURCE) {
+        // SUP-25193: re-verify the board-attached merged-PR proof at this close
+        // boundary, on the locked repo binding. The attach call alone never
+        // discharges debt; only this accepted close does.
+        if (closeStatusVersion === undefined) {
+          throw conflict("Landing proof could not be bound to this close; retry the close.", {
+            code: "done_transition_missing_delivery", issueId: issue.id,
+          });
+        }
+        let verifiedHead: string | null = null;
+        try {
+          const attached = await withLandingDeadline(loadAttachedBoardLandingProof(tx, issue));
+          if (attached?.activityId === proof.proofActivityId) {
+            const verified = await withLandingDeadline(verifyBoardLandingProof(tx, {
+              id: issue.id, companyId: issue.companyId, projectId: locked.projectId,
+              projectWorkspaceId: locked.projectWorkspaceId, executionWorkspaceId: locked.executionWorkspaceId,
+            }, attached.evidence));
+            if (verified.ok && verified.proof.repoUrl === proof.repoUrl && verified.proof.baseRef === proof.baseRef) {
+              verifiedHead = verified.proof.mergeCommitSha;
+            }
+          }
+        } catch { verifiedHead = null; /* Failed and timed-out rechecks cannot discharge debt. */ }
+        if (verifiedHead !== proof.head) throw conflict("Board landing proof changed or could not be re-verified; retry the close.", {
+          code: "done_transition_missing_delivery", issueId: issue.id,
+        });
+        await tx.update(activityLog).set({
+          details: sql`${activityLog.details} || jsonb_build_object(
+            'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+            'closeStatusVersion', ${closeStatusVersion}::int,
+            'landingProof', jsonb_build_object('head', ${proof.head}::text, 'source', ${proof.source}::text,
+              'repoUrl', ${proof.repoUrl}::text, 'baseRef', ${proof.baseRef}::text,
+              'pullRequestNumber', ${proof.pullRequestNumber}::int, 'proofActivityId', ${proof.proofActivityId}::text))`,
+        }).where(debtWhere);
+        return;
+      }
+      // Positive probes require an execution branch. Lock that binding through
+      // commit so an in-place repo/base/branch update cannot invalidate the proof.
+      const [workspace] = locked.executionWorkspaceId ? await tx.select().from(executionWorkspaces)
+        .where(and(eq(executionWorkspaces.id, locked.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
+        .for("share") : [];
+      const binding = result.landingContext;
+      if (!workspace || !binding || !proof || closeStatusVersion === undefined ||
+        workspace.repoUrl !== binding.repoUrl || workspace.baseRef !== binding.defaultRef ||
+        workspace.branchName !== binding.branch ||
+        (proof.source === "worktree" && (workspace.providerRef ?? workspace.cwd) !== binding.worktreePath)) {
+        throw conflict("Repository binding changed; retry the landing check.", {
+          code: "done_transition_missing_delivery", issueId: issue.id,
+        });
+      }
+      // A database lock cannot freeze Git. Re-measure the same head source at
+      // this close boundary; bound the I/O while holding the issue/workspace locks.
+      let currentHead: string | null = null;
+      try {
+        if (proof.source === "worktree" && binding.worktreePath && binding.branch) {
+          currentHead = await localDeliveryHead(binding.worktreePath, binding.branch);
+        } else if (proof.source === "remote" && binding.branch) {
+          const parsed = parseRepoUrl(binding.repoUrl);
+          const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
+          const { token } = await resolveGitHubToken(tx, issue.companyId, signal);
+          if (parsed && token) currentHead = await resolveGitHubRefHeadSha(
+            parsed.hostname, parsed.owner, parsed.repo, binding.branch, token, signal,
+          );
+          signal.throwIfAborted();
+        }
+      } catch { currentHead = null; /* Missing, failed, and timed-out rechecks cannot discharge debt. */ }
+      if (currentHead !== proof.head) throw conflict("Delivery head changed or could not be verified; retry the landing check.", {
+        code: "done_transition_missing_delivery", issueId: issue.id,
+      });
+      await tx.update(activityLog).set({
+        details: sql`${activityLog.details} || jsonb_build_object(
+          'landingDebtDisposition', 'discharged', 'dischargedAt', now(),
+          'closeStatusVersion', ${closeStatusVersion}::int,
+          'landingProof', jsonb_build_object('head', ${proof.head}::text, 'source', ${proof.source}::text,
+            'repoUrl', ${binding.repoUrl}::text, 'baseRef', ${binding.defaultRef}::text, 'branch', ${binding.branch}::text))`,
+      }).where(debtWhere);
+    },
+  };
+}
+
+/**
  * ADR-103 M3.6: the laddered-child census the guard already computed during an
  * evaluation, surfaced to the wrapper so a below-threshold carve-out can be
  * audited on a successful close without a second query.
@@ -302,12 +738,14 @@ interface DoneTier2CloseAuditDetails {
   closingRunId?: string | null;
   /** SUP-23490: the closing run's resolved start (`startedAt ?? createdAt`), when resolvable. */
   closingRunStartedAt?: string | null;
+  /** SUP-24402: set when the close was accepted as a zero-delta repository_delivery close. */
+  zeroDelta?: ZeroDeltaCloseMeasurement;
 }
 
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
-  tier: "tier1" | "tier2" | null;
+  tier: "tier0" | "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
   tier2Audit?: DoneTier2CloseAuditDetails;
@@ -317,9 +755,28 @@ export interface DoneTierDeclarationResult {
   // and re-checks that inside the write (verifyNoRepositoryLandingAtTransition).
   landing?: "noRepositoryLanding";
   noRepositoryMeasurement?: NoRepositoryLandingMeasurement;
+  // SUP-24402: set when the accepted declaration is a zero-delta
+  // repository_delivery close, with what it measured. The accepting door
+  // re-checks that inside its status write (verifyZeroDeltaCloseAtTransition).
+  zeroDeltaMeasurement?: ZeroDeltaCloseMeasurement;
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
+  // Set when the refusal carries its own route error code. A door that maps every
+  // refused declaration to done_transition_missing_tier_declaration uses this one
+  // instead when it is set.
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE | "done_transition_record_only_probe_contradiction";
+}
+
+interface DoneTierDeclarationOptions {
+  allowTier0DecisionOnly?: boolean;
+  // Only the PATCH door rechecks a zero-delta measurement inside its status write.
+  zeroDeltaRecheckedAtWrite?: boolean;
+  // SUP-23347: a record_only card's participant review decision carried the close
+  // and the delivery guard skipped for record_only_delivery_skipped. A close
+  // comment with no tier declaration text at all is then an audited skip
+  // (record_only_review_decision); a malformed or refused tier line still refuses.
+  recordOnlyReviewDecision?: boolean;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -391,6 +848,7 @@ async function githubBranchExists(
   repo: string,
   branch: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<BranchProbeOutcome> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
@@ -403,7 +861,7 @@ async function githubBranchExists(
     authorization: `Bearer ${token}`,
   };
   try {
-    const response = await ghFetch(url, { headers });
+    const response = await ghFetch(url, { headers, signal });
     if (response.status === 401 || response.status === 403) {
       return { outcome: "auth_failed", status: response.status };
     }
@@ -440,6 +898,7 @@ async function resolveGitHubRefHeadSha(
   repo: string,
   ref: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`;
@@ -449,7 +908,7 @@ async function resolveGitHubRefHeadSha(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
-  const response = await ghFetch(url, { headers });
+  const response = await ghFetch(url, { headers, signal });
   if (response.status === 404 || (await isNoCommitFoundResponse(response))) return null;
   if (response.status === 401 || response.status === 403) {
     throw new GitHubAuthError(response.status, `GitHub commits API returned ${response.status}`);
@@ -544,22 +1003,65 @@ async function githubMergedPrCountForIdentifier(
   repo: string,
   identifier: string,
   token: string,
+  expectedHead?: string | null,
+  defaultRef?: string | null,
 ): Promise<number | null> {
+  if (expectedHead !== undefined && (!expectedHead || !defaultRef)) return null;
   const apiBase = gitHubApiBase(hostname);
   const query = `repo:${owner}/${repo} is:pr is:merged in:title,body "${identifier}"`;
-  const url = `${apiBase}/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  const url = `${apiBase}/search/issues?q=${encodeURIComponent(query)}&per_page=${expectedHead === undefined ? 1 : 100}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-done-transition-guard",
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
+  const signal = AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS);
   try {
-    const response = await ghFetch(url, { headers });
+    const response = await ghFetch(url, { headers, signal });
     if (!response.ok) return null;
     const body = await response.json().catch(() => null);
+    signal.throwIfAborted();
     const total = (body as Record<string, unknown> | null)?.total_count;
-    return typeof total === "number" ? total : null;
+    if (expectedHead === undefined) return typeof total === "number" ? total : null;
+    if (!Array.isArray(body?.items)) return null;
+    for (const item of body.items) {
+      if (!Number.isSafeInteger(item?.number)) continue;
+      const response = await ghFetch(`${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${item.number}`, { headers, signal });
+      if (!response.ok) return null;
+      const pr = await response.json();
+      signal.throwIfAborted();
+      if (!pr?.merged || !pr.head?.sha || pr.base?.ref !== defaultRef?.replace(/^origin\//, "")) continue;
+      // The carrier may have a different branch and may have been squash-merged.
+      // Its pre-merge head must contain the checked delivery, not just its identifier.
+      const ahead = await githubCompareAheadBy(hostname, owner, repo, pr.head.sha, expectedHead!, token, signal);
+      signal.throwIfAborted();
+      if (ahead === 0) return 1;
+    }
+    return 0;
+  } catch {
+    return null;
+  }
+}
+
+async function localDeliveryHead(worktreePath: string, branch: string): Promise<string | null> {
+  const head = (await runHardenedGit(["-C", worktreePath, "show-ref", "--verify", "--hash", `refs/heads/${branch}`], {
+    cwd: "/", timeoutMs: GITHUB_BASE_COMPARE_TIMEOUT_MS,
+  })).trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(head) ? head : null;
+}
+
+async function carrierDeliveryHead(ctx: IssueRepoContext, parsed: CitedCommitRepository, token: string): Promise<LandingHeadProof | null> {
+  if (ctx.worktreePath && ctx.branch) {
+    try {
+      const head = await localDeliveryHead(ctx.worktreePath, ctx.branch);
+      if (head) return { head, source: "worktree" };
+    } catch { /* The remote branch can still provide the delivery head. */ }
+  }
+  try {
+    // Await here so rejected lookups, including non-Error throws, stay unverified.
+    const head = ctx.branch ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, ctx.branch, token) : null;
+    return head ? { head, source: "remote" } : null;
   } catch {
     return null;
   }
@@ -591,6 +1093,8 @@ export async function githubBranchHasMergedPr(
   repo: string,
   branch: string,
   token: string,
+  expectedHead?: string,
+  defaultRef?: string,
 ): Promise<BranchMergedPrProbe> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=closed&per_page=100`;
@@ -615,6 +1119,10 @@ export async function githubBranchHasMergedPr(
     const record = pr as Record<string, unknown>;
     const merged = record.merged === true || typeof record.merged_at === "string";
     if (!merged) continue;
+    if (expectedHead !== undefined && (
+      (record.head as { sha?: string } | null)?.sha !== expectedHead ||
+      (record.base as { ref?: string } | null)?.ref !== defaultRef?.replace(/^origin\//, "")
+    )) continue;
     hasMergedPr = true;
     if (mergedPrNumber === null && typeof record.number === "number") {
       mergedPrNumber = record.number;
@@ -648,6 +1156,220 @@ async function writeAuditLog(
   } catch (err) {
     logger.warn({ err, issueId: issue.id, action }, "failed to write done-transition audit log");
   }
+}
+
+/**
+ * SUP-24136: a mechanism C refusal is deterministic — the same unsatisfied
+ * stage refuses the same way until a decision lands — yet the 15 s
+ * stranded-summary sweep (execution-control-reconciliation.ts) re-evaluates
+ * the guard on every tick for a Summarizer-assigned card. SUP-24118 got 54
+ * identical rows in 13 minutes, SUP-24121 47, SUP-23420 several hundred.
+ * Bound the audit trail per (company, issue, reason): while fewer than
+ * LADDER_REFUSAL_REPEAT_LIMIT identical refusal rows exist inside the window,
+ * the refusal is recorded unchanged; the next one records a single
+ * `issue.done_transition_ladder_refusal_repeated` escalation row; further
+ * identical refusals inside the window record nothing.
+ *
+ * One clock only: the window test compares `activity_log.created_at` (stamped
+ * by the database default `now()`) with the database `now()` in the same SQL
+ * statement. The application clock is never read, so app/database skew cannot
+ * widen or shrink the window.
+ *
+ * Only the audit row is bounded. The caller computes the refusal verdict
+ * before this runs and returns it unchanged; nothing on the close path reads
+ * these rows. A failed count read records the refusal row, as before the cap.
+ * Two concurrent refusals can both read the same count, so the bound is
+ * approximate under concurrency, never below the pre-cap behaviour.
+ */
+export const LADDER_REFUSAL_REPEAT_LIMIT = 3;
+export const LADDER_REFUSAL_REPEAT_WINDOW_SECONDS = 60 * 60;
+const LADDER_REFUSED_ACTION = "issue.done_transition_ladder_refused";
+const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_repeated";
+
+/**
+ * SUP-24298: a done write refused with 422 `done_transition_missing_tier_declaration`
+ * leaves its own refusal-class row, countable like `LADDER_REFUSED_ACTION`. The row
+ * is written per refused write: the thread remedy comment is deduped per guard code
+ * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
+ * comment and this row is the only per-write machine trace. Never throws, so the
+ * HTTP result of the refusal is unchanged by a failed audit write.
+ *
+ * SUP-24429: a 409 `done_transition_record_only_flip_refused` (a close request that
+ * also relabels a stored repository_delivery card record_only) writes the same
+ * refusal-class row, naming the stored and requested requirements and recording
+ * that the landing check was not skipped.
+ */
+export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
+
+export async function writeDoneTransitionRefusedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details:
+    | {
+        code:
+          | "done_transition_missing_tier_declaration"
+          | typeof DONE_TRANSITION_TIER_CONFLICT_CODE
+          | "done_transition_record_only_probe_contradiction";
+        httpStatus: 422;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        stage?: string;
+      }
+    | {
+        // SUP-25336: a dual-source done-tier conflict, refused before any
+        // rendering or write. Only the sanitized conflict summary is stored.
+        code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+        httpStatus: 422;
+        reason: string;
+        runId: string | null;
+        door: "patch" | "comment_auto_approval" | "recovery_action_resolution";
+        conflicts: DoneTierDualSourceConflictReason[];
+        differingFields: string[];
+      }
+    | {
+        code: "done_transition_record_only_flip_refused";
+        httpStatus: 409;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        storedDeliveryRequirement: IssueDeliveryRequirement;
+        requestedDeliveryRequirement: "record_only";
+        landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
+      },
+): Promise<void> {
+  await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
+    ...details,
+    source: "done_transition_guard",
+  });
+}
+
+/**
+ * The shared repeat cap behind `writeLadderRefusalAuditLog` and
+ * `writeGuardSkippedAuditLog`. `signatureKey` names the `activity_log.details`
+ * field whose value identifies a repeat; the cap counts `action` rows and
+ * `repeatedAction` escalation rows with that signature inside the window.
+ */
+async function writeRepeatCappedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  cap: {
+    action: string;
+    repeatedAction: string;
+    signatureKey: string;
+    signature: string;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  const { action, repeatedAction, signatureKey, signature, details } = cap;
+  let priorRefusals = 0;
+  let priorEscalations = 0;
+  try {
+    const [counts] = await db
+      .select({
+        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${action})`,
+        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${repeatedAction})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          inArray(activityLog.action, [action, repeatedAction]),
+          sql`${activityLog.details} ->> ${signatureKey}::text = ${signature}`,
+          sql`${activityLog.createdAt} > now() - make_interval(secs => ${LADDER_REFUSAL_REPEAT_WINDOW_SECONDS})`,
+        ),
+      );
+    const refused = Number(counts?.refused);
+    const escalated = Number(counts?.escalated);
+    if (Number.isFinite(refused)) priorRefusals = refused;
+    if (Number.isFinite(escalated)) priorEscalations = escalated;
+  } catch (err) {
+    logger.warn({ err, issueId: issue.id, action }, "failed to count prior repeats; recording the row");
+  }
+  if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
+    await writeAuditLog(db, issue, action, details);
+    return;
+  }
+  if (priorEscalations === 0) {
+    await writeAuditLog(db, issue, repeatedAction, {
+      ...details,
+      refusalCount: priorRefusals + 1,
+      repeatLimit: LADDER_REFUSAL_REPEAT_LIMIT,
+      windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
+    });
+  }
+}
+
+async function writeLadderRefusalAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown> & { reason: string },
+): Promise<void> {
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: LADDER_REFUSED_ACTION,
+    repeatedAction: LADDER_REFUSAL_REPEATED_ACTION,
+    signatureKey: "reason",
+    signature: details.reason,
+    details,
+  });
+}
+
+/**
+ * SUP-24557 (SUP-24216): the same cap for `issue.done_transition_guard_skipped`
+ * rows whose class is `branch_absent_on_remote`. The sweeps that re-run the
+ * guard every tick (stranded-summary reaper, merged-operator-merge-cards) wrote
+ * one such row per tick for a card whose branch stays absent from the remote.
+ * The signature is (issue, skip action, class, BRANCH): the branch is parsed
+ * out of the skipReason (`branch_absent_on_remote:<branch>[; <pr skip reason>]`,
+ * where the optional `; ` tail varies per tick and is excluded) or taken from
+ * the refusal row's `branch`, and is stored in `details.repeatSignature`. A
+ * second absent branch is its own signature and starts its own count. The
+ * refusal row (`reason: branch_absent_on_remote`, `allowed: false`) and the
+ * fail-open row (`skipReason: branch_absent_on_remote:<branch>`) keep separate
+ * signatures. The escalation row needs its own action name because
+ * `issue.done_transition_ladder_refusal_repeated` is ladder-specific.
+ *
+ * Every other skip row is written unchanged, in the same synchronous step.
+ */
+export const GUARD_SKIP_REPEATED_ACTION = "issue.done_transition_guard_skip_repeated";
+const GUARD_SKIPPED_ACTION = "issue.done_transition_guard_skipped";
+const BRANCH_ABSENT_SKIP_CLASS = "branch_absent_on_remote";
+
+function branchAbsentSkipSignature(details: Record<string, unknown>): string | null {
+  const skipReason = details.skipReason;
+  const prefix = `${BRANCH_ABSENT_SKIP_CLASS}:`;
+  if (typeof skipReason === "string" && skipReason.startsWith(prefix)) {
+    const branch = skipReason.slice(prefix.length).split("; ")[0];
+    return branch ? `${prefix}${branch}` : null;
+  }
+  if (details.reason === BRANCH_ABSENT_SKIP_CLASS && typeof details.branch === "string" && details.branch) {
+    return `refused:${prefix}${details.branch}`;
+  }
+  return null;
+}
+
+export async function writeGuardSkippedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown>,
+): Promise<void> {
+  const signature = branchAbsentSkipSignature(details);
+  if (signature === null) {
+    await writeAuditLog(db, issue, GUARD_SKIPPED_ACTION, details);
+    return;
+  }
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: GUARD_SKIPPED_ACTION,
+    repeatedAction: GUARD_SKIP_REPEATED_ACTION,
+    signatureKey: "repeatSignature",
+    signature,
+    details: { ...details, repeatSignature: signature },
+  });
 }
 
 /**
@@ -696,6 +1418,156 @@ async function fetchPullRequestReviewDecision(
   } catch {
     return null;
   }
+}
+
+/**
+ * SUP-24135: live landability of a `landing-delegated` carrier PR, read once at
+ * close time. A declaration names the carrier; this is the only read of the
+ * carrier itself before the obligation transfers to the backstop.
+ */
+interface LandingCarrierHealth {
+  headSha: string | null;
+  mergeStateStatus: string | null;
+  /**
+   * Required checks whose every same-type, same-name context on the head is
+   * terminal-failed. Empty when the context list was cut at a page boundary:
+   * a rerun on a later page could still pass, so a partial read never refuses.
+   */
+  failedRequired: Array<{ name: string; conclusion: string }>;
+}
+
+// Terminal check-run conclusions and commit-status states that cannot satisfy a
+// required check. NEUTRAL/SKIPPED/SUCCESS satisfy it; STALE is not terminal-failed.
+// ACTION_REQUIRED awaits manual approval and is not terminal-failed.
+const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
+const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+// A hung carrier read must not hold the close; an aborted read fails open.
+const LANDING_CARRIER_PROBE_TIMEOUT_MS = 10_000;
+// The refusal names at most this many failed checks, each cut to a bounded length.
+const LANDING_CARRIER_REFUSAL_MAX_CHECKS = 3;
+const LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS = 80;
+
+/**
+ * Read-only GraphQL probe of the carrier's head required checks and merge state.
+ * Every unresolvable outcome returns null; callers fail open, as for
+ * fetchPullRequestReviewDecision (never fail closed on a GitHub outage).
+ */
+async function fetchLandingCarrierHealth(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<LandingCarrierHealth | null> {
+  const query =
+    "query landingCarrier($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { state mergeStateStatus " +
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { __typename " +
+    "... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) } " +
+    "... on StatusContext { context state isRequired(pullRequestNumber: $number) } } } } } } } } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+      signal: AbortSignal.timeout(LANDING_CARRIER_PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || (Array.isArray(body.errors) && body.errors.length > 0)) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    if (!pullRequest || pullRequest.state !== "OPEN") return null;
+    const commitNodes = (pullRequest.commits as { nodes?: unknown } | null | undefined)?.nodes;
+    const commit = Array.isArray(commitNodes)
+      ? (commitNodes[0] as { commit?: Record<string, unknown> } | undefined)?.commit
+      : undefined;
+    const rollup = commit?.statusCheckRollup as
+      | { contexts?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } | null } }
+      | null
+      | undefined;
+    const contexts = Array.isArray(rollup?.contexts?.nodes) ? rollup.contexts.nodes : [];
+    // A re-run leaves the failed run beside a newer one with the same name, so a
+    // required check counts as failed only when none of its contexts can still pass.
+    // Check runs and commit statuses are separate requirements on GitHub, so one
+    // type never satisfies (or hides) the other: group by type plus name.
+    const byCheck = new Map<string, { name: string; failed: string | null; open: boolean }>();
+    for (const node of contexts) {
+      const ctx = node as Record<string, unknown> | null;
+      if (!ctx || ctx.isRequired !== true) continue;
+      let name: string | null = null;
+      let failed: string | null = null;
+      if (ctx.__typename === "CheckRun" && typeof ctx.name === "string") {
+        name = ctx.name;
+        const conclusion = typeof ctx.conclusion === "string" ? ctx.conclusion : null;
+        if (ctx.status === "COMPLETED" && conclusion && FAILED_CHECK_RUN_CONCLUSIONS.has(conclusion)) failed = conclusion;
+      } else if (ctx.__typename === "StatusContext" && typeof ctx.context === "string") {
+        name = ctx.context;
+        if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
+      }
+      if (name === null) continue;
+      const key = `${ctx.__typename}\u0000${name}`;
+      const entry = byCheck.get(key) ?? { name, failed: null, open: false };
+      if (failed) entry.failed = failed;
+      else entry.open = true;
+      byCheck.set(key, entry);
+    }
+    const partial = rollup?.contexts?.pageInfo?.hasNextPage !== false;
+    const failedRequired = partial
+      ? []
+      : [...byCheck.values()]
+        .filter((entry) => entry.failed !== null && !entry.open)
+        .map((entry) => ({ name: entry.name, conclusion: entry.failed!.toLowerCase() }));
+    return {
+      headSha: typeof commit?.oid === "string" ? commit.oid : null,
+      mergeStateStatus: typeof pullRequest.mergeStateStatus === "string" ? pullRequest.mergeStateStatus : null,
+      failedRequired,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SUP-24135: refuse a `landing-delegated` close whose carrier cannot land as it
+ * stands. `BLOCKED` alone is the normal delegated state (required checks still
+ * running, review pending) and `UNKNOWN` is GitHub still computing, so neither
+ * refuses; a terminal-failed required check or a merge conflict does.
+ */
+function landingCarrierRefusal(
+  prNumber: number,
+  health: LandingCarrierHealth | null,
+): DoneTierDeclarationResult | null {
+  if (!health) return null;
+  const head = health.headSha ? ` on head ${health.headSha.slice(0, 12)}` : "";
+  if (health.failedRequired.length > 0) {
+    const named = health.failedRequired.slice(0, LANDING_CARRIER_REFUSAL_MAX_CHECKS).map((check) => {
+      const name = check.name.length > LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS
+        ? `${check.name.slice(0, LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS)}…`
+        : check.name;
+      return `${name} (${check.conclusion})`;
+    });
+    const more = health.failedRequired.length - named.length;
+    const checks = more > 0 ? `${named.join(", ")} and ${more} more` : named.join(", ");
+    return refuseTier1(
+      `carrier_required_check_failed: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but its required check ${checks} is terminal-failed${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Fix the failing required check on PR #${prNumber} (push a fix or re-run it) and close again once it is passing or running, or keep the card open until the carrier can land.`,
+    );
+  }
+  if (health.mergeStateStatus === "DIRTY") {
+    return refuseTier1(
+      `carrier_merge_conflict: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but it has merge conflicts with its base branch${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Resolve the merge conflicts on PR #${prNumber} and close again, or keep the card open until the carrier can land.`,
+    );
+  }
+  return null;
 }
 
 /**
@@ -780,6 +1652,28 @@ type Tier1Parse =
   | { kind: "missing_suffix" }
   | { kind: "absent" };
 
+type Tier0Parse =
+  | { kind: "matched"; reason: string }
+  | { kind: "not_at_line_start"; offendingLine: string }
+  | { kind: "absent" };
+
+function parseTier0Declaration(body: string): Tier0Parse {
+  const lines = body.split(/\r?\n/);
+  let notAtLineStart: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_0_PREFIX)) {
+      return { kind: "matched", reason: trimmed.slice(TIER_0_PREFIX.length).trim() };
+    }
+    if (notAtLineStart === null && trimmed.includes(TIER_0_PREFIX)) {
+      notAtLineStart = trimmed;
+    }
+  }
+  return notAtLineStart !== null
+    ? { kind: "not_at_line_start", offendingLine: notAtLineStart }
+    : { kind: "absent" };
+}
+
 function parseTier2Declaration(body: string): Tier2Parse {
   const lines = body.split(/\r?\n/);
   let notAtLineStart: string | null = null;
@@ -853,7 +1747,8 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //    AND belongs to this issue (a linked merged PR merge commit, or this issue's recorded
 //    delivery head / work-product commit — SUP-23031; ancestry alone is not possession).
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
-//    post-merge carrier (the async worker itself is unchanged here).
+//    post-merge carrier, and a live open carrier has no terminal-failed required check and
+//    no merge conflict (SUP-24135; the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
@@ -1173,6 +2068,15 @@ async function proveLandingDelegated(
               `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
             );
           }
+        }
+        // SUP-24135: the carrier itself must still be able to land. Only a live
+        // open PR is probed; any unreadable probe fails open (null).
+        if (hydration.hydrated && live.cachedState === "open") {
+          const carrierRefusal = landingCarrierRefusal(
+            number,
+            await fetchLandingCarrierHealth(pr, candidate.token),
+          );
+          if (carrierRefusal) return carrierRefusal;
         }
         break;
       }
@@ -1587,6 +2491,47 @@ const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
   "i",
 );
 
+// Named, token-anchored contradictions in the record-only declaration's trailing
+// predicate/result only. This is a bounded denylist, NOT natural-language verdict
+// inference: command/target text and unrelated comment prose are not evidence.
+// Numeric markers capture one COMPLETE signed decimal token (integer, fraction,
+// or exponent form) and judge its numeric value, so `scanned=0.5` is not zero and
+// `failed=0.0` / `exit -0` are zero. Keep these eight names and forms synchronized
+// with the done-close documentation.
+const DECIMAL = String.raw`([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w]|\.\d)`;
+// Exact decimal zero test on the token text (no Number() coercion, which underflows
+// `1e-400` to 0): zero iff the mantissa has no nonzero digit, whatever the exponent.
+const DECIMAL_ZERO_RE = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?$/i;
+const isZeroDecimal = (token: string) => DECIMAL_ZERO_RE.test(token);
+const isPositiveDecimal = (token: string) => !token.startsWith("-") && !isZeroDecimal(token);
+const numericMarker = (name: string, label: string, test: (token: string) => boolean) => {
+  const re = new RegExp(String.raw`\b${label}${DECIMAL}`, "gi");
+  return {
+    name,
+    matches: (text: string) => {
+      for (const m of text.matchAll(re)) {
+        if (test(m[1])) return true;
+      }
+      return false;
+    },
+  };
+};
+const phraseMarker = (name: string, pattern: RegExp) => ({
+  name,
+  matches: (text: string) => pattern.test(text),
+});
+const RECORD_ONLY_PASS_CONTRADICTIONS = [
+  numericMarker("exit_nonzero", String.raw`exit[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("exited_nonzero", String.raw`exited[ \t]+`, (t) => !isZeroDecimal(t)),
+  numericMarker("failed_positive", "failed=", isPositiveDecimal),
+  numericMarker("scanned_zero", "scanned=", isZeroDecimal),
+  phraseMarker("non_clean", /\bnon-clean\b/i),
+  // Literal scan-failure contexts only; bare expected-negative "failed closed" stays valid.
+  phraseMarker("failed_closed", /\b(?:failed[ \t]+closed\.[ \t]+All|scan[ \t]+failed[ \t]+closed[ \t]+on[ \t]+all[ \t]+4[ \t]+repos)\b/i),
+  phraseMarker("refused", /\bREFUSED\b/),
+  phraseMarker("partial_failure", /\bpartial[ \t]+failure\b/i),
+] as const;
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -1766,6 +2711,24 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
+  for (const marker of RECORD_ONLY_PASS_CONTRADICTIONS) {
+    if (marker.matches(predicateResult!)) {
+      const remedy =
+        "Report the non-clean cycle and do not close. Re-probe and claim Tier 2 only when the " +
+        `predicate genuinely passes. Accepted form: ${TIER2_RECORD_ONLY_FORM}`;
+      return {
+        ...refuseTier2(
+          `record-only close Tier 2 result: pass contradicts failed probe evidence (${marker.name}); ` +
+          remedy,
+        ),
+        code: "done_transition_record_only_probe_contradiction",
+        remedy,
+      };
+    }
+  }
+  // Every accepting door persists this audit as issue.done_transition_tier2_close
+  // in the terminal write's transaction. tierForm=record-only counts this class;
+  // contradictions above never mint a green row or an accepted-failure event.
   return acceptTier2(evidence.trim(), sameRun, {
     probeCommand: probeCommand!.trim(),
     probeTarget: observedTarget!.trim(),
@@ -1786,21 +2749,22 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
 // accepted as fresh proof. The guard now loads the closing run's
 // `heartbeat_runs` row and refuses an observation that predates the run's
 // start (`startedAt ?? createdAt` — both precede any probe the run itself can
-// make) or that postdates the evaluation by more than a clock-skew allowance,
-// with the reason naming the run and its start. Fail-closed: a closing run
+// make) or that postdates the evaluation (SUP-24266: no clock-skew allowance —
+// the evaluation precedes the close write that carries the declaration, so an
+// observed instant later than it is later than the close), with the reason
+// naming the run and its start. Fail-closed: a closing run
 // whose row cannot be resolved has no verifiable lifetime, so the observation
 // cannot be attributed to it. The merge-head grammar has no `observed`
 // component and its origin predicate (probe head == delivery merge head) is
 // unchanged: it is stamped with the closing run id but never lifetime-gated.
 // Doors without a run id (human closes, the system backstop) have no lifetime
-// to compare against; they keep the pre-existing grammar checks only, and the
+// to compare against; they keep the pre-existing grammar checks plus the
+// future-observed refusal (SUP-24266, applied to every closer), and the
 // audit row's null `closingRunId` says so. Every accepted result — both forms —
 // is stamped with `closingRunId`/`closingRunStartedAt` so the
 // `issue.done_transition_tier2_close` activity row carries the closing run
 // identity beside the cited observation (SUP-23366's machine record).
 // ───────────────────────────────────────────────────────────────────────
-const TIER2_OBSERVED_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
 async function loadClosingRunStart(
   db: Db,
   companyId: string,
@@ -1837,6 +2801,23 @@ async function attributeTier2EvidenceToClosingRun(
   // no observation instant to place inside the run's lifetime.
   if (audit.tierForm !== "record-only") {
     return { ...result, tier2Audit: audit };
+  }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  // Compare at the full accepted precision (1-6 fractional digits): `Date.parse`
+  // truncates to milliseconds, so `.7261Z` would tie a `.726Z` close write. The
+  // evaluation clock has millisecond precision, so any observed sub-millisecond
+  // tail past it is strictly later.
+  if (
+    latestObserved &&
+    utcInstantSortKey(latestObserved) > utcInstantSortKey(new Date(Date.now()).toISOString())
+  ) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
   }
   if (!runId) {
     // An agent closer has no excuse: every agent request can carry the run id
@@ -1886,18 +2867,500 @@ async function attributeTier2EvidenceToClosingRun(
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  const latestObserved = audit.observedRangeEnd ?? audit.observed;
-  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now() + TIER2_OBSERVED_CLOCK_SKEW_MS) {
-    return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
-        "evaluation by more than the allowed clock skew; an observation cannot be made after the close that " +
-        "cites it. " +
-        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
-    );
-  }
   audit.closingRunStartedAt = runStart.toISOString();
   return { ...result, tier2Audit: audit };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// SUP-24402: the zero-delta repository_delivery close. A routine cycle card
+// whose own branch carries no change has no pull request and no recorded merge
+// commit, so the merge-head origin predicate above refused every truthful Tier
+// 2 declaration it could write (merge_commit_unrecorded). Such a card closes at
+// Tier 2 only when the SERVER proves, at close time, every one of:
+//   (1) no pull request: no linked pull request in any state (drafts
+//       included) and no pull_request work product in any status;
+//   (2) no recorded merge commit: none on any work product, in any form;
+//   (3) zero commits ahead of the base ref: `rev-list --count base..HEAD`
+//       prints exactly 0 in the card's worktree, and GitHub's compare of the
+//       base branch with that HEAD, and with the card's branch when it exists
+//       on the remote, is ahead by 0;
+//   (4) HEAD is an ancestor of the base ref: `merge-base --is-ancestor`;
+//   (5) a clean worktree: `status --porcelain=v1 --untracked-files=all`
+//       prints nothing (no tracked change, no untracked file).
+// The declaration is not the evidence. Its probe head must name the HEAD the
+// server measured, so a declaration that claims zero delta while the worktree
+// is ahead refuses on the measurement, not on the text.
+//
+// The proof is bound to the card itself, never to a workspace the closer
+// chooses: the execution workspace must be the one this issue owns
+// (`sourceIssueId`), in this company, an isolated git worktree; the worktree
+// path and branch are that row's `providerRef ?? cwd` and `branchName`, which
+// an agent cannot set (PATCH /api/execution-workspaces refuses them for agent
+// keys); and the base is the workspace's own `baseRef` (the base the delivery
+// guard compares the branch with), accepted only when it names one of the
+// project's branches: the project workspace's default or reference branch
+// (board-only) or the repository's default branch on GitHub. The remote
+// compare is the authority over refs the worktree can write: a worktree whose
+// local origin ref was moved onto its own commits still refuses. Every failure
+// to read, resolve or measure refuses, with the merge_commit_unrecorded reason
+// kept as the refusal's prefix.
+// ───────────────────────────────────────────────────────────────────────
+
+const ZERO_DELTA_CLOSE_CONDITIONS =
+  "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only through " +
+  "PATCH /api/issues/{id}, and only when the server proves from the board-recorded forge repository that every " +
+  "branch and tag tip is on the base line or is a pull-request head, that a ref naming this card is on the base " +
+  "line, and that the declared head is on the base line. A name is never a reason to skip a tip. The close write " +
+  "re-reads that snapshot and refuses if it changed. Local checks can only refuse.";
+
+/** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
+export interface ZeroDeltaCloseMeasurement {
+  executionWorkspaceId: string;
+  workspaceProjectWorkspaceId: string;
+  /** The issue row's project workspace at measurement. The close write requires it unchanged. */
+  issueProjectWorkspaceId: string | null;
+  repository: string;
+  /** The workspace row's recorded path, verbatim; the close write compares its re-read against this. */
+  recordedWorktreePath: string;
+  worktreePath: string;
+  commonDir: string;
+  branch: string;
+  baseBranch: string;
+  baseRef: string;
+  baseSha: string;
+  headSha: string;
+  /** sha256 of the forge base, every non-pull ref, and repository-owned PR head set. */
+  forgeSnapshotDigest: string;
+  /** The project workspace's `defaultRef` and `repoRef` as read; the close write requires both unchanged. */
+  projectDefaultRef: string | null;
+  projectRepoRef: string | null;
+  /** The card the sibling scan attributed branches and worktrees to; the close write repeats that scan. */
+  issueIdentifier: string;
+  /** Digest of the branches the sibling scan read; the close write requires them unchanged. */
+  refsDigest: string;
+}
+
+type ZeroDeltaCloseProof =
+  | { ok: true; measurement: ZeroDeltaCloseMeasurement; token: string }
+  | { ok: false; reason: string };
+
+async function proveZeroDeltaRepositoryClose(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
+  executionWorkspaceId: string | null,
+  deliveryRepository: { hostname: string; owner: string; repo: string },
+): Promise<ZeroDeltaCloseProof> {
+  const refuse = (reason: string): ZeroDeltaCloseProof => ({ ok: false, reason });
+
+  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+  if (linkedPrs.length > 0) {
+    return refuse(`the card links pull requests (${linkedPrs.map((pr) => `${pr.displayName} ${pr.cachedState ?? "unknown"}`).join(", ")})`);
+  }
+  const workProducts = await db
+    .select({ type: issueWorkProducts.type, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+    .from(issueWorkProducts)
+    .where(and(eq(issueWorkProducts.companyId, issue.companyId), eq(issueWorkProducts.issueId, issue.id)));
+  const pullRequestProduct = workProducts.find((product) => product.type === "pull_request");
+  if (pullRequestProduct) {
+    return refuse(`the card records a pull_request work product (status ${pullRequestProduct.status})`);
+  }
+  if (
+    workProducts.some((product) => {
+      const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+      return (metadata.mergeCommitSha ?? metadata.merge_commit_sha ?? null) !== null;
+    })
+  ) {
+    return refuse("the card records a merge commit on a work product");
+  }
+
+  if (!executionWorkspaceId) return refuse("the card has no execution workspace");
+  const workspace = await db
+    .select({
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      projectId: executionWorkspaces.projectId,
+      projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+      mode: executionWorkspaces.mode,
+      strategyType: executionWorkspaces.strategyType,
+      providerType: executionWorkspaces.providerType,
+      providerRef: executionWorkspaces.providerRef,
+      cwd: executionWorkspaces.cwd,
+      branchName: executionWorkspaces.branchName,
+      baseRef: executionWorkspaces.baseRef,
+    })
+    .from(executionWorkspaces)
+    .where(and(eq(executionWorkspaces.id, executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!workspace || workspace.sourceIssueId !== issue.id) {
+    return refuse("the card's execution workspace is not one this card owns in this company");
+  }
+  if (
+    workspace.mode !== "isolated_workspace" ||
+    workspace.strategyType !== "git_worktree" ||
+    workspace.providerType !== "git_worktree"
+  ) {
+    return refuse(
+      `the card's execution workspace is ${workspace.mode}/${workspace.strategyType}/${workspace.providerType}, not its own isolated git worktree`,
+    );
+  }
+  const worktreePath = workspace.providerRef ?? workspace.cwd;
+  if (!worktreePath) return refuse("the card's execution workspace records no worktree path");
+  if (!workspace.branchName) return refuse("the card's execution workspace records no branch");
+  const baseBranch = normalizeBaseBranch(workspace.baseRef);
+  if (!baseBranch) return refuse("the card's execution workspace records no base ref");
+  // The GitHub compare strips one leading `origin/` from its base, so a branch
+  // literally named `origin/…` would be measured locally and remotely against
+  // two different branches.
+  if (baseBranch.startsWith("origin/")) {
+    return refuse(`the base branch ${baseBranch} starts with origin/, which the remote compare cannot name unambiguously`);
+  }
+  if (!workspace.projectWorkspaceId) return refuse("the card's execution workspace names no project workspace");
+  const projectWorkspace = await db
+    .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
+    .from(projectWorkspaces)
+    .where(
+      and(
+        eq(projectWorkspaces.id, workspace.projectWorkspaceId),
+        eq(projectWorkspaces.companyId, issue.companyId),
+        eq(projectWorkspaces.projectId, workspace.projectId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  const projectRepository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+  if (
+    !projectRepository ||
+    `${projectRepository.hostname}/${projectRepository.owner}/${projectRepository.repo}`.toLowerCase() !==
+      `${deliveryRepository.hostname}/${deliveryRepository.owner}/${deliveryRepository.repo}`.toLowerCase()
+  ) {
+    return refuse("the card's delivery repository is not its project workspace's repository");
+  }
+  const { hostname, owner, repo } = projectRepository;
+
+  const { token } = await resolveGitHubToken(db, issue.companyId);
+  if (!token) return refuse("no GitHub credential is configured to compare with the base on the remote");
+  const projectBranches = new Set<string>();
+  for (const ref of [projectWorkspace?.defaultRef, projectWorkspace?.repoRef]) {
+    const branch = normalizeBaseBranch(ref ?? null);
+    if (branch) projectBranches.add(branch);
+  }
+  const githubDefaultBranch = await readGitHubDefaultBranch(hostname, owner, repo, token);
+  if (githubDefaultBranch) projectBranches.add(githubDefaultBranch);
+  if (!projectBranches.has(baseBranch)) {
+    return refuse(`the base ref ${workspace.baseRef} is not one of the project's branches`);
+  }
+  if (!issue.identifier) return refuse("the card has no identifier to tie its worktree's branches to it");
+  // Branches registered to ANOTHER issue's execution workspace in this company
+  // and project belong to that card (branchName is board-only for agents);
+  // the probe refuses every other branch that is neither this card's nor one
+  // of the project's own branches.
+  const attributedBranches = await db
+    .select({ branchName: executionWorkspaces.branchName })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.projectId, workspace.projectId),
+        isNotNull(executionWorkspaces.sourceIssueId),
+        ne(executionWorkspaces.sourceIssueId, issue.id),
+        isNotNull(executionWorkspaces.branchName),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.branchName!).sort());
+  const probe = await probeZeroDeltaWorktree({
+    recordedWorktreePath: worktreePath,
+    managedProjectRoot: path.dirname(
+      resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: workspace.projectId }),
+    ),
+    branch: workspace.branchName,
+    baseBranch,
+    issueIdentifier: issue.identifier,
+    projectBranches,
+    attributedBranches: new Set(attributedBranches),
+    existingOtherCardIdentifiers: async (candidates) =>
+      new Set(
+        await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              ne(issues.id, issue.id),
+              inArray(issues.identifier, [...candidates]),
+            ),
+          )
+          .then((rows) => rows.flatMap((row) => (row.identifier ? [row.identifier] : []))),
+      ),
+    countCommitsAheadOfBase: async (sha) => {
+      const ahead = await githubCompareAheadBy(
+        hostname,
+        owner,
+        repo,
+        baseBranch,
+        sha,
+        token,
+        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead === null) throw new Error("GitHub compare returned no ahead_by");
+      return ahead;
+    },
+  });
+  if (!probe.ok) return refuse(probe.reason);
+  const forge = githubForgeReader(token);
+  const forgeCard = { repo: { hostname, owner, repo }, baseBranch, declaredHead: probe.headSha, cardBranch: workspace.branchName, cardIdentifier: issue.identifier, otherCardBranches: new Set(attributedBranches) };
+  const decided = await decideZeroDeltaFromForge(forgeCard, forge, ZERO_DELTA_MEASUREMENT_BUDGET);
+  if (!decided.ok) return refuse(decided.reason);
+  if (decided.proof.baseSha !== probe.baseSha.toLowerCase()) {
+    return refuse(`the local base ref ${probe.baseRef} is not the remote base ${baseBranch}`);
+  }
+  try {
+    const outside = await localRefOutsideRemoteBaseRefusal(
+      path.dirname(probe.commonDir),
+      decided.proof.baseSha,
+      issue.identifier,
+      performance.now() + ZERO_DELTA_MEASUREMENT_BUDGET.totalMs,
+    );
+    if (outside) return refuse(outside);
+  } catch (err) {
+    return refuse(`the local refs could not be compared with the remote base (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  return {
+    ok: true,
+    token,
+    measurement: {
+      executionWorkspaceId,
+      workspaceProjectWorkspaceId: workspace.projectWorkspaceId,
+      issueProjectWorkspaceId: issue.projectWorkspaceId ?? null,
+      repository: `${hostname}/${owner}/${repo}`,
+      recordedWorktreePath: worktreePath,
+      worktreePath: probe.worktreePath,
+      commonDir: probe.commonDir,
+      branch: probe.branch,
+      baseBranch,
+      baseRef: probe.baseRef,
+      baseSha: decided.proof.baseSha,
+      headSha: probe.headSha,
+      forgeSnapshotDigest: decided.proof.snapshotDigest,
+      projectDefaultRef: projectWorkspace?.defaultRef ?? null,
+      projectRepoRef: projectWorkspace?.repoRef ?? null,
+      issueIdentifier: issue.identifier,
+      refsDigest: probe.refsDigest,
+    },
+  };
+}
+
+async function proveZeroDeltaTier2Live(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null; projectWorkspaceId?: string | null },
+  executionWorkspaceId: string | null,
+  deliveryRepository: { hostname: string; owner: string; repo: string },
+  evidence: string,
+  shape: RegExpExecArray,
+  sameRun: boolean,
+  unrecorded: string,
+  tier2Forms: string,
+): Promise<DoneTierDeclarationResult> {
+  let proof: ZeroDeltaCloseProof;
+  try {
+    proof = await proveZeroDeltaRepositoryClose(db, issue, executionWorkspaceId, deliveryRepository);
+  } catch (err) {
+    proof = { ok: false, reason: `the proof could not be completed (${err instanceof Error ? err.message : "unknown"})` };
+  }
+  if (!proof.ok) {
+    return refuseTier2(
+      `${unrecorded}A zero-delta close was not proven: ${proof.reason}. ${ZERO_DELTA_CLOSE_CONDITIONS} ` +
+        `Accepted form: ${tier2Forms}`,
+    );
+  }
+  const { measurement } = proof;
+  const probeHead = shape[2]!.toLowerCase();
+  let probeHeadResolved: string | null;
+  try {
+    probeHeadResolved = await resolveGitHubRefHeadSha(
+      deliveryRepository.hostname,
+      deliveryRepository.owner,
+      deliveryRepository.repo,
+      probeHead,
+      proof.token,
+      AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+    );
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
+  }
+  if (probeHeadResolved !== measurement.headSha) {
+    return refuseTier2(
+      `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved ?? "nothing on the remote"}) is not HEAD ` +
+        `${measurement.headSha} of this card's own worktree, which the server measured zero-delta against ` +
+        `${measurement.baseRef}; a zero-delta close names the HEAD the server measured. ` +
+        `Accepted form: ${tier2Forms}`,
+    );
+  }
+  const probeCommand = shape[1]!.trim();
+  return {
+    ...acceptTier2(evidence.trim(), sameRun, {
+      probeCommand,
+      probeTarget: /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null,
+      observed: null,
+      observedRangeEnd: null,
+      tierForm: "live",
+      probeHead,
+      mergeCommit: null,
+      zeroDelta: measurement,
+    }),
+    zeroDeltaMeasurement: measurement,
+  };
+}
+
+export type ZeroDeltaCloseVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * SUP-24402 compare-and-set, inside the status write that lands a zero-delta
+ * close and against the row it holds `FOR UPDATE`. It makes no network call:
+ * it re-reads the database half of the proof and requires it to match what
+ * was measured (including the project settings that approved the base), then
+ * requires the recorded path to still resolve to the measured worktree and
+ * re-checks that worktree (index, status, ignored entries and stash on the
+ * measured branch and commit), the branches the sibling scan read, and every
+ * other worktree on a branch naming the card, under one shared 15 s budget,
+ * so work written after the measurement refuses.
+ */
+export async function verifyZeroDeltaCloseAtTransition(
+  tx: Db,
+  lockedIssue: {
+    id: string;
+    companyId: string;
+    status?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
+    executionWorkspaceId?: string | null;
+    projectWorkspaceId?: string | null;
+  },
+  measurement: ZeroDeltaCloseMeasurement,
+): Promise<ZeroDeltaCloseVerdict> {
+  const refuse = (reason: string): ZeroDeltaCloseVerdict => ({ ok: false, reason });
+  if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+    return refuse("the issue's status changed after the close was measured");
+  }
+  if (lockedIssue.deliveryRequirement !== "repository_delivery") {
+    return refuse("is accepted only on an issue already stored as repository_delivery at the close write");
+  }
+  if ((lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId) {
+    return refuse("the issue's execution workspace changed after the close was measured");
+  }
+  if ((lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId) {
+    return refuse("the issue's project workspace changed after the close was measured");
+  }
+  try {
+    const linkedPrs = await resolveLinkedPullRequestsWithState(tx, lockedIssue.companyId, lockedIssue.id, { includeDrafts: true });
+    if (linkedPrs.length > 0) {
+      return refuse(`the card links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}) at the close write`);
+    }
+    const workProducts = await tx
+      .select({ type: issueWorkProducts.type, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.companyId, lockedIssue.companyId), eq(issueWorkProducts.issueId, lockedIssue.id)));
+    if (workProducts.some((product) => product.type === "pull_request")) {
+      return refuse("the card records a pull_request work product at the close write");
+    }
+    if (
+      workProducts.some((product) => {
+        const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+        return (metadata.mergeCommitSha ?? metadata.merge_commit_sha ?? null) !== null;
+      })
+    ) {
+      return refuse("the card records a merge commit on a work product at the close write");
+    }
+    const workspace = await tx
+      .select({
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+        providerRef: executionWorkspaces.providerRef,
+        cwd: executionWorkspaces.cwd,
+        branchName: executionWorkspaces.branchName,
+        baseRef: executionWorkspaces.baseRef,
+      })
+      .from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.id, measurement.executionWorkspaceId), eq(executionWorkspaces.companyId, lockedIssue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!workspace || workspace.sourceIssueId !== lockedIssue.id) {
+      return refuse("the card's execution workspace is not one this card owns in this company at the close write");
+    }
+    if (workspace.projectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
+      return refuse("the execution workspace's project workspace changed after the close was measured");
+    }
+    if ((workspace.providerRef ?? workspace.cwd) !== measurement.recordedWorktreePath) {
+      return refuse("the recorded worktree path changed after the close was measured");
+    }
+    if (workspace.branchName !== measurement.branch) {
+      return refuse("the recorded branch changed after the close was measured");
+    }
+    if (normalizeBaseBranch(workspace.baseRef) !== measurement.baseBranch) {
+      return refuse("the recorded base ref changed after the close was measured");
+    }
+    const projectWorkspace = await tx
+      .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.id, measurement.workspaceProjectWorkspaceId),
+          eq(projectWorkspaces.companyId, lockedIssue.companyId),
+          eq(projectWorkspaces.projectId, workspace.projectId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    const projectRepository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+    if (
+      !projectRepository ||
+      `${projectRepository.hostname}/${projectRepository.owner}/${projectRepository.repo}`.toLowerCase() !==
+        measurement.repository.toLowerCase()
+    ) {
+      return refuse("the project's repository changed after the close was measured");
+    }
+    if (
+      (projectWorkspace?.defaultRef ?? null) !== measurement.projectDefaultRef ||
+      (projectWorkspace?.repoRef ?? null) !== measurement.projectRepoRef
+    ) {
+      return refuse("the project's base branch settings changed after the close was measured");
+    }
+  } catch (err) {
+    return refuse(`could not be verified at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const resolvedWorktreePath = await realpath(measurement.recordedWorktreePath).catch(() => null);
+  if (resolvedWorktreePath !== measurement.worktreePath) {
+    return refuse("the recorded worktree path no longer resolves to the measured worktree");
+  }
+  const recheck = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
+  });
+  if (!recheck.ok) return refuse(`refused at the close write: ${recheck.reason}`);
+  try {
+    const { token } = await resolveGitHubToken(tx, lockedIssue.companyId);
+    if (!token) return refuse("the remote could not be re-read at the close write");
+    const [hostname, owner, repo] = measurement.repository.split("/");
+    if (!hostname || !owner || !repo) return refuse("the measured repository could not be re-read at the close write");
+    const again = await recheckZeroDeltaForgeAtWrite(
+      { repo: { hostname, owner, repo }, baseBranch: measurement.baseBranch },
+      { snapshotDigest: measurement.forgeSnapshotDigest, baseSha: measurement.baseSha },
+      githubForgeReader(token),
+      ZERO_DELTA_WRITE_BUDGET,
+    );
+    if (!again.ok) return refuse(again.reason);
+  } catch (err) {
+    return refuse(`the remote could not be re-read at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const afterRemote = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
+    base: { ref: measurement.baseRef, sha: measurement.baseSha, headSha: measurement.headSha },
+  });
+  if (!afterRemote.ok) return refuse(`refused at the close write: ${afterRemote.reason}`);
+  return { ok: true };
 }
 
 async function proveTier2Live(
@@ -1905,6 +3368,7 @@ async function proveTier2Live(
   issue: {
     id: string;
     companyId: string;
+    identifier?: string | null;
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
@@ -1912,6 +3376,7 @@ async function proveTier2Live(
   evidence: string,
   sameRun: boolean,
   deliveryRequirement: IssueDeliveryRequirement | null | undefined,
+  zeroDeltaRecheckedAtWrite: boolean,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: classification-aware routing. The record-only grammar is
   // accepted only on record_only cards; a repository_delivery card submitting
@@ -1944,8 +3409,10 @@ async function proveTier2Live(
   }
   const probeHead = shape[2]!.toLowerCase();
   let ctx: IssueRepoContext | null;
+  let executionWorkspaceId: string | null;
   try {
     const fields = await loadTier1RepoFields(db, issue);
+    executionWorkspaceId = fields.executionWorkspaceId;
     ctx = await resolveIssueRepoContext(db, {
       companyId: issue.companyId,
       projectId: fields.projectId,
@@ -1976,13 +3443,26 @@ async function proveTier2Live(
     return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (recordedMergeCommit === null) {
-    return refuseTier2(
+    const unrecorded =
       "Tier 2 declaration could not be verified: no recorded delivery merge commit is available " +
-        "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
-        "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
-        "fallback to the live branch tip. " +
-        `Accepted form: ${tier2Forms}`,
-    );
+      "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
+      "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
+      "fallback to the live branch tip. ";
+    // SUP-24402: only a card stored as repository_delivery may prove a
+    // zero-delta close instead; every other classification, and an absent one,
+    // keeps this refusal byte for byte.
+    if (deliveryRequirement !== "repository_delivery") {
+      return refuseTier2(`${unrecorded}Accepted form: ${tier2Forms}`);
+    }
+    // Only a door that re-checks the measurement inside its status write
+    // (verifyZeroDeltaCloseAtTransition) may accept the zero-delta form.
+    if (!zeroDeltaRecheckedAtWrite) {
+      return refuseTier2(
+        `${unrecorded}A zero-delta close is accepted only on PATCH /api/issues/{id}, whose status write re-checks ` +
+          `the measured worktree; this close path does not. Accepted form: ${tier2Forms}`,
+      );
+    }
+    return proveZeroDeltaTier2Live(db, { ...issue, identifier: issue.identifier ?? null }, executionWorkspaceId, parsed, evidence, shape, sameRun, unrecorded, tier2Forms);
   }
   let token: string | null;
   try {
@@ -2076,6 +3556,7 @@ export interface NoRepositoryLandingSubject {
   companyId: string;
   identifier: string | null;
   status?: string | null;
+  projectId?: string | null;
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
@@ -2083,12 +3564,22 @@ export interface NoRepositoryLandingSubject {
   originId?: string | null;
 }
 
+/** The entry ruling a no-repository close rests on, as measured. */
+interface NoRepositoryLandingRuling {
+  documentId: string;
+  revisionNumber: number;
+  revisionCount: number;
+  updatedAt: string;
+}
+
 /**
- * What a no-repository close measured: the issue's workspace binding, the
- * ruling it rests on, the base it was compared against and the probe result.
- * The close audit records it, and the status write re-checks it.
+ * What a no-repository close measured on a card that owns an isolated git
+ * worktree: the issue's workspace binding, the ruling it rests on, the base it
+ * was compared against and the probe result. The close audit records it, and
+ * the status write re-checks it.
  */
-export interface NoRepositoryLandingMeasurement {
+export interface NoRepositoryLandingWorktreeMeasurement {
+  proof: "isolated_worktree";
   executionWorkspaceId: string;
   issueProjectWorkspaceId: string | null;
   workspaceProjectWorkspaceId: string;
@@ -2099,7 +3590,7 @@ export interface NoRepositoryLandingMeasurement {
   repoRef: string | null;
   recoverySourceIssueId: string | null;
   permittedSourceCard: { id: string; identifier: string } | null;
-  ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
+  ruling: NoRepositoryLandingRuling;
   probe: {
     branch: string;
     headSha: string;
@@ -2109,15 +3600,74 @@ export interface NoRepositoryLandingMeasurement {
   };
 }
 
+/**
+ * SUP-24547: what a no-repository close measured on a card with no project and
+ * no execution workspace that never had one. There is no worktree to probe
+ * and no repository to compare against; the close rests on the control-plane
+ * records that show no workspace was ever attached to the card, the
+ * independent entry ruling, and the absence of linked pull requests.
+ */
+export interface NoRepositoryLandingNoWorkspaceMeasurement {
+  proof: "never_had_execution_workspace";
+  ruling: NoRepositoryLandingRuling;
+  /** Whether issue.created recorded project, project workspace and description, or the check rested on the current null pointers. */
+  creationSnapshot?: "recorded" | "not_recorded";
+}
+
+export type NoRepositoryLandingMeasurement =
+  | NoRepositoryLandingWorktreeMeasurement
+  | NoRepositoryLandingNoWorkspaceMeasurement;
+
 export type NoRepositoryLandingVerdict =
   | { ok: true; measurement: NoRepositoryLandingMeasurement }
   | { ok: false; reason: string; remedy?: string };
 
 type NoRepositoryLandingRefusal = Extract<NoRepositoryLandingVerdict, { ok: false }>;
 
-/** The close audit's view of a measurement: the ruling, the binding, the base and the probe result. */
+/** The records checked to establish that a card never had a project, a workspace or a repository deliverable. */
+const NO_WORKSPACE_HISTORY_RECORDS = [
+  "execution_workspaces, workspace_operations, environment_leases, workspace_runtime_services, execution_workspace_runtime_leases, tool_runtime_slots (any row tied to the issue)",
+  "issue_work_products (only artifact or document, no project or workspace, no repository reference)",
+  "heartbeat_runs linked by native_issue_id or whose context names the issue by id or identifier (no project, workspace, repository, branch, worktree or pull request key in context, result_json, usage_json, stdout/stderr excerpts or error), and native_run_results.result_json of the issue",
+  "activity_log of the issue (allow-listed actions and changed fields only, no truncated text change, no repository reference, and issue.created records projectId, projectWorkspaceId and description, or, where it does not, the issue's current null project and workspace pointers stand in for the creation snapshot; the creationSnapshot field says which)",
+  "issue_comments (none deleted, no repository reference)",
+  "documents of the issue (every revision, no repository reference)",
+  "issue title and description (current and every recorded change)",
+  "external_object_mentions (none)",
+] as const;
+
+/**
+ * SUP-24547: every table with an execution or project workspace column, and
+ * the column that ties a row to an issue. A no-workspace close refuses a card
+ * that any row of these tables names. A schema test keeps this list equal to
+ * the set of such tables, so a new one cannot be added unread.
+ */
+export const NO_WORKSPACE_REFERENCE_TABLES: Readonly<Record<string, string>> = {
+  execution_workspaces: "source_issue_id",
+  workspace_operations: "issue_id",
+  environment_leases: "issue_id",
+  workspace_runtime_services: "issue_id",
+  execution_workspace_runtime_leases: "owner_issue_id",
+  tool_runtime_slots: "issue_id",
+  issue_work_products: "issue_id",
+};
+
+/** The close audit's view of a measurement: the proof used, the ruling, and for a worktree the binding, base and probe result. */
 export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLandingMeasurement) {
+  if (measurement.proof === "never_had_execution_workspace") {
+    return {
+      proof: measurement.proof,
+      rulingDocumentId: measurement.ruling.documentId,
+      rulingRevisionNumber: measurement.ruling.revisionNumber,
+      projectId: null,
+      projectWorkspaceId: null,
+      executionWorkspaceId: null,
+      creationSnapshot: measurement.creationSnapshot ?? "not_recorded",
+      checkedRecords: [...NO_WORKSPACE_HISTORY_RECORDS],
+    };
+  }
   return {
+    proof: measurement.proof,
     rulingDocumentId: measurement.ruling.documentId,
     rulingRevisionNumber: measurement.ruling.revisionNumber,
     executionWorkspaceId: measurement.executionWorkspaceId,
@@ -2137,20 +3687,8 @@ export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLanding
 // Repository evidence a no-repository declaration must not carry: a close that
 // claims no repository landing while citing a PR, a commit, a ref or a GitHub
 // URL is citing somebody's repository work as its own record.
-const REPOSITORY_EVIDENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bPR\s*#\s*\d+/i, "a pull request number"],
-  [/\/pull\/\d+/i, "a pull request URL"],
-  [/github\.com\//i, "a GitHub URL"],
-  [/\brefs\/(?:heads|remotes|tags)\//i, "a Git ref"],
-];
-
 function citedRepositoryEvidence(text: string): string | null {
-  for (const [pattern, label] of REPOSITORY_EVIDENCE_PATTERNS) {
-    if (pattern.test(text)) return label;
-  }
-  const hexTokens = text.match(/\b[0-9a-f]{7,64}\b/gi) ?? [];
-  if (hexTokens.some((token) => /[0-9]/.test(token) && /[a-f]/i.test(token))) return "a commit SHA";
-  return extractCitedCommitShas(text).length > 0 ? "a commit SHA" : null;
+  return detectEvidence(text, "prose")?.label ?? null;
 }
 
 // A ruling that opens with one of these words, or says nothing else, is a
@@ -2178,8 +3716,8 @@ function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandi
 
 /** Everything the close rests on that the database holds; `probe` aside, the measurement. */
 type NoRepositoryLandingRecord = Omit<
-  NoRepositoryLandingMeasurement,
-  "probe" | "recoverySourceIssueId" | "permittedSourceCard"
+  NoRepositoryLandingWorktreeMeasurement,
+  "proof" | "probe" | "recoverySourceIssueId" | "permittedSourceCard"
 > & {
   identifier: string;
   projectId: string;
@@ -2188,16 +3726,559 @@ type NoRepositoryLandingRecord = Omit<
   attributedBranches: string[];
 };
 
+type NoRepositoryLandingRead =
+  | NoRepositoryLandingRefusal
+  | { ok: true; proof: "isolated_worktree"; record: NoRepositoryLandingRecord }
+  | { ok: true; proof: "never_had_execution_workspace"; ruling: NoRepositoryLandingRuling; creationSnapshot: "recorded" | "not_recorded" };
+
+const NO_WORKSPACE_REFUSAL_REASON = "requires this issue's own execution workspace.";
+
+/**
+ * SUP-24547: the one detector for repository work in a card's text. It is
+ * applied to every text surface the card ever had: the current title and
+ * description, every recorded change of them, every comment, every revision
+ * of every document, every string in the card's audit rows and every work
+ * product. It matches pull and merge requests in any form (a number, a URL of
+ * GitHub, GitLab, Bitbucket or Azure DevOps, a bare `owner/repo#N`), any URL
+ * or SSH address of a code host, and Git refs.
+ */
+function repositoryReference(text: string | null | undefined): string | null {
+  if (!text) return null;
+  return detectEvidence(text, "prose")?.label ?? null;
+}
+
+function forEachJsonEntry(value: unknown, visit: (key: string | null, value: unknown) => boolean): boolean {
+  if (Array.isArray(value)) return value.some((item) => visit(null, item) || forEachJsonEntry(item, visit));
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).some(([key, item]) => visit(key, item) || forEachJsonEntry(item, visit));
+  }
+  return false;
+}
+
+function jsonRepositoryReference(value: unknown): string | null {
+  if (typeof value === "string") return repositoryReference(value);
+  let found: string | null = null;
+  forEachJsonEntry(value, (_key, item) => {
+    if (typeof item === "string") found = repositoryReference(item);
+    return found !== null;
+  });
+  return found;
+}
+
+
+function namesWorkspace(value: unknown): boolean {
+  return detectEvidence(value, "machine")?.arm === "key";
+}
+
+
+// The audit actions a card with no project and no workspace can carry: its
+// creation, plain field edits, comments, documents, reads, and the close
+// guard's own rows. Any other action refuses.
+const NO_WORKSPACE_ALLOWED_ACTIVITY_ACTIONS: ReadonlySet<string> = new Set([
+  "issue.created",
+  "issue.created_without_parent",
+  "issue.updated",
+  "issue.comment_added",
+  // A tombstoned comment keeps its row with `deletedAt`, and that row refuses
+  // below. Hard comment removals (`issue.comment_cancelled`,
+  // `issue.queued_comment_discarded`) are not allowed and refuse here.
+  "issue.comment_deleted",
+  "issue.document_created",
+  "issue.document_updated",
+  "issue.read_marked",
+  "issue.done_transition_refused",
+  "issue.done_transition_guard_skipped",
+  "issue.done_tier_declaration_skipped",
+  "issue.done_transition_tier1_close",
+  "issue.document_locked",
+  "issue.document_unlocked",
+  "issue.checked_out",
+  "issue.released",
+  "issue.checkout_lock_adopted",
+  "issue.successful_run_handoff_required",
+  "issue.workspace_preflight_blocked",
+  "issue.done_transition_no_repository_landing_verified",
+  "issue.done_transition_exclusion_below_threshold",
+]);
+
+// The fields an `issue.updated` row may record as changed. Any other changed
+// field (a project, a workspace, a parent, a delivery classification, ...)
+// refuses.
+const NO_WORKSPACE_ALLOWED_CHANGED_FIELDS: ReadonlySet<string> = new Set([
+  "status",
+  "priority",
+  "title",
+  "description",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "labelIds",
+  "blockedByIssueIds",
+  "startedAt",
+  "completedAt",
+  "cancelledAt",
+  "checkoutRunId",
+  "executionRunId",
+  "executionAgentNameKey",
+  "executionLockedAt",
+  "statusVersion",
+]);
+
+// `buildIssueChanges` keeps at most this many characters of a changed title or
+// description; a longer value is unreadable history.
+const RECORDED_CHANGE_TEXT_LIMIT = 200;
+
+function activityRowRefusal(action: string, details: unknown): NoRepositoryLandingRefusal | null {
+  if (!NO_WORKSPACE_ALLOWED_ACTIVITY_ACTIONS.has(action)) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+  if (namesWorkspace(details)) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+  const record = details !== null && typeof details === "object" ? (details as Record<string, unknown>) : {};
+  if (action === "issue.updated") {
+    const changes = record.changes;
+    if (changes !== undefined && (changes === null || typeof changes !== "object")) {
+      return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+    }
+    // A plugin host's issues.update records the requested `patch` and no old
+    // value. The presence of any key outside the allow-list refuses even when
+    // its value is null (a stripped project), and a text rewrite whose earlier
+    // value is not recorded is unreadable history. A row with neither
+    // `changes` nor `patch` records nothing about what changed.
+    const patch = record.patch;
+    if (patch !== undefined && (patch === null || typeof patch !== "object" || Array.isArray(patch))) {
+      return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+    }
+    if (changes === undefined && patch === undefined) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+    for (const field of Object.keys((patch ?? {}) as Record<string, unknown>)) {
+      if (!NO_WORKSPACE_ALLOWED_CHANGED_FIELDS.has(field)) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+      if (field === "title" || field === "description") {
+        return noRepositoryRefusal(
+          "cannot be declared on an issue whose title or description was rewritten without a recorded earlier value: the earlier text can no longer be checked for repository work.",
+        );
+      }
+    }
+    for (const [field, change] of Object.entries((changes ?? {}) as Record<string, unknown>)) {
+      if (!NO_WORKSPACE_ALLOWED_CHANGED_FIELDS.has(field)) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+      const changeRecord = change !== null && typeof change === "object" ? (change as Record<string, unknown>) : null;
+      if ((field === "title" || field === "description") && (changeRecord === null || !Object.hasOwn(changeRecord, "from"))) {
+        return noRepositoryRefusal(
+          "cannot be declared on an issue whose title or description was rewritten without a recorded earlier value: the earlier text can no longer be checked for repository work.",
+        );
+      }
+      const { from, to } = (changeRecord ?? {}) as { from?: unknown; to?: unknown };
+      if ([from, to].some((value) => typeof value === "string" && Array.from(value).length >= RECORDED_CHANGE_TEXT_LIMIT)) {
+        return noRepositoryRefusal(
+          "cannot be declared on an issue whose recorded title or description history is truncated: the earlier text can no longer be checked for repository work.",
+        );
+      }
+    }
+  }
+  const reference = jsonRepositoryReference(details);
+  if (reference) {
+    return noRepositoryRefusal(`cannot be declared on an issue whose history cites repository work (${reference}).`);
+  }
+  return null;
+}
+
+/**
+ * SUP-24547: the closed-world proof that a card with no project and no
+ * workspace never had one and carries no repository work. The pointers on the
+ * issue row are writable by its assignee, and its text can be edited or
+ * deleted, so the proof reads what the server keeps and what cannot be
+ * scrubbed: every row tied to the card in a table that can name a workspace;
+ * every run whose context names the card by id or identifier under any key;
+ * every audit row of the card, against an allow-list of actions and changed
+ * fields; every comment (a deleted one refuses, its text is gone); every
+ * revision of every document; and the current title and description. A row of
+ * a kind the allow-list does not name, or text that cannot be read in full,
+ * refuses.
+ */
+function creationSnapshotComplete(details: unknown): boolean {
+  if (details === null || typeof details !== "object" || Array.isArray(details)) return false;
+  const record = details as Record<string, unknown>;
+  return Object.hasOwn(record, "projectId") && Object.hasOwn(record, "projectWorkspaceId") && Object.hasOwn(record, "description");
+}
+
+async function creationSnapshotState(db: Db, issue: { id: string; companyId: string }): Promise<"recorded" | "not_recorded"> {
+  const rows = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, issue.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, issue.id),
+      eq(activityLog.action, "issue.created"),
+    ));
+  return rows.length > 0 && rows.every((row) => creationSnapshotComplete(row.details)) ? "recorded" : "not_recorded";
+}
+
+const NO_WORKSPACE_EVENT_ROW_LIMIT = 2000;
+const NO_WORKSPACE_EVENT_BYTE_LIMIT = 32 * 1024 * 1024;
+
+async function noWorkspaceHistoryRefusal(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string },
+): Promise<NoRepositoryLandingRefusal | null> {
+  const referencing = await db.execute(sql`
+    select 1 from ${executionWorkspaces} where ${executionWorkspaces.companyId} = ${issue.companyId} and ${executionWorkspaces.sourceIssueId} = ${issue.id}
+    union all select 1 from ${workspaceOperations} where ${workspaceOperations.companyId} = ${issue.companyId} and ${workspaceOperations.issueId} = ${issue.id}
+    union all select 1 from ${environmentLeases} where ${environmentLeases.companyId} = ${issue.companyId} and ${environmentLeases.issueId} = ${issue.id}
+    union all select 1 from ${workspaceRuntimeServices} where ${workspaceRuntimeServices.companyId} = ${issue.companyId} and ${workspaceRuntimeServices.issueId} = ${issue.id}
+    union all select 1 from ${executionWorkspaceRuntimeLeases} where ${executionWorkspaceRuntimeLeases.companyId} = ${issue.companyId} and ${executionWorkspaceRuntimeLeases.ownerIssueId} = ${issue.id}
+    union all select 1 from ${toolRuntimeSlots} where ${toolRuntimeSlots.companyId} = ${issue.companyId} and ${toolRuntimeSlots.issueId} = ${issue.id}
+    union all select 1 from ${issueWorkProducts} where ${issueWorkProducts.companyId} = ${issue.companyId} and ${issueWorkProducts.issueId} = ${issue.id}
+      and (${issueWorkProducts.projectId} is not null or ${issueWorkProducts.executionWorkspaceId} is not null)
+    limit 1
+  `);
+  if ((referencing as unknown as unknown[]).length > 0) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+
+  const runs = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        or(
+          eq(heartbeatRuns.nativeIssueId, issue.id),
+          and(
+            isNull(heartbeatRuns.nativeIssueId),
+            or(
+              sql`strpos(${heartbeatRuns.contextSnapshot}::text, ${issue.id}) > 0`,
+              sql`jsonb_path_exists(${heartbeatRuns.contextSnapshot}, 'strict $.** ? (@ == $ref)', jsonb_build_object('ref', ${issue.identifier}::text))`,
+            ),
+          ),
+        ),
+      ),
+    );
+  const runIds = runs.map((run) => run.id);
+  const eventScope = and(eq(heartbeatRunEvents.companyId, issue.companyId), inArray(heartbeatRunEvents.runId, runIds));
+  if (runIds.length > 0) {
+    const [eventSize] = await db
+      .select({
+        rows: sql<number>`count(*)::int`,
+        bytes: sql<number>`coalesce(sum(octet_length(to_jsonb(${heartbeatRunEvents})::text)), 0)::float8`,
+      })
+      .from(heartbeatRunEvents)
+      .where(eventScope);
+    if ((eventSize?.rows ?? 0) > NO_WORKSPACE_EVENT_ROW_LIMIT || (eventSize?.bytes ?? 0) > NO_WORKSPACE_EVENT_BYTE_LIMIT) {
+      return noRepositoryRefusal("cannot be declared on an issue whose run events exceed the scan size budget.");
+    }
+  }
+  const events = runIds.length === 0
+    ? []
+    : await db.select().from(heartbeatRunEvents).where(eventScope).limit(NO_WORKSPACE_EVENT_ROW_LIMIT);
+  const receipts = await db
+    .select()
+    .from(issueDeliveryReceipts)
+    .where(and(eq(issueDeliveryReceipts.companyId, issue.companyId), eq(issueDeliveryReceipts.sourceIssueId, issue.id)));
+  const issueRow = await db.select().from(issues).where(eq(issues.id, issue.id)).then((rows) => rows[0] ?? null);
+  const nativeResults = await db
+    .select()
+    .from(nativeRunResults)
+    .where(and(eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.issueId, issue.id)));
+  const surfaces: unknown[] = [...runs, ...events, ...receipts, ...nativeResults];
+  if (issueRow) surfaces.push({ billingCode: issueRow.billingCode, executionPolicy: issueRow.executionPolicy });
+  if (surfaces.some((surface) => detectEvidence(surface, "machine") !== null)) {
+    return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+  }
+
+  const activity = await db
+    .select({ action: activityLog.action, details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+      ),
+    );
+  for (const row of activity) {
+    const refusal = activityRowRefusal(row.action, row.details);
+    if (refusal) return refusal;
+  }
+  const created = activity.filter((row) => row.action === "issue.created");
+  const projectAbsentNow = issueRow?.projectId == null && issueRow?.projectWorkspaceId == null;
+  const creationUnknown = created.length === 0 || created.some((row) => !creationSnapshotComplete(row.details));
+  if (!projectAbsentNow && creationUnknown) {
+    return noRepositoryRefusal(
+      "cannot be declared on an issue whose creation snapshot is unknown: issue.created did not record projectId, projectWorkspaceId and description.",
+    );
+  }
+
+  if (projectAbsentNow) {
+    const affectedIssue = sql<boolean>`${activityLog.details} -> 'affectedIssues' @> ${JSON.stringify([{ issueId: issue.id }])}::jsonb`;
+    const [deletedBinding] = await db
+      .select({ affectedIssue })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "project"),
+          inArray(activityLog.action, ["project.deleted", "project.workspace_deleted"]),
+          or(
+            affectedIssue,
+            creationUnknown && issueRow?.executionWorkspaceId == null
+              ? sql`${activityLog.details} -> 'affectedTruncated' = 'true'::jsonb`
+              : undefined,
+          ),
+        ),
+      )
+      .limit(1);
+    if (deletedBinding) {
+      if (deletedBinding.affectedIssue) return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+      return noRepositoryRefusal(
+        "cannot be declared because a project or workspace deletion in this company exceeded the audit cap: the incomplete audit cannot rule out a former binding for this issue.",
+        "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified; " +
+          "keep the issue record_only and close again; the board close path stays available.",
+      );
+    }
+  }
+
+  const mention = await db
+    .select({ objectType: externalObjectMentions.objectType, providerKey: externalObjectMentions.providerKey })
+    .from(externalObjectMentions)
+    .where(and(eq(externalObjectMentions.companyId, issue.companyId), eq(externalObjectMentions.sourceIssueId, issue.id)))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (mention) {
+    return noRepositoryRefusal(
+      `cannot be declared on an issue that mentions an external object (${mention.providerKey} ${mention.objectType}).`,
+    );
+  }
+
+  const products = await db
+    .select({
+      type: issueWorkProducts.type,
+      url: issueWorkProducts.url,
+      externalId: issueWorkProducts.externalId,
+      title: issueWorkProducts.title,
+      summary: issueWorkProducts.summary,
+      metadata: issueWorkProducts.metadata,
+    })
+    .from(issueWorkProducts)
+    .where(and(eq(issueWorkProducts.companyId, issue.companyId), eq(issueWorkProducts.issueId, issue.id)));
+  const repositoryProduct = products.find(
+    (product) =>
+      !NON_REPOSITORY_WORK_PRODUCT_TYPES.has(product.type) ||
+      jsonRepositoryReference([product.url, product.externalId, product.title, product.summary, product.metadata]) !== null,
+  );
+  if (repositoryProduct) {
+    return noRepositoryRefusal(
+      `cannot be declared on an issue that records a repository work product (${repositoryProduct.type}).`,
+    );
+  }
+
+  const comments = await db
+    .select({ body: issueComments.body, deletedAt: issueComments.deletedAt })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id)));
+  if (comments.some((comment) => comment.deletedAt !== null)) {
+    return noRepositoryRefusal(
+      "cannot be declared on an issue with a deleted comment: its text can no longer be checked for repository work.",
+    );
+  }
+  const card = await db
+    .select({ title: issues.title, description: issues.description })
+    .from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
+    .then((rows) => rows[0] ?? null);
+  const revisions = await db
+    .select({ body: documentRevisions.body, title: documents.title, latestBody: documents.latestBody })
+    .from(issueDocuments)
+    .innerJoin(documents, and(eq(issueDocuments.documentId, documents.id), eq(documents.companyId, issue.companyId)))
+    .leftJoin(
+      documentRevisions,
+      and(eq(documentRevisions.documentId, documents.id), eq(documentRevisions.companyId, issue.companyId)),
+    )
+    .where(and(eq(issueDocuments.companyId, issue.companyId), eq(issueDocuments.issueId, issue.id)));
+  const texts = [
+    card?.title,
+    card?.description,
+    ...comments.map((comment) => comment.body),
+    ...revisions.flatMap((revision) => [revision.body, revision.title, revision.latestBody]),
+  ];
+  for (const text of texts) {
+    const reference = repositoryReference(text);
+    if (reference) {
+      return noRepositoryRefusal(`cannot be declared on an issue whose thread cites repository work (${reference}).`);
+    }
+  }
+  if (issueRow) {
+    const census = await scanCardEvidence(db, {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdAt: issueRow.createdAt,
+    }, runIds);
+    if (census) {
+      return noRepositoryRefusal(
+        `cannot be declared on an issue whose ${census.table} row carries unread workspace or repository evidence (${census.label}).`,
+      );
+    }
+  }
+  return null;
+}
+
+// Work product types that carry no repository deliverable by themselves.
+const NON_REPOSITORY_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set(["artifact", "document"]);
+
+/**
+ * SUP-24547: whether a ruling author is a board member of this company: a
+ * user with an active, non-viewer membership in it. An instance admin with no
+ * membership is not accepted. Agents are not accepted as authors of a ruling
+ * for a card with no workspace: an assignee can rewrite the card's execution
+ * policy, so a "named reviewer" read from it is not independent of the closer.
+ */
+async function isBoardMemberOfCompany(db: Db, companyId: string, userId: string): Promise<boolean> {
+  const membership = await db
+    .select({ role: companyMemberships.membershipRole })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  return membership !== null && membership.role !== "viewer";
+}
+
+interface EntryRulingOptions {
+  /** SUP-24547: every author of every revision must be a board user of this company. */
+  boardAuthorsOnly?: boolean;
+  /** Lock the ruling and its link until the status write commits, so it cannot be replaced under the close. */
+  lock?: boolean;
+}
+
+/**
+ * The ruling: exactly the "entry-ruling" document linked to THIS issue in
+ * THIS company, with a substantive body, and no revision of it written by
+ * the closing actor.
+ */
+async function readEntryRuling(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor,
+  options: EntryRulingOptions = {},
+): Promise<NoRepositoryLandingRefusal | { ok: true; ruling: NoRepositoryLandingRuling }> {
+  const rulingQuery = db
+    .select({
+      documentId: documents.id,
+      latestBody: documents.latestBody,
+      latestRevisionNumber: documents.latestRevisionNumber,
+      updatedAt: documents.updatedAt,
+      createdByAgentId: documents.createdByAgentId,
+      createdByUserId: documents.createdByUserId,
+      updatedByAgentId: documents.updatedByAgentId,
+      updatedByUserId: documents.updatedByUserId,
+    })
+    .from(issueDocuments)
+    .innerJoin(
+      documents,
+      and(eq(issueDocuments.documentId, documents.id), eq(documents.companyId, issue.companyId)),
+    )
+    .where(
+      and(
+        eq(issueDocuments.companyId, issue.companyId),
+        eq(issueDocuments.issueId, issue.id),
+        eq(issueDocuments.key, ENTRY_RULING_DOCUMENT_KEY),
+      ),
+    );
+  const ruling = await (options.lock ? rulingQuery.for("update") : rulingQuery).then((rows) => rows[0] ?? null);
+  if (!ruling || ruling.latestBody.trim().length === 0) {
+    return noRepositoryRefusal(`requires a non-empty "${ENTRY_RULING_DOCUMENT_KEY}" document on this issue.`);
+  }
+  const placeholder = placeholderRulingReason(ruling.latestBody);
+  if (placeholder) {
+    return noRepositoryRefusal(
+      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document that states a ruling; this one is a placeholder (${placeholder}).`,
+    );
+  }
+  const revisions = await db
+    .select({ agentId: documentRevisions.createdByAgentId, userId: documentRevisions.createdByUserId })
+    .from(documentRevisions)
+    .where(
+      and(
+        eq(documentRevisions.companyId, issue.companyId),
+        eq(documentRevisions.documentId, ruling.documentId),
+      ),
+    );
+  const authors = [
+    { agentId: ruling.createdByAgentId, userId: ruling.createdByUserId },
+    { agentId: ruling.updatedByAgentId, userId: ruling.updatedByUserId },
+    ...revisions,
+  ];
+  if (revisions.length === 0 || authors.some((author) => !author.agentId && !author.userId)) {
+    return noRepositoryRefusal(
+      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document whose every revision has a recorded author.`,
+    );
+  }
+  if (
+    authors.some(
+      (author) =>
+        (closingActor.agentId !== null && author.agentId === closingActor.agentId) ||
+        (closingActor.userId !== null && author.userId === closingActor.userId),
+    )
+  ) {
+    return noRepositoryRefusal(
+      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document written by someone other than the closing actor; the closer wrote at least one revision of it.`,
+    );
+  }
+  if (options.boardAuthorsOnly) {
+    for (const author of authors) {
+      if (author.agentId || !author.userId || !(await isBoardMemberOfCompany(db, issue.companyId, author.userId))) {
+        return noRepositoryRefusal(
+          `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document whose every revision was written by a board member of this company ` +
+            "(an active, non-viewer member) when the issue has no execution workspace.",
+        );
+      }
+    }
+  }
+  return {
+    ok: true,
+    ruling: {
+      documentId: ruling.documentId,
+      revisionNumber: ruling.latestRevisionNumber,
+      revisionCount: revisions.length,
+      updatedAt: ruling.updatedAt.toISOString(),
+    },
+  };
+}
+
+/** Foreign repository evidence recorded on the issue itself. */
+async function linkedRepositoryWorkRefusal(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+): Promise<NoRepositoryLandingRefusal | null> {
+  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+  if (linkedPrs.length > 0) {
+    return noRepositoryRefusal(
+      `cannot be declared on an issue that links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}).`,
+    );
+  }
+  const pullRequestProducts = await readPullRequestWorkProductLinks(db, issue);
+  if (pullRequestProducts.some((product) => product.kind !== "foreign")) {
+    return noRepositoryRefusal("cannot be declared on an issue that records a pull request work product.");
+  }
+  return null;
+}
+
 /**
  * The database half of the proof: classification, closer, workspace kind and
  * binding, base, ruling and linked pull requests. Reads only; runs no Git and
  * makes no network call, so the status write can repeat it under the row lock.
+ *
+ * SUP-24547: a card with no project, no project workspace and no execution
+ * workspace, that the control plane shows never had one, rests on the
+ * independent ruling and the absence of linked pull requests alone; there is
+ * no worktree to probe. Every other card without an execution workspace keeps
+ * the refusal below unchanged.
  */
 async function readNoRepositoryLandingRecord(
   db: Db,
   issue: NoRepositoryLandingSubject,
   closingActor: DoneTierClosingActor | null,
-): Promise<NoRepositoryLandingRefusal | { ok: true; record: NoRepositoryLandingRecord }> {
+  options: { lockRuling?: boolean } = {},
+): Promise<NoRepositoryLandingRead> {
   if (issue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
   }
@@ -2208,7 +4289,24 @@ async function readNoRepositoryLandingRecord(
     return noRepositoryRefusal("requires an issue identifier to tie the worktree's branch to this issue.");
   }
   if (!issue.executionWorkspaceId) {
-    return noRepositoryRefusal("requires this issue's own execution workspace.");
+    if (issue.projectId !== null || issue.projectWorkspaceId !== null) {
+      return noRepositoryRefusal(NO_WORKSPACE_REFUSAL_REASON);
+    }
+    const history = await noWorkspaceHistoryRefusal(db, { id: issue.id, companyId: issue.companyId, identifier: issue.identifier });
+    if (history) return history;
+    const ruling = await readEntryRuling(db, issue, closingActor, {
+      boardAuthorsOnly: true,
+      lock: options.lockRuling === true,
+    });
+    if (!ruling.ok) return ruling;
+    const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
+    if (linkedWork) return linkedWork;
+    return {
+      ok: true,
+      proof: "never_had_execution_workspace",
+      ruling: ruling.ruling,
+      creationSnapshot: await creationSnapshotState(db, issue),
+    };
   }
 
   const workspace = await db
@@ -2269,84 +4367,10 @@ async function readNoRepositoryLandingRecord(
     return noRepositoryRefusal("requires the project workspace to name its default branch.");
   }
 
-  // The ruling: exactly the "entry-ruling" document linked to THIS issue in
-  // THIS company, with a substantive body, and no revision of it written by
-  // the closing actor.
-  const ruling = await db
-    .select({
-      documentId: documents.id,
-      latestBody: documents.latestBody,
-      latestRevisionNumber: documents.latestRevisionNumber,
-      updatedAt: documents.updatedAt,
-      createdByAgentId: documents.createdByAgentId,
-      createdByUserId: documents.createdByUserId,
-      updatedByAgentId: documents.updatedByAgentId,
-      updatedByUserId: documents.updatedByUserId,
-    })
-    .from(issueDocuments)
-    .innerJoin(
-      documents,
-      and(eq(issueDocuments.documentId, documents.id), eq(documents.companyId, issue.companyId)),
-    )
-    .where(
-      and(
-        eq(issueDocuments.companyId, issue.companyId),
-        eq(issueDocuments.issueId, issue.id),
-        eq(issueDocuments.key, ENTRY_RULING_DOCUMENT_KEY),
-      ),
-    )
-    .then((rows) => rows[0] ?? null);
-  if (!ruling || ruling.latestBody.trim().length === 0) {
-    return noRepositoryRefusal(`requires a non-empty "${ENTRY_RULING_DOCUMENT_KEY}" document on this issue.`);
-  }
-  const placeholder = placeholderRulingReason(ruling.latestBody);
-  if (placeholder) {
-    return noRepositoryRefusal(
-      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document that states a ruling; this one is a placeholder (${placeholder}).`,
-    );
-  }
-  const revisions = await db
-    .select({ agentId: documentRevisions.createdByAgentId, userId: documentRevisions.createdByUserId })
-    .from(documentRevisions)
-    .where(
-      and(
-        eq(documentRevisions.companyId, issue.companyId),
-        eq(documentRevisions.documentId, ruling.documentId),
-      ),
-    );
-  const authors = [
-    { agentId: ruling.createdByAgentId, userId: ruling.createdByUserId },
-    { agentId: ruling.updatedByAgentId, userId: ruling.updatedByUserId },
-    ...revisions,
-  ];
-  if (revisions.length === 0 || authors.some((author) => !author.agentId && !author.userId)) {
-    return noRepositoryRefusal(
-      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document whose every revision has a recorded author.`,
-    );
-  }
-  if (
-    authors.some(
-      (author) =>
-        (closingActor.agentId !== null && author.agentId === closingActor.agentId) ||
-        (closingActor.userId !== null && author.userId === closingActor.userId),
-    )
-  ) {
-    return noRepositoryRefusal(
-      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document written by someone other than the closing actor; the closer wrote at least one revision of it.`,
-    );
-  }
-
-  // Foreign repository evidence recorded on the issue itself.
-  const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
-  if (linkedPrs.length > 0) {
-    return noRepositoryRefusal(
-      `cannot be declared on an issue that links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}).`,
-    );
-  }
-  const pullRequestProducts = await readPullRequestWorkProductLinks(db, issue);
-  if (pullRequestProducts.some((product) => product.kind !== "foreign")) {
-    return noRepositoryRefusal("cannot be declared on an issue that records a pull request work product.");
-  }
+  const ruling = await readEntryRuling(db, issue, closingActor);
+  if (!ruling.ok) return ruling;
+  const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
+  if (linkedWork) return linkedWork;
 
   const recordedWorktreePath = workspace.providerRef ?? workspace.cwd;
   if (!recordedWorktreePath) {
@@ -2380,6 +4404,7 @@ async function readNoRepositoryLandingRecord(
     .then((rows) => rows.map((row) => row.branchName!).sort());
   return {
     ok: true,
+    proof: "isolated_worktree",
     record: {
       identifier: issue.identifier,
       projectId: workspace.projectId,
@@ -2392,12 +4417,7 @@ async function readNoRepositoryLandingRecord(
       attributedBranches,
       baseBranch,
       repoRef,
-      ruling: {
-        documentId: ruling.documentId,
-        revisionNumber: ruling.latestRevisionNumber,
-        revisionCount: revisions.length,
-        updatedAt: ruling.updatedAt.toISOString(),
-      },
+      ruling: ruling.ruling,
     },
   };
 }
@@ -2443,6 +4463,9 @@ async function verifyNoRepositoryLanding(
 ): Promise<NoRepositoryLandingVerdict> {
   const read = await readNoRepositoryLandingRecord(db, issue, closingActor);
   if (!read.ok) return read;
+  if (read.proof === "never_had_execution_workspace") {
+    return { ok: true, measurement: { proof: read.proof, ruling: read.ruling, creationSnapshot: read.creationSnapshot } };
+  }
   const { record } = read;
   const { token } = await resolveGitHubToken(db, issue.companyId);
   if (!token) {
@@ -2456,7 +4479,7 @@ async function verifyNoRepositoryLanding(
   const projectBranches = new Set([record.baseBranch, githubDefaultBranch]);
   if (record.repoRef) projectBranches.add(record.repoRef);
   const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(issue.originKind) ? issue.originId ?? null : null;
-  let permittedSourceCard: NoRepositoryLandingMeasurement["permittedSourceCard"] = null;
+  let permittedSourceCard: NoRepositoryLandingWorktreeMeasurement["permittedSourceCard"] = null;
   if (recoverySourceIssueId) {
     permittedSourceCard = await db
       .select({ id: issues.id, identifier: issues.identifier })
@@ -2510,6 +4533,7 @@ async function verifyNoRepositoryLanding(
   return {
     ok: true,
     measurement: {
+      proof: "isolated_worktree",
       executionWorkspaceId: record.executionWorkspaceId,
       issueProjectWorkspaceId: record.issueProjectWorkspaceId,
       workspaceProjectWorkspaceId: record.workspaceProjectWorkspaceId,
@@ -2538,6 +4562,9 @@ export interface NoRepositoryLandingCloseRequest {
   requestedDeliveryRequirement: unknown;
   requestedExecutionWorkspaceId: unknown;
   requestedProjectWorkspaceId: unknown;
+  requestedProjectId: unknown;
+  requestedTitle?: unknown;
+  requestedDescription?: unknown;
 }
 
 // Neither the classification nor the workspace binding the proof rests on may
@@ -2561,6 +4588,23 @@ function closeRequestRefusal(
     request.requestedProjectWorkspaceId !== (issue.projectWorkspaceId ?? null)
   ) {
     return noRepositoryRefusal("cannot ride a request that changes the issue's project workspace.");
+  }
+  // SUP-24547: a card without an execution workspace closes only while it has
+  // no project, so the request that lands the close may not attach one.
+  if (
+    workspaceId === null &&
+    request.requestedProjectId !== undefined &&
+    request.requestedProjectId !== (issue.projectId ?? null)
+  ) {
+    return noRepositoryRefusal("cannot ride a request that changes the issue's project.");
+  }
+  if (workspaceId === null) {
+    for (const text of [request.requestedTitle, request.requestedDescription]) {
+      const reference = typeof text === "string" ? repositoryReference(text) : null;
+      if (reference) {
+        return noRepositoryRefusal(`cannot ride a request whose title or description cites repository work (${reference}).`);
+      }
+    }
   }
   return null;
 }
@@ -2588,9 +4632,18 @@ export async function measureNoRepositoryLandingForClose(
   }
 }
 
+function rulingChangedSinceMeasurement(current: NoRepositoryLandingRuling, measured: NoRepositoryLandingRuling): boolean {
+  return (
+    current.documentId !== measured.documentId ||
+    current.revisionNumber !== measured.revisionNumber ||
+    current.revisionCount !== measured.revisionCount ||
+    current.updatedAt !== measured.updatedAt
+  );
+}
+
 function changedSinceMeasurement(
   record: NoRepositoryLandingRecord,
-  measurement: NoRepositoryLandingMeasurement,
+  measurement: NoRepositoryLandingWorktreeMeasurement,
 ): string | null {
   if (record.workspaceProjectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
     return "the execution workspace's project workspace";
@@ -2603,12 +4656,7 @@ function changedSinceMeasurement(
   ) {
     return "the project's repository or default branch";
   }
-  if (
-    record.ruling.documentId !== measurement.ruling.documentId ||
-    record.ruling.revisionNumber !== measurement.ruling.revisionNumber ||
-    record.ruling.revisionCount !== measurement.ruling.revisionCount ||
-    record.ruling.updatedAt !== measurement.ruling.updatedAt
-  ) {
+  if (rulingChangedSinceMeasurement(record.ruling, measurement.ruling)) {
     return `the "${ENTRY_RULING_DOCUMENT_KEY}" document`;
   }
   return null;
@@ -2641,6 +4689,9 @@ export async function verifyNoRepositoryLandingAtTransition(
   if (lockedIssue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on an issue already stored as record_only at the close write.");
   }
+  if (measurement.proof === "never_had_execution_workspace") {
+    return verifyNoWorkspaceLandingAtTransition(tx, lockedIssue, closingActor, measurement);
+  }
   if (
     (lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId ||
     (lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId
@@ -2667,7 +4718,7 @@ export async function verifyNoRepositoryLandingAtTransition(
       return noRepositoryRefusal("refused: the recovery source identifier changed after the close was measured.");
     }
   }
-  let read: Awaited<ReturnType<typeof readNoRepositoryLandingRecord>>;
+  let read: NoRepositoryLandingRead;
   try {
     read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor);
   } catch (err) {
@@ -2676,6 +4727,9 @@ export async function verifyNoRepositoryLandingAtTransition(
     );
   }
   if (!read.ok) return read;
+  if (read.proof !== "isolated_worktree") {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
   const changed = changedSinceMeasurement(read.record, measurement);
   if (changed) {
     return noRepositoryRefusal(`refused: ${changed} changed after the close was measured.`);
@@ -2685,9 +4739,46 @@ export async function verifyNoRepositoryLandingAtTransition(
     commonDir: measurement.probe.commonDir,
     branch: measurement.probe.branch,
     headSha: measurement.probe.headSha,
+    stashScope: { issueIdentifier: read.record.identifier, attributedBranches: new Set(read.record.attributedBranches) },
   });
   if (!recheck.ok) {
     return noRepositoryRefusal(`refused at the close write: ${recheck.reason}.`);
+  }
+  return { ok: true, measurement };
+}
+
+/**
+ * SUP-24547: the compare-and-set for a close that rests on the card never
+ * having had an execution workspace. Under the row lock the card must still
+ * have no project, project workspace or execution workspace, the control-plane
+ * records must still show none was ever attached (a run that provisioned one
+ * since the measurement refuses), and the ruling must be the one measured.
+ */
+async function verifyNoWorkspaceLandingAtTransition(
+  tx: Db,
+  lockedIssue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor,
+  measurement: NoRepositoryLandingNoWorkspaceMeasurement,
+): Promise<NoRepositoryLandingVerdict> {
+  if (lockedIssue.executionWorkspaceId || lockedIssue.projectWorkspaceId || lockedIssue.projectId) {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  let read: NoRepositoryLandingRead;
+  try {
+    // The ruling and its link stay locked until this status write commits, so
+    // a ruling replaced after this re-check waits for the close, not the reverse.
+    read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor, { lockRuling: true });
+  } catch (err) {
+    return noRepositoryRefusal(
+      `could not be verified at the close write (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+  if (!read.ok) return read;
+  if (read.proof !== "never_had_execution_workspace") {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  if (rulingChangedSinceMeasurement(read.ruling, measurement.ruling)) {
+    return noRepositoryRefusal(`refused: the "${ENTRY_RULING_DOCUMENT_KEY}" document changed after the close was measured.`);
   }
   return { ok: true, measurement };
 }
@@ -2810,6 +4901,40 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse, tier2Forms:
   return null;
 }
 
+/**
+ * SUP-24299: the Tier 1 marker "Liveness unverified." disclaims the probe that
+ * a Tier 2 (live) declaration claims, so one declaration cannot carry both. The
+ * Tier 2 matchers end in a catch-all (`(.+)$`), which accepted the marker as
+ * part of the predicate text. Returns the refusal, or null when the Tier 2
+ * evidence does not carry the marker. The check reads only the matched evidence
+ * line, so a separate Tier 1 line elsewhere in the same comment is unaffected.
+ */
+function refuseTier2LivenessConflict(
+  evidence: string,
+  tier2Forms: string,
+  tier1Forms: string,
+): DoneTierDeclarationResult | null {
+  if (!evidence.toLowerCase().includes(TIER_1_SUFFIX.toLowerCase())) {
+    return null;
+  }
+  return {
+    allowed: false,
+    reason:
+      `A Tier 2 declaration also carries the Tier 1 marker "${TIER_1_SUFFIX}". The two are mutually ` +
+      'exclusive: "Closed at Tier 2 (live)" claims the running surface was probed, and ' +
+      `"${TIER_1_SUFFIX}" says it was not. ` +
+      `Accepted Tier 2 form: ${tier2Forms} — per SUP-12693.`,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+    code: DONE_TRANSITION_TIER_CONFLICT_CODE,
+    remedy:
+      `If you probed the running surface, remove "${TIER_1_SUFFIX}" from the Tier 2 line and keep the ` +
+      `probe evidence: ${tier2Forms}. If you did not probe it, do not claim Tier 2: close at Tier 1 ` +
+      `with the marker as the suffix of the Tier 1 line: ${tier1Forms} — per SUP-12693.`,
+  };
+}
+
 export async function evaluateDoneTierDeclaration(
   db: Db,
   issue: {
@@ -2837,6 +4962,7 @@ export async function evaluateDoneTierDeclaration(
   // closing run or it refuses — an agent can otherwise drop the run id header
   // and skip the closing-run lifetime gate entirely.
   closingAgentId: string | null = null,
+  options: DoneTierDeclarationOptions = {},
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -2853,11 +4979,69 @@ export async function evaluateDoneTierDeclaration(
     skipped,
     skipReason,
   });
+  const missingDeclaration = (reason: string, specificReason: string | null): DoneTierDeclarationResult => {
+    if (specificReason === null && options.recordOnlyReviewDecision) {
+      return fallback(
+        "Record-only participant review decision carried the close without consumer probe evidence",
+        true,
+        "record_only_review_decision",
+      );
+    }
+    return {
+      allowed: false,
+      reason: specificReason ?? reason,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  };
   const tier1Forms = `${TIER1_FORM}${noRepositoryTier1FormSuffix(issue)}`;
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
+    if (options.allowTier0DecisionOnly) {
+      const tier0 = parseTier0Declaration(accompanyingComment);
+      if (tier0.kind === "matched") {
+        if (tier0.reason.length === 0) {
+          return {
+            allowed: false,
+            reason: `Tier 0 decision-only declaration found but <reason> is empty. Use: ${TIER0_FORM}`,
+            tier: null,
+            skipped: false,
+            skipReason: null,
+          };
+        }
+        return {
+          allowed: true,
+          reason: `Tier 0 decision-only declaration found: ${tier0.reason.slice(0, 200)}`,
+          tier: "tier0",
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      if (tier0.kind === "not_at_line_start") {
+        return {
+          allowed: false,
+          reason:
+            "A Tier 0 decision-only declaration was found but it does not begin its own line — the guard " +
+            "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
+            `Offending line: "${tier0.offendingLine.slice(0, 200)}". Accepted form: ${TIER0_FORM}.`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: false,
+        reason: `Decision-only close requires ${TIER0_FORM}.`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
+      const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+      if (conflict) return conflict;
       // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
       // the origin predicate resolves the named probe head and compares it with
       // the delivery merge head before the close is allowed. SUP-22801: on a
@@ -2868,7 +5052,7 @@ export async function evaluateDoneTierDeclaration(
       return attributeTier2EvidenceToClosingRun(
         db,
         issue,
-        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
+        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement, options.zeroDeltaRecheckedAtWrite === true),
         runId,
         closingAgentId,
       );
@@ -2886,19 +5070,14 @@ export async function evaluateDoneTierDeclaration(
       }
       return proveTier1Landing(db, issue, tier1.reason, false, accompanyingComment, noRepositoryLandingCloser);
     }
-    return {
-      allowed: false,
-      reason:
-        describeTierRejection(tier2, tier1, tier2Forms, tier1Forms) ??
-        ("Close comment is missing a done-tier declaration. Accepted forms: " +
-          `${tier2Forms}` +
-          ` or ` +
-          `${tier1Forms}` +
-          ` — per SUP-12693.`),
-      tier: null,
-      skipped: false,
-      skipReason: null,
-    };
+    return missingDeclaration(
+      "Close comment is missing a done-tier declaration. Accepted forms: " +
+        `${tier2Forms}` +
+        ` or ` +
+        `${tier1Forms}` +
+        ` — per SUP-12693.`,
+      describeTierRejection(tier2, tier1, tier2Forms, tier1Forms),
+    );
   }
 
   if (!runId) {
@@ -2951,8 +5130,39 @@ export async function evaluateDoneTierDeclaration(
     };
   }
 
+  if (options.allowTier0DecisionOnly) {
+    const tier0 = parseTier0Declaration(sameRunComment.body);
+    if (tier0.kind === "matched") {
+      if (tier0.reason.length === 0) {
+        return {
+          allowed: false,
+          reason: `Tier 0 decision-only declaration found in same-run comment but <reason> is empty. Use: ${TIER0_FORM}`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: true,
+        reason: `Tier 0 decision-only declaration found in same-run comment: ${tier0.reason.slice(0, 200)}`,
+        tier: "tier0",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: false,
+      reason: `Decision-only close requires ${TIER0_FORM}.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
   const tier2 = parseTier2Declaration(sameRunComment.body);
   if (tier2.kind === "matched") {
+    const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+    if (conflict) return conflict;
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
     // identically on both doors. SUP-23490: the same closing-run lifetime gate
@@ -2960,7 +5170,7 @@ export async function evaluateDoneTierDeclaration(
     return attributeTier2EvidenceToClosingRun(
       db,
       issue,
-      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
+      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement, options.zeroDeltaRecheckedAtWrite === true),
       runId,
       closingAgentId,
     );
@@ -2982,19 +5192,14 @@ export async function evaluateDoneTierDeclaration(
     return proveTier1Landing(db, issue, tier1.reason, true, sameRunComment.body, noRepositoryLandingCloser);
   }
 
-  return {
-    allowed: false,
-    reason:
-      describeTierRejection(tier2, tier1, tier2Forms, tier1Forms) ??
-      ("Same-run comment does not contain a done-tier declaration. " +
-        `Accepted forms: ${tier2Forms}` +
-        ` or ` +
-        `${tier1Forms}` +
-        ` — per SUP-12693.`),
-    tier: null,
-    skipped: false,
-    skipReason: null,
-  };
+  return missingDeclaration(
+    "Same-run comment does not contain a done-tier declaration. " +
+      `Accepted forms: ${tier2Forms}` +
+      ` or ` +
+      `${tier1Forms}` +
+      ` — per SUP-12693.`,
+    describeTierRejection(tier2, tier1, tier2Forms, tier1Forms),
+  );
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -3367,10 +5572,11 @@ export async function resolveCitedCommits(
  *
  * Tier handling mirrors the wrapper's two branches exactly, without
  * duplicating predicates:
- * - a sweep that holds landing evidence supplies `structuredDoneTier`; it is
- *   rendered into the close comment (persisted the same way PATCH renders the
- *   structured field into the persisted close comment) and evaluated by the
- *   shared `evaluateDoneTierDeclaration`.
+ * - a sweep that holds landing evidence supplies `structuredDoneTier`; the
+ *   shared `resolveDoneTierDeclarationSources` resolves it against the close
+ *   comment first (a dual-source conflict refuses before any probe), then the
+ *   resolved comment is persisted the same way PATCH persists it and evaluated
+ *   by the shared `evaluateDoneTierDeclaration`.
  * - a declaration-incapable system janitor passes none and gets the SUP-13939
  *   board-bypass shape: the runner RETURNS the `doneTierSkipAudit` activity
  *   input (same shape the guard's own audit rows use) instead of writing it —
@@ -3394,20 +5600,52 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
 }): Promise<
-  | { allowed: true; closeComment: string | null; doneTierSkipAudit: null }
+  | {
+      allowed: true;
+      closeComment: string | null;
+      doneTierSkipAudit: null;
+      // SUP-23925: the tier close rows are returned, not written. The backstop
+      // caller persists them on the SAME transaction as its terminal write, so
+      // a refused or raced sweep close can never leave an orphan close row.
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+      finalizeLandingDebt: (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion?: number) => Promise<void>;
+    }
   | {
       allowed: true;
       closeComment: string | null;
       doneTierSkipAudit: Parameters<typeof logActivity>[1];
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+      finalizeLandingDebt: (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion?: number) => Promise<void>;
     }
   | {
       allowed: false;
-      code: "done_transition_missing_delivery" | "done_transition_missing_tier_declaration";
+      code:
+        | "done_transition_missing_delivery"
+        | "done_transition_missing_tier_declaration"
+        | NonNullable<DoneTierDeclarationResult["code"]>;
       reason: string;
+    }
+  | {
+      allowed: false;
+      code: typeof DONE_TIER_DUAL_SOURCE_CONFLICT_CODE;
+      reason: string;
+      conflict: DoneTierDualSourceConflict;
     }
 > {
   const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
-  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false);
+  // SUP-25336: the same pure source resolver the route doors run, before any
+  // guard probe or rendering.
+  const tierSources = resolveDoneTierDeclarationSources(closeComment, structuredDoneTier);
+  if (!tierSources.ok) {
+    return {
+      allowed: false,
+      code: DONE_TIER_DUAL_SOURCE_CONFLICT_CODE,
+      reason: tierSources.conflict.message,
+      conflict: tierSources.conflict,
+    };
+  }
+  const debt = await prepareLandingDebtClose(db, issue);
+  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false, undefined, debt.owed);
   if (!guardResult.allowed) {
     return {
       allowed: false,
@@ -3415,8 +5653,10 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       reason: guardResult.reason,
     };
   }
+  const finalizeLandingDebt = (tx: Db, locked: LandingDebtCloseRow, closeStatusVersion = locked.statusVersion) =>
+    debt.finalize(tx, locked, guardResult, closeStatusVersion);
   if (structuredDoneTier) {
-    const renderedComment = renderDoneTierDeclaration(closeComment, structuredDoneTier);
+    const renderedComment = tierSources.commentBody;
     const tierResult = await evaluateDoneTierDeclaration(
       db,
       issue,
@@ -3427,24 +5667,55 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     if (!tierResult.allowed) {
       return {
         allowed: false,
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
       };
     }
+    // SUP-23925: the tier close rows are deferred to the caller's close
+    // transaction (they used to be fire-and-forget writes here, before and
+    // outside it, so a caller whose close later refused or lost the race left
+    // an orphan close row on a card that never wrote status→done).
+    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
-      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier1_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+        },
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
-        ...tierResult.tier2Audit,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+          ...tierResult.tier2Audit,
+        },
       });
     }
-    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits, finalizeLandingDebt };
   }
   return {
     allowed: true,
@@ -3467,6 +5738,8 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         systemBackstopActor: actorId,
       },
     },
+    closeRowAudits: [],
+    finalizeLandingDebt,
   };
 }
 
@@ -4381,14 +6654,24 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
   // ADR-103 M3.6: out-parameter the census the core already computed, so the
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
-  observer?: { census?: DoneTransitionCensus },
+  // `quiet` evaluates without writing audit rows (the SUP-25193 attach preflight).
+  observer?: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext; quiet?: boolean },
+  // SUP-24429: the requirement stored before the close request; undefined when
+  // the caller's request does not change it.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
+  landingDebtOwed = false,
 ): Promise<DoneTransitionGuardResult> {
+  const writeAudit: typeof writeAuditLog = observer?.quiet ? async () => {} : writeAuditLog;
+  const writeSkippedAudit: typeof writeGuardSkippedAuditLog = observer?.quiet ? async () => {} : writeGuardSkippedAuditLog;
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
     reason,
@@ -4429,7 +6712,7 @@ async function evaluateDoneTransitionGuardCore(
     if (recovered !== null) {
       reviewLadder = recovered;
       if (recovered.satisfied) {
-        void writeAuditLog(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
+        void writeAudit(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
           reason: "review_ladder_recovered_from_decisions",
           completedStageIds: recovered.completedStageIds,
           skippedStageIds: recovered.skippedStageIds,
@@ -4501,7 +6784,7 @@ async function evaluateDoneTransitionGuardCore(
   // waved through by a credential-less or network-fail-open configuration.
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+    await writeLadderRefusalAuditLog(db, issue, {
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,
@@ -4541,7 +6824,7 @@ async function evaluateDoneTransitionGuardCore(
   // gated at the children and the parent would close ungated. Fail closed
   // here, in the same pre-network zone as mechanism C.
   if (mechanismA !== null && mechanismA.count >= 2) {
-    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+    void writeAudit(db, issue, "issue.done_transition_null_policy_refused", {
       reason: "ungated_decomposed_parent",
       ladderedChildCount: mechanismA.count,
       ladderedChildIdentifiers: mechanismA.identifiers,
@@ -4577,7 +6860,7 @@ async function evaluateDoneTransitionGuardCore(
   // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
   // Runs in the same pre-network zone as mechanisms A and C.
   if (ladderShape !== null) {
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+    void writeAudit(db, issue, "issue.done_transition_ladder_shape_refused", {
       reason: "adr072_close_ladder_shape_incomplete",
       missingStageLabels: ladderShape.missingStageLabels,
       outOfOrderStageLabels: ladderShape.outOfOrderStageLabels,
@@ -4644,7 +6927,15 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
 
-  if (issue.deliveryRequirement === "record_only") {
+  // SUP-24429: the skip follows the requirement stored before this request.
+  // A close request that just relabelled a repository_delivery card record_only
+  // falls through to the repository landing check below. A caller that passes
+  // no stored requirement changes nothing in that request.
+  if (
+    !landingDebtOwed &&
+    issue.deliveryRequirement === "record_only" &&
+    (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
+  ) {
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
@@ -4656,6 +6947,11 @@ async function evaluateDoneTransitionGuardCore(
       skipped: true,
       skipReason: "record_only_delivery_skipped",
     };
+  }
+  // An approval or no-deliverable override cannot discharge already-owed landing.
+  if (landingDebtOwed) {
+    override = null;
+    decisionCarried = false;
   }
 
   // SUP-14878: head-check waiver. A card that passed all three review gates
@@ -4690,7 +6986,7 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
-    void writeAuditLog(db, issue, "issue.done_transition_override", {
+    void writeAudit(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
@@ -4719,6 +7015,7 @@ async function evaluateDoneTransitionGuardCore(
   const getCtx = async (): Promise<IssueRepoContext | null> => {
     if (cachedCtx === undefined) {
       cachedCtx = await resolveIssueRepoContext(db, issue);
+      if (observer && cachedCtx) observer.landingContext = cachedCtx;
     }
     return cachedCtx;
   };
@@ -4784,7 +7081,7 @@ async function evaluateDoneTransitionGuardCore(
   );
   if (staleOpenUnverifiable.length > 0) {
     prSkipReason = appendSkipReason(prSkipReason, `stale_open_unverifiable:${staleOpenUnverifiable.length}`);
-    void writeAuditLog(db, issue, "issue.done_transition_guard_failed_open", {
+    void writeAudit(db, issue, "issue.done_transition_guard_failed_open", {
       reason: `stale_open_unverifiable:${staleOpenUnverifiable.length}`,
       prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
     });
@@ -4838,7 +7135,7 @@ async function evaluateDoneTransitionGuardCore(
       if (refused.length > 0) {
         const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
         const refusedNames = refused.map((p) => p.displayName).join(", ");
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
           reason: refusalToken,
           skipReason: refusalToken,
           prs: refusedNames,
@@ -4865,10 +7162,21 @@ async function evaluateDoneTransitionGuardCore(
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)
       // closes must still land the PRs first.
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,
@@ -4885,7 +7193,7 @@ async function evaluateDoneTransitionGuardCore(
         skipReason: prSkipReason,
       };
     }
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `open_linked_prs:${openPrs.length}`,
       skipReason: `open_linked_prs:${openPrs.length}`,
       prs: prNames,
@@ -5004,7 +7312,7 @@ async function evaluateDoneTransitionGuardCore(
         // ref (unresolvable/stale on the remote) or a transient API state, not
         // the deliverable branch. Never report this as branch-absent.
         if (decisionCarried) {
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `compare_404_base_ref_unresolvable_decision_carried:${branch}`,
             skipReason: prSkipReason,
             branch,
@@ -5046,6 +7354,7 @@ async function evaluateDoneTransitionGuardCore(
         // work that is already merged and live. A merged PR naming the identifier
         // is positive evidence of landing — fail open on it. An unmeasurable probe
         // also fails open: never block on a signal we could not measure (SUP-13199).
+        const deliveryHead = landingDebtOwed && issue.identifier ? await carrierDeliveryHead(ctx, parsed, token) : undefined;
         const mergedPrCount = issue.identifier
           ? await githubMergedPrCountForIdentifier(
               parsed.hostname,
@@ -5053,6 +7362,8 @@ async function evaluateDoneTransitionGuardCore(
               parsed.repo,
               issue.identifier,
               token,
+              landingDebtOwed ? deliveryHead?.head ?? null : undefined,
+              ctx.defaultRef,
             )
           : null;
         if (mergedPrCount === null) {
@@ -5063,11 +7374,15 @@ async function evaluateDoneTransitionGuardCore(
           );
         }
         if (mergedPrCount > 0) {
-          return fallback(
-            `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
-            true,
-            `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
-          );
+          return {
+            ...fallback(
+              `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
+              true,
+              `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
+            ),
+            landingVerified: true,
+            landingProof: deliveryHead ?? undefined,
+          };
         }
         if (decisionCarried) {
           // Defense-in-depth (SUP-13691): a 404 here means the branch was not
@@ -5075,7 +7390,7 @@ async function evaluateDoneTransitionGuardCore(
           // approval that arms the merge must not be blocked by the unpushed
           // branch it is approving (SUP-13207/13290 precedent); a plain close
           // still lands the deliverable first.
-          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
             reason: `branch_absent_decision_carried:${branch}`,
             skipReason: `branch_absent_decision_carried:${branch}`,
             branch,
@@ -5103,7 +7418,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        await writeSkippedAudit(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
@@ -5154,8 +7469,24 @@ async function evaluateDoneTransitionGuardCore(
   }
 
   if (aheadBy === 0) {
+    let landingProof: LandingHeadProof | undefined;
+    if (landingDebtOwed) {
+      try {
+        const head = await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, branch, token);
+        // The first compare used a moving branch name. Bind the proof to this
+        // immutable head before allowing the finalizer to accept it.
+        if (!head || await githubCompareAheadBy(parsed.hostname, parsed.owner, parsed.repo, ctx.defaultRef, head, token) !== 0) {
+          return fallback("The current delivery head is not verified on the base; retry the landing check");
+        }
+        landingProof = { head, source: "remote" };
+      } catch {
+        return fallback("The current delivery head could not be verified; retry the landing check");
+      }
+    }
     return {
       allowed: true,
+      landingVerified: true,
+      landingProof,
       reason: `Branch ${branch} is not ahead of ${ctx.defaultRef}`,
       aheadBy: 0,
       branch,
@@ -5185,7 +7516,7 @@ async function evaluateDoneTransitionGuardCore(
       : null;
     const attributableCount = attribution?.attributableCount ?? 0;
 
-    if (attributableCount > 0) {
+    if (attributableCount > 0 && !landingDebtOwed) {
       return {
         allowed: true,
         reason:
@@ -5205,7 +7536,7 @@ async function evaluateDoneTransitionGuardCore(
       // Same deadlock shape as the open-linked-PR block above, firing when the
       // open PR is unlinked/unhydrated: the approval that arms the merge must
       // not be blocked by the unmerged branch it is approving (SUP-13207).
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
         reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
         skipReason: appendSkipReason(
           foreignToken,
@@ -5232,17 +7563,22 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
+    const deliveryHead = landingDebtOwed ? await carrierDeliveryHead(ctx, parsed, token) : undefined;
     const mergedPrCount = await githubMergedPrCountForIdentifier(
       parsed.hostname,
       parsed.owner,
       parsed.repo,
       identifier,
       token,
+      landingDebtOwed ? deliveryHead?.head ?? null : undefined,
+      ctx.defaultRef,
     );
 
     if (mergedPrCount !== null && mergedPrCount > 0) {
       return {
         allowed: true,
+        landingVerified: true,
+        landingProof: deliveryHead ?? undefined,
         reason:
           `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch), ` +
           `but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference${mergedPrCount === 1 ? "s" : ""} ${identifier} (carrier delivery); transition allowed`,
@@ -5306,7 +7642,7 @@ async function evaluateDoneTransitionGuardCore(
       };
     }
 
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: "foreign_workspace_branch",
       skipReason: foreignToken,
       branch,
@@ -5339,8 +7675,14 @@ async function evaluateDoneTransitionGuardCore(
   }
 
   let hasMergedPr: boolean;
+  let deliveryHead: string | null | undefined;
   try {
-    hasMergedPr = (await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token)).hasMergedPr;
+    deliveryHead = landingDebtOwed
+      ? await resolveGitHubRefHeadSha(parsed.hostname, parsed.owner, parsed.repo, branch, token)
+      : undefined;
+    hasMergedPr = deliveryHead !== null && (await githubBranchHasMergedPr(
+      parsed.hostname, parsed.owner, parsed.repo, branch, token, deliveryHead, ctx.defaultRef,
+    )).hasMergedPr;
   } catch (err) {
     if (err instanceof GitHubAuthError) {
       return fallback(
@@ -5359,6 +7701,8 @@ async function evaluateDoneTransitionGuardCore(
   if (hasMergedPr) {
     return {
       allowed: true,
+      landingVerified: true,
+      landingProof: deliveryHead ? { head: deliveryHead, source: "remote" } : undefined,
       reason: `Branch ${branch} has a merged PR; transition allowed`,
       aheadBy,
       branch,
@@ -5374,7 +7718,7 @@ async function evaluateDoneTransitionGuardCore(
     // Same deadlock shape as the open-linked-PR block above, firing when the
     // open PR is unlinked/unhydrated: the approval that arms the merge must
     // not be blocked by the unmerged branch it is approving (SUP-13207).
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+    void writeAudit(db, issue, "issue.done_transition_guard_skipped", {
       reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       skipReason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
       branch,
@@ -5412,6 +7756,27 @@ async function evaluateDoneTransitionGuardCore(
 }
 
 /**
+ * SUP-25193: why a board-attached landing proof could not change this card's
+ * close outcome, or null when it could. The proof only answers outstanding
+ * landing debt; it never overrides a core guard refusal such as a measured
+ * ahead-of-base or foreign execution branch. Writes no audit rows.
+ */
+export async function boardLandingProofCloseBlocker(
+  db: Db,
+  issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
+  landingDebtOwed: boolean,
+): Promise<string | null> {
+  if (!landingDebtOwed) {
+    return "the card owes no repository landing debt, so a landing proof cannot change its close";
+  }
+  const core = await evaluateDoneTransitionGuardCore(db, issue, null, false, { quiet: true }, undefined, true);
+  if (!core.allowed) {
+    return `the done guard refuses this close for a reason a landing proof does not answer: ${core.reason}`;
+  }
+  return null;
+}
+
+/**
  * ADR-103 M3: the exported entry point. Runs the guard core, then records the
  * M3.6 exclusion audit on a successful close whose laddered-child count fell
  * below the `>= 2` threshold only because of carve-out exclusions. The census
@@ -5425,9 +7790,62 @@ export async function evaluateDoneTransitionGuard(
   issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // SUP-24429: the requirement stored before this request, passed by a door that
+  // lets the close request change it. The record-only skip applies only when this
+  // is record_only too; omitted means the request did not change the requirement.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
+  landingDebtOwed = false,
+  // SUP-25193: only a board close may present a board-attached merged-PR landing
+  // proof. Every other door (agent closes, the landing backstop) leaves it off, so
+  // no agent close path accepts more evidence than it did before.
+  options: { acceptBoardLandingProof?: boolean } = {},
 ): Promise<DoneTransitionGuardResult> {
-  const observer: { census?: DoneTransitionCensus } = {};
-  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const observer: { census?: DoneTransitionCensus; landingContext?: IssueRepoContext } = {};
+  const result = await evaluateDoneTransitionGuardCore(
+    db,
+    issue,
+    override,
+    decisionCarried,
+    observer,
+    storedDeliveryRequirement,
+    landingDebtOwed,
+  );
+  if (landingDebtOwed && result.landingVerified) result.landingContext = observer.landingContext;
+  let boardProofRefusal: string | null = null;
+  if (landingDebtOwed && result.allowed && !result.landingVerified && options.acceptBoardLandingProof) {
+    const attached = await loadAttachedBoardLandingProof(db, issue);
+    if (attached) {
+      const fields = await loadTier1RepoFields(db, issue);
+      const verified = await verifyBoardLandingProof(db, { id: issue.id, companyId: issue.companyId, ...fields }, attached.evidence);
+      if (verified.ok) {
+        return {
+          ...result,
+          landingVerified: true,
+          landingContext: observer.landingContext,
+          landingProof: {
+            head: verified.proof.mergeCommitSha,
+            source: BOARD_LANDING_PROOF_SOURCE,
+            proofActivityId: attached.activityId,
+            pullRequestNumber: verified.proof.pullRequestNumber,
+            repoUrl: verified.proof.repoUrl,
+            baseRef: verified.proof.baseRef,
+          },
+          reason: `${result.reason}; landing verified by the board-attached merged PR ` +
+            `${verified.proof.owner}/${verified.proof.repo}#${verified.proof.pullRequestNumber}`,
+        };
+      }
+      boardProofRefusal = `The board-attached landing proof failed re-verification (${verified.code}: ${verified.reason}).`;
+    }
+  }
+  if (landingDebtOwed && result.allowed && !result.landingVerified) {
+    return {
+      ...result, allowed: false, skipped: false, skipReason: null, mechanism: "delivery",
+      reason: "Repository landing debt remains: no successful repository landing proof was obtained." +
+        (boardProofRefusal ? ` ${boardProofRefusal}` : ""),
+      remedy:
+        "Verify landing via a probe-able repository and branch or a merged PR, then retry the close; reclassification and board tier-form bypass do not waive landing debt. If landing cannot be verified, cancel the issue instead.",
+    };
+  }
   const census = observer.census;
   if (
     result.allowed

@@ -111,6 +111,54 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     services.dispose();
   });
 
+  it("does not forward an executionPolicy that selects release-assurance authority through a plugin-host issues.update", async () => {
+    const company = await createCompany(db, "PRA");
+    const [approver] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Approval participant",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+    }).returning();
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Release assurance authority",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    // executionPolicy is not an SDK-declared issues.update field: the host drops it.
+    await services.issues.update({
+      issueId: issue.id,
+      companyId: company.id,
+      patch: {
+        title: "Renamed by the plugin",
+        executionPolicy: {
+          mode: "normal",
+          approvalAuthority: "release_assurance",
+          stages: [{
+            id: randomUUID(),
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: approver!.id }],
+          }],
+          monitor: null,
+        },
+      } as never,
+    });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row!.title).toBe("Renamed by the plugin");
+    expect(row!.executionPolicy).toBeNull();
+    services.dispose();
+  });
+
   it("accepts a satisfiable low-trust policy carrying a trustBoundary and writes it", async () => {
     const company = await createCompany(db, "PIG");
     const targetIssue = await db

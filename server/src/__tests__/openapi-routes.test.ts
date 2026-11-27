@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
-import { gitCommitShaSchema } from "@paperclipai/shared";
+import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { z } from "zod";
+import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
+import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -35,6 +38,7 @@ const apiPrefixes: Record<string, string> = {
   "assets.ts": "/api",
   "auth.ts": "/api/auth",
   "board-chat.ts": "/api",
+  "browser-use.ts": "/api",
   "built-in-agents.ts": "/api",
   "chat-channels.ts": "/api",
   "slack-tools.ts": "/api",
@@ -70,6 +74,7 @@ const apiPrefixes: Record<string, string> = {
   "plugin-ui-static.ts": "/api",
   "plugins.ts": "/api",
   "projects.ts": "/api",
+  "public-mcp.ts": "/api",
   "project-tools.ts": "/api",
   "release-decisions.ts": "/api",
   "resource-memberships.ts": "/api",
@@ -103,6 +108,14 @@ const HTTP_METHODS = new Set([
 const explicitOpenApiCoverageExclusions = new Set<string>();
 
 const explicitOpenApiOperationCoverageExclusions = new Set([
+  // OAuth discovery and protocol endpoints have their own metadata contract;
+  // browser connection-management operations remain documented in the board API.
+  "GET /.well-known/oauth-authorization-server",
+  "POST /mcp/oauth/register",
+  "POST /mcp/oauth/device_authorization",
+  "GET /mcp/oauth/authorize",
+  "POST /mcp/oauth/token",
+  "POST /mcp/oauth/revoke",
   // This endpoint is authenticated by the provider signature rather than by a
   // Paperclip board/agent credential. It intentionally stays out of the public
   // board API document, while this exact exclusion keeps route coverage honest.
@@ -143,6 +156,7 @@ function normalizeExpressPath(routePath: string) {
 }
 
 function resolveMountedPath(file: string, prefix: string, routePath: string) {
+  if (file === "public-mcp.ts" && (routePath.startsWith("/mcp/oauth/") || routePath.startsWith("/.well-known/") || routePath === PUBLIC_MCP_PATH)) return routePath;
   if (
     (file === "chat-channels.ts" || file === "email.ts") &&
     routePath.startsWith("/api/chat-webhooks/")
@@ -238,6 +252,41 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents board-only pool management with revision-checked deletion", () => {
+    const { spec } = loadSpecRoutes();
+    const pools = spec.paths["/api/companies/{companyId}/ai-connection-pools"];
+    const remove = spec.paths["/api/companies/{companyId}/ai-connection-pools/{poolId}"].delete;
+    const inspection = spec.paths["/api/companies/{companyId}/ai-connection-pools/{poolId}/inspection"].get;
+    for (const operation of [pools.get, pools.post, remove, inspection]) {
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    }
+    expect(remove.requestBody.required).toBe(true);
+    expect(remove.requestBody.content["application/json"].schema).toMatchObject({
+      required: ["expectedRevision"], additionalProperties: false,
+      properties: { expectedRevision: { type: "integer", minimum: 0, exclusiveMinimum: true } },
+    });
+    expect(Object.keys(remove.responses)).toEqual(expect.arrayContaining(["200", "400", "401", "403", "404", "409"]));
+  });
+
+  it("documents the board-only SUP-25193 landing-proof route with its typed refusals", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/landing-proof"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      required: expect.arrayContaining(["owner", "repo", "pullRequestNumber", "reason"]),
+      additionalProperties: false,
+    });
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["200", "201", "403", "409", "422"]));
+    for (const code of [
+      "landing_proof_not_applicable", "landing_proof_wrong_repo", "landing_proof_pr_not_found",
+      "landing_proof_pr_not_merged", "landing_proof_pr_closed_unmerged", "landing_proof_sha_mismatch",
+      "landing_proof_not_on_base", "landing_proof_unverifiable", "landing_proof_repo_identity_mismatch",
+      "landing_proof_not_card_delivery",
+    ]) {
+      expect(operation.description).toContain(code);
+    }
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
@@ -476,6 +525,41 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();
   });
 
+  it("serves the future-monitor loss activity contract advertised by MCP", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    expect(res.status).toBe(200);
+    const api = res.body.paths["/api/issues/{id}/activity"].get.responses["200"]
+      .content["application/json"].schema.items.oneOf[0];
+    const tool = createToolDefinitions(new PaperclipApiClient({
+      apiUrl: "http://localhost:3100/api", apiKey: "test-token", companyId: null, agentId: null, runId: null,
+    })).find((candidate) => candidate.name === "paperclipListIssueActivity");
+    expect(tool?.outputSchema).toBeDefined();
+    const output = z.toJSONSchema(tool!.outputSchema!);
+    const required = ["identifier", "previousNextCheckAt", "recoveryPolicy", "reason", "notes"];
+    const actorType = { type: "string", enum: ["agent", "user", "system", "plugin"] };
+    const previousNextCheckAt = { type: "string", format: "date-time" };
+    const recoveryPolicy = { type: "string", enum: ["wake_owner", "create_recovery_issue", "escalate_to_board"] };
+    const reason = "cleared_by_close_future_check";
+    expect(api.properties.details).toMatchObject({
+      required, properties: { previousNextCheckAt, recoveryPolicy: { ...recoveryPolicy, nullable: true }, reason: { enum: [reason] } },
+    });
+    expect(api.properties.actorType).toEqual(actorType);
+    expect(api.required).toEqual(expect.arrayContaining(["actorType", "actorId", "agentId", "runId", "details"]));
+    expect(output).toMatchObject({
+      properties: { items: { items: { anyOf: [{
+        required: api.required,
+        properties: {
+          actorType,
+          details: { required, properties: {
+            previousNextCheckAt,
+            recoveryPolicy: { anyOf: [recoveryPolicy, { type: "null" }] },
+            reason: { const: reason },
+          } },
+        },
+      }, expect.anything()] } } },
+    });
+  });
+
   it("publishes the live rearmExecutionPolicy field on PATCH /api/issues/{id}", () => {
     const { spec } = loadSpecRoutes();
     const schema =
@@ -534,6 +618,29 @@ describe("openapi routes", () => {
     expect(identity.required).toEqual(["repo", "branch", "headSha"]);
     expect(identity.description).toContain("delivery_identity_write_rejected");
     expect(identity.description).toContain("in_review");
+  });
+
+  it("pins the delivery-receipt-recovery headSha to exactly 40 lowercase hex characters (M6)", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/delivery-receipt-recovery"].post;
+    const headSha = operation.requestBody.content["application/json"].schema.properties.headSha;
+    expect(headSha.pattern).toBe("^[0-9a-f]{40}$");
+    expect(headSha.type).toBe("string");
+    const mirror = new RegExp(headSha.pattern);
+    expect(mirror.test("a".repeat(40))).toBe(true);
+    for (const value of [
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(64),
+      "a".repeat(65),
+      "A".repeat(40),
+      "g".repeat(40),
+      `${"a".repeat(40)}\n`,
+      "",
+    ]) {
+      expect(mirror.test(value), JSON.stringify(value)).toBe(false);
+    }
+    expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["400", "201"]));
   });
 
   it("documents the deliveryIdentity.headSha pattern the live delivery write applies", () => {
@@ -1335,6 +1442,8 @@ const BARE_PATH_CONSTANTS: Record<string, string> = {
   // so mirror that strip rather than hardcoding the stripped literal.
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH:
     OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH.replace(/^\/api/, ""),
+  // Upstream #14846: the public MCP ingress (OAuth bearer, mounted outside /api).
+  PUBLIC_MCP_PATH: PUBLIC_MCP_PATH,
 };
 
 // Strip `if (req.actor.type !== "agent") { ... }` blocks: an assertBoard inside

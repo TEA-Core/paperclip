@@ -113,7 +113,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     };
   }
 
-  function recoveryServiceWithMocks(deps: { enqueueWakeup?: (agentId: string) => Promise<{ id: string } | null> } = {}) {
+  function recoveryServiceWithMocks(deps: {
+    enqueueWakeup?: (agentId: string, wake: Record<string, unknown>) => Promise<{ id: string } | null>;
+  } = {}) {
     loadConfigMock.mockReturnValue(buildTestConfig());
     const enqueueWakeup = deps.enqueueWakeup ?? vi.fn(async () => ({ id: randomUUID() }));
     return recoveryService(db as never, { enqueueWakeup: enqueueWakeup as never });
@@ -1150,6 +1152,96 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(healEvents).toHaveLength(0);
   });
 
+  // SUP-24126: ADR-072 §6 review-stage park — blocked, no blocker edge, a
+  // descriptor naming the blocker, execution stage pending, no monitor.
+  const stageParkExecutionState = (participantAgentId: string) => ({
+    status: "pending",
+    currentStageId: randomUUID(),
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant: { type: "agent", agentId: participantAgentId },
+    returnAssignee: { type: "agent", agentId: participantAgentId },
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+  const stageParkDescriptor = { owner: "board", action: "Board action on the first-class blocker" } as const;
+
+  it("skips a zero-blocker heal for a descriptor-only review-stage park and does not re-admit it after the re-arm window", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        unblockDescriptor: stageParkDescriptor,
+        executionState: stageParkExecutionState(agentId),
+      })
+      .where(eq(issues.id, blockedIssueId));
+    const now = new Date();
+    const windowMs = 6 * 60 * 60 * 1000;
+    const consumedAt = new Date(now.getTime() - windowMs - 2 * 60 * 1000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, zeroBlockerHeal: true },
+      status: "completed",
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:zero_blocker`,
+      createdAt: consumedAt,
+      updatedAt: consumedAt,
+      finishedAt: consumedAt,
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+    });
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result.zeroBlockerObserved).toBe(1);
+    expect(result.livePathSkipped).toBe(1);
+    expect(result.zeroBlockerHealed).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const healEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
+    expect(healEvents).toHaveLength(0);
+  });
+
+  it("still heals a zero-blocker issue that has only a descriptor or only a pending stage", async () => {
+    // Descriptor but no execution stage: a self-parked card, not a stage park.
+    const descriptorOnly = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: stageParkDescriptor })
+      .where(eq(issues.id, descriptorOnly.blockedIssueId));
+    const descriptorOnlyEnqueue = vi.fn(async () => ({ id: randomUUID() }));
+    const descriptorOnlyResult = await recoveryServiceWithMocks({
+      enqueueWakeup: descriptorOnlyEnqueue,
+    }).reconcileResolvedDependencyWakeBackstop({ companyId: descriptorOnly.companyId });
+    expect(descriptorOnlyEnqueue).toHaveBeenCalledTimes(1);
+    expect(descriptorOnlyResult.zeroBlockerHealed).toBe(1);
+
+    // Pending stage but no descriptor: no declared park, so it is stranded.
+    const stageOnly = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({ executionState: stageParkExecutionState(stageOnly.agentId) })
+      .where(eq(issues.id, stageOnly.blockedIssueId));
+    const stageOnlyEnqueue = vi.fn(async () => ({ id: randomUUID() }));
+    const stageOnlyResult = await recoveryServiceWithMocks({
+      enqueueWakeup: stageOnlyEnqueue,
+    }).reconcileResolvedDependencyWakeBackstop({ companyId: stageOnly.companyId });
+    expect(stageOnlyEnqueue).toHaveBeenCalledTimes(1);
+    expect(stageOnlyResult.zeroBlockerHealed).toBe(1);
+  });
+
   it("skips re-arm cap escalation while a future monitor owns the next execution check", async () => {
     const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
     const now = new Date();
@@ -1643,14 +1735,184 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.healed).toBe(1);
     expect(result.existingWakeSkipped).toBe(0);
     expect(result.issueIds).toEqual([blockedIssueId]);
-    // The enqueue consumer must receive the dependent generation cutoff —
-    // heartbeat preserves an explicit completedRearmCutoff instead of deriving
-    // the dependent's blockedTransitionAt, so passing the re-arm-age cutoff
-    // here would let the same historical completed row suppress the enqueue.
+    // The enqueue consumer gets the re-arm-AGE cutoff (now - window); heartbeat
+    // derives the generation from the dependent's blockedTransitionAt itself.
     expect(enqueueWakeup).toHaveBeenCalledWith(
       agentId,
-      expect.objectContaining({ completedRearmCutoff: laterBlockedTransitionAt }),
+      expect.objectContaining({ completedRearmCutoff: new Date(now.getTime() - windowMs) }),
     );
+  });
+
+  it("does not let a wake requested in the previous generation and completed after the current one began suppress the backstop", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    // Generation 1's wake was requested at 10:00, generation 2 began at 11:00,
+    // and the generation-1 wake only completed at 11:30. Its updatedAt is
+    // after both cutoffs, but it was requested before the current generation.
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const generationTwoAt = new Date("2026-11-12T11:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: generationTwoAt, updatedAt: generationTwoAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+      createdAt: new Date("2026-11-12T10:00:00.000Z"),
+      requestedAt: new Date("2026-11-12T10:00:00.000Z"),
+      updatedAt: new Date("2026-11-12T11:30:00.000Z"),
+      finishedAt: new Date("2026-11-12T11:30:00.000Z"),
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+  });
+
+  it("re-arms a same-generation completed canonical wake once it ages past the re-arm window", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const now = new Date("2026-11-12T12:00:00.000Z");
+    const windowMs = 6 * 60 * 60 * 1000;
+    const blockedAt = new Date("2026-11-12T03:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: blockedAt, updatedAt: blockedAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+      createdAt: new Date("2026-11-12T04:00:00.000Z"),
+      requestedAt: new Date("2026-11-12T04:00:00.000Z"),
+      updatedAt: new Date("2026-11-12T05:00:00.000Z"),
+      finishedAt: new Date("2026-11-12T05:00:00.000Z"),
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+  });
+
+  it("keeps re-arming a dependent whose same-generation wakes complete without unblocking it until the cap escalates it", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const windowMs = 6 * 60 * 60 * 1000;
+    const maxCount = 4;
+    const sweepCount = 10;
+    const blockedAt = new Date("2026-11-12T00:00:00.000Z");
+    const stateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerIssueId],
+    });
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt: blockedAt, updatedAt: blockedAt })
+      .where(eq(issues.id, blockedIssueId));
+    const recordCompletedWake = async (at: Date) => {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: blockerIssueId,
+          blockerIssueIds: [blockerIssueId],
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: at,
+        requestedAt: at,
+        updatedAt: at,
+        finishedAt: at,
+      });
+    };
+    // The current generation's first wake already completed and left the
+    // dependent blocked.
+    await recordCompletedWake(new Date(blockedAt.getTime() + 60_000));
+
+    // Every enqueued wake runs and completes at the sweep's clock without
+    // unblocking the dependent; the next sweep runs past the re-arm window.
+    let clock = new Date(blockedAt.getTime() + 60_000);
+    const enqueueWakeup = vi.fn(async () => {
+      await recordCompletedWake(clock);
+      return { id: randomUUID() };
+    });
+    const svc = recoveryServiceWithMocks({ enqueueWakeup });
+    const totals = { healed: 0, existingWakeSkipped: 0, reArmCapEscalated: 0, reArmCapSkipped: 0 };
+    for (let sweep = 0; sweep < sweepCount; sweep++) {
+      clock = new Date(clock.getTime() + windowMs + 60_000);
+      const result = await svc.reconcileResolvedDependencyWakeBackstop({
+        companyId,
+        now: clock,
+        rearmWindowMs: windowMs,
+        rearmMaxCount: maxCount,
+      });
+      totals.healed += result.healed;
+      totals.existingWakeSkipped += result.existingWakeSkipped;
+      totals.reArmCapEscalated += result.reArmCapEscalated;
+      totals.reArmCapSkipped += result.reArmCapSkipped;
+    }
+
+    // One seeded consumed wake plus three re-arms reach the cap of four; the
+    // fourth sweep escalates and the remaining six see the open escalation.
+    expect(totals).toEqual({
+      healed: maxCount - 1,
+      existingWakeSkipped: 0,
+      reArmCapEscalated: 1,
+      reArmCapSkipped: sweepCount - maxCount,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(maxCount - 1);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      kind: "blocked_without_blockers",
+      cause: "dependency_wake_rearm_cap_exhausted",
+      evidence: expect.objectContaining({ reArmCount: maxCount, reArmMax: maxCount }),
+    });
   });
 
   it("still suppresses a same-generation backstop repeat when a completed canonical wake covers the current blocked generation", async () => {
@@ -1828,6 +2090,118 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         }),
       }),
     );
+  });
+
+  it("counts every canonical stable-key wake toward the re-arm cap regardless of which blocker its payload names", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const secondBlockerIssueId = randomUUID();
+    const windowMs = 6 * 60 * 60 * 1000;
+    // Older than the completed-wake cutoff so the seeded canonical rows do not
+    // suppress the candidate as an existing wake; they must still CONSUME the
+    // re-arm budget.
+    const outsideSuppressWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: secondBlockerIssueId,
+      companyId,
+      title: "Synthetic second completed blocker",
+      status: "done",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: "R-CANON-3",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: secondBlockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    const readiness = await issueService(db).getDependencyReadiness(blockedIssueId);
+    expect(readiness.isDependencyReady).toBe(true);
+    expect(readiness.blockerIssueIds).toHaveLength(2);
+    const [currentEdgeBlockerIssueId, otherEdgeBlockerIssueId] = readiness.blockerIssueIds;
+    expect(currentEdgeBlockerIssueId).toBeTruthy();
+    expect(otherEdgeBlockerIssueId).toBeTruthy();
+    const stateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: readiness.blockerIssueIds,
+    });
+
+    // Two completed canonical rows for the SAME stable key, each naming a
+    // DIFFERENT resolved blocker edge in its payload. A canonical wake covers
+    // the full (dependent, blocker-set) ready state, so both must consume the
+    // budget. The legacy per-edge row for the non-current edge must NOT count.
+    await db.insert(agentWakeupRequests).values([
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: currentEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: otherEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: otherEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${otherEdgeBlockerIssueId}`,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+    ]);
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      now: new Date(),
+      rearmWindowMs: windowMs,
+      rearmMaxCount: 2,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.reArmCapEscalated).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    // Exactly 2: both canonical rows counted, the unrelated legacy edge did not.
+    expect(action?.evidence).toMatchObject({ reArmCount: 2, reArmMax: 2 });
   });
 
   it("does not spend the re-arm budget when a succeeded run checks out and re-parks the dependent as blocked", async () => {

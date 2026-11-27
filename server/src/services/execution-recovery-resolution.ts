@@ -1,9 +1,11 @@
+import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
-import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { canonicalExecutionUuid, runBoundToIssue } from "./execution-identity.js";
+import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -69,6 +71,10 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
+  }
+  if (hasWorkspaceRestoreFailure(run.resultJson) &&
+      (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
+    throw conflict("Verify safe workspace staging or repair and record workspaceRepairEvidence before continuing this run.");
   }
   for (const pid of [
     run.processPid,
@@ -270,6 +276,8 @@ export async function deliverReconciledExecutions(
               and(
                 eq(heartbeatRuns.companyId, action.companyId),
                 eq(heartbeatRuns.id, run.id),
+                // A coalesced wake can return the source run itself (SUP-24883).
+                ne(heartbeatRuns.id, decision.runId),
                 eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
                 sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
                 sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
@@ -355,8 +363,8 @@ export async function settleUnrecoverableExecutions(
       heartbeatRuns,
       and(
         eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
-        sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
-        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
+        eq(heartbeatRuns.id, canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)),
+        runBoundToIssue({ uuid: issueRecoveryActions.sourceIssueId, text: sql`${issueRecoveryActions.sourceIssueId}::text` }),
       ),
     )
     .leftJoin(
@@ -471,9 +479,12 @@ export async function settleUnrecoverableExecutions(
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
         const note = current
-          ? "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
+          ? hasWorkspaceRestoreFailure(run.resultJson)
+            ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
+            : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
+        let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
         if (current) {
           const [projected] = await tx
             .update(issues)
@@ -488,6 +499,10 @@ export async function settleUnrecoverableExecutions(
           // An already-blocked task may have a separate human/dependency hold.
           if (task.status !== "blocked" && run.runtimeMode === "native") {
             nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          }
+          if (task.status !== "blocked" && run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
+              run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === "paperclip_runner") {
+            nativeBootstrapFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion, previousStatus: task.status };
           }
         }
         await tx
@@ -504,6 +519,7 @@ export async function settleUnrecoverableExecutions(
             evidence: {
               ...action.evidence,
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
+              ...(nativeBootstrapFailureBlock ? { nativeBootstrapFailureBlock } : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,

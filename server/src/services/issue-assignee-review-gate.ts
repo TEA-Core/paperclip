@@ -213,6 +213,84 @@ function isWorkflowControlledPendingReviewParticipant(input: {
   });
 }
 
+/**
+ * SUP-24280: the one write the Wiki handoff guard admits without the canonical
+ * Maintainer as the resulting assignee. The emitter must be able to cancel a
+ * half-emitted handoff stub that nobody owns, and the cancellation must leave
+ * the row unowned. All conditions hold together:
+ * - the write persists status `cancelled`;
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`),
+ *   including one a workflow transition adds;
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the resulting row keeps the stored null
+ * assignees. Any assignee write, any other status, any owned row, and any
+ * unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffCancellation(input: {
+  requestedStatus: unknown;
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.requestedStatus === "cancelled" &&
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
+// Request attribution an issue write carries without setting an issue field.
+const ISSUE_WRITE_ATTRIBUTION_KEYS: ReadonlySet<string> = new Set([
+  "actorAgentId",
+  "actorAgentApiKeyId",
+  "actorRunId",
+  "actorRunStopId",
+  "actorUserId",
+  "boardApiKeyId",
+  "expectedUpdatedAt",
+]);
+
+/**
+ * SUP-24762: true when an issue write sets no issue field: every present key
+ * is undefined or request attribution. A comment-only PATCH is such a write.
+ * It cannot change who holds a Wiki handoff or what the handoff is, so the
+ * Wiki handoff guard must not judge the stored assignee as if it were written
+ * (a human reviewer's seat stores assigneeAgentId null). A write with any
+ * other key, including null values and bookkeeping keys, is not field-less.
+ */
+export function isFieldlessIssueWrite(data: Record<string, unknown>): boolean {
+  return Object.entries(data).every(
+    ([key, value]) => value === undefined || ISSUE_WRITE_ATTRIBUTION_KEYS.has(key),
+  );
+}
+
+/**
+ * SUP-24632: the second and only other write the Wiki handoff guard admits
+ * without the canonical Maintainer as the resulting assignee. The board stage
+ * decision (`POST /issues/:id/execution-stage/board-decision`) closing the final
+ * stage of an unowned handoff hands the card back to a null return-to; nobody is
+ * assigned before or after. All conditions hold together:
+ * - the caller marks the write as that route's decision (the guard's
+ *   `boardStageDecision` input, fed by an internal field no request schema accepts);
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`);
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the row keeps its stored null assignees, so
+ * the exemption can only leave an unassigned handoff unassigned. Any assignee
+ * write, any owned row, and any unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffBoardStageDecision(input: {
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -227,6 +305,25 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
+  /**
+   * SUP-24280: the persisted status and assignee shape of this write, so the
+   * guard can admit an unassigned-stub cancellation. Omit it at doors that
+   * cannot cancel; without it the exemption never applies.
+   */
+  cancellation?: {
+    requestedStatus: unknown;
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
+  /**
+   * SUP-24632: the board stage decision's marker and assignee shape, so the
+   * guard can admit a final-stage close of an unassigned handoff. Omit it at
+   * doors that cannot be that decision; without it the exemption never applies.
+   */
+  boardStageDecision?: {
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -249,6 +346,23 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     workflowControlledAssignment: input.workflowControlledAssignment,
   });
   if (!violation) return;
+  if (
+    input.cancellation &&
+    isUnassignedWikiHandoffCancellation({
+      requestedStatus: input.cancellation.requestedStatus,
+      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
+  if (
+    input.boardStageDecision &&
+    isUnassignedWikiHandoffBoardStageDecision({
+      assigneeFieldWritten: input.boardStageDecision.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.boardStageDecision.currentAssigneeUserId,
+    })
+  ) return;
   if (
     violation.reason === "wiki_handoff_self_satisfy" &&
     input.workflowControlledAssignment !== true &&

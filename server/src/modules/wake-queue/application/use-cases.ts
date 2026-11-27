@@ -356,8 +356,13 @@ async function promoteDeferredWake(
   // after completion; it cannot revive a cancelled task. Other stale
   // continuations cannot revive assignee execution. Cancel before claiming promotion so
   // the compare-and-set still sees the deferred wake.
+  const onboardingResultReport = currentIssue.status === "done" && currentIssue.originKind === "onboarding_first_task" &&
+    await ports.transaction.isCompletedOnboardingHandoffWake({ companyId: run.companyId, issueId: currentIssue.id,
+      agentId: workingCandidate.agentId, reason: workingCandidate.wakeReason ?? workingCandidate.reason,
+      contextSnapshot: workingCandidate.deferredContextSeed });
   if (
     !shouldReopen &&
+    !onboardingResultReport &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
     workingCandidate.agentId === currentIssue.assigneeAgentId
   ) {
@@ -826,8 +831,13 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // Each resolved card has its own immutable decision and continuation. Never
     // merge it with comments or another card, in either arrival order.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
+    const activeRunContext = parseObject(input.activeExecutionRun.contextSnapshot);
+    // SUP-20121: a run that owns this issue without naming it in its own
+    // context (it created or self-assigned the card) must not absorb the wake:
+    // merging would rewrite that run's issue scope. Hold the wake behind it.
+    const activeRunScopedElsewhere = readNonEmptyString(activeRunContext.issueId) !== input.issueId;
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || parseObject(input.activeExecutionRun.contextSnapshot).interactionId
+      allowRunCoalescing: interactionReceipt || activeRunContext.interactionId || activeRunScopedElsewhere
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,

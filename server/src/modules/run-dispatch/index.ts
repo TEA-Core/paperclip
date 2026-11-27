@@ -4,15 +4,17 @@ import {
   createCancelStaleQueuedRun,
   createDispatchResolvedInteractionIfCurrent,
   createEvaluateScheduledRetryGate,
+  createExpireStaleQueuedRuns,
   createPromoteDueScheduledRetries,
   createPromoteScheduledRetry,
 } from "./application/use-cases.js";
-import type { RunDispatchWriter, ScheduledRetryReader } from "./application/ports.js";
+import type { QueuedRunExpiry, RunDispatchWriter, ScheduledRetryReader } from "./application/ports.js";
 
 export {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
+  AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
@@ -46,14 +48,14 @@ export { RunDispatchApplicationError } from "./application/types.js";
 
 export type RunDispatchDeps = {
   /** Overrides the Postgres adapter; a test builds its module against a fake instead. */
-  adapter?: ScheduledRetryReader & RunDispatchWriter;
+  adapter?: ScheduledRetryReader & RunDispatchWriter & QueuedRunExpiry;
 };
 
 /**
  * Composes the run-dispatch module: the Postgres adapter and its semantic
  * use cases. `heartbeat.ts` holds the only caller: it builds one
- * instance per process and delegates the scheduled-retry promotion gate and
- * the queued-run staleness gate to it.
+ * instance per process and delegates the scheduled-retry promotion gate,
+ * the queued-run staleness gate, and the queued-run age bound to it.
  */
 export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
   const adapter = deps.adapter ?? createPostgresRunDispatchAdapter(db);
@@ -75,6 +77,7 @@ export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
     dispatchResolvedInteractionIfCurrent: createDispatchResolvedInteractionIfCurrent({
       writer: adapter,
     }),
+    expireStaleQueuedRuns: createExpireStaleQueuedRuns({ expiry: adapter }),
   };
 }
 

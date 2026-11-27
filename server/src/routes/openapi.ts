@@ -8,12 +8,18 @@ import { z } from "zod";
 import {
   createAiConnectionSchema,
   GIT_COMMIT_SHA_WIRE_PATTERN,
+  aiConnectionPoolConfigSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
   emailEndpointSetupSchema,
   emailConnectionSchema,
+  emailAddressCheckSchema,
   emailSendSchema,
+  browserUseControlSchema,
+  browserUseSettingsSchema,
+  browserUseViewportSchema,
+  browserUseViewerSchema,
   slackToolCallSchema,
   slackSearchConfigSchema,
   // Agent
@@ -28,6 +34,8 @@ import {
   updateAgentInstructionsPathSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
+  restoreAgentInstructionSchema,
+  resolveAgentInstructionCandidateSchema,
   createAgentKeySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
@@ -43,7 +51,9 @@ import {
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
   // Issue
+  issueActivityResponseSchema,
   createIssueSchema,
+  setIssueTitleSchema,
   updateIssueObjectSchema,
   approveIssueHeadSchema,
   enrollReleaseAssuranceSchema,
@@ -147,6 +157,10 @@ import {
   probeEnvironmentConfigSchema,
   startEnvironmentCustomImageSetupSessionSchema,
   // Company skills
+  skillSourceDiscoverySchema,
+  skillSourcePreviewSchema,
+  skillSourceCreateSchema,
+  skillSourceSelectionSchema,
   companySkillCreateSchema,
   companySkillFileDeleteSchema,
   companySkillFileUpdateSchema,
@@ -169,11 +183,14 @@ import {
   // Issue tree
   createIssueTreeHoldSchema,
   previewIssueTreeControlSchema,
+  parkRecoveryCarrierSchema,
+  releaseRecoveryCarrierParkSchema,
   releaseIssueTreeHoldSchema,
   // Issue interactions
   createIssueThreadInteractionSchema,
   createChildIssueSchema,
   acceptIssueThreadInteractionSchema,
+  resolveConfirmationFromCommentSchema,
   rejectIssueThreadInteractionSchema,
   respondIssueThreadInteractionSchema,
   skipIssueThreadInteractionSchema,
@@ -213,6 +230,8 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  retryWorkspaceExportSchema,
+  attachIssueLandingProofSchema,
   cancelIssueThreadInteractionSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
@@ -258,6 +277,7 @@ import {
   revokeToolTrustRuleSchema,
   unbindToolProfileBindingSchema,
   importMcpJsonSchema,
+  mcpConsentSchema,
   toolPolicyTestRequestSchema,
   createToolMcpGatewaySchema,
   completeConnectionIntentSchema,
@@ -303,6 +323,8 @@ import {
 // route -> heartbeat.ts.
 import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce-schemas.js";
 import { agentInstallationTokenRequestSchema } from "./agent-github-tokens-schemas.js";
+import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
+import { composioAppsSyncSchema, composioAppsRefreshSchema, composioAppSetupSchema, composioAppAccountSchema } from "@paperclipai/shared/composio-app-setup";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
@@ -660,6 +682,10 @@ const registry = new OpenAPIRegistry();
 const heartbeatRunIdParamSchema = z.string()
   .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/)
   .describe("Heartbeat run UUID; malformed values return 400");
+
+const cliAuthChallengeIdParamSchema = z.string().trim()
+  .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/)
+  .describe("CLI auth challenge UUID; malformed values return 400");
 
 const ErrorSchema = registry.register("Error", z.object({ error: z.string() }));
 
@@ -1331,6 +1357,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1349,6 +1376,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -1430,7 +1458,20 @@ const BOARD_ONLY_PREFIXES = [
   "/api/instance/",
 ];
 
+const browserUseOperations = [
+  ["get", "/api/issues/{issueId}/browsers", "List authorized task browsers", undefined],
+  ["get", "/api/issues/{issueId}/browsers/{browserId}/viewer", "Get a private live browser viewer", undefined],
+  ["post", "/api/issues/{issueId}/browsers/{browserId}/presence", "Renew visible browser presence", undefined],
+  ["post", "/api/issues/{issueId}/browsers/{browserId}/control", "Control a task browser", browserUseControlSchema],
+  ["post", "/api/issues/{issueId}/browsers/{browserId}/viewport", "Set the browser viewport", browserUseViewportSchema],
+  ["post", "/api/issues/{issueId}/browsers/{browserId}/viewport/release", "Release viewport ownership", browserUseViewerSchema],
+  ["get", "/api/companies/{companyId}/browser-use-cloud/grants/{grantId}/profiles", "List available browser profiles", undefined],
+  ["get", "/api/companies/{companyId}/browser-use-cloud/grants/{grantId}/settings", "Read browser credential settings", undefined],
+  ["put", "/api/companies/{companyId}/browser-use-cloud/grants/{grantId}/settings", "Update browser credential settings", browserUseSettingsSchema],
+] as const;
+
 const BOARD_ONLY_OPERATIONS = new Set([
+  ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   // Added upstream in the 2026-09-19 slice-2d fold range (#13284, Agent Chat).
   // Every ai-connections handler calls assertBoard() unconditionally, so the
   // fork's SUP-16341 regression guard requires them listed here.
@@ -1442,7 +1483,12 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "DELETE /api/companies/{companyId}/ai-connections/local/attempts/{sessionId}",
   "PUT /api/companies/{companyId}/ai-connections/default",
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/active-runs",
+  "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
+  "GET /api/companies/{companyId}/ai-connection-pools",
+  "POST /api/companies/{companyId}/ai-connection-pools",
+  "DELETE /api/companies/{companyId}/ai-connection-pools/{poolId}",
+  "GET /api/companies/{companyId}/ai-connection-pools/{poolId}/inspection",
 
   // Added upstream in the 2026-09-08 slice-2a fold range. Each handler calls
   // assertBoard() unconditionally, so publishing them as agent-callable made the
@@ -1582,6 +1628,15 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/tool-connections/{connectionId}/railway/ssh",
   "POST /api/tool-connections/{connectionId}/catalog/refresh",
   "GET /api/tool-connections/{connectionId}/catalog",
+  "GET /api/tool-connections/{connectionId}/aggregator/apps",
+  "POST /api/tool-connections/{connectionId}/aggregator/apps/sync",
+  "POST /api/tool-connections/{connectionId}/aggregator/apps/refresh",
+  "PUT /api/tool-connections/{connectionId}/aggregator/discovery",
+  "GET /api/tool-connections/{connectionId}/composio/apps",
+  "POST /api/tool-connections/{connectionId}/composio/apps/sync",
+  "POST /api/tool-connections/{connectionId}/composio/apps/refresh",
+  "POST /api/tool-connections/{connectionId}/composio/apps/{toolkit}/setup",
+  "POST /api/tool-connections/{connectionId}/composio/apps/{toolkit}/accounts",
   "GET /api/tool-connections/{connectionId}/activity",
   "GET /api/tool-connections/{connectionId}/test-agents",
   "GET /api/tool-connections/{connectionId}/test-agents/{agentId}/access",
@@ -1595,6 +1650,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/connection-intents/{interactionId}/setup-options",
   "POST /api/connection-intents/{interactionId}/phase",
   "POST /api/connection-intents/{interactionId}/complete",
+  "POST /api/agents/{id}/connection-intents/{interactionId}/adopt",
   "POST /api/connection-intents/{interactionId}/decline",
   "GET /api/companies/{companyId}/tools/profiles",
   "POST /api/companies/{companyId}/tools/profiles",
@@ -1671,12 +1727,18 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/tree-control/state",
   "GET /api/issues/{id}/tree-holds",
   "GET /api/issues/{id}/tree-holds/{holdId}",
+  "GET /api/issues/{id}/recovery-carrier-park/candidate",
+  "POST /api/issues/{id}/recovery-carrier-park",
+  "POST /api/issues/{id}/recovery-carrier-park/{holdId}/release",
   "POST /api/issues/{id}/tree-control/preview",
   "POST /api/issues/{id}/tree-holds",
   "POST /api/issues/{id}/tree-holds/{holdId}/release",
   "POST /api/issues/{id}/interactions",
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/recovery-actions/resolve",
+  "POST /api/issues/{id}/recovery-actions/retry-workspace-export",
+  "POST /api/issues/{id}/landing-proof",
+  "GET /api/companies/{companyId}/chats",
   "POST /api/issues/{id}/scheduled-retry/retry-now",
   "POST /api/issues/{id}/stalled-review-decision",
   "DELETE /api/secrets/{id}",
@@ -1707,8 +1769,10 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/import/transfers/{transferId}/apply",
   "POST /api/companies/{companyId}/email/inspect",
   "POST /api/companies/{companyId}/email/inboxes",
+  "GET /api/companies/{companyId}/email/connections",
   "POST /api/companies/{companyId}/email/connections",
   "POST /api/companies/{companyId}/email/connections/{connectionId}/inspect",
+  "POST /api/companies/{companyId}/email/connections/{connectionId}/check-address",
   "POST /api/email/inboxes/{endpointId}/control",
   "POST /api/email/inboxes/{endpointId}/reconnect",
   "POST /api/companies/{companyId}/email/deliveries/{publicationId}/resolve",
@@ -1941,6 +2005,8 @@ function resolveOperationAuthLevel(
   path: string,
 ): OpenApiAuthLevel {
   const key = operationKey(method, path);
+  if (key === "GET /api/mcp/requests/{id}" || key === "GET /api/mcp/device") return "public";
+  if (path === "/api/mcp/setup" || path === "/api/mcp/device/consent" || path.startsWith("/api/mcp/requests/") || path.startsWith("/api/mcp/connections")) return "board";
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/mcp/project-tools" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
@@ -2399,9 +2465,35 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+for (const [method, path, summary, body] of browserUseOperations) {
+  registerCurrentRoute({
+    method, path, summary, body, tags: ["Browser Use Cloud"],
+    ...(path.endsWith("/viewer") ? { query: browserUseViewerSchema.partial() } : {}),
+    responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+  });
+}
+
 // Explicit task-bound email. Board setup and agent actions share the same vaulted
 // connection, while automatic chat publication never applies to these endpoints.
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/email/connections/{connectionId}/check-address",
+  tags: ["Email"],
+  summary: "Check for an existing AgentMail address using a saved credential",
+  description: "Requires a board connection manager and enabled chat connectors. Read-only: does not create or reserve an inbox. A missing inbox returns unknown because AgentMail hides resources outside the credential scope; it is never proof of availability.",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), connectionId: z.string().uuid() }),
+    body: jsonBody(emailAddressCheckSchema),
+  },
+  responses: {
+    200: r.ok(z.object({ address: z.string(), status: z.enum(["taken", "unknown"]) })),
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    422: r.unprocessable, 429: { description: "AgentMail request limit reached; retry later" },
+    502: r.serverError,
+  },
+});
 for (const [method, path, summary, body, success] of [
+  ["get", "/api/companies/{companyId}/email/connections", "List accessible saved AgentMail API keys (metadata only)", undefined, 200],
   ["post", "/api/companies/{companyId}/email/connections", "Save AgentMail credential and access", emailConnectionSchema, 201],
   ["post", "/api/companies/{companyId}/email/connections/{connectionId}/inspect", "Inspect inboxes using a saved AgentMail credential", undefined, 200],
   ["get", "/api/companies/{companyId}/email/inboxes", "List authorized AgentMail inboxes", undefined, 200],
@@ -2415,7 +2507,7 @@ for (const [method, path, summary, body, success] of [
   ["post", "/api/companies/{companyId}/email/deliveries/{publicationId}/resolve", "Resolve uncertain email after checking the provider", z.object({ outcome: z.enum(["sent", "failed"]), providerMessageId: z.string().min(1).max(998).optional() }).strict(), 200],
 ] as const) {
   registry.registerPath({ method, path, tags: ["Email"], summary,
-    description: "Experimental AgentMail channel. Internal comments never send email. Agent sends require assigned inbox and task ownership, active run authority, and configured action policies. Preserve the same idempotencyKey and payload across retries. New conversations create an email child task; replies require conversationId and replyToMessageId. Reply-all is deliberate and never includes Bcc.",
+    description: "AgentMail email connection. Available without the experimental chat setting. Internal comments never send email. Agent sends require assigned inbox and task ownership, active run authority, and configured action policies. Preserve the same idempotencyKey and payload across retries. New conversations create an email child task; replies require conversationId and replyToMessageId. Reply-all is deliberate and never includes Bcc.",
     request: { params: z.object(Object.fromEntries([...path.matchAll(/\{([^}]+)\}/g)].map(match => [match[1], z.string().uuid()]))), ...(body ? { body: jsonBody(body) } : {}) },
     responses: { [success]: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
   });
@@ -3797,8 +3889,8 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/{id}/instructions-bundle/file",
   tags: ["agents"],
-  summary: "Get agent instructions file",
-  request: { params: z.object({ id: z.string() }) },
+  summary: "Get agent file content or download its original bytes",
+  request: { params: z.object({ id: z.string() }), query: z.object({ path: z.string(), download: z.enum(["true", "false"]).optional() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
@@ -3814,12 +3906,46 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+for (const operation of [
+  { suffix: "history", summary: "List immutable instruction revisions", query: z.object({ path: z.string().optional(), cursor: z.string().uuid().optional() }) },
+  { suffix: "revision/{revisionId}", summary: "Read exact instruction content at a revision", query: z.object({ path: z.string().optional() }) },
+  { suffix: "diff", summary: "Compare instruction revisions (exact common prefix, removed, added, suffix)", query: z.object({ path: z.string().optional(), from: z.string().uuid(), to: z.string().uuid() }) },
+]) {
+  registry.registerPath({ method: "get", path: `/api/agents/{id}/instructions-bundle/${operation.suffix}`, tags: ["agents"], summary: operation.summary,
+    request: { params: operation.suffix.includes("revisionId") ? z.object({ id: z.string(), revisionId: z.string().uuid() }) : z.object({ id: z.string() }), query: operation.query },
+    responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+}
+registry.registerPath({ method: "post", path: "/api/agents/{id}/instructions-bundle/restore", tags: ["agents"], summary: "Restore a pre-upgrade instruction snapshot into current files with compare-and-swap",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(restoreAgentInstructionSchema) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict } });
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/instructions-bundle/candidates",
+  tags: ["agents"],
+  summary: "List preserved instruction edits and collection diagnostics",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/instructions-bundle/candidates/{runId}/resolve",
+  tags: ["agents"],
+  summary: "Explicitly save a preserved instruction edit with compare-and-swap",
+  request: {
+    params: z.object({ id: z.string(), runId: z.string().uuid() }),
+    body: jsonBody(resolveAgentInstructionCandidateSchema),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
 registry.registerPath({
   method: "delete",
   path: "/api/agents/{id}/instructions-bundle/file",
   tags: ["agents"],
-  summary: "Delete agent instructions file",
-  request: { params: z.object({ id: z.string() }) },
+  summary: "Delete agent file with compare-and-swap for managed storage",
+  request: { params: z.object({ id: z.string() }), query: z.object({ path: z.string(), baseHash: z.string().regex(/^[a-f0-9]{64}$/).optional() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -4149,6 +4275,16 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/chats",
+  tags: ["issues"],
+  summary: "List the current board user's agent conversations",
+  description: "Requires Agent Chat to be enabled. Returns accessible conversations in the company, ordered by most recent activity. Each agent has one conversation per user.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
@@ -4207,6 +4343,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "Create an issue",
+  description: "Title is optional when description contains the task prompt. The server seeds a provisional title from the first 120 characters of the whitespace-normalized prompt and asks the assigned agent to refine it early. Explicit titles are preserved.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createIssueSchema),
@@ -4238,6 +4375,37 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/publication-close-eligibility",
+  tags: ["issues"],
+  summary: "Read publication close eligibility for an issue",
+  description:
+    "Read-only. Requires issue:read on the issue, the same actor that can read the issue and its runs. " +
+    "Does not require company_scope:read and is not board-only. Every key is always present. Each boolean is never null. " +
+    "deliveryIdentity is true when the parsed execution-state delivery block is present. " +
+    "deliveryReceipt is true when any delivery receipt exists for this company and issue, in any state. " +
+    "cachedLinkedPullRequest is cached and advisory: it is true when the card has a cached GitHub pull-request mention " +
+    "whose cached state is open or unknown, including drafts. It is the cached read the accept path uses. " +
+    "This route does not call GitHub, so it does not refresh pull-request state and does not discover unmentioned pull requests. " +
+    "The done-close guard does both, so the close can decide differently. " +
+    "cachedLinkedPullRequestFetchedAt is the oldest GitHub fetch time among the cached pull-request rows that field reads. " +
+    "It is null when there is no such row or when one of them was never fetched. " +
+    "A true boolean means the accept path would refuse the card for that binding. This route never writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      deliveryIdentity: z.boolean(),
+      deliveryReceipt: z.boolean(),
+      cachedLinkedPullRequest: z.boolean(),
+      cachedLinkedPullRequestFetchedAt: z.string().datetime().nullable(),
+    }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
@@ -4246,11 +4414,22 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "put",
+  path: "/api/issues/{id}/title",
+  tags: ["issues"],
+  summary: "Set a task title",
+  description: "Changes only the title. onlyIfProvisional preserves an explicit title, including concurrent user edits. Agent callers must own the task's active run. Allowed in Ask and Plan modes.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(setIssueTitleSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
   method: "patch",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Update an issue",
   description:
+    "Closing to done or cancelled still clears the monitor. If its prior nextCheckAt is later than the close write, issue.monitor_cleared records details.previousNextCheckAt, details.recoveryPolicy (nullable), details.reason=cleared_by_close_future_check and the existing actorType/actorId/agentId/runId attribution. This records cancellation of the future check; it does not re-register it. Past-due monitors retain their ordinary clear behavior. " +
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
     "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
@@ -4276,7 +4455,7 @@ registry.registerPath({
         .optional()
         .nullable()
         .describe(
-          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, or `control-plane-operation-no-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
+          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, `control-plane-operation-no-deliverable`, or `decision-only-no-repository-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). The decision-only disposition requires `Closed at Tier 0 (decision-only): <reason>` in the close comment. A no-deliverable-head override does not clear a review-ladder refusal.",
         ),
       deliveryIdentity: z
         .object({
@@ -4300,7 +4479,7 @@ registry.registerPath({
         .strict()
         .optional()
         .describe(
-          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is refused with 422 `workspace_issue_override_disallowed` whether or not the request names an `executionWorkspaceId`: the route re-supplies the stored workspace id on that write, and the policy check counts it as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are independently optional in this schema; a record with only one of them is not a PR binding, and approval refuses such a record where a PR binding is required. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
+          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and, without PR fields, `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). To bind an existing pull request (AS-05), send `prNumber` and `prUrl` TOGETHER (exactly one of them is 422 `delivery_identity_write_rejected`): `branch` is then the pull request's head branch, the server verifies the exact open, non-draft PR — canonical URL, live head branch, live head SHA — with the same verifier approval time uses (any mismatch or missing GitHub token is 422 `delivery_identity_write_rejected`), and stamps `kind=as05_bound_pr` plus the control-plane-derived `cardBranch` server-side; `kind`/`cardBranch` are server-owned and rejected if client-supplied. The live write-time verification and the AS-05 stamp apply to the lease-holding run's entry-into-review write; a board refresh on a card already `in_review` keeps the exact-branch rule above for a both-fields record — it is stored as sent, without a live write-time PR check and without the AS-05 stamp, and approval time re-verifies the binding as usual. `sourceIssueId` is optional and must name this card when supplied. `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is accepted: the route re-supplies the stored workspace id on that write, and the policy check does not count an `executionWorkspaceId` equal to the one the card already holds as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` other than the one the card already holds is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are each optional in this schema but must be sent together: a record with exactly one of them is refused at write time with 422 `delivery_identity_write_rejected`, before anything is persisted. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
       expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
         "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
@@ -5881,7 +6060,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List company activity",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(issueActivityResponseSchema), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -6001,7 +6180,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List activity for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(issueActivityResponseSchema), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -7243,7 +7422,7 @@ registry.registerPath({
   tags: ["access"],
   summary: "Approve a CLI auth challenge",
   request: {
-    params: z.object({ id: z.string() }),
+    params: z.object({ id: cliAuthChallengeIdParamSchema }),
     body: jsonBody(resolveCliAuthChallengeSchema),
   },
   responses: {
@@ -7260,7 +7439,7 @@ registry.registerPath({
   tags: ["access"],
   summary: "Cancel a CLI auth challenge",
   request: {
-    params: z.object({ id: z.string() }),
+    params: z.object({ id: cliAuthChallengeIdParamSchema }),
     body: jsonBody(resolveCliAuthChallengeSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 404: r.notFound },
@@ -8063,6 +8242,20 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/resolve-from-comment",
+  tags: ["issues"],
+  summary: "Record a user's conversational confirmation answer",
+  description: "An eligible active agent run resolves a confirmation on its own task using the latest user comment. Resolver permissions, target staleness and conversation reset boundaries remain enforced. Matching retries are idempotent. No new wake is scheduled.",
+  request: {
+    params: z.object({ id: z.string(), interactionId: z.string() }),
+    body: jsonBody(resolveConfirmationFromCommentSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: { description: "Stale or conflicting decision" }, 422: { description: "Invalid answer evidence or selection" } },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/accept",
   tags: ["issues"],
   summary: "Accept an issue thread interaction",
@@ -8186,7 +8379,7 @@ registry.registerPath({
       owner: z.string().trim().min(1),
       repo: z.string().trim().min(1),
       pullRequestNumber: z.number().int().positive(),
-      headSha: z.string().regex(/^[0-9a-f]{40,64}$/),
+      headSha: z.string().regex(/^[0-9a-f]{40}$/),
       reason: z.string().trim().min(1),
       idempotencyKey: z.string().trim().min(1).max(255),
     }).strict()),
@@ -8445,6 +8638,39 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/recovery-carrier-park/candidate",
+  tags: ["issues"],
+  summary: "Get recovery carrier park candidate",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park",
+  tags: ["issues"],
+  summary: "Park a recovery carrier by board decision",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(parkRecoveryCarrierSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/recovery-carrier-park/{holdId}/release",
+  tags: ["issues"],
+  summary: "Release a board-parked recovery carrier",
+  request: {
+    params: z.object({ id: z.string(), holdId: z.string() }),
+    body: jsonBody(releaseRecoveryCarrierParkSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/tree-control/preview",
   tags: ["issues"],
@@ -8647,12 +8873,12 @@ registry.registerPath({
   method: "patch",
   path: "/api/companies/{companyId}/skills/{skillId}/files",
   tags: ["skills"],
-  summary: "Update a skill file",
+  summary: "Update a skill file (optional expectedVersionId and idempotencyKey guard agent retries)",
   request: {
     params: z.object({ companyId: z.string(), skillId: z.string() }),
     body: jsonBody(companySkillFileUpdateSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -10247,8 +10473,8 @@ registry.registerPath({
   path: "/api/cli-auth/challenges/{id}",
   tags: ["access"],
   summary: "Get a CLI auth challenge",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 404: r.notFound },
+  request: { params: z.object({ id: cliAuthChallengeIdParamSchema }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 404: r.notFound },
 });
 
 // ─── Invite onboarding ────────────────────────────────────────────────────────
@@ -11041,6 +11267,56 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/issues/{id}/recovery-actions/retry-workspace-export",
+  tags: ["issues"],
+  summary: "Retry only workspace export for a repaired accepted native result",
+  body: retryWorkspaceExportSchema,
+  responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/landing-proof",
+  tags: ["issues"],
+  summary: "Attach a GitHub-verified merged-PR landing proof to a delivered card (board only)",
+  description:
+    "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
+    "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
+    "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
+    "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
+    "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
+    "reason, the call is 409 `landing_proof_cannot_close` before the submitted proof is verified and nothing is recorded. The body names one pull request in the card's " +
+    "project repository (`owner`, `repo`, `pullRequestNumber`), at least one of `mergeCommitSha` / `headSha` (full shas), and a " +
+    "`reason`. The server verifies the proof live against GitHub: the repository is the card's project repository " +
+    "(422 `landing_proof_wrong_repo`), the card resolves a control-plane base branch (422 `landing_proof_no_base`), the PR exists " +
+    "(422 `landing_proof_pr_not_found`), it is merged (422 `landing_proof_pr_not_merged`, or `landing_proof_pr_closed_unmerged` " +
+    "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), " +
+    "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
+    "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
+    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
+    "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
+    "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
+    "or a board user's comment on the card naming the PR, or a head or merge " +
+    "commit recorded on such a work product that is the PR head or merge commit or one of the PR's own commits; links, comments " +
+    "and delivery identities an agent wrote do not count, and a head branch name is not a tie; otherwise 422 " +
+    "`landing_proof_not_card_delivery`), and the " +
+    "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
+    "not contained). A missing credential, a network error, a non-OK GitHub answer or an unresolvable base branch is 422 " +
+    "`landing_proof_unverifiable`, which may succeed on retry. A refusal records nothing. On success (201) the server records an " +
+    "`issue.landing_proof_attached` activity row naming the actor and the evidence, plus a `pull_request` work product with the " +
+    "merge and head commits. The call is idempotent for retries: replaying the same evidence returns 200 with `replayed: true` " +
+    "and the recorded proof, and writes nothing. Attaching discharges no landing debt. A later board `PATCH /api/issues/{id}` with " +
+    "`status: done` re-verifies the latest attached proof and discharges the repository landing debt (for example from a " +
+    "`record_only` reclassification) atomically with that accepted close. Non-board close doors do not accept the proof.",
+  body: attachIssueLandingProofSchema,
+  responses: {
+    200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: r.conflict, 422: r.unprocessable,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/issues/{id}/recovery-actions/resolve",
   tags: ["issues"],
   summary: "Resolve an issue recovery action",
@@ -11222,7 +11498,8 @@ registerCurrentRoute({
   method: "get",
   path: "/mcp/runtime-tools",
   tags: ["connection-intents"],
-  summary: "Inspect the heartbeat-bound runtime tools MCP endpoint",
+  summary: "Reject SSE discovery because the runtime tools endpoint supports POST only",
+  responses: { 405: { description: "SSE stream is not supported" }, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registerCurrentRoute({
@@ -11292,6 +11569,23 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/agents/{id}/connection-intents/{interactionId}/adopt",
+  tags: ["connection-intents", "agents"],
+  summary: "Validate and atomically adopt an AI connection for a legacy agent",
+  body: completeConnectionIntentSchema,
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/connection-intents/{interactionId}/decline",
   tags: ["connection-intents"],
   summary: "Decline an addressed connection request",
@@ -11302,9 +11596,52 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "get",
+  path: "/api/companies/{companyId}/ai-connection-pools",
+  tags: ["ai-connections"],
+  summary: "List company AI connection pools for connection managers",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connection-pools",
+  tags: ["ai-connections"],
+  summary: "Create or revise an experimental plugin-owned connection pool",
+  body: z.object({ pluginKey: z.string().min(1), id: z.string().uuid().optional(), expectedRevision: z.number().int().positive().optional(), config: aiConnectionPoolConfigSchema }).strict(),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/companies/{companyId}/ai-connection-pools/{poolId}",
+  tags: ["ai-connections"],
+  summary: "Delete a connection pool while retaining task and run records",
+  body: z.object({ expectedRevision: z.number().int().positive() }).strict(),
+  responses: { 200: r.ok(z.object({ ok: z.literal(true) })), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connection-pools/{poolId}/inspection",
+  tags: ["ai-connections"],
+  summary: "Inspect authorized pool members and fresh cached usage without probing",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/usage",
+  tags: ["ai-connections"],
+  summary: "Probe the selected AI account’s provider usage limits on demand",
+  query: z.object({ grantId: z.string().uuid().optional() }),
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "get",
   path: "/api/companies/{companyId}/ai-connections",
   tags: ["ai-connections"],
-  summary: "List available AI connections and personal defaults",
+  summary: "List available AI connections, personal defaults, and connection-manager access",
   query: z.object({ agentId: z.string().uuid().optional() }),
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
@@ -11690,6 +12027,38 @@ registerCurrentRoute({
   path: "/api/tool-connections/{connectionId}/activity",
   tags: ["tool-access"],
   summary: "List tool connection activity",
+});
+
+for (const provider of ["aggregator", "composio"] as const) {
+  registerCurrentRoute({
+    method: "get", path: `/api/tool-connections/{connectionId}/${provider}/apps`, tags: ["tool-access"],
+    summary: "List upstream account observations for the current connection manager",
+  });
+  registerCurrentRoute({
+    method: "post", path: `/api/tool-connections/{connectionId}/${provider}/apps/sync`, tags: ["tool-access"],
+    summary: "Start upstream account discovery without changing tool access",
+    body: provider === "aggregator" ? aggregatorAppsSyncSchema : composioAppsSyncSchema,
+  });
+  registerCurrentRoute({
+    method: "post", path: `/api/tool-connections/{connectionId}/${provider}/apps/refresh`, tags: ["tool-access"],
+    summary: "Refresh upstream account observations",
+    body: provider === "aggregator" ? aggregatorAppsRefreshSchema : composioAppsRefreshSchema,
+  });
+}
+registerCurrentRoute({
+  method: "put", path: "/api/tool-connections/{connectionId}/aggregator/discovery", tags: ["tool-access"],
+  summary: "Save manager-owned optional Arcade account discovery credentials",
+  body: arcadeDiscoverySetupSchema,
+});
+registerCurrentRoute({
+  method: "post", path: "/api/tool-connections/{connectionId}/composio/apps/{toolkit}/setup", tags: ["tool-access"],
+  summary: "Start or verify Composio app authorization through a saved gateway",
+  body: composioAppSetupSchema,
+});
+registerCurrentRoute({
+  method: "post", path: "/api/tool-connections/{connectionId}/composio/apps/{toolkit}/accounts", tags: ["tool-access"],
+  summary: "Manage a Composio account through a saved gateway",
+  body: composioAppAccountSchema,
 });
 
 registerCurrentRoute({
@@ -12287,6 +12656,49 @@ registerCurrentRoute({
 });
 
 registerCurrentRoute({
+  method: "get", path: "/api/mcp/setup", tags: ["tool-gateway"],
+  summary: "Read assistant connection setup using a human browser session",
+  // Available while disabled; returns metadata only and never grants access.
+  responses: {
+    200: r.ok(z.object({ enabled: z.boolean(), serverUrl: z.string().url(), invitationUrl: z.string().url(), invitation: z.string() })),
+    401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get", path: "/api/mcp/requests/{id}", tags: ["tool-gateway"],
+  summary: "Describe an assistant connection request and available sign-in options",
+  responses: { 200: r.ok(), 404: r.notFound },
+});
+registerCurrentRoute({
+  method: "post", path: "/api/mcp/requests/{id}/consent", tags: ["tool-gateway"],
+  summary: "Approve or deny assistant access using a same-origin browser session",
+  body: mcpConsentSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/mcp/device", tags: ["tool-gateway"],
+  summary: "Describe a device approval request without revealing unauthenticated organization data",
+  responses: { 200: r.ok(), 400: r.badRequest, 404: r.notFound },
+});
+registerCurrentRoute({
+  method: "post", path: "/api/mcp/device/consent", tags: ["tool-gateway"],
+  summary: "Approve or deny a device request using a same-origin human browser session",
+  body: mcpConsentSchema.extend({ userCode: z.string().min(8).max(12) }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/mcp/connections", tags: ["tool-gateway"],
+  summary: "List the signed-in person's assistant connections",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+registerCurrentRoute({
+  method: "delete", path: "/api/mcp/connections/{id}", tags: ["tool-gateway"],
+  summary: "Revoke an assistant connection using a same-origin browser session",
+  responses: { 204: { description: "Connection revoked" }, 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
   method: "get",
   path: "/api/tool-gateway/gateways/{gatewayId}/mcp",
   tags: ["tool-gateway"],
@@ -12557,4 +12969,30 @@ registerCurrentRoute({
   tags: ["ai-connections"], summary: "Check the local operator's subscription sign-in without saving a connection",
   body: localAiConnectionSchema,
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+for (const [method, path, summary] of [
+  ["get", "/api/companies/{companyId}/skill-sources", "List GitHub skill sources"],
+  ["get", "/api/companies/{companyId}/skill-sources/repositories", "Browse authorized GitHub repositories for skills"],
+  ["get", "/api/companies/{companyId}/skill-sources/{sourceId}", "Get a skill source and entries"],
+  ["post", "/api/companies/{companyId}/skill-sources/discover", "Discover and validate repository skills"],
+  ["post", "/api/companies/{companyId}/skill-sources/preview", "Preview an audited skill package file at an immutable commit"],
+  ["post", "/api/companies/{companyId}/skill-sources", "Import a GitHub skill source"],
+  ["patch", "/api/companies/{companyId}/skill-sources/{sourceId}", "Save skill source selection and connection"],
+  ["post", "/api/companies/{companyId}/skill-sources/{sourceId}/refresh", "Refresh installed source skills"],
+  ["delete", "/api/companies/{companyId}/skill-sources/{sourceId}", "Disconnect a skill source and retain installed skills"],
+] as const) registerCurrentRoute({
+  method, path, tags: ["skills"], summary,
+  ...(method === "patch" ? { body: skillSourceSelectionSchema }
+    : method === "post" && path.endsWith("/discover") ? { body: skillSourceDiscoverySchema }
+    : method === "post" && path.endsWith("/preview") ? { body: skillSourcePreviewSchema }
+    : method === "post" && path.endsWith("/skill-sources") ? { body: skillSourceCreateSchema } : {}),
+  responses: {
+    [method === "post" && path.endsWith("/skill-sources") ? 201 : 200]: path.endsWith("/discover") ? {
+      description: "JSON discovery by default. Accept: application/x-ndjson streams progress (phase, measured Git download percentages, and package/file counts), candidate metadata, then complete with discovery. An error event terminates a failed scan; partial candidates cannot be imported. Disconnecting cancels further provider reads.",
+      content: { "application/json": { schema: z.unknown() }, "application/x-ndjson": { schema: z.string() } },
+    } : r.ok(),
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden,
+    404: r.notFound, 409: r.conflict, 422: r.unprocessable,
+  },
 });
