@@ -937,6 +937,67 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       },
     );
 
+    // A failure after the recovery effect but before the completion transaction
+    // commits must not make the retry repeat a consumer-visible effect: the next
+    // tick records the exhaustion once and every recovery effect stays single.
+    it.each([
+      ["wake_owner", "issue.monitor_recovery_wake_queued"],
+      ["create_recovery_issue", "issue.monitor_recovery_issue_created"],
+      ["escalate_to_board", "issue.monitor_escalated_to_board"],
+    ] as const)(
+      "%s: a completion failure after the effect does not repeat the effect on the next tick",
+      async (recoveryPolicy, effectAction) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        const effectActivity = async () =>
+          (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).filter(
+            (row) => row.action === effectAction,
+          ).length;
+        const queuedRecoveryWakeups = async () =>
+          (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).filter(
+            (row) =>
+              row.status !== "skipped" &&
+              (row.idempotencyKey?.startsWith("issue-monitor-recovery:") ||
+                row.idempotencyKey?.startsWith("issue-monitor-recovery-issue:")),
+          ).length;
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected completion fault'; end $$;
+          create trigger sup23786_completion_fault before insert on activity_log for each row
+            when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          await heartbeat.drainActiveRunExecutions();
+          const failed = await readIssue(issueId);
+          expect(failed.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+          expect(failed.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+          expect(await exhaustionRows(issueId)).toHaveLength(0);
+        } finally {
+          await db.execute(
+            sql.raw(
+              "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+            ),
+          );
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+
+        const effects = await recoveryEffects(issueId, agentId, companyId);
+        expect(effects.exhaustions).toBe(1);
+        expect(await effectActivity()).toBe(1);
+        expect(effects.comments).toBe(recoveryPolicy === "escalate_to_board" ? 1 : 0);
+        expect(effects.recoveryIssues).toBe(recoveryPolicy === "create_recovery_issue" ? 1 : 0);
+        expect(await queuedRecoveryWakeups()).toBe(recoveryPolicy === "escalate_to_board" ? 0 : 1);
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
     it("timeout: an agent re-arm after timeoutAt still reaches the recovery", async () => {
       const monitor = {
         timeoutAt: "2026-04-11T12:45:00.000Z",

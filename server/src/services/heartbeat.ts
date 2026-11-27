@@ -458,7 +458,7 @@ import {
   DEFAULT_SELF_DECLARED_RUN_TTL_MS,
 } from "./run-stillborn.js";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
-import { logActivity, logActivityInTransaction, publishActivity, publishPluginDomainEvent, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, logActivityInTransactionBestEffort, publishActivity, publishPluginDomainEvent, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -12713,7 +12713,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  // The idempotency key of a recovery wake names one exhaustion (issue, clear reason,
+  // claimed schedule). A queued or coalesced row with that key means an earlier attempt
+  // at this same exhaustion already delivered the wake, so a retry must not send it again.
+  async function issueMonitorRecoveryWakeAlreadySent(input: {
+    companyId: string;
+    agentId: string;
+    idempotencyKey: string;
+  }) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+          ne(agentWakeupRequests.status, "skipped"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
   async function performIssueMonitorRecovery(input: {
+    tx: Db;
+    postCommitPublications: ActivityPublication[];
     claimed: IssueMonitorDispatchRow;
     scheduledAtIso: string;
     nextAttemptCount: number;
@@ -12781,14 +12806,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // The recovery issue is the effect; waking its assignee is best effort. A paused or
       // budget-blocked assignee must not undo or repeat the issue creation.
       let recoveryWakeQueued = false;
-      if (recoveryIssue.assigneeAgentId) {
+      const recoveryWakeKey = `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
+      if (
+        recoveryIssue.assigneeAgentId &&
+        (await issueMonitorRecoveryWakeAlreadySent({
+          companyId: input.claimed.companyId,
+          agentId: recoveryIssue.assigneeAgentId,
+          idempotencyKey: recoveryWakeKey,
+        }))
+      ) {
+        recoveryWakeQueued = true;
+      } else if (recoveryIssue.assigneeAgentId) {
         try {
           recoveryWakeQueued = Boolean(
             await enqueueWakeup(recoveryIssue.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",
               reason: "issue_monitor_recovery_issue",
-              idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+              idempotencyKey: recoveryWakeKey,
               payload: withRecoveryContext(
                 { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
                 "status_only",
@@ -12811,7 +12846,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await logActivity(db, {
+      await logActivityInTransactionBestEffort(input.tx, {
         companyId: input.claimed.companyId,
         actorType: input.actorType,
         actorId: input.actorId,
@@ -12828,14 +12863,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           recoveryIssueReused: reusedRecoveryIssue,
           recoveryWakeQueued,
         },
-      });
+      }, input.postCommitPublications);
       return {
         recoveryOutcome: reusedRecoveryIssue ? ("recovery_issue_reused" as const) : ("recovery_issue_created" as const),
       };
     }
 
     if (input.recoveryPolicy === "escalate_to_board") {
-      await db.insert(issueComments).values({
+      // Pure database writes: they commit or roll back with the completion transaction.
+      await input.tx.insert(issueComments).values({
         companyId: input.claimed.companyId,
         issueId: input.claimed.id,
         body: monitorRecoveryComment({
@@ -12846,7 +12882,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }),
       });
 
-      await logActivity(db, {
+      await logActivityInTransactionBestEffort(input.tx, {
         companyId: input.claimed.companyId,
         actorType: input.actorType,
         actorId: input.actorId,
@@ -12857,15 +12893,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         entityType: "issue",
         entityId: input.claimed.id,
         details,
-      });
+      }, input.postCommitPublications);
       return { recoveryOutcome: "escalated_to_board" as const };
     }
 
-    const wakeResult = await enqueueWakeup(input.claimed.assigneeAgentId!, {
+    const ownerWakeKey = `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
+    const ownerWakeAlreadySent = await issueMonitorRecoveryWakeAlreadySent({
+      companyId: input.claimed.companyId,
+      agentId: input.claimed.assigneeAgentId!,
+      idempotencyKey: ownerWakeKey,
+    });
+    const wakeResult = ownerWakeAlreadySent ? true : await enqueueWakeup(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_monitor_recovery",
-      idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+      idempotencyKey: ownerWakeKey,
       payload: withRecoveryContext(
         {
           issueId: input.claimed.id,
@@ -12902,7 +12944,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // on-demand wakes). Never record or report a queued wake that was not queued.
     if (!wakeResult) return { recoveryOutcome: "owner_wake_not_queued" as const };
 
-    await logActivity(db, {
+    await logActivityInTransactionBestEffort(input.tx, {
       companyId: input.claimed.companyId,
       actorType: input.actorType,
       actorId: input.actorId,
@@ -12913,7 +12955,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       entityType: "issue",
       entityId: input.claimed.id,
       details,
-    });
+    }, input.postCommitPublications);
     return { recoveryOutcome: "owner_wake_queued" as const };
   }
 
@@ -12940,8 +12982,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // retries; it is never cleared with the recovery lost. A per-issue advisory
     // lock serialises overlapping claims of the same due monitor, and the
     // claimed-schedule check inside it means the loser writes and runs nothing.
+    //
+    // A retry after a completion failure must not repeat an effect. The board
+    // comment and every recovery activity row are written on this transaction,
+    // so they commit or roll back with the clear and the exhaustion row. The
+    // effects that cannot join it (the recovery issue and the wakes) are
+    // idempotent per exhaustion: an open recovery issue is reused, and a wake
+    // whose per-exhaustion idempotency key is already queued is not sent again.
+    // Realtime publications wait until the transaction commits.
+    const postCommitPublications: ActivityPublication[] = [];
     try {
-      return await db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${`issue-monitor-exhaustion:${input.claimed.id}`}, 0))`,
         );
@@ -12959,6 +13010,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         const recovery = await performIssueMonitorRecovery({
+          tx: tx as unknown as Db,
+          postCommitPublications,
           claimed: input.claimed,
           scheduledAtIso: input.scheduledAtIso,
           nextAttemptCount: input.nextAttemptCount,
@@ -13012,9 +13065,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             attemptCount: input.claimed.monitorAttemptCount ?? 0,
             recoveryOutcome: recovery.recoveryOutcome,
           },
-        });
+        }, postCommitPublications);
         return { outcome: "skipped" as const, reason: input.clearReason };
       });
+      for (const publication of postCommitPublications) publishActivity(publication);
+      return result;
     } catch (err) {
       await db
         .update(issues)
