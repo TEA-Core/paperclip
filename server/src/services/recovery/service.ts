@@ -1708,25 +1708,28 @@ export function recoveryService(
 
   async function postExternalPullRecoveryNotice(
     input: {
-      issue: Pick<typeof issues.$inferSelect, "id" | "companyId">;
+      issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId">;
       assignee: Pick<typeof agents.$inferSelect, "id" | "name">;
       reason: ExternalPullRecoveryBoardOnlyReason | "recovery_exhausted";
       episodeId: string;
     },
     runner: Db = db,
   ) {
-    const marker = `external_pull_recovery_notice:${input.reason}:${input.episodeId}`;
-    const alreadyNoticed = await runner
-      .select({ id: issueComments.id })
+    const reasonPrefix = `external_pull_recovery_notice:${input.reason}:`;
+    const episodePrefix = `${reasonPrefix}${input.issue.status}:${input.issue.assigneeAgentId ?? "none"}:`;
+    const [latestNotice] = await runner
+      .select({ body: issueComments.body })
       .from(issueComments)
       .where(and(
         eq(issueComments.companyId, input.issue.companyId),
         eq(issueComments.issueId, input.issue.id),
         eq(issueComments.authorType, "system"),
-        sql`${issueComments.body} like ${`%${marker}%`}`,
+        sql`strpos(${issueComments.body}, ${reasonPrefix}) > 0`,
       ))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(1);
-    if (alreadyNoticed.length > 0) return;
+    if (latestNotice?.body.includes(episodePrefix)) return;
+    const marker = `${episodePrefix}${input.episodeId}`;
     await issueService(runner).addComment(
       input.issue.id,
       `Recovery notice for ${input.assignee.name}: ${EXTERNAL_PULL_RECOVERY_NOTICE_REASONS[input.reason]} ` +

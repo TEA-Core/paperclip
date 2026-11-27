@@ -414,6 +414,52 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("stranded assigned issue: keeps the active-card board hold open through a read projection", async () => {
+    const fleet = await seedFleet();
+    const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
+    await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, issueId));
+    const { svc } = makeSweep();
+    await svc.reconcileStrandedAssignedIssues();
+
+    const { errorHandler } = await import("../middleware/index.js");
+    const { issueRoutes } = await import("../routes/issues.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: Record<string, unknown> }).actor = { type: "board", source: "local_implicit" };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any, {}));
+    app.use(errorHandler);
+    const res = await request(app).get(`/api/issues/${issueId}`);
+
+    expect(res.status).toBe(200);
+    const actions = await recoveryActionRows(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].kind).toBe("no_live_path_owner_unavailable");
+    expect(actions[0].status).toBe("active");
+  });
+
+  it("stranded assigned issue: posts one notice per park episode even when the board hold is replaced", async () => {
+    const fleet = await seedFleet();
+    const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
+    await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, issueId));
+    const { svc, enqueueWakeup } = makeSweep();
+
+    await svc.reconcileStrandedAssignedIssues();
+    await db
+      .update(issueRecoveryActions)
+      .set({ status: "cancelled", outcome: "cancelled", resolvedAt: new Date() })
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    await db.update(issues).set({ updatedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(issues.id, issueId));
+    const second = await svc.reconcileStrandedAssignedIssues();
+
+    expect(second.noLivePathOwnerUnavailable).toBe(1);
+    expect(await externalPullNotices(issueId)).toHaveLength(1);
+    await expectNotReassigned(fleet, issueId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("stranded assigned issue: leaves an in_progress card of a live external-pull assignee alone while a wake interaction is pending", async () => {
     const fleet = await seedFleet();
     const { issueId } = await seedStrandedCard(fleet.companyId, fleet.externalAgentId);
@@ -665,7 +711,9 @@ describeEmbeddedPostgres("recovery sweeps leave external-pull assignees' cards w
     const notices = await externalPullNotices(issueId);
     expect(notices).toHaveLength(1);
     expect(notices[0].body).toContain("firstmate-primary");
-    expect(notices[0].body).toContain(`external_pull_recovery_notice:recovery_exhausted:${action.id}`);
+    expect(notices[0].body).toContain(
+      `external_pull_recovery_notice:recovery_exhausted:in_progress:${fleet.externalAgentId}:${action.id}`,
+    );
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
