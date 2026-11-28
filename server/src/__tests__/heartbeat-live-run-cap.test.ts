@@ -1194,23 +1194,21 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
   });
 
-  it("(r) F1: the scheduled sweep of an agent-scheduled monitor mints a card that also waits for a general slot", async () => {
+  it.each([
+    {
+      scheduledBy: "assignee" as const,
+      agentName: "SelfMonitorSweep",
+      label: "the scheduled sweep of an agent-scheduled monitor mints a card that also waits for a general slot",
+    },
+    {
+      scheduledBy: "board" as const,
+      agentName: "BoardMonitor",
+      label: "a board-scheduled monitor's card is general too, so it also does not take a reserved slot (accepted cost)",
+    },
+  ])("(r) F1: $label", async ({ scheduledBy, agentName }) => {
     const olderGeneral = await seedReservedSlotsFree();
-    const agent = await seedAgent("SelfMonitorSweep");
-    const sourceId = await seedTimedOutMonitorCard(agent, "assignee");
-
-    await heartbeat.tickTimers(new Date());
-    await heartbeat.resumeQueuedRuns();
-
-    expect(await recoveryCardFingerprints(sourceId)).toHaveLength(1);
-    expect(await statusOf(olderGeneral)).toBe("queued");
-    expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
-  });
-
-  it("(r) F1: a board-scheduled monitor's card is general too, so it also does not take a reserved slot (accepted cost)", async () => {
-    const olderGeneral = await seedReservedSlotsFree();
-    const agent = await seedAgent("BoardMonitor");
-    const sourceId = await seedTimedOutMonitorCard(agent, "board");
+    const agent = await seedAgent(agentName);
+    const sourceId = await seedTimedOutMonitorCard(agent, scheduledBy);
 
     await heartbeat.tickTimers(new Date());
     await heartbeat.resumeQueuedRuns();
