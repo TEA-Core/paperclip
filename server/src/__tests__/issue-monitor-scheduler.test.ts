@@ -608,7 +608,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     // Applies the owner's policy PATCH the way the issues route does: stamp the
     // actor's scheduledBy, run the policy transition, persist policy + patch.
-    async function rearm(issueId: string, scheduledBy: "assignee" | "board", monitor: Record<string, unknown>) {
+    async function rearm(
+      issueId: string,
+      scheduledBy: "assignee" | "board",
+      monitor: Record<string, unknown>,
+      executor: Pick<typeof db, "update"> = db,
+    ) {
       const issue = await readIssue(issueId);
       const policy = setIssueExecutionPolicyMonitorScheduledBy(
         normalizeIssueExecutionPolicy({ stages: [], monitor: { nextCheckAt: rearmCheckAt, ...monitor } }),
@@ -622,7 +627,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         actor: { agentId: issue.assigneeAgentId },
         monitorExplicitlyUpdated: true,
       });
-      await db
+      await executor
         .update(issues)
         .set({ executionPolicy: policy as unknown as Record<string, unknown>, ...patch })
         .where(eq(issues.id, issueId));
@@ -1481,6 +1486,54 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
       expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
       expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
+
+    it("escalate_to_board: a concurrent re-arm does not wait on the claim the recovery holds locked", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "escalate_to_board" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      const rearmedAt = "2026-04-11T15:00:00.000Z";
+
+      const gateKey = 731_002;
+      const gateHeld = deferred<void>();
+      const gateRelease = deferred<void>();
+      const gate = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(${gateKey})`);
+        gateHeld.resolve();
+        await gateRelease.promise;
+      });
+      await gateHeld.promise;
+      await db.execute(sql.raw(`
+        create or replace function test_hold_escalation() returns trigger language plpgsql as $$
+        begin perform pg_advisory_xact_lock_shared(${gateKey}); return new; end $$;
+        create trigger test_hold_escalation after insert on issue_comments
+          for each row when (new.issue_id = '${issueId}') execute function test_hold_escalation();
+      `));
+      let tick: Promise<unknown> | undefined;
+      try {
+        tick = heartbeat.tickTimers(recoveryTickAt);
+        await waitForLockWaiters(1);
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`set local lock_timeout = '5s'`);
+          await rearm(issueId, "assignee", { ...monitor, nextCheckAt: rearmedAt }, tx);
+        });
+      } finally {
+        gateRelease.resolve();
+        await gate;
+        await tick;
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_hold_escalation on issue_comments; drop function if exists test_hold_escalation();",
+          ),
+        );
+      }
+      await heartbeat.drainActiveRunExecutions();
+
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
     });
 
     it("timeout: an agent re-arm after timeoutAt still reaches the recovery", async () => {

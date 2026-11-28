@@ -14,7 +14,8 @@ import { issues } from "./issues.js";
  *
  * Only the current arm's claim is ever read. The arm trigger (migration 0335) deletes
  * the issue's claims for earlier generations in the same transaction that arms the
- * new generation, so superseded claims do not accumulate.
+ * new generation, so superseded claims do not accumulate. It skips a claim that a
+ * recovery tick holds locked, so the re-arm never waits on it; a later arm deletes it.
  *
  * `company_id` keeps the default ON DELETE NO ACTION, like the other issue-keyed
  * bookkeeping tables (`issue_recovery_actions`, `issue_read_states`,

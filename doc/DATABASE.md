@@ -649,8 +649,10 @@ external-service monitor, unique per issue and `arm_generation`. The
 `issues.monitor_arm_generation` (`bigint`, never reset) on every monitor arm or
 re-arm. In the same transaction, it deletes the issue's claims for earlier
 generations. Only the current arm's claim is read, so superseded claims do not
-accumulate. A claim that a tick inserts for an arm that a concurrent re-arm has
-just replaced stays until the issue's next arm.
+accumulate. The trigger skips a claim that a recovery tick holds locked, so the
+re-arm does not wait on that tick. A skipped claim, and a claim that a tick
+inserts for an arm that a concurrent re-arm has just replaced, stay until a later
+arm of the issue.
 
 `company_id` keeps ON DELETE NO ACTION, like the other issue-keyed bookkeeping
 tables (`issue_recovery_actions`, `issue_read_states`, `issue_relations`). A claim

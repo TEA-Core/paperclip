@@ -9,7 +9,8 @@ ALTER TABLE "issues" DROP COLUMN "monitor_arm_generation";--> statement-breakpoi
 ALTER TABLE "issues" RENAME COLUMN "monitor_arm_generation_bigint" TO "monitor_arm_generation";--> statement-breakpoint
 ALTER TABLE "issue_monitor_recovery_claims" ALTER COLUMN "arm_generation" SET DATA TYPE bigint;--> statement-breakpoint
 -- Every arm or re-arm also deletes the issue's claims for earlier generations in the
--- same transaction: only the current arm's claim is ever read.
+-- same transaction: only the current arm's claim is ever read. A claim that a recovery
+-- tick holds locked is skipped, so the re-arm never waits on it; a later arm deletes it.
 CREATE OR REPLACE FUNCTION "issues_bump_monitor_arm_generation"() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.monitor_next_check_at IS NOT NULL AND (
@@ -19,7 +20,11 @@ BEGIN
   ) THEN
     NEW.monitor_arm_generation := OLD.monitor_arm_generation + 1;
     DELETE FROM "issue_monitor_recovery_claims"
-    WHERE "issue_id" = NEW.id AND "arm_generation" < NEW.monitor_arm_generation;
+    WHERE "id" IN (
+      SELECT "id" FROM "issue_monitor_recovery_claims"
+      WHERE "issue_id" = NEW.id AND "arm_generation" < NEW.monitor_arm_generation
+      FOR UPDATE SKIP LOCKED
+    );
   END IF;
   RETURN NEW;
 END $$;
