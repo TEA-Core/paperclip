@@ -184,7 +184,7 @@ describeEmbeddedPostgres("SUP-24557 repeated branch_absent_on_remote guard-skip 
     expect(escalations).toHaveLength(1);
     expect(escalations[0]).toMatchObject({
       actorType: "system",
-      actorId: "done-transition-guard",
+      actorId: "system:execution-control-reconciliation",
       runId: null,
       details: expect.objectContaining({
         reason: "branch_absent_on_remote",

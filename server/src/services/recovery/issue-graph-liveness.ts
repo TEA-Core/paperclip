@@ -208,14 +208,23 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
 
   const { policyMonitor, stateMonitor } = monitorFromIssue(issue);
   const timeoutAtMs = readDateMs(policyMonitor?.timeoutAt ?? stateMonitor?.timeoutAt);
-  if (timeoutAtMs !== null && timeoutAtMs <= nowMs) return false;
-
   const maxAttempts = readPositiveInteger(policyMonitor?.maxAttempts ?? stateMonitor?.maxAttempts);
   const stateAttemptCount = readPositiveInteger(stateMonitor?.attemptCount) ?? 0;
   const attemptCount = issue.monitorAttemptCount ?? stateAttemptCount;
-  if (maxAttempts !== null && attemptCount >= maxAttempts) return false;
+  const boundsExhausted =
+    (timeoutAtMs !== null && timeoutAtMs <= nowMs) || (maxAttempts !== null && attemptCount >= maxAttempts);
+  if (!boundsExhausted) return true;
 
-  return true;
+  // SUP-23786: an exhausted bound normally leaves nothing to wait for. The exception is an
+  // agent-armed monitor that fired before and names a recoveryPolicy: the policy update path
+  // persists its re-arm so the due dispatch can run the recovery, which is a real action path
+  // until that recovery ran.
+  return (
+    attemptCount > 0 &&
+    policyMonitor?.scheduledBy === "assignee" &&
+    typeof policyMonitor.recoveryPolicy === "string" &&
+    !stateMonitor?.exhaustionRecoveredAt
+  );
 }
 
 // SUP-15565: the execution_participant path is a maintained action path only

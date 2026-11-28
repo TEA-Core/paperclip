@@ -566,6 +566,8 @@ export const issueExecutionMonitorStateSchema = z.object({
     .nullable()
     .optional()
     .default(null),
+  // Optional without a default: states that never recovered stay byte-identical.
+  exhaustionRecoveredAt: z.string().datetime().nullable().optional(),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
 });

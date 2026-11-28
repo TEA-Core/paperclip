@@ -45,6 +45,12 @@ import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
+import {
+  pluginCanReadIssues,
+  pluginEventForRecipient,
+  pluginRunPayloadForRecipient,
+} from "./plugin-event-issue-visibility.js";
+import { createRunIssueLookup } from "./run-issue-lookup.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -735,6 +741,7 @@ export function buildHostServices(
   } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
+  const runIssueId = createRunIssueLookup(db);
   const stateStore = pluginStateStore(db);
   const pluginDb = pluginDatabaseService(db);
   const secretsHandler = createPluginSecretsHandler({ db, pluginId });
@@ -1593,9 +1600,10 @@ export function buildHostServices(
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
       async subscribe(params: { eventPattern: string; filter?: Record<string, unknown> | null }) {
+        const canReadIssues = pluginCanReadIssues(options.manifest);
         const handler = async (event: import("@paperclipai/plugin-sdk").PluginEvent) => {
           if (notifyWorker) {
-            notifyWorker("onEvent", { event });
+            notifyWorker("onEvent", { event: pluginEventForRecipient(event, canReadIssues) });
           }
         };
         if (params.filter) {
@@ -3387,11 +3395,13 @@ export function buildHostServices(
             activeSubscriptions.delete(entry);
           };
 
-          const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
-            const payload = event.payload as Record<string, unknown> | undefined;
-            if (!payload || payload.runId !== run.id) return;
-
-            if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") {
+          // Run output reaches the worker only as this plugin may read it: a
+          // plugin with issues.read gets every event unchanged and at once; a
+          // plugin without it gets metadata for a run on an issue, through a
+          // chain that keeps publish order while the run's issue is resolved.
+          const canReadIssues = pluginCanReadIssues(options.manifest);
+          const deliver = (type: string, payload: Record<string, unknown>) => {
+            if (type === "heartbeat.run.log" || type === "heartbeat.run.event") {
               notifyWorker("agents.sessions.event", {
                 sessionId: params.sessionId,
                 runId: run.id,
@@ -3401,7 +3411,7 @@ export function buildHostServices(
                 message: (payload.chunk as string) ?? (payload.message as string) ?? null,
                 payload: payload,
               });
-            } else if (event.type === "heartbeat.run.status") {
+            } else if (type === "heartbeat.run.status") {
               const status = payload.status as string;
               if (TERMINAL_STATUSES.has(status)) {
                 notifyWorker("agents.sessions.event", {
@@ -3428,6 +3438,20 @@ export function buildHostServices(
                 });
               }
             }
+          };
+          let delivery = Promise.resolve();
+          const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+            const payload = event.payload as Record<string, unknown> | undefined;
+            if (!payload || payload.runId !== run.id) return;
+            if (canReadIssues) {
+              deliver(event.type, payload);
+              return;
+            }
+            delivery = delivery.then(async () => {
+              deliver(event.type, pluginRunPayloadForRecipient(payload, false, await runIssueId(companyId, payload)));
+            }).catch((err) => {
+              logger.warn({ err, pluginId, pluginKey, runId: run.id }, "session event delivery failed; event dropped");
+            });
           });
 
           // Safety-net timeout: if the run never reaches a terminal status,
