@@ -17,6 +17,12 @@ export const issueExecutionDecisions = pgTable(
     outcome: text("outcome").notNull(),
     body: text("body").notNull(),
     createdByRunId: uuid("created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    // The delivered head and the review round (the stage's `pendingSince`) the
+    // decision was made on. Null on rows written before the binding existed and
+    // when the state recorded no head or round. Only a row bound to the current
+    // head and round can reconcile a re-pended stage.
+    deliveredHeadSha: text("delivered_head_sha"),
+    reviewRoundStartedAt: timestamp("review_round_started_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

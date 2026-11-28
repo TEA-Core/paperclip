@@ -2890,6 +2890,16 @@ export interface BoardStageDecisionInput {
    * (SUP-15805 addendum item 4).
    */
   actorUserId?: string | null;
+  /**
+   * SUP-25518: the id of the latest durable `approved` row for each stage in
+   * `decidedStageIds` whose row is bound to the current delivered head and
+   * review round ({@link executionDecisionBindingMatches}). An approval whose
+   * current stage is still pending on such a row reconciles that stage from
+   * this row before any later stage is targeted, and writes no second decision
+   * row. A pending current stage whose approval is absent here (unbound or
+   * stale) is decided afresh by the board approval.
+   */
+  durableApprovalIds?: ReadonlyMap<string, string>;
 }
 
 export interface BoardStageDecisionResult {
@@ -2902,6 +2912,14 @@ export interface BoardStageDecisionResult {
    */
   displacedParticipant: IssueExecutionStagePrincipal | null;
   workflowControlledAssignment: boolean;
+  /**
+   * SUP-25518: the existing durable decision, bound to the current head and
+   * round, that the patch reconciles the projection from. When set, the caller
+   * records this id as `lastDecisionId` and inserts no decision row. Null for
+   * a fresh decision, including a fresh approval of a pending stage whose
+   * durable approval is bound to another head or round.
+   */
+  reconciledDecisionId: string | null;
 }
 
 /**
@@ -2967,6 +2985,71 @@ function resolveBoardTargetStage(
 }
 
 /**
+ * SUP-25518: the head and review round an execution decision is made on. The
+ * head is the delivery identity recorded for the round (`delivery.headSha`,
+ * else the stall bookkeeping `deliveredHeadSha`); the round is the current
+ * stage's `pendingSince`, stamped each time a stage arms. Either is null when
+ * the state records none.
+ */
+export interface ExecutionDecisionBinding {
+  deliveredHeadSha: string | null;
+  reviewRoundStartedAt: Date | null;
+}
+
+export function executionDecisionBinding(
+  state: IssueExecutionState | Record<string, unknown> | null | undefined,
+): ExecutionDecisionBinding {
+  const parsed = parseIssueExecutionState(state);
+  const deliveryHead = deliveryBindingValue(parsed?.delivery, "headSha");
+  const head =
+    typeof deliveryHead === "string" && deliveryHead.length > 0 ? deliveryHead : parsed?.deliveredHeadSha ?? null;
+  const roundMs = parsed?.pendingSince ? Date.parse(parsed.pendingSince) : Number.NaN;
+  return {
+    deliveredHeadSha: head && head.length > 0 ? head : null,
+    reviewRoundStartedAt: Number.isNaN(roundMs) ? null : new Date(roundMs),
+  };
+}
+
+/**
+ * SUP-25518: whether a durable decision row may be reused for the current
+ * round. Both bindings must be recorded and equal, and the head the final
+ * delivery preflight would certify (`certifiedHeadSha`, when one resolved)
+ * must be the row's head. An unbound (legacy) row never matches.
+ */
+export function executionDecisionBindingMatches(
+  row: { deliveredHeadSha: string | null; reviewRoundStartedAt: Date | null },
+  current: ExecutionDecisionBinding,
+  certifiedHeadSha: string | null,
+): boolean {
+  if (!row.deliveredHeadSha || !row.reviewRoundStartedAt) return false;
+  if (!current.deliveredHeadSha || !current.reviewRoundStartedAt) return false;
+  if (row.deliveredHeadSha !== current.deliveredHeadSha) return false;
+  if (row.reviewRoundStartedAt.getTime() !== current.reviewRoundStartedAt.getTime()) return false;
+  return certifiedHeadSha === null || certifiedHeadSha === row.deliveredHeadSha;
+}
+
+/**
+ * SUP-25518: the pending current stage whose latest durable verdict is already
+ * `approved`. This is the drift shape left when a write re-pends a stage after
+ * its approval committed (a non-terminal status write dissolves the completed
+ * projection, then an `in_review` write re-arms the ladder). The target
+ * selector treats the stage as decided, so without this the board cannot act.
+ * `decisionId` is the row to reconcile from when it is bound to the current
+ * head and round, else null: the board approval is then a fresh decision.
+ */
+function resolveDurablyApprovedPendingStage(
+  policy: IssueExecutionPolicy,
+  previous: IssueExecutionState | null,
+  decidedStageIds?: readonly string[],
+  durableApprovalIds?: ReadonlyMap<string, string>,
+): { stage: IssueExecutionStage; decisionId: string | null } | null {
+  if (previous?.status !== PENDING_STATUS || !previous.currentStageId) return null;
+  const stage = findStageById(policy, previous.currentStageId);
+  if (!stage || !(decidedStageIds ?? []).includes(stage.id)) return null;
+  return { stage, decisionId: durableApprovalIds?.get(stage.id) ?? null };
+}
+
+/**
  * SUP-15805: a board user approves or requests changes on an execution stage on
  * behalf of an (unresponsive or absent) agent participant. Unlike the PATCH
  * decision path this function is NOT bound to `principalsEqual(participant,
@@ -2998,7 +3081,19 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     input.policy.stages.map((stage) => stage.id),
   ).state;
   const currentAssignee = assigneePrincipal(input.issue);
-  const targetStage = resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  // SUP-25518: an approval on a current stage still pending on a durable
+  // approval acts on that stage before any later stage is targeted, so a later
+  // stage's own approver is never skipped. A row bound to the current head and
+  // round is applied exactly as it would have applied when it was recorded (the
+  // caller writes no new row); an unbound or stale row is never reused, and the
+  // board approval is recorded as a fresh decision.
+  const durablyApproved =
+    input.decision === "approved"
+      ? resolveDurablyApprovedPendingStage(input.policy, previous, input.decidedStageIds, input.durableApprovalIds)
+      : null;
+  const targetStage =
+    durablyApproved?.stage ?? resolveBoardTargetStage(input.policy, previous, input.decidedStageIds);
+  const reconciledDecisionId = durablyApproved?.decisionId ?? null;
   if (!targetStage) throw new BoardStageNoUndecidedStageError();
 
   const returnAssignee = resolveReturnAssignee({
@@ -3070,6 +3165,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
       targetStage,
       displacedParticipant,
       workflowControlledAssignment: true,
+      reconciledDecisionId,
     };
   }
 
@@ -3091,6 +3187,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
     targetStage,
     displacedParticipant,
     workflowControlledAssignment: true,
+    reconciledDecisionId: null,
   };
 }
 

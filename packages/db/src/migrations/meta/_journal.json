@@ -2325,6 +2325,13 @@
       "when": 1795808759954,
       "tag": "0333_issue_monitor_recovery_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 332,
+      "version": "7",
+      "when": 1795827691628,
+      "tag": "0334_issue_execution_decision_binding",
+      "breakpoints": true
     }
   ]
 }
