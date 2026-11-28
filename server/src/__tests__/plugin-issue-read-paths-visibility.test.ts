@@ -147,6 +147,16 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
         details: { status: "failed", errorCode: "adapter_failed", error: `${RESTRICTED} run error` },
         createdAt: new Date("2026-01-03T00:00:00Z"),
       },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: "agent-1",
+        action: "environment.lease_released",
+        entityType: "environment_lease",
+        entityId: randomUUID(),
+        details: { status: "released", driver: "local", failureReason: `${RESTRICTED} lease failure` },
+        createdAt: new Date("2026-01-03T00:00:01Z"),
+      },
     ]);
     const agentId = randomUUID();
     await db.insert(agents).values({
@@ -267,6 +277,10 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
       status: "failed",
       errorCode: "adapter_failed",
     });
+    expect(entries.find((entry) => entry.entityType === "environment_lease")?.details).toEqual({
+      status: "released",
+      driver: "local",
+    });
     host.dispose();
   });
 
@@ -281,6 +295,9 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     });
     expect(entries.find((entry) => entry.entityType === "heartbeat_run")?.details).toMatchObject({
       error: `${RESTRICTED} run error`,
+    });
+    expect(entries.find((entry) => entry.entityType === "environment_lease")?.details).toMatchObject({
+      failureReason: `${RESTRICTED} lease failure`,
     });
     host.dispose();
   });

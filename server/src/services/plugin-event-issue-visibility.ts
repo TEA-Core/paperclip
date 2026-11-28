@@ -68,7 +68,8 @@ export function pluginIssueRecordForRecipient<T extends object>(record: T): T {
  * Descriptions, comment bodies and snippets, document bodies, annotation
  * quotes and every other content field are withheld. An entry about a run on
  * an issue keeps only its metadata, and one about a run with no issue loses
- * its free-form `error` and `message` text. A plugin that can read issues
+ * its free-form `error` and `message` text. An entry about an environment
+ * lease loses its `failureReason`, which carries the run's error text. A plugin that can read issues
  * receives the payload unchanged, as it does an entry about any other entity.
  */
 export function pluginEntityPayloadForRecipient(
@@ -85,6 +86,11 @@ export function pluginEntityPayloadForRecipient(
   if (entityType === "heartbeat_run") {
     const issueId = typeof payload.issueId === "string" && payload.issueId.length > 0 ? payload.issueId : null;
     return pluginRunPayloadForRecipient(payload, false, issueId);
+  }
+  if (entityType === "environment_lease" && "failureReason" in payload) {
+    // A lease released by a failed run records the run's error text.
+    const { failureReason: _withheld, ...visible } = payload;
+    return visible;
   }
   return payload;
 }
