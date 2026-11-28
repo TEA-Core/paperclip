@@ -113,6 +113,47 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
     }));
   });
 
+  it("lists and gets a non-system hyphenated key with the same identity, revision and body", async () => {
+    const { issueId } = await createIssueWithDocuments();
+    const created = await svc.upsertIssueDocument({
+      issueId,
+      key: "census-chain-ledger",
+      title: "census-chain-ledger",
+      format: "markdown",
+      body: "last-census-serial: 79",
+    });
+    const updated = await svc.upsertIssueDocument({
+      issueId,
+      key: "census-chain-ledger",
+      title: "census-chain-ledger",
+      format: "markdown",
+      body: "last-census-serial: 80",
+      baseRevisionId: created.document.latestRevisionId,
+    });
+
+    const listed = (await svc.listIssueDocuments(issueId)).find((doc) => doc.key === "census-chain-ledger");
+    const fetched = await svc.getIssueDocumentByKey(issueId, "census-chain-ledger");
+    const agreement = (doc: typeof fetched) => ({
+      id: doc?.id,
+      issueId: doc?.issueId,
+      key: doc?.key,
+      latestRevisionId: doc?.latestRevisionId,
+      latestRevisionNumber: doc?.latestRevisionNumber,
+      body: doc?.body,
+    });
+
+    expect(agreement(fetched)).toEqual({
+      id: created.document.id,
+      issueId,
+      key: "census-chain-ledger",
+      latestRevisionId: updated.document.latestRevisionId,
+      latestRevisionNumber: 2,
+      body: "last-census-serial: 80",
+    });
+    expect(agreement(listed ?? null)).toEqual(agreement(fetched));
+    expect(await svc.getIssueDocumentByKey(randomUUID(), "census-chain-ledger")).toBeNull();
+  });
+
   it("preserves literal backslash escapes across document writes and reads", async () => {
     const { issueId } = await createIssueWithDocuments();
     const current = (await svc.getIssueDocumentByKey(issueId, "plan"))!;

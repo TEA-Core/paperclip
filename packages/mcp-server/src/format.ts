@@ -22,6 +22,7 @@ export function formatErrorResponse(error: unknown): McpTextResponse {
       status: error.status,
       method: error.method,
       path: error.path,
+      url: error.url,
       body: error.body,
     });
   }

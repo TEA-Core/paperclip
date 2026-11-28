@@ -4,12 +4,15 @@ export class PaperclipApiError extends Error {
   readonly status: number;
   readonly method: string;
   readonly path: string;
+  /** Absolute request URL, naming the API target that answered. */
+  readonly url: string;
   readonly body: unknown;
 
   constructor(input: {
     status: number;
     method: string;
     path: string;
+    url: string;
     body: unknown;
     message: string;
   }) {
@@ -18,6 +21,7 @@ export class PaperclipApiError extends Error {
     this.status = input.status;
     this.method = input.method;
     this.path = input.path;
+    this.url = input.url;
     this.body = input.body;
   }
 }
@@ -104,6 +108,7 @@ export class PaperclipApiClient {
         status: response.status,
         method: method.toUpperCase(),
         path,
+        url: url.toString(),
         body: parsedBody,
         message: buildErrorMessage(method.toUpperCase(), path, response.status, parsedBody),
       });

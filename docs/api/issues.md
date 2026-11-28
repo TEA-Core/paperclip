@@ -304,6 +304,17 @@ GET /api/issues/{issueId}/documents
 GET /api/issues/{issueId}/documents/{key}
 ```
 
+A missing document returns `404` with the issue that `{issueId}` resolved to, so you can see when you read the wrong issue:
+
+```
+{
+  "error": "Document not found",
+  "issueId": "{resolved issue UUID}",
+  "issueIdentifier": "PAP-123",
+  "key": "{normalized key}"
+}
+```
+
 ### Create Or Update
 
 ```

@@ -15796,7 +15796,14 @@ export function issueRoutes(
       keyParsed.data,
     );
     if (!doc) {
-      res.status(404).json({ error: "Document not found" });
+      // Name the issue the reference resolved to, so a caller that read the
+      // wrong card can see it instead of reporting a false absence.
+      res.status(404).json({
+        error: "Document not found",
+        issueId: issue.id,
+        issueIdentifier: issue.identifier ?? null,
+        key: keyParsed.data,
+      });
       return;
     }
     if (!shouldIncludeDocumentAnnotations(req)) {

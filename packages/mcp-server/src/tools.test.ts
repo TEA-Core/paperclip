@@ -377,6 +377,64 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("forwards issue document list and get reads to the issue document routes", async () => {
+    const ledger = {
+      id: "66666666-6666-4666-8666-666666666666",
+      issueId: "77777777-7777-4777-8777-777777777777",
+      key: "census-chain-ledger",
+      latestRevisionId: "88888888-8888-4888-8888-888888888888",
+      latestRevisionNumber: 3,
+      body: "last-census-serial: 80",
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockJsonResponse([ledger]))
+      .mockResolvedValueOnce(mockJsonResponse(ledger));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const listed = await getTool("paperclipListDocuments").execute({ issueId: "PAP-1135" });
+    const fetched = await getTool("paperclipGetDocument").execute({
+      issueId: "PAP-1135",
+      key: "census-chain-ledger",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [listUrl, listInit] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(String(listUrl)).toBe("http://localhost:3100/api/issues/PAP-1135/documents");
+    expect(listInit.method).toBe("GET");
+    const [getUrl, getInit] = fetchMock.mock.calls[1] as [URL, RequestInit];
+    expect(String(getUrl)).toBe("http://localhost:3100/api/issues/PAP-1135/documents/census-chain-ledger");
+    expect(getInit.method).toBe("GET");
+    expect(listed.isError).toBeUndefined();
+    expect(JSON.parse(listed.content[0]!.text)).toEqual([ledger]);
+    expect(JSON.parse(fetched.content[0]!.text)).toEqual(ledger);
+  });
+
+  it("preserves status, path, body and the API target on an issue document 404", async () => {
+    const notFoundBody = {
+      error: "Document not found",
+      issueId: "a6fb3c84-28eb-4bbd-8509-665f41a558b1",
+      issueIdentifier: "PAP-1136",
+      key: "census-chain-ledger",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse(notFoundBody, 404));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await getTool("paperclipGetDocument").execute({
+      issueId: "a6fb3c84-28eb-4bbd-8509-665f41a558b1",
+      key: "census-chain-ledger",
+    });
+
+    const path = "/issues/a6fb3c84-28eb-4bbd-8509-665f41a558b1/documents/census-chain-ledger";
+    expect(JSON.parse(result.content[0]!.text)).toEqual({
+      error: `GET ${path} failed with 404: Document not found`,
+      status: 404,
+      method: "GET",
+      path,
+      url: `http://localhost:3100/api${path}`,
+      body: notFoundBody,
+    });
+  });
+
   it("controls issue workspace services through the current execution workspace", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(mockJsonResponse({
