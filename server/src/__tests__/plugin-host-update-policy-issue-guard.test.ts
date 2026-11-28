@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -242,6 +243,115 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, targetIssue.id) });
     expect(row!.executionPolicy).toEqual({});
     services.dispose();
+  });
+
+  // SUP-24563 round 3: the execution state (who is seated in which review
+  // stage, and by whom) is written only by the server's execution-policy
+  // engine. A plugin that could write it could seat any agent in a review
+  // stage, and the live-run cap reads that stage for its reserved slots.
+  function pendingStageFor(agentId: string) {
+    return {
+      status: "pending",
+      currentStageId: randomUUID(),
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId: randomUUID() },
+      deliveryAuthor: { type: "agent", agentId: randomUUID() },
+      participantSeat: {
+        participant: { type: "agent", agentId },
+        seatedBy: { type: "user", userId: "board-user" },
+      },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+  }
+
+  it("never writes executionState through a plugin-host issues.update: it can neither seat a stage nor clear one", async () => {
+    const company = await createCompany(db, "PES");
+    const engineState = pendingStageFor(randomUUID());
+    const [blank, seated] = await db
+      .insert(issues)
+      .values([
+        { companyId: company.id, title: "No stage", status: "todo", priority: "medium" },
+        { companyId: company.id, title: "Engine stage", status: "in_review", priority: "medium", executionState: engineState },
+      ])
+      .returning();
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    for (const [issue, executionState] of [[blank!, pendingStageFor(randomUUID())], [seated!, null]] as const) {
+      const updated = await services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { description: "plugin edit", executionState } as never,
+      });
+      expect(updated.description).toBe("plugin edit");
+      const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+      expect(row!.executionState).toEqual(issue.executionState);
+    }
+    services.dispose();
+  });
+
+  it("refuses a plugin-host issues.create that carries executionState and creates nothing", async () => {
+    const company = await createCompany(db, "PEC");
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(
+      services.issues.create({
+        companyId: company.id,
+        title: "Plugin-made review card",
+        status: "in_review",
+        executionState: pendingStageFor(randomUUID()),
+      } as never),
+    ).rejects.toMatchObject({ status: 422 });
+
+    expect(await db.select().from(issues).where(eq(issues.companyId, company.id))).toEqual([]);
+    expect(await db.select().from(activityLog)).toEqual([]);
+    services.dispose();
+  });
+
+  it.each(["policy", "columns"] as const)("never lets a plugin-host issues.create stamp a monitor as board-scheduled through %s (SUP-24563 N1)", async (shape) => {
+    const company = await createCompany(db, "PMB");
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Monitor assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+    }).returning();
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    const issue = await services.issues.create({
+      companyId: company.id,
+      title: "Plugin-made monitor card",
+      status: "in_progress",
+      assigneeAgentId: agent!.id,
+      ...(shape === "policy" ? {
+        executionPolicy: {
+          mode: "normal",
+          monitor: {
+            nextCheckAt: "2027-01-01T00:00:00.000Z",
+            scheduledBy: "board",
+            recoveryPolicy: "create_recovery_issue",
+          },
+          stages: [],
+        },
+      } : {
+        monitorNextCheckAt: new Date("2027-01-01T00:00:00.000Z"),
+        monitorScheduledBy: "board",
+      }),
+    } as never);
+
+    try {
+      const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+      const policy = row!.executionPolicy as { monitor?: { scheduledBy?: string } } | null;
+      if (shape === "policy") expect(policy?.monitor?.scheduledBy).toBe("assignee");
+      expect(row!.monitorScheduledBy).toBe("assignee");
+    } finally {
+      await db.delete(issues).where(eq(issues.id, issue.id));
+      services.dispose();
+    }
   });
 });
 

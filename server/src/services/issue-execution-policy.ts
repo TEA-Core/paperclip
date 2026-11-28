@@ -4,6 +4,7 @@ import type {
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionParticipantSeat,
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
@@ -1066,6 +1067,8 @@ export function applyExecutionPolicyReArm(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy;
   executionState: IssueExecutionState;
+  /** The actor of the policy write that re-arms the pointer (SUP-24563 seat record). */
+  seatedBy?: IssueExecutionStagePrincipal | null;
 }): TransitionResult {
   const { issue, policy, executionState } = input;
   const rearm = rearmExecutionPolicyPointer({ policy, executionState });
@@ -1096,6 +1099,7 @@ export function applyExecutionPolicyReArm(input: {
     participant,
     returnAssignee,
     changesRequestedCount: 0,
+    seatedBy: input.seatedBy ?? null,
   });
   return { patch, workflowControlledAssignment: true };
 }
@@ -1681,6 +1685,25 @@ function buildSkippedStageCompletedState(input: {
   };
 }
 
+function toStagePrincipal(principal: IssueExecutionStagePrincipal): IssueExecutionStagePrincipal {
+  return principal.type === "agent"
+    ? { type: "agent", agentId: principal.agentId ?? null, userId: null }
+    : { type: "user", userId: principal.userId ?? null, agentId: null };
+}
+
+/**
+ * SUP-24563: the record of who seated `participant`: always the actor of the
+ * seating transition. A participant that re-seats itself is recorded as its
+ * own seater, whoever seated it before, so a seat another principal gave it
+ * never carries over to work the participant itself moved back into review.
+ */
+function buildParticipantSeat(
+  participant: IssueExecutionStagePrincipal,
+  seatedBy: IssueExecutionStagePrincipal | null,
+): IssueExecutionParticipantSeat {
+  return { participant: toStagePrincipal(participant), seatedBy: seatedBy ? toStagePrincipal(seatedBy) : null };
+}
+
 function buildPendingState(input: {
   previous: IssueExecutionState | null;
   stage: IssueExecutionStage;
@@ -1690,6 +1713,7 @@ function buildPendingState(input: {
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
   deliveryAuthor?: IssueExecutionStagePrincipal | null;
+  seatedBy: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
   return {
     status: PENDING_STATUS,
@@ -1699,6 +1723,7 @@ function buildPendingState(input: {
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
     deliveryAuthor: input.deliveryAuthor ?? input.previous?.deliveryAuthor ?? null,
+    participantSeat: buildParticipantSeat(input.participant, input.seatedBy),
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
     skippedStageIds: mergeSkippedStageIds(input.previous),
@@ -1760,6 +1785,8 @@ function buildPendingStagePatch(input: {
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
   deliveryAuthor?: IssueExecutionStagePrincipal | null;
+  /** The actor of the seating transition; null when there is none (SUP-24563). */
+  seatedBy: IssueExecutionStagePrincipal | null;
 }) {
   input.patch.status = "in_review";
   Object.assign(input.patch, patchForPrincipal(input.participant));
@@ -1772,6 +1799,7 @@ function buildPendingStagePatch(input: {
     reviewRequest: input.reviewRequest,
     changesRequestedCount: input.changesRequestedCount,
     deliveryAuthor: input.deliveryAuthor,
+    seatedBy: input.seatedBy,
   });
 }
 
@@ -1992,6 +2020,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           participant: currentParticipant,
           returnAssignee: existingState?.returnAssignee ?? null,
           reviewRequest: effectiveReviewRequest,
+          seatedBy: actor,
         });
       }
       return { patch };
@@ -2041,6 +2070,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           currentAssignee,
         }) ?? actor,
         reviewRequest: effectiveReviewRequest,
+        seatedBy: actor,
       });
       return {
         patch,
@@ -2115,6 +2145,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             currentAssignee,
           }) ?? actor,
           reviewRequest: input.reviewRequest ?? null,
+          seatedBy: actor,
         });
         return {
           patch,
@@ -2195,6 +2226,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               returnAssignee,
               reviewRequest: effectiveReviewRequest,
               changesRequestedCount: nextRounds,
+              seatedBy: actor,
             });
             return {
               patch,
@@ -2253,6 +2285,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             returnAssignee,
             reviewRequest: effectiveReviewRequest,
             changesRequestedCount: nextRounds,
+            seatedBy: actor,
           });
           return {
             patch,
@@ -2319,6 +2352,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           participant: explicitAssignee,
           returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
           reviewRequest: effectiveReviewRequest,
+          seatedBy: actor,
         });
         return { patch };
       }
@@ -2368,6 +2402,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           currentAssignee,
         }) ?? actor,
         reviewRequest: effectiveReviewRequest,
+        seatedBy: actor,
       });
       return {
         patch,
@@ -2484,6 +2519,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
     deliveryAuthor: currentAssignee,
+    seatedBy: actor,
   });
   return {
     patch,
@@ -2750,6 +2786,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
       issue: scopedInput.issue,
       policy: input.policy,
       executionState: pruned.state,
+      seatedBy: actorPrincipal(input.actor),
     });
     if (pruned.droppedStageIds.length > 0) rearmed.droppedStageIds = pruned.droppedStageIds;
     return rearmed;
@@ -3143,6 +3180,7 @@ export function applyBoardStageDecision(input: BoardStageDecisionInput): BoardSt
         stage: nextStage,
         participant,
         returnAssignee: returnAssignee ?? null,
+        seatedBy: input.actorUserId ? { type: "user", userId: input.actorUserId, agentId: null } : null,
       });
     } else {
       // Final stage: complete the ladder and hand the card back to its return

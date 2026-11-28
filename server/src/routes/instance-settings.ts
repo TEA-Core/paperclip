@@ -224,6 +224,13 @@ export function instanceSettingsRoutes(db: Db) {
         (field) => hidden.has(`instance.general.${field}`),
       );
       const updated = await svc.updateGeneral(req.body);
+      if (Object.prototype.hasOwnProperty.call(req.body, "liveRunCap")) {
+        // SUP-24563: apply at once. Raising (or turning off) the cap drains the
+        // queue now; lowering it starts nothing and touches no running run.
+        // Detached: the drive is tracked by the heartbeat service and its
+        // failure only defers the drain to the scheduler tick.
+        void heartbeat.applyLiveRunCapSettingChange();
+      }
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
       await Promise.all(
@@ -249,6 +256,14 @@ export function instanceSettingsRoutes(db: Db) {
       res.json(updated.general);
     },
   );
+
+  // SUP-24563: read-only live-run cap status. Counts only (no run ids, no
+  // router address). The counts span every company, so only instance admins
+  // may read them (the same rule as GET /instance/lifecycle).
+  router.get("/instance/live-run-cap", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await heartbeat.getLiveRunCapStatus());
+  });
 
   router.get("/instance/settings/experimental", async (req, res) => {
     // Experimental settings are readable by any authenticated org member

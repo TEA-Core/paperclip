@@ -7157,6 +7157,17 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
+// ─── Global live-run cap (SUP-24563) ─────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/live-run-cap",
+  tags: ["instance"],
+  summary:
+    "Get the global live-run cap status: setting, router input, effective cap, live run count and queued-waiting counts (counts only)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
 // ─── Task drain (upstream run-admission hold) ────────────────────────────────
 
 registry.registerPath({

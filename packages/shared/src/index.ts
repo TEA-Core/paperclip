@@ -1174,6 +1174,7 @@ export type {
   IssueExecutionStagePrincipal,
   IssueExecutionStallEscalationPolicy,
   IssueExecutionStallHandoff,
+  IssueExecutionParticipantSeat,
   IssueExecutionStallSignal,
   IssueExecutionDecision,
   IssueComment,
@@ -1820,6 +1821,7 @@ export {
 } from "./execution-workspace-guards.js";
 
 export {
+  LIVE_RUN_CAP_CEILING,
   MAX_TASK_DRAIN_TTL_MS,
   startTaskDrainRequestSchema,
   type StartTaskDrainRequest,

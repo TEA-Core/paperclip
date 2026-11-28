@@ -540,6 +540,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       priority: "high",
       assigneeAdapterOverrides: null,
     });
+    // The live-run cap classifies a monitor-minted card as general work by this
+    // server-generated prefix (SUP-24563), so it is part of the contract.
+    expect(recoveryIssue?.originFingerprint).toMatch(/^issue_monitor:/);
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
   });
 

@@ -595,6 +595,20 @@ export const issueExecutionStateSchema = z.object({
    * (SUP-13899).
    */
   deliveryAuthor: issueExecutionStatePrincipalSchema.nullable().optional().default(null),
+  /**
+   * The engine's record of who seated `currentParticipant` (SUP-24563).
+   * Written only by the execution-policy engine; no route accepts an
+   * execution state, the plugin host refuses one on issue create, and a
+   * plugin issue update never writes it.
+   */
+  participantSeat: z
+    .object({
+      participant: issueExecutionStatePrincipalSchema,
+      seatedBy: issueExecutionStatePrincipalSchema.nullable(),
+    })
+    .strict()
+    .nullable()
+    .optional(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
   completedStageIds: z.array(z.string().guid()).default([]),
   skippedStageIds: z.array(z.string().guid()).optional().default([]),

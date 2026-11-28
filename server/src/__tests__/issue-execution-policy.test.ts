@@ -6123,6 +6123,95 @@ describe("actor-versus-seat and stage membership compare principal ids exactly",
   });
 });
 
+// SUP-24563: the review stage a run is seated in is a server fact the
+// live-run cap reads, so the engine records who seated each participant.
+describe("delivery seating records the seat", () => {
+  it("records the participant and the actor that seated it on each seat", () => {
+    const policy = twoStagePolicy();
+    const delivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Implemented.",
+    });
+    const reviewState = delivered.patch.executionState as IssueExecutionState;
+    expect(reviewState.participantSeat).toEqual({
+      participant: { type: "agent", agentId: qaAgentId, userId: null },
+      seatedBy: { type: "agent", agentId: coderAgentId, userId: null },
+    });
+    expect(parseIssueExecutionState(reviewState)!.participantSeat).toEqual(reviewState.participantSeat);
+
+    const approved = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: reviewState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Reviewed.",
+    });
+    expect((approved.patch.executionState as IssueExecutionState).participantSeat).toEqual({
+      participant: { type: "user", userId: ctoUserId, agentId: null },
+      seatedBy: { type: "agent", agentId: qaAgentId, userId: null },
+    });
+  });
+
+  it("records a participant that re-seats itself as its own seater, whoever seated it before (no held seat survives)", () => {
+    const policy = reviewOnlyPolicy();
+    const qa = { type: "agent" as const, agentId: qaAgentId, userId: null };
+    const coder = { type: "agent" as const, agentId: coderAgentId, userId: null };
+    const pendingState = (participantSeat: IssueExecutionState["participantSeat"]) => ({
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+      ...(participantSeat === undefined ? {} : { participantSeat }),
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    // The issue drifted out of in_review (here: unassigned and rewritten); the
+    // seated reviewer moves it back, which re-seats the same participant. The
+    // seat it held from another agent's delivery must not carry over to work
+    // the participant itself moved back into review (SUP-24563 round 4, F2).
+    const reseatByParticipant = (executionState: Record<string, unknown>) =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      }).patch.executionState as IssueExecutionState;
+
+    expect(reseatByParticipant(pendingState({ participant: qa, seatedBy: coder })).participantSeat)
+      .toEqual({ participant: qa, seatedBy: qa });
+    expect(reseatByParticipant(pendingState(undefined)).participantSeat)
+      .toEqual({ participant: qa, seatedBy: qa });
+  });
+});
+
 // SUP-23786: the re-arm that follows the last permitted fire used to be refused
 // (MONITOR_BOUNDS_EXHAUSTED) even when the owner configured a recoveryPolicy, and
 // the due dispatch that runs recovery could then never occur. An agent re-arm

@@ -6,6 +6,7 @@ import * as controllerLeases from "../services/legacy-controller-lease.js";
 import * as instructionWorkingCopies from "../services/agent-instruction-working-copies.js";
 import * as runEvents from "../services/heartbeat-run-events.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { invalidateLiveRunCapSettingCache, liveRunCapAdmission } from "../services/live-run-cap.js";
 import { createHash, randomUUID } from "node:crypto";
 import { legacyExecutionNeedsReconciliation, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
@@ -14790,6 +14791,42 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
     },
   );
+
+  // SUP-24563 (h): the global live-run cap is admission only. Native restart
+  // recovery re-attaches a run that is already running, so a full cap must not
+  // hold it back, and the cap's gate never evaluates it.
+  it("re-attaches native restart recovery while the global live-run cap is full", async () => {
+    await withTempPaperclipHome(async () => {
+      await fs.mkdir(resolvePaperclipInstanceRoot(), { recursive: true });
+      const { child } = await seedPreparedChatRecovery("historical");
+      // The recovered run is itself a counted live run, so cap 1 is full.
+      await instanceSettingsService(db).updateGeneral({ liveRunCap: 1 });
+      invalidateLiveRunCapSettingCache();
+      // Reservations and waiter records only happen inside an admission.
+      const admit = vi.spyOn(liveRunCapAdmission, "admit");
+      const factory = vi.fn(() => {
+        throw new NativeRunnerOwnershipUnverifiedError();
+      });
+      const heartbeat = heartbeatService(db, {
+        nativeSessionBackendFactory: factory,
+      });
+      try {
+        expect((await heartbeat.recoverNativeRunsAfterRestart()).claims).toEqual([
+          expect.objectContaining({
+            runId: child.runId,
+            kind: "bootstrap_incomplete",
+          }),
+        ]);
+        await heartbeat.drainActiveRunExecutions();
+        expect(factory).toHaveBeenCalledTimes(1);
+        expect(admit.mock.calls.map(([input]) => input.entry.runId)).not.toContain(child.runId);
+      } finally {
+        admit.mockRestore();
+        await instanceSettingsService(db).updateGeneral({ liveRunCap: null });
+        invalidateLiveRunCapSettingCache();
+      }
+    });
+  });
 
   it.each(["admitted", "historical"] as const)(
     "does not acquire a new chat gate lock for protected native recovery: %s",
