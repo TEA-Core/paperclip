@@ -9,7 +9,7 @@ import { createPaperclipMcpServer } from "../../../packages/mcp-server/src/index
 import express from "express";
 import request from "supertest";
 import { eq, and } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentApiKeys,
@@ -261,6 +261,17 @@ describeEmbeddedPostgres("issue create parentage contract routes", () => {
     expect(stored.monitorScheduledBy).toBe(savedMonitor.scheduledBy);
     expect(stored.monitorNotes).toBe(savedMonitor.notes);
     expect(JSON.stringify(stored)).not.toContain(monitor.externalRef);
+    if (actor === "agent") {
+      // A parentless agent create writes its audit row fire-and-forget; wait for it so the
+      // redaction check below covers it and cleanup cannot race the late insert.
+      await vi.waitFor(async () => {
+        const audit = await db.select().from(activityLog).where(and(
+          eq(activityLog.entityId, created.body.id),
+          eq(activityLog.action, "issue.created_without_parent"),
+        ));
+        expect(audit).toHaveLength(1);
+      });
+    }
     for (const rows of [
       await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
       await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
