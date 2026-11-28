@@ -60,6 +60,42 @@ describe("plugin issue event visibility", () => {
     expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
+  it("gives a plugin without issues.read only the title and metadata of an ordinary issue's events", () => {
+    const updated = event({
+      payload: {
+        identifier: "PAP-3",
+        title: "Ordinary issue title",
+        description: "Ordinary issue description",
+        status: "todo",
+        _previous: { description: "Earlier ordinary description", status: "backlog" },
+      },
+    });
+    expect(pluginEventForRecipient(updated, false).payload).toEqual({
+      identifier: "PAP-3",
+      title: "Ordinary issue title",
+      status: "todo",
+      _previous: { status: "backlog" },
+    });
+    expect(pluginEventForRecipient(updated, true)).toBe(updated);
+
+    const commented = event({
+      eventType: "issue.comment.created",
+      payload: {
+        commentId: "comment-3",
+        bodySnippet: "Ordinary comment body",
+        identifier: "PAP-3",
+        issueTitle: "Ordinary issue title",
+        authorizationReason: "Ordinary authorization text",
+      },
+    });
+    expect(pluginEventForRecipient(commented, false).payload).toEqual({
+      commentId: "comment-3",
+      identifier: "PAP-3",
+      issueTitle: "Ordinary issue title",
+    });
+    expect(pluginEventForRecipient(commented, true)).toBe(commented);
+  });
+
   it("strips referenced and blocking issue titles from an unreadable issue's event", () => {
     const reference = { id: "issue-2", identifier: "PAP-2", title: "Referenced restricted title" };
     const original = event({
