@@ -1597,6 +1597,18 @@ function carriedStallFields(
   };
 }
 
+function recordCompletedStageRounds(
+  previous: IssueExecutionState | null,
+  completedStageIds: readonly string[],
+): Pick<IssueExecutionState, "completedStageRounds"> {
+  const rounds = { ...(previous?.completedStageRounds ?? {}) };
+  const roundStageId = previous?.status === PENDING_STATUS ? previous.currentStageId : null;
+  if (roundStageId && previous?.pendingSince && completedStageIds.includes(roundStageId)) {
+    rounds[roundStageId] = previous.pendingSince;
+  }
+  return Object.keys(rounds).length > 0 ? { completedStageRounds: rounds } : {};
+}
+
 function buildCompletedState(
   previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
@@ -1623,6 +1635,7 @@ function buildCompletedState(
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
     childCarrierClaim: previous?.childCarrierClaim,
+    ...recordCompletedStageRounds(previous, completedStageIds),
     ...carriedStallFields(previous, null),
   };
 }
@@ -1650,6 +1663,7 @@ function buildStateWithCompletedStages(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
+    ...recordCompletedStageRounds(input.previous, input.completedStageIds),
     ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
@@ -1677,6 +1691,7 @@ function buildSkippedStageCompletedState(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
+    ...recordCompletedStageRounds(input.previous, input.completedStageIds),
     ...carriedStallFields(input.previous, null),
   };
 }
@@ -1707,6 +1722,7 @@ function buildPendingState(input: {
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     pendingSince: new Date().toISOString(),
+    ...recordCompletedStageRounds(input.previous, []),
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,

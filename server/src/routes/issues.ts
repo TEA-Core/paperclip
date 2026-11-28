@@ -14436,7 +14436,9 @@ export function issueRoutes(
   });
 
   // SUP-25193: board-only landing proof. A delivered card whose completed review
-  // stage names only a user, and which records no deliveryIdentity, has no other
+  // stage names only a user (or a record_only card with an independent agent
+  // approval bound to the merged PR head; eligibility is owned by
+  // boardLandingProofIneligibility), and which records no deliveryIdentity, has no other
   // way to prove its landing, so landing debt from an earlier record_only
   // reclassification blocks `done` for good. The board names the merged PR; the
   // server verifies it against GitHub and records it. Attaching discharges
@@ -14459,7 +14461,7 @@ export function issueRoutes(
       repo: body.repo,
       pullRequestNumber: body.pullRequestNumber,
     };
-    const ineligible = boardLandingProofIneligibility(existing);
+    const ineligible = await boardLandingProofIneligibility(db, existing);
     if (ineligible) {
       res.status(409).json({
         error: `Landing proof refused: ${ineligible}`,
@@ -14493,7 +14495,9 @@ export function issueRoutes(
       const [locked] = await tx.select().from(issueRows)
         .where(and(eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId)))
         .for("update");
-      const lockedIneligible = locked ? boardLandingProofIneligibility(locked) : "the card no longer exists";
+      const lockedIneligible = locked
+        ? await boardLandingProofIneligibility(tx as unknown as Db, locked, proof.headSha)
+        : "the card no longer exists";
       if (lockedIneligible) return { kind: "ineligible" as const, reason: lockedIneligible };
       if (
         locked!.projectId !== existing.projectId ||

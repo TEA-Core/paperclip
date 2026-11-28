@@ -11309,7 +11309,15 @@ registerCurrentRoute({
   summary: "Attach a GitHub-verified merged-PR landing proof to a delivered card (board only)",
   description:
     "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
-    "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
+    "execution workflow is completed and either has at least one completed review stage naming only users, or is `record_only` " +
+    "with every stage approved or skipped and at least one completed review stage whose latest durable decision is an approval " +
+    "recorded by an agent participant of that stage who is not the card's executor, assignee or author and was not replaced by a " +
+    "board user (an old board-user approval, a self-review and an empty participant list do not qualify), whose recorded " +
+    "`delivered_head_sha` equals the live-verified pull request head and whose recorded `review_round_started_at` equals the " +
+    "start of the review round in which that stage completed, recorded per stage in the execution state's `completedStageRounds` (when " +
+    "the state records no round for that stage, as on a card completed before rounds were recorded, the call is 409 `landing_proof_not_applicable`: " +
+    "fail closed, close the card through the board route instead; an unbound, legacy, old-head or old-round decision does not qualify), " +
+    "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
     "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
@@ -11321,7 +11329,8 @@ registerCurrentRoute({
     "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), " +
     "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
     "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
-    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
+    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`; a PR opened from a fork of the repository " +
+    "is refused the same way, and a PR whose live base branch is not the card's base branch is 422 `landing_proof_not_on_base`), the PR is this card's own delivery " +
     "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
     "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
     "or a board user's comment on the card naming the PR, or a head or merge " +

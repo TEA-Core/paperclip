@@ -3,10 +3,13 @@ import {
   activityLog,
   externalObjectMentions,
   externalObjects,
+  heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueWorkProducts,
   type Db,
 } from "@paperclipai/db";
+import { latestDecisionPerStage, resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
@@ -22,8 +25,9 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
  * SUP-25193 (option a): a board-attached landing proof.
  *
  * Some delivered cards cannot reach `done` with any landing proof. Their review
- * stage names only a user (the board seat) and is already completed, and no
- * deliveryIdentity is recorded. Repository landing debt left by a record_only
+ * stage names only a user (the board seat) and is already completed, or the card
+ * was reclassified `record_only` after an agent-reviewed review workflow
+ * completed. No deliveryIdentity is recorded. Repository landing debt left by a record_only
  * reclassification can be discharged only by a proof that `prepareLandingDebtClose`
  * re-measures at the close, and every existing proof needs a live
  * execution-workspace branch. A merged PR's head branch is usually deleted.
@@ -216,6 +220,20 @@ export async function verifyBoardLandingProof(
       return refuse(
         "landing_proof_repo_identity_mismatch",
         `pull request #${evidence.pullRequestNumber} targets repository ${pr.baseRepoFullName ?? "(unreadable)"} (id ${pr.baseRepoId ?? "unknown"}), not this card's repository ${owner}/${repo} (id ${identity.id})`,
+      );
+    }
+    if ((pr.headRepoFullName ?? "").toLowerCase() !== cardRepo) {
+      return refuse(
+        "landing_proof_repo_identity_mismatch",
+        `pull request #${evidence.pullRequestNumber} was opened from ${pr.headRepoFullName ?? "an unreadable head repository"}, ` +
+          `not from this card's repository ${owner}/${repo} (a fork's code is not the card's delivery)`,
+      );
+    }
+    if (pr.baseRef !== baseRef) {
+      return refuse(
+        "landing_proof_not_on_base",
+        `pull request #${evidence.pullRequestNumber} was merged into ${pr.baseRef ?? "an unreadable base branch"}, ` +
+          `not into this card's base branch ${baseRef}`,
       );
     }
     if (evidence.repositoryId != null && evidence.repositoryId !== identity.id) {
@@ -495,16 +513,36 @@ async function listPullRequestCommits(
   return shas;
 }
 
-/**
- * The stuck shape this proof exists for. The workflow is completed, at least one
- * completed review stage names only users, no deliveryIdentity is recorded, and
- * the card is not closed. Returns null when eligible, else the refusal reason.
- */
-export function boardLandingProofIneligibility(issue: {
+type EligibilityIssue = {
+  id: string;
+  companyId: string;
   status: string;
+  deliveryRequirement?: string | null;
+  assigneeAgentId?: string | null;
+  createdByAgentId?: string | null;
+  executionRunId?: string | null;
+  checkoutRunId?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
-}): string | null {
+};
+
+type ParticipantRef = { type?: unknown; agentId?: unknown };
+
+/**
+ * The stuck shape this proof exists for. The workflow is completed, no
+ * deliveryIdentity is recorded, and the card is not closed. Either at least one
+ * completed review stage names only users, or the card is `record_only`, every
+ * stage is completed or skipped, and an agent-reviewed completed review stage
+ * carries a durable independent approval ({@link judgeAgentReviewedStages}).
+ * With `mergedHeadSha` (the live-verified PR head) the approval must also be
+ * bound to that head; the caller passes it once the PR is verified. Returns null
+ * when eligible, else the refusal reason.
+ */
+export async function boardLandingProofIneligibility(
+  db: Db,
+  issue: EligibilityIssue,
+  mergedHeadSha?: string,
+): Promise<string | null> {
   if (issue.status === "done" || issue.status === "cancelled") {
     return `the card is already ${issue.status}`;
   }
@@ -519,22 +557,156 @@ export function boardLandingProofIneligibility(issue: {
     return "the card's execution workflow is not completed; it still has a live review path";
   }
   const completed = new Set(state.completedStageIds ?? []);
+  const skipped = new Set(state.skippedStageIds ?? []);
   const policy = issue.executionPolicy && typeof issue.executionPolicy === "object"
     ? (issue.executionPolicy as { stages?: unknown })
     : null;
   const stages = Array.isArray(policy?.stages) ? policy.stages : [];
-  const userOnlyCompletedReview = stages.some((stage) => {
-    if (!stage || typeof stage !== "object") return false;
+  const completedReviewStages = stages.flatMap((stage) => {
+    if (!stage || typeof stage !== "object") return [];
     const { id, type, participants } = stage as { id?: unknown; type?: unknown; participants?: unknown };
-    if (type !== "review" || typeof id !== "string" || !completed.has(id)) return false;
-    return Array.isArray(participants) && participants.length > 0 &&
-      participants.every((participant) =>
-        !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "user");
+    if (type !== "review" || typeof id !== "string" || !completed.has(id)) return [];
+    return [{ id, participants }];
   });
-  if (!userOnlyCompletedReview) {
-    return "the card has no completed review stage that names only a user";
+  const userOnlyCompletedReview = completedReviewStages.some(({ participants }) =>
+    Array.isArray(participants) && participants.length > 0 &&
+    participants.every((participant) =>
+      !!participant && typeof participant === "object" && (participant as ParticipantRef).type === "user"));
+  if (userOnlyCompletedReview) return null;
+  const agentParticipantIds = (participants: unknown): Set<string> => new Set(
+    Array.isArray(participants)
+      ? participants.flatMap((participant) => {
+        if (!participant || typeof participant !== "object") return [];
+        const { type, agentId } = participant as ParticipantRef;
+        return type === "agent" && typeof agentId === "string" && agentId.length > 0 ? [agentId] : [];
+      })
+      : [],
+  );
+  const agentReviewedStages = completedReviewStages
+    .map(({ id, participants }) => ({ id, agentIds: agentParticipantIds(participants) }))
+    .filter((stage) => stage.agentIds.size > 0);
+  if (issue.deliveryRequirement !== "record_only" || agentReviewedStages.length === 0) {
+    return "the card has no completed review stage that names only a user, and is not a record_only card with a completed agent review stage";
+  }
+  const everyStageSettled = stages.every((stage) => {
+    const id = stage && typeof stage === "object" ? (stage as { id?: unknown }).id : null;
+    return typeof id === "string" && (completed.has(id) || skipped.has(id));
+  });
+  if (!everyStageSettled) {
+    return "the card's review workflow still has a stage that is neither approved nor skipped";
+  }
+  const judged = await judgeAgentReviewedStages(
+    db,
+    issue,
+    policy,
+    rawState,
+    state.completedStageRounds ?? {},
+    agentReviewedStages,
+    mergedHeadSha,
+  );
+  if (judged === "no_independent_approval") {
+    return "the card has no completed agent review stage whose latest decision is an approval by an agent participant " +
+      "other than the card's executor, assignee or author, recorded by that agent and not by the board in its place";
+  }
+  if (judged === "no_recorded_round") {
+    return "the card records no review round for its approved agent review stage (completedStageRounds), so no approval can be bound to it; " +
+      "the landing proof cannot be attached, and the board closes the card through its own board route instead";
+  }
+  if (judged === "not_bound_to_merged_head") {
+    return "the card's agent approval is not bound to the merged pull request head and a recorded review round; " +
+      "an unbound, legacy or old-head approval does not qualify";
+  }
+  if (judged === "old_round") {
+    return "the card's agent approval is from an older review round than the round its stage completed in";
   }
   return null;
+}
+
+/**
+ * Judges the agent review of a completed agent-reviewed stage. Genuine review
+ * means the stage's LATEST durable decision is `approved`, names an agent that is
+ * a participant of that stage, was not recorded by the board in the agent's
+ * place (no `actorUserId`), and the agent is not the card's executor. The
+ * executor set is the self-approval principal union (policy and state return
+ * assignee, delivery author, creating agent) plus the current assignee and the
+ * agents of the card's execution and checkout runs. A stage with no decision
+ * row, a superseded approval and a board-user approval all fail.
+ *
+ * When `mergedHeadSha` is given, the approval must also be bound to that head
+ * and to the review round: its `deliveredHeadSha` equals the merged PR head and
+ * its `reviewRoundStartedAt` equals the round its own stage completed in (the
+ * state's `completedStageRounds[stageId]`). A stage with no recorded round,
+ * such as one completed before rounds were recorded, fails closed
+ * ("no_recorded_round"). An unbound or legacy decision has no head or round and
+ * fails ("not_bound_to_merged_head"); a bound one from another round fails
+ * ("old_round").
+ */
+async function judgeAgentReviewedStages(
+  db: Db,
+  issue: EligibilityIssue,
+  policy: { stages?: unknown } | null,
+  rawState: Record<string, unknown> | null,
+  completedStageRounds: Record<string, string>,
+  agentReviewedStages: Array<{ id: string; agentIds: Set<string> }>,
+  mergedHeadSha: string | undefined,
+): Promise<"ok" | "no_independent_approval" | "no_recorded_round" | "not_bound_to_merged_head" | "old_round"> {
+  const decisions = await db
+    .select({
+      id: issueExecutionDecisions.id,
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      actorUserId: issueExecutionDecisions.actorUserId,
+      deliveredHeadSha: issueExecutionDecisions.deliveredHeadSha,
+      reviewRoundStartedAt: issueExecutionDecisions.reviewRoundStartedAt,
+      createdAt: issueExecutionDecisions.createdAt,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(
+      eq(issueExecutionDecisions.issueId, issue.id),
+      eq(issueExecutionDecisions.companyId, issue.companyId),
+    ));
+  const latest = latestDecisionPerStage(decisions);
+  const executors = resolveSelfApprovalPrincipals(
+    (policy ?? {}) as Record<string, unknown>,
+    rawState ?? {},
+    issue.createdByAgentId ?? null,
+  ).agentIds;
+  if (issue.assigneeAgentId) executors.add(issue.assigneeAgentId);
+  const runIds = [issue.executionRunId, issue.checkoutRunId].filter((id): id is string => typeof id === "string");
+  if (runIds.length > 0) {
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, runIds)));
+    for (const run of runs) executors.add(run.agentId);
+  }
+  const independentApprovals = agentReviewedStages.flatMap((stage) => {
+    const decision = latest.get(stage.id);
+    return decision &&
+        decision.outcome === "approved" &&
+        decision.actorUserId === null &&
+        typeof decision.actorAgentId === "string" &&
+        stage.agentIds.has(decision.actorAgentId) &&
+        !executors.has(decision.actorAgentId)
+      ? [{ decision, stageRoundMs: Date.parse(completedStageRounds[stage.id] ?? "") }]
+      : [];
+  });
+  if (independentApprovals.length === 0) return "no_independent_approval";
+  // Fail closed: a stage with no recorded completion round has nothing to bind
+  // an approval to, and a guess would let an older round's approval pass.
+  const roundRecorded = independentApprovals.filter(({ stageRoundMs }) => !Number.isNaN(stageRoundMs));
+  if (roundRecorded.length === 0) return "no_recorded_round";
+  if (mergedHeadSha === undefined) return "ok";
+  const mergedHead = normalizeSha(mergedHeadSha);
+  const bound = roundRecorded.filter(({ decision }) =>
+    mergedHead !== null &&
+    normalizeSha(decision.deliveredHeadSha) === mergedHead &&
+    decision.reviewRoundStartedAt !== null);
+  if (bound.length === 0) return "not_bound_to_merged_head";
+  return bound.some(({ decision, stageRoundMs }) => decision.reviewRoundStartedAt!.getTime() === stageRoundMs)
+    ? "ok"
+    : "old_round";
 }
 
 export interface AttachedBoardLandingProof {

@@ -317,8 +317,26 @@ issue and its evidence in one transaction. No-repository close rechecks use a
 monotonic 15-second budget, so wall-clock adjustments do not cause false timeouts.
 
 Board landing proof (SUP-25193). Some delivered cards have no other landing proof.
-Such a card is not done or cancelled. Its execution workflow is completed, at
-least one completed review stage names only users, and it records no
+Such a card is not done or cancelled. Its execution workflow is completed, and
+either at least one completed review stage names only users, or the card is
+`record_only` with every stage approved or skipped and at least one completed
+review stage whose latest durable decision is an approval recorded by an agent
+participant of that stage (an agent-reviewed card). The approving agent must not
+be the card's executor, assignee, return assignee, delivery author or creating
+agent, and the board must not have recorded the decision in its place. An old
+board-user approval, a self-review and a stage with no participants do not
+qualify. The approving decision must also be bound to the merged pull request:
+its recorded `delivered_head_sha` must equal the pull request head the server
+verified live, and its recorded `review_round_started_at` must equal the start
+of the review round in which that stage completed, which the execution state
+records per stage in `completedStageRounds` (keyed by stage id, carried forward
+as later stages arm and complete). When the state records no round for that
+stage (a card completed before rounds were recorded), the proof is refused 409
+`landing_proof_not_applicable` (fail closed, no guess); the board then closes the
+card through its own board route. An unbound, legacy, old-head or old-round decision does not qualify.
+The pull request must have been opened from the card's own repository, not a
+fork, and its live base branch must be the card's control-plane base branch
+(`landing_proof_repo_identity_mismatch`, `landing_proof_not_on_base`). It records no
 `deliveryIdentity`. For such a card a board actor may call
 `POST /api/issues/:id/landing-proof` with one merged pull request in the card's
 project repository, its merge or head commit, and a reason. An agent key is

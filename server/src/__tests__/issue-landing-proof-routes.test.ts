@@ -19,6 +19,7 @@ import {
   externalObjects,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueWorkProducts,
   issues,
   projectWorkspaces,
@@ -36,6 +37,11 @@ import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
 import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { issueRoutes } from "../routes/issues.js";
 import { evaluateDoneTransitionGuard, prepareLandingDebtClose } from "../services/done-transition-guard.js";
+import {
+  applyBoardStageDecision,
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.js";
 
 // SUP-25193: a board-attached, GitHub-verified merged-PR landing proof for a
 // delivered card whose completed review stage names only a user and which has no
@@ -199,6 +205,12 @@ function resetGitHub() {
     merge_commit_sha: MENTIONED_MERGE,
     head: { sha: sha("e9"), ref: "mention-only-branch", repo: { full_name: `${OWNER}/${REPO}` } },
   }));
+  // A merged PR whose head branch lives in a fork, on the card's base branch.
+  github.prs.set(510, pr({
+    head: { sha: HEAD_OF_MERGED, ref: "fork-branch", repo: { full_name: "someone-else/paperclip" } },
+  }));
+  // A merged PR whose live base branch is not the card's configured base branch.
+  github.prs.set(511, pr({ base: { ref: "release/1.0", repo: { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` } } }));
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -265,6 +277,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   }
 
   const stageId = "cccccccc-0000-4000-8000-000000000001";
+  const secondStageId = "cccccccc-0000-4000-8000-000000000003";
 
   /** The stuck shape: completed user-only review stage, no deliveryIdentity, no execution workspace. */
   async function seedStuckCard(options: {
@@ -279,6 +292,32 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     boardLinkedPr?: number | null;
     /** An `executionState.deliveredHeadSha`, which the active run writes. Default none. */
     deliveredHeadSha?: string | null;
+    /**
+     * For an agent review stage: the durable decision on the completed stage.
+     * `independent` (default) is an approval recorded by a separate reviewer agent
+     * that is a stage participant and bound to the merged PR head. The others are
+     * the shapes the proof must refuse.
+     */
+    reviewDecision?:
+      | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant"
+      | "executor_non_participant" | "old_head" | "unbound" | "old_round" | "unbound_round";
+    /**
+     * For a completed agent review stage: how the production builders completed
+     * the pending stage. `reviewer` (default) is the reviewer agent approving it;
+     * `board` is the board approval that reconciles the stage from the reviewer's
+     * durable approval; `legacy` is the reviewer's completion as written before
+     * per-stage review rounds were recorded.
+     */
+    completedBy?: "reviewer" | "board" | "legacy";
+    /**
+     * A second policy stage after the agent review stage, completed through the
+     * production builders after the reviewer approves the first: a user
+     * `board_approval` stage the board approves, an `agent_review` stage a second
+     * reviewer agent approves, or a review stage the second reviewer bounces and
+     * that is then auto-skipped (`skipped`) once its only participant is the
+     * card's return assignee.
+     */
+    secondStage?: "board_approval" | "agent_review" | "skipped";
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
@@ -316,29 +355,144 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     }
     const deliveredHeadSha = options.deliveredHeadSha ?? null;
+    const reviewDecision = options.reviewDecision ?? "independent";
+    const reviewerId = reviewDecision === "executor" ? agentId : randomUUID();
+    if (options.participant === "agent" && reviewerId !== agentId) {
+      await db.insert(agents).values({
+        id: reviewerId, companyId, name: "Reviewer", role: "reviewer", status: "active", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+    }
     const participant = options.participant === "agent"
-      ? { type: "agent", agentId }
+      ? { type: "agent", agentId: reviewerId }
       : { type: "user", userId: "local-board" };
+    const at = (secondsAgo: number) => new Date(now.getTime() - secondsAgo * 1000);
+    const secondReviewerId = randomUUID();
+    if (options.secondStage === "agent_review" || options.secondStage === "skipped") {
+      await db.insert(agents).values({
+        id: secondReviewerId, companyId, name: "Second reviewer", role: "reviewer", status: "active", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+    }
+    const secondStage = options.secondStage === "board_approval"
+      ? { id: secondStageId, type: "approval", participants: [{ type: "user", userId: "local-board" }] }
+      : options.secondStage
+        ? { id: secondStageId, type: "review", participants: [{ type: "agent", agentId: secondReviewerId }] }
+        : null;
+    let executionPolicy: { mode: string; commentRequired: boolean; stages: Array<Record<string, unknown>> } = {
+      mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", participants: [participant] }, ...(secondStage ? [secondStage] : [])],
+    };
+    const agentCompletion = options.participant === "agent" && options.workflow !== "pending";
+    const pendingState = {
+      status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: participant,
+      returnAssignee: secondStage ? { type: "agent", agentId, userId: null } : null,
+      completedStageIds: [], skippedStageIds: [],
+      lastDecisionId: null, lastDecisionOutcome: null, deliveredHeadSha,
+      ...(agentCompletion ? { pendingSince: at(8).toISOString() } : {}),
+    };
     await db.insert(issues).values({
       id: issueId, companyId, identifier, title: "Delivered card with a user-only review stage",
       status: "in_progress", priority: "medium", assigneeAgentId: agentId, createdByUserId: "local-board",
       projectId, projectWorkspaceId, executionWorkspaceId, deliveryRequirement: "repository_delivery",
-      executionPolicy: {
-        mode: "normal", commentRequired: true,
-        stages: [{ id: stageId, type: "review", participants: [participant] }],
-      },
-      executionState: options.workflow === "pending"
-        ? {
-          status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
-          currentParticipant: participant, returnAssignee: null, completedStageIds: [], skippedStageIds: [],
-          lastDecisionId: null, lastDecisionOutcome: null, deliveredHeadSha,
-        }
+      executionPolicy,
+      executionState: options.workflow === "pending" || agentCompletion
+        ? pendingState
         : {
           status: "completed", currentStageId: null, currentStageIndex: null, currentStageType: null,
           currentParticipant: null, returnAssignee: null, completedStageIds: [stageId], skippedStageIds: [],
           lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
         },
     });
+    const decisionIds: string[] = [];
+    if (agentCompletion && reviewDecision !== "none") {
+      const decision = (over: Partial<typeof issueExecutionDecisions.$inferInsert>) => ({
+        companyId, issueId, stageId, stageType: "review", actorAgentId: reviewerId, actorUserId: null,
+        outcome: "approved", body: "Approved.", deliveredHeadSha: HEAD_OF_MERGED, reviewRoundStartedAt: at(8),
+        ...over,
+      });
+      const insert = async (...rows: Array<ReturnType<typeof decision>>) => {
+        const inserted = await db.insert(issueExecutionDecisions).values(rows).returning({ id: issueExecutionDecisions.id });
+        decisionIds.push(...inserted.map((row) => row.id));
+      };
+      if (reviewDecision === "board_user") {
+        await insert(decision({ actorAgentId: null, actorUserId: "local-board", createdAt: at(5) }));
+      } else if (reviewDecision === "board_in_place") {
+        await insert(decision({ actorUserId: "local-board", createdAt: at(5) }));
+      } else if (reviewDecision === "executor_non_participant") {
+        await insert(decision({ actorAgentId: agentId, createdAt: at(5) }));
+      } else if (reviewDecision === "non_participant") {
+        const strangerId = randomUUID();
+        await db.insert(agents).values({
+          id: strangerId, companyId, name: "Stranger", role: "reviewer", status: "active", adapterType: "codex_local",
+          adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await insert(decision({ actorAgentId: strangerId, createdAt: at(5) }));
+      } else if (reviewDecision === "superseded") {
+        await insert(
+          decision({ createdAt: at(10) }),
+          decision({ outcome: "changes_requested", body: "Reopened.", createdAt: at(5) }),
+        );
+      } else {
+        const boundHead = reviewDecision === "old_head" ? OTHER_SHA : reviewDecision === "unbound" ? null : HEAD_OF_MERGED;
+        const round = reviewDecision === "unbound_round" ? null : reviewDecision === "old_round" ? at(100) : at(8);
+        await insert(decision({ createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? round : null }));
+      }
+    }
+    if (agentCompletion) {
+      let policy = normalizeIssueExecutionPolicy(executionPolicy)!;
+      const transition = (
+        state: Record<string, unknown>,
+        actorAgentId: string,
+        requestedStatus: string,
+        issueStatus = "in_review",
+      ) => applyIssueExecutionPolicyTransition({
+        issue: {
+          status: issueStatus, assigneeAgentId: actorAgentId, assigneeUserId: null, createdByUserId: "local-board",
+          executionPolicy: policy, executionState: state,
+        },
+        policy, requestedStatus, requestedAssigneePatch: {}, actor: { agentId: actorAgentId }, commentBody: "Decided.",
+      }).patch.executionState as Record<string, unknown>;
+      const completedBy = options.completedBy ?? "reviewer";
+      let completed: Record<string, unknown>;
+      if (completedBy === "board") {
+        completed = applyBoardStageDecision({
+          issue: {
+            status: "in_review", assigneeAgentId: reviewerId, assigneeUserId: null, createdByUserId: "local-board",
+            executionPolicy: policy, executionState: pendingState,
+          },
+          policy, decision: "approved", commentBody: "Approved.", actorUserId: "local-board",
+          decidedStageIds: [stageId], durableApprovalIds: new Map([[stageId, decisionIds[decisionIds.length - 1]!]]),
+        }).patch.executionState as Record<string, unknown>;
+      } else {
+        completed = transition(pendingState, reviewerId, "done");
+        if (options.secondStage === "board_approval") {
+          completed = applyBoardStageDecision({
+            issue: {
+              status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board", createdByUserId: "local-board",
+              executionPolicy: policy, executionState: completed,
+            },
+            policy, decision: "approved", commentBody: "Approved.", actorUserId: "local-board", decidedStageIds: [stageId],
+          }).patch.executionState as Record<string, unknown>;
+        } else if (options.secondStage === "agent_review") {
+          completed = transition(completed, secondReviewerId, "done");
+        } else if (options.secondStage === "skipped") {
+          const bounced = transition(completed, secondReviewerId, "in_progress");
+          expect(bounced).toMatchObject({ status: "changes_requested", currentStageId: secondStageId });
+          executionPolicy = {
+            ...executionPolicy,
+            stages: [executionPolicy.stages[0]!, { ...secondStage!, participants: [{ type: "agent", agentId }] }],
+          };
+          policy = normalizeIssueExecutionPolicy(executionPolicy)!;
+          completed = transition(bounced, agentId, "done", "in_progress");
+          expect(completed).toMatchObject({ skippedStageIds: [secondStageId] });
+        }
+      }
+      expect(completed).toMatchObject({ status: "completed" });
+      if (completedBy === "legacy") delete completed.completedStageRounds;
+      await db.update(issues).set({ executionState: completed, executionPolicy }).where(eq(issues.id, issueId));
+    }
     const card = { companyId, agentId, issueId, identifier };
     const boardLinkedPr = options.boardLinkedPr === undefined ? 501 : options.boardLinkedPr;
     if (boardLinkedPr !== null) await linkPr(card, boardLinkedPr);
@@ -562,7 +716,7 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
   });
 
   it.each([
-    ["an agent review stage", { participant: "agent" as const }],
+    ["an agent review stage on a repository_delivery card", { participant: "agent" as const }],
     ["a live (pending) review workflow", { workflow: "pending" as const }],
   ])("refuses a card with %s as not applicable", async (_label, options) => {
     const { issueId } = await seedStuckCard(options);
@@ -570,6 +724,184 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     expect(refused.status, JSON.stringify(refused.body)).toBe(409);
     expect(refused.body.code).toBe("landing_proof_not_applicable");
     expect(await proofRows(issueId)).toHaveLength(0);
+  });
+
+  it.each([
+    ["a pull request whose head branch is in a fork", 510, "landing_proof_repo_identity_mismatch"],
+    ["a pull request whose live base branch is not the card's base branch", 511, "landing_proof_not_on_base"],
+  ] as const)("refuses %s and records nothing", async (_label, pullRequestNumber, code) => {
+    const { issueId } = await seedStuckCard({ boardLinkedPr: pullRequestNumber });
+    await reclassifyRecordOnly(issueId);
+    const refused = await attach(issueId, goodProof({ pullRequestNumber }));
+    expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+    expect(refused.body.code).toBe(code);
+    expect(await proofRows(issueId)).toHaveLength(0);
+    expect(await workProducts(issueId)).toHaveLength(0);
+  });
+
+  describe("an agent-reviewed record_only card whose review stage is completed", () => {
+    it("accepts a live-verified merged PR, and the board close then discharges the debt", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(attached.body).toMatchObject({ landingDebtOwed: true, landingDebtDischarged: false, replayed: false });
+      const [proof] = await proofRows(issueId);
+      expect(proof).toMatchObject({ actorType: "user", actorId: "local-board" });
+      const closed = await patch(issueId, { status: "done", comment: "Landing proven by the board-attached PR." });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const [debt] = await debtDispositions(issueId);
+      expect(debt).toMatchObject({
+        landingDebtDisposition: "discharged",
+        landingProof: { head: MERGE_ON_BASE, source: "board_merged_pr", pullRequestNumber: 501 },
+      });
+    });
+
+    it("accepts a stage the board completed from the reviewer's durable approval of the current round", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent", completedBy: "board" });
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState).toMatchObject({ status: "completed", lastDecisionOutcome: "approved" });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(await proofRows(issueId)).toHaveLength(1);
+    });
+
+    it.each([
+      ["the board then approves a user approval stage", "board_approval" as const],
+      ["a second reviewer agent then approves a second review stage", "agent_review" as const],
+      ["a second review stage is then auto-skipped", "skipped" as const],
+    ])("accepts a current-round agent approval of the first stage when %s", async (_label, secondStage) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", secondStage });
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState).toMatchObject({ status: "completed", completedStageIds: expect.arrayContaining([stageId, secondStageId]) });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(await proofRows(issueId)).toHaveLength(1);
+    });
+
+    it.each([
+      ["the reviewer completed the stage", { completedBy: "reviewer" as const }],
+      ["the board completed the stage", { completedBy: "board" as const }],
+      ["the board then approved a second, user approval stage", { secondStage: "board_approval" as const }],
+    ])("refuses an approval from an older review round when %s, and records nothing", async (_label, options) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision: "old_round", ...options });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(refused.body.error).toContain("older review round");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it.each([
+      ["a head-bound independent approval", { reviewDecision: "independent" as const }],
+      ["a head-bound approval from an older review round", { reviewDecision: "old_round" as const }],
+      ["a head-bound approval followed by a board-approved stage", { secondStage: "board_approval" as const }],
+    ])("refuses %s when the card was completed before its review rounds were recorded, and records nothing", async (_label, options) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", ...options, completedBy: "legacy" });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(refused.body.error).toContain("records no review round");
+      expect(refused.body.error).toContain("board route");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+    });
+
+    it.each([
+      ["the card's own executor reviewed its own work", "executor" as const],
+      ["only an old board-user approval is recorded on the stage", "board_user" as const],
+      ["the board recorded the approval in the reviewer agent's place", "board_in_place" as const],
+      ["the approval was superseded by a later changes_requested decision", "superseded" as const],
+      ["an executor that is not a stage participant approved", "executor_non_participant" as const],
+      ["a non-executor agent that is not a stage participant approved", "non_participant" as const],
+      ["no decision is recorded on the completed stage", "none" as const],
+      ["the independent approval is bound to an old head, not the merged PR head", "old_head" as const],
+      ["the independent approval is unbound (a legacy decision with no head)", "unbound" as const],
+      ["the independent approval is from an older review round on the same head", "old_round" as const],
+      ["the independent approval records no review round", "unbound_round" as const],
+    ])("refuses when %s, and records nothing", async (_label, reviewDecision) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
+    });
+
+    it("refuses while the review workflow is not completed", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent", workflow: "pending" });
+      await db.update(issues).set({ deliveryRequirement: "record_only" }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it("refuses while a second policy stage is neither approved nor skipped", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const policy = row!.executionPolicy as { stages: unknown[] };
+      await db.update(issues).set({
+        executionPolicy: {
+          ...policy,
+          stages: [
+            ...policy.stages,
+            { id: "cccccccc-0000-4000-8000-000000000002", type: "approval", participants: [{ type: "user", userId: "local-board" }] },
+          ],
+        },
+      }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it("refuses a record_only card whose completed review stage has no participants", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      await db.update(issues).set({
+        executionPolicy: {
+          mode: "normal", commentRequired: true,
+          stages: [{ id: stageId, type: "review", participants: [] }],
+        },
+      }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it("refuses an agent key, including the assignee holding a live run", async () => {
+      const card = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(card.issueId);
+      await actAsAssigneeRun(card);
+      const refused = await attach(card.issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(403);
+      expect(await proofRows(card.issueId)).toHaveLength(0);
+      expect(await workProducts(card.issueId)).toHaveLength(0);
+    });
+
+    it.each([
+      ["an unmerged (open) PR", goodProof({ pullRequestNumber: 502 }), "landing_proof_pr_not_merged", 502],
+      ["a wrong repository", goodProof({ owner: "someone-else" }), "landing_proof_wrong_repo", 501],
+      ["a merge commit not on base", goodProof({ pullRequestNumber: 504, mergeCommitSha: MERGE_OFF_BASE }), "landing_proof_not_on_base", 504],
+    ] as const)("still refuses %s and records nothing", async (_label, body, code, linkedPr) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", boardLinkedPr: linkedPr });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, body);
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.code).toBe(code);
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+    });
   });
 
   it("refuses a card that already records a deliveryIdentity or is closed", async () => {

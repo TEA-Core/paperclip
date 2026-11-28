@@ -847,6 +847,13 @@ export interface IssueExecutionState {
    */
   pendingSince?: string | null;
   /**
+   * The review round start (ISO) each stage completed in, keyed by stage id:
+   * the stage's `pendingSince` when it completed. Carried forward across later
+   * stages; a stage completed with no known round, or before this was
+   * recorded, has no entry.
+   */
+  completedStageRounds?: Record<string, string>;
+  /**
    * Head commit delivered to review for the current round, stamped from the
    * `deliveryIdentity.headSha` recorded on the `in_review` transition. Cleared
    * when a changes-requested decision hands the round back, so a re-delivery
