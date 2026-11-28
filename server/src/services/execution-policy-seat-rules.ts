@@ -5,19 +5,30 @@
  * Board ruling 2026-11-27. The agent tools enforce the same rule before they
  * write (`exec_policy.assert_lawful_seats` / `assert_lawful_write` in
  * paperclip-agent-tools). An agent that calls the API directly skips those
- * tools, so the server enforces the rule itself. Every write runs through one
- * of two shared entry points:
+ * tools, so the server enforces the rule itself. Every caller-driven create
+ * and update path refuses through one of two shared entry points:
  *   - a new issue: `newIssueSeatRuleInput`, judged inside `issueService.create`
  *     on the policy the issue will carry (its own or the inherited project or
- *     company default). Every create door reaches it: the issue routes, child
- *     create, accepted-plan decomposition, suggest_tasks accept, the runner
- *     `create_task` tool, routine runs, decision and plugin effects.
+ *     company default). Issue create, child create, accepted-plan
+ *     decomposition, suggest_tasks accept, the runner `create_task` tool,
+ *     manual and API routine runs, decision and delegation effects and the
+ *     plugin host `issues.create` all reach it.
  *   - an existing issue: `assertIssueUpdateSeatsLawful`, called by PATCH
  *     (policy, assignee, or both, including a whole-policy replace and a
  *     monitor-alias write), checkout, the runner `reassign_task` tool, the
  *     decision `assign_issue` effect and the plugin host `issues.update`.
  * Routine create, update and revision restore apply the rule to the routine's
  * policy and assignee, since every issue the routine dispatches carries them.
+ *
+ * Platform producers that warn instead (create with
+ * `executionPolicySeatRules: "warn"`, which logs the conflict): scheduled and
+ * webhook routine dispatch, inbound email, inbound chat, external-service
+ * monitor recovery, exhausted-recovery escalation, task-watchdog review, and
+ * the agent chat conversation.
+ * Platform updates exempt by design (not judged): stage-machine seating of the
+ * active participant, recovery reassignment (behind the self-satisfying
+ * review-stage gate), task-watchdog reopen, interaction hand-backs, and
+ * auto-checkout with an unchanged assignee.
  *
  * The rule compares agent ids only, never names: every `review` or
  * `approval` stage participant of type `agent` must differ from

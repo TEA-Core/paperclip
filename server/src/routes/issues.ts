@@ -27393,6 +27393,9 @@ export function issueRoutes(
         title: `Chat with ${agent.name}`, assigneeAgentId: agent.id,
         conversationAgentId: agent.id, conversationUserId: req.actor.userId,
         conversationState: "waiting", status: "in_review", createdByUserId: req.actor.userId,
+        // A conversation is not review work: opening a chat with an agent the
+        // inherited ladder seats is logged, never refused (execution-policy-seat-rules.ts).
+        executionPolicySeatRules: "warn",
       });
       await logActivity(db, { companyId, actorType: "user", actorId: req.actor.userId,
         boardApiKeyId: getActorInfo(req).boardApiKeyId,

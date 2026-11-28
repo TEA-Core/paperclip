@@ -25,6 +25,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueService } from "../services/issues.js";
 import { logger } from "../middleware/logger.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -873,10 +874,36 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
           originId: "seat-rule-fixture",
           conflicts: [expect.objectContaining({ participantId: reviewerId, conflictingRole: "assignee" })],
         }),
-        expect.stringContaining("no caller to refuse"),
+        expect.stringContaining("platform producer warns"),
       );
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  it("agent chat: opening a chat with an agent the inherited default seats warns, never refuses", async () => {
+    const { companyId, reviewerId } = await seed();
+    await db.update(companies).set({
+      defaultExecutionPolicy: policy(agentStage("review", reviewerId)) as unknown as Record<string, unknown>,
+    }).where(eq(companies.id, companyId));
+    const settings = instanceSettingsService(db);
+    const previousAgentChat = (await settings.getExperimental()).enableAgentChat;
+    await settings.updateExperimental({ enableAgentChat: true });
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const res = await request(app()).post(`/api/companies/${companyId}/chats/${reviewerId}`).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({ assigneeAgentId: reviewerId, conversationAgentId: reviewerId });
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          companyId,
+          conflicts: [expect.objectContaining({ participantId: reviewerId, conflictingRole: "assignee" })],
+        }),
+        expect.stringContaining("platform producer warns"),
+      );
+    } finally {
+      warn.mockRestore();
+      await settings.updateExperimental({ enableAgentChat: previousAgentChat });
     }
   });
 });

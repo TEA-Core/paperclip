@@ -2237,8 +2237,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
    * the issue will carry (its own, or the project or company default applied
    * below): it may not seat the issue's creator or assignee as reviewer or
    * approver (execution-policy-seat-rules.ts). "enforce" (the default)
-   * refuses with 422. "warn" creates the issue and logs the conflict; only a
-   * producer with no caller to refuse uses it.
+   * refuses with 422. "warn" creates the issue and logs the conflict; only the
+   * platform producers listed in execution-policy-seat-rules.ts use it.
    */
   executionPolicySeatRules?: "enforce" | "warn";
 };
@@ -11412,7 +11412,7 @@ export function issueService(
           if (seatConflicts.length > 0) {
             logger.warn(
               { companyId, originKind: issueData.originKind, originId: issueData.originId, conflicts: seatConflicts },
-              "new issue's execution policy seats its creator or assignee as reviewer or approver; no caller to refuse, creating anyway",
+              "new issue's execution policy seats its creator or assignee as reviewer or approver; platform producer warns, creating anyway",
             );
           }
         }

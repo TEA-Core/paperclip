@@ -908,7 +908,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
           originId: routineId,
           conflicts: [expect.objectContaining({ participantId: agentId, conflictingRole: "assignee" })],
         }),
-        expect.stringContaining("seats its creator or assignee as reviewer or approver; no caller to refuse"),
+        expect.stringContaining("seats its creator or assignee as reviewer or approver; platform producer warns"),
       );
     } finally {
       warn.mockRestore();
