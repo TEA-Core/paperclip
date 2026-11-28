@@ -600,7 +600,7 @@ export async function boardLandingProofIneligibility(
     issue,
     policy,
     rawState,
-    state.completedRoundStartedAt ?? null,
+    state.completedStageRounds ?? {},
     agentReviewedStages,
     mergedHeadSha,
   );
@@ -608,13 +608,16 @@ export async function boardLandingProofIneligibility(
     return "the card has no completed agent review stage whose latest decision is an approval by an agent participant " +
       "other than the card's executor, assignee or author, recorded by that agent and not by the board in its place";
   }
-  if (judged === "no_current_round") {
-    return "the card's completed review round start (completedRoundStartedAt) is not recorded, so no approval can be bound to it; " +
+  if (judged === "no_recorded_round") {
+    return "the card records no review round for its approved agent review stage (completedStageRounds), so no approval can be bound to it; " +
       "the landing proof cannot be attached, and the board closes the card through its own board route instead";
   }
   if (judged === "not_bound_to_merged_head") {
-    return "the card's agent approval is not bound to the merged pull request head and current review round; " +
-      "an unbound, legacy, old-head or old-round approval does not qualify";
+    return "the card's agent approval is not bound to the merged pull request head and a recorded review round; " +
+      "an unbound, legacy or old-head approval does not qualify";
+  }
+  if (judged === "old_round") {
+    return "the card's agent approval is from an older review round than the round its stage completed in";
   }
   return null;
 }
@@ -631,21 +634,22 @@ export async function boardLandingProofIneligibility(
  *
  * When `mergedHeadSha` is given, the approval must also be bound to that head
  * and to the review round: its `deliveredHeadSha` equals the merged PR head and
- * its `reviewRoundStartedAt` equals the round that completed the workflow (the
- * state's recorded `completedRoundStartedAt`). A card whose completed state
- * records no such round, such as one completed before it was recorded, fails
- * closed ("no_current_round").
- * An unbound or legacy decision has no head or round and fails.
+ * its `reviewRoundStartedAt` equals the round its own stage completed in (the
+ * state's `completedStageRounds[stageId]`). A stage with no recorded round,
+ * such as one completed before rounds were recorded, fails closed
+ * ("no_recorded_round"). An unbound or legacy decision has no head or round and
+ * fails ("not_bound_to_merged_head"); a bound one from another round fails
+ * ("old_round").
  */
 async function judgeAgentReviewedStages(
   db: Db,
   issue: EligibilityIssue,
   policy: { stages?: unknown } | null,
   rawState: Record<string, unknown> | null,
-  completedRoundStartedAt: string | null,
+  completedStageRounds: Record<string, string>,
   agentReviewedStages: Array<{ id: string; agentIds: Set<string> }>,
   mergedHeadSha: string | undefined,
-): Promise<"ok" | "no_independent_approval" | "no_current_round" | "not_bound_to_merged_head"> {
+): Promise<"ok" | "no_independent_approval" | "no_recorded_round" | "not_bound_to_merged_head" | "old_round"> {
   const decisions = await db
     .select({
       id: issueExecutionDecisions.id,
@@ -677,8 +681,6 @@ async function judgeAgentReviewedStages(
       .where(and(eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, runIds)));
     for (const run of runs) executors.add(run.agentId);
   }
-  const parsedRoundMs = completedRoundStartedAt ? Date.parse(completedRoundStartedAt) : Number.NaN;
-  const currentRoundMs = Number.isNaN(parsedRoundMs) ? null : parsedRoundMs;
   const independentApprovals = agentReviewedStages.flatMap((stage) => {
     const decision = latest.get(stage.id);
     return decision &&
@@ -687,24 +689,24 @@ async function judgeAgentReviewedStages(
         typeof decision.actorAgentId === "string" &&
         stage.agentIds.has(decision.actorAgentId) &&
         !executors.has(decision.actorAgentId)
-      ? [decision]
+      ? [{ decision, stageRoundMs: Date.parse(completedStageRounds[stage.id] ?? "") }]
       : [];
   });
   if (independentApprovals.length === 0) return "no_independent_approval";
-  // Fail closed: without the card's completed review round start there is nothing
-  // to bind an approval to, and a guess would let an older round's approval pass.
-  if (currentRoundMs === null) return "no_current_round";
+  // Fail closed: a stage with no recorded completion round has nothing to bind
+  // an approval to, and a guess would let an older round's approval pass.
+  const roundRecorded = independentApprovals.filter(({ stageRoundMs }) => !Number.isNaN(stageRoundMs));
+  if (roundRecorded.length === 0) return "no_recorded_round";
   if (mergedHeadSha === undefined) return "ok";
   const mergedHead = normalizeSha(mergedHeadSha);
-  // Bound to the merged head AND to the current review round: an approval from an
-  // older round on the same head is not this review, and a decision with no
-  // recorded round never qualifies.
-  return mergedHead !== null && independentApprovals.some((decision) =>
-      normalizeSha(decision.deliveredHeadSha) === mergedHead &&
-      decision.reviewRoundStartedAt !== null &&
-      decision.reviewRoundStartedAt.getTime() === currentRoundMs)
+  const bound = roundRecorded.filter(({ decision }) =>
+    mergedHead !== null &&
+    normalizeSha(decision.deliveredHeadSha) === mergedHead &&
+    decision.reviewRoundStartedAt !== null);
+  if (bound.length === 0) return "not_bound_to_merged_head";
+  return bound.some(({ decision, stageRoundMs }) => decision.reviewRoundStartedAt!.getTime() === stageRoundMs)
     ? "ok"
-    : "not_bound_to_merged_head";
+    : "old_round";
 }
 
 export interface AttachedBoardLandingProof {

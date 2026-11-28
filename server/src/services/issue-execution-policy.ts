@@ -1597,11 +1597,16 @@ function carriedStallFields(
   };
 }
 
-function completedRoundStart(
+function recordCompletedStageRounds(
   previous: IssueExecutionState | null,
-): Pick<IssueExecutionState, "completedRoundStartedAt"> {
-  const round = previous?.status === PENDING_STATUS ? previous.pendingSince : previous?.completedRoundStartedAt;
-  return round ? { completedRoundStartedAt: round } : {};
+  completedStageIds: readonly string[],
+): Pick<IssueExecutionState, "completedStageRounds"> {
+  const rounds = { ...(previous?.completedStageRounds ?? {}) };
+  const roundStageId = previous?.status === PENDING_STATUS ? previous.currentStageId : null;
+  if (roundStageId && previous?.pendingSince && completedStageIds.includes(roundStageId)) {
+    rounds[roundStageId] = previous.pendingSince;
+  }
+  return Object.keys(rounds).length > 0 ? { completedStageRounds: rounds } : {};
 }
 
 function buildCompletedState(
@@ -1630,7 +1635,7 @@ function buildCompletedState(
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
     childCarrierClaim: previous?.childCarrierClaim,
-    ...completedRoundStart(previous),
+    ...recordCompletedStageRounds(previous, completedStageIds),
     ...carriedStallFields(previous, null),
   };
 }
@@ -1658,7 +1663,7 @@ function buildStateWithCompletedStages(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
-    ...(input.previous?.status === COMPLETED_STATUS ? completedRoundStart(input.previous) : {}),
+    ...recordCompletedStageRounds(input.previous, input.completedStageIds),
     ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
@@ -1686,7 +1691,7 @@ function buildSkippedStageCompletedState(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
-    ...completedRoundStart(input.previous),
+    ...recordCompletedStageRounds(input.previous, input.completedStageIds),
     ...carriedStallFields(input.previous, null),
   };
 }
@@ -1717,6 +1722,7 @@ function buildPendingState(input: {
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
     pendingSince: new Date().toISOString(),
+    ...recordCompletedStageRounds(input.previous, []),
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,

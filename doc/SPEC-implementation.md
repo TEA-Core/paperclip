@@ -328,9 +328,10 @@ board-user approval, a self-review and a stage with no participants do not
 qualify. The approving decision must also be bound to the merged pull request:
 its recorded `delivered_head_sha` must equal the pull request head the server
 verified live, and its recorded `review_round_started_at` must equal the start
-of the review round that completed the workflow, which the completed execution
-state records as `completedRoundStartedAt`. When the state records no
-`completedRoundStartedAt` (a card completed before it was recorded), the proof is refused 409
+of the review round in which that stage completed, which the execution state
+records per stage in `completedStageRounds` (keyed by stage id, carried forward
+as later stages arm and complete). When the state records no round for that
+stage (a card completed before rounds were recorded), the proof is refused 409
 `landing_proof_not_applicable` (fail closed, no guess); the board then closes the
 card through its own board route. An unbound, legacy, old-head or old-round decision does not qualify.
 The pull request must have been opened from the card's own repository, not a
