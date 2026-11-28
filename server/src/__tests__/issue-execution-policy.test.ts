@@ -2043,15 +2043,58 @@ describe("issue execution policy transitions", () => {
       });
     }
 
-    it("leaves the requested done in place when every stage holds a current approval", () => {
+    it("closes on a completed projection of the policy's stages when every stage holds a current approval (SUP-24233)", () => {
       const policy = reviewPolicyReturningToCoder();
       const result = coderDoneOnNullState(policy, [policy.stages[0].id]);
 
       expect(result.patch.status).toBeUndefined();
       expect(result.patch.assigneeAgentId).toBeUndefined();
-      expect(result.patch.executionState).toBeUndefined();
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        currentStageId: null,
+        currentParticipant: null,
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionOutcome: "approved",
+      });
       expect(result.workflowControlledAssignment).toBeUndefined();
       expect(result.decision).toBeUndefined();
+    });
+
+    it("builds the completed projection from the policy's stages only, never an earlier projection id (SUP-24233)", () => {
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "changes_requested",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: ["99999999-9999-4999-8999-999999999999"],
+            lastDecisionId: null,
+            lastDecisionOutcome: "changes_requested",
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        decidedStageIds: [policy.stages[1].id, policy.stages[0].id],
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: policy.stages.map((stage) => stage.id),
+        lastDecisionOutcome: "approved",
+        returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+      });
     });
 
     it("still arms the stage when no durable approval exists", () => {

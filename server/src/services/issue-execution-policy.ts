@@ -104,7 +104,8 @@ type TransitionInput = {
    * (`listCurrentPolicyApprovedStageIds`). Read only when a `done` request
    * starts the workflow (no active stage). A reopen nulls the executionState
    * projection while the decision rows survive; when every stage is in this set
-   * nothing is re-armed and the requested `done` reaches the done-transition
+   * nothing is re-armed, the close writes a completed projection of the policy's
+   * stages (SUP-24233), and the requested `done` reaches the done-transition
    * guard, which recovers the ladder from the same rows (SUP-14912). Absent
    * counts as empty.
    */
@@ -1583,11 +1584,11 @@ function carriedStallFields(
 
 function buildCompletedState(
   previous: IssueExecutionState | null,
-  currentStage: IssueExecutionStage,
+  currentStage: IssueExecutionStage | null,
   decidedStageIds: readonly string[] = [],
 ): IssueExecutionState {
   const completedStageIds = Array.from(
-    new Set([...(previous?.completedStageIds ?? []), ...decidedStageIds, currentStage.id]),
+    new Set([...(previous?.completedStageIds ?? []), ...decidedStageIds, ...(currentStage ? [currentStage.id] : [])]),
   );
   return {
     status: COMPLETED_STATUS,
@@ -2380,11 +2381,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // approved decision row, nothing is re-armed and the requested `done` reaches
   // the done-transition guard, which recovers the ladder from the same rows
   // (SUP-14912). A partial ladder re-arms from the start as before.
+  // SUP-24233: the close also writes the completed projection, so the readers of
+  // `completedStageIds`/`lastDecisionOutcome` (head review, delivery-receipt
+  // recovery, merge arming) see a completed ladder. Its stages are exactly the
+  // policy's, each of which `decidedStageIds` (built by the route from the
+  // decision rows) has just shown to be durably approved; no earlier projection
+  // id is carried. `approvalStatus` is carried, not rebuilt: no decision row
+  // records a head.
   if (
     requestedStatus === "done" &&
     input.policy.stages.length > 0 &&
     input.policy.stages.every((stage) => (input.decidedStageIds ?? []).includes(stage.id))
   ) {
+    patch.executionState = {
+      ...buildCompletedState(existingState, null),
+      completedStageIds: input.policy.stages.map((stage) => stage.id),
+    };
     return { patch };
   }
   let pendingStage =

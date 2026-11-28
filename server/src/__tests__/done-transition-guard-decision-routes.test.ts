@@ -33,6 +33,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { createAuthorityGuard, ladderIsTerminallyApproved } from "../services/merge-arming.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
@@ -3383,6 +3384,49 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(recovered).toHaveLength(1);
+    });
+
+    it("PATCH: the done after a reopen persists the completed ladder its consumers read (SUP-24233)", async () => {
+      const { companyId, implementerAgentId, issueId, identifier, firstStageId } = await seedBoardApprovedCard("S24233A");
+      mockMergedBranch();
+      currentActor = boardOwner(companyId);
+      const boardClose = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Approved and merged; closing." });
+      expect(boardClose.status, JSON.stringify(boardClose.body)).toBe(200);
+      await db.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, issueId));
+
+      currentActor = agentActor(companyId, implementerAgentId, await seedRun(companyId, implementerAgentId, issueId));
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [closed] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(closed?.status).toBe("done");
+      expect(closed?.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [firstStageId],
+        lastDecisionOutcome: "approved",
+      });
+
+      // Merge arming: the ladder check and the authority guard its actuator re-reads.
+      expect(ladderIsTerminallyApproved(
+        closed!.executionPolicy as Parameters<typeof ladderIsTerminallyApproved>[0],
+        closed!.executionState as Parameters<typeof ladderIsTerminallyApproved>[1],
+      )).toBe(true);
+      const authority = await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true });
+      expect(await authority.stillHolds()).toBeNull();
+
+      currentActor = boardOwner(companyId);
+      // Delivery-receipt recovery passes its approved-ladder gates and reaches its input validation.
+      const receipt = await request(app).post(`/api/issues/${issueId}/delivery-receipt-recovery`).send({});
+      expect(receipt.status, JSON.stringify(receipt.body)).toBe(400);
+      // Head review passes the ladder and stage-integrity gates. It still needs the
+      // certified approval head, which the reopen cleared and no decision row records.
+      const headReview = await request(app).get(`/api/issues/${issueId}/merge-arming/head-review`);
+      expect(headReview.status).toBe(409);
+      expect(headReview.body.error).toBe("No certified approval head is recorded");
     });
 
     it("PATCH: an approval superseded by a later changes_requested still re-arms the stage (fail closed)", async () => {
