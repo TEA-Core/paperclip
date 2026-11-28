@@ -922,7 +922,7 @@ When an execution-policy review stage has a pending agent participant, the parti
 
 ### Issue monitors
 
-An issue monitor is a one-shot deferred action path for agent-owned issues in `in_progress` or `in_review`.
+An issue monitor is a one-shot deferred action path for agent-owned issues in `in_progress`, `in_review`, or `blocked`.
 
 Use a monitor when the current assignee owns a future check against an async system or external service. Examples include Greptile review loops, GitHub checks, Vercel deployments, or provider jobs where the agent should come back later and decide what happens next.
 
@@ -933,6 +933,17 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `serviceName`: optional non-secret external-service context
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
+
+On creation, send these fields inside `executionPolicy.monitor`. The create
+response and a fresh issue read expose the saved policy there, with its scheduled
+time also in `monitorNextCheckAt`. Top-level create inputs such as
+`monitorNextCheckAt`, `monitorRecoveryPolicy`, `monitorServiceName`, and
+`monitorMaxAttempts` are rejected with a validation error naming the fields;
+they are not monitor-setting aliases. This applies to REST requests and MCP tool
+calls. MCP create and update calls return `isError: true` for unsupported fields,
+before any issue write. The served OpenAPI and MCP create schema advertise the
+nested policy. `scheduledBy` is derived from the authenticated actor, and
+`externalRef` retains the redaction behavior above.
 
 `PATCH /api/issues/{id}` also accepts a top-level `monitor` alias for `executionPolicy.monitor`. The route normalizes it into a partial `executionPolicy` write that preserves the other stored policy fields, and it passes the same authorization gates as the nested spelling. A body that sends both `monitor` and `executionPolicy` (even `null`) is rejected with a validation error. The alias is update-only; issue creation uses `executionPolicy.monitor`.
 

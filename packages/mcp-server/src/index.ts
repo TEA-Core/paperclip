@@ -4,6 +4,8 @@ import { PaperclipApiClient } from "./client.js";
 import { readConfigFromEnv, type PaperclipMcpConfig } from "./config.js";
 import { createToolDefinitions } from "./tools.js";
 
+const STRICT_INPUT_TOOLS = new Set(["paperclipCreateIssue", "paperclipUpdateIssue"]);
+
 export function createPaperclipMcpServer(config: PaperclipMcpConfig = readConfigFromEnv()) {
   const server = new McpServer({
     name: "paperclip",
@@ -13,15 +15,17 @@ export function createPaperclipMcpServer(config: PaperclipMcpConfig = readConfig
   const client = new PaperclipApiClient(config);
   const tools = createToolDefinitions(client);
   for (const tool of tools) {
-    if (tool.outputSchema) {
-      server.registerTool(tool.name, {
-        description: tool.description,
-        inputSchema: tool.schema,
-        outputSchema: tool.outputSchema,
-      }, tool.execute);
-    } else {
-      server.tool(tool.name, tool.description, tool.schema.shape, tool.execute);
-    }
+    // Issue create/update register the full strict object so the SDK refuses
+    // unknown top-level fields (e.g. monitorNextCheckAt) instead of stripping
+    // them. Tools with an output schema register the full object too. Other
+    // tools keep the shape, which ignores stray keys.
+    const inputSchema =
+      STRICT_INPUT_TOOLS.has(tool.name) || tool.outputSchema ? tool.schema : tool.schema.shape;
+    server.registerTool(tool.name, {
+      description: tool.description,
+      inputSchema,
+      ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+    }, tool.execute);
   }
 
   return {

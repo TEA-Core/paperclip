@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
-import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import { createIssueSchema, gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
 import { z } from "zod";
 import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
 import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
@@ -380,6 +382,116 @@ describe("openapi routes", () => {
     expect(schema.properties.items.items.properties.currentExecutionWorkspace.properties.deliveryState.enum)
       .toEqual(["merged_via_pr", "merged_by_ancestry", "unmerged", "unknown"]);
     expect(schema.properties.items.items.properties.workProducts.items.required).toContain("type");
+  });
+
+  it("advertises the same nested create monitor contract as the MCP adapter and refuses top-level spellings", async () => {
+    const response = await request(createApp()).get("/api/openapi.json").expect(200);
+    const schema = response.body.paths["/api/companies/{companyId}/issues"].post
+      .requestBody.content["application/json"].schema;
+    const tool = createToolDefinitions(new PaperclipApiClient({
+      apiUrl: "http://localhost:3100/api",
+      apiKey: "test-token",
+      companyId: "11111111-1111-4111-8111-111111111111",
+      agentId: null,
+      runId: null,
+    })).find((candidate) => candidate.name === "paperclipCreateIssue")!;
+    const objectSchema = z.object({
+      properties: z.record(z.string(), z.unknown()),
+      required: z.array(z.string()).optional(),
+      additionalProperties: z.boolean().optional(),
+    });
+    const nullableSchema = z.object({ anyOf: z.array(z.unknown()) });
+    const objectVariant = (value: unknown) => objectSchema.parse(
+      nullableSchema.parse(value).anyOf.find((option) => objectSchema.safeParse(option).success),
+    );
+    const advertised = objectSchema.parse(z.toJSONSchema(tool.schema, { io: "input" }));
+    const monitor = schema.properties.executionPolicy.properties.monitor;
+    const mcpPolicy = objectVariant(advertised.properties.executionPolicy);
+    const mcpMonitor = objectVariant(mcpPolicy.properties.monitor);
+    const fields = [
+      "nextCheckAt", "notes", "scheduledBy", "kind", "serviceName",
+      "externalRef", "timeoutAt", "maxAttempts", "recoveryPolicy",
+    ];
+    expect(Object.keys(monitor.properties).sort()).toEqual([...fields].sort());
+    expect(Object.keys(mcpMonitor.properties).sort()).toEqual([...fields].sort());
+    expect(monitor.required).toEqual(["nextCheckAt"]);
+    expect(mcpMonitor.required).toEqual(["nextCheckAt"]);
+    expect(monitor.additionalProperties).toBe(false);
+    expect(mcpMonitor.additionalProperties).toBe(false);
+    expect(monitor.properties.maxAttempts).toMatchObject({
+      type: "integer", minimum: 0, exclusiveMinimum: true, maximum: 100,
+    });
+    expect(nullableSchema.parse(mcpMonitor.properties.maxAttempts).anyOf)
+      .toContainEqual(expect.objectContaining({ type: "integer", exclusiveMinimum: 0, maximum: 100 }));
+    expect(nullableSchema.parse(mcpMonitor.properties.recoveryPolicy).anyOf)
+      .toContainEqual(expect.objectContaining({ type: "string", enum: monitor.properties.recoveryPolicy.enum }));
+    const nestedMonitor = {
+      nextCheckAt: "2099-12-01T12:00:00.000Z",
+      serviceName: "deployment-health",
+      maxAttempts: 3,
+      recoveryPolicy: "escalate_to_board",
+    };
+    expect(tool.schema.parse({ title: "Monitor", executionPolicy: { monitor: nestedMonitor } }))
+      .toMatchObject({ executionPolicy: { monitor: nestedMonitor } });
+    expect(schema.additionalProperties).toBe(false);
+    expect(advertised.additionalProperties).toBe(false);
+    for (const [field, value] of Object.entries({
+      monitorNextCheckAt: nestedMonitor.nextCheckAt,
+      monitorRecoveryPolicy: nestedMonitor.recoveryPolicy,
+      monitorServiceName: nestedMonitor.serviceName,
+      monitorMaxAttempts: nestedMonitor.maxAttempts,
+    })) {
+      expect(schema.properties).not.toHaveProperty(field);
+      expect(advertised.properties).not.toHaveProperty(field);
+      const parsed = tool.schema.safeParse({ title: "Monitor", [field]: value });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) expect(parsed.error.message).toContain(field);
+    }
+  });
+
+  it("rejects the same create monitor and title values in the served schema as the runtime validator", async () => {
+    const response = await request(createApp()).get("/api/openapi.json").expect(200);
+    const schema = response.body.paths["/api/companies/{companyId}/issues"].post
+      .requestBody.content["application/json"].schema;
+    const monitor = schema.properties.executionPolicy.properties.monitor.properties;
+    // ajv and ajv-formats are CJS modules; under this ESM test build the default import holds the module namespace.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const AjvCtor = (Ajv as any).default ?? Ajv;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const applyFormats = (addFormats as any).default ?? addFormats;
+    const ajv = new AjvCtor({ strict: false });
+    applyFormats(ajv);
+    const served = (fragment: unknown, value: unknown) => ajv.validate(fragment as object, value);
+    const bodyRule = { anyOf: schema.anyOf };
+    const monitorBody = (fields: Record<string, unknown>) => ({
+      title: "Monitor",
+      executionPolicy: { monitor: { nextCheckAt: "2099-12-01T12:00:00.000Z", ...fields } },
+    });
+    const cases: Array<[string, unknown, unknown, Record<string, unknown>]> = [
+      ["offset nextCheckAt", monitor.nextCheckAt, "2099-12-01T12:00:00+02:00", monitorBody({ nextCheckAt: "2099-12-01T12:00:00+02:00" })],
+      ["offset timeoutAt", monitor.timeoutAt, "2099-12-02T12:00:00+02:00", monitorBody({ timeoutAt: "2099-12-02T12:00:00+02:00" })],
+      ["whitespace serviceName", monitor.serviceName, "   ", monitorBody({ serviceName: "   " })],
+      ["whitespace externalRef", monitor.externalRef, "   ", monitorBody({ externalRef: "   " })],
+      ["empty body", bodyRule, {}, {}],
+      ["empty title", bodyRule, { title: "" }, { title: "" }],
+      ["whitespace title", bodyRule, { title: "   " }, { title: "   " }],
+    ];
+    for (const [label, fragment, value, body] of cases) {
+      expect({ label, served: served(fragment, value) }).toEqual({ label, served: false });
+      expect({ label, runtime: createIssueSchema.safeParse(body).success }).toEqual({ label, runtime: false });
+    }
+    const accepted: Array<[string, unknown, unknown, Record<string, unknown>]> = [
+      ["Z nextCheckAt", monitor.nextCheckAt, "2099-12-01T12:00:00.000Z", monitorBody({})],
+      ["Z timeoutAt", monitor.timeoutAt, "2099-12-02T12:00:00Z", monitorBody({ timeoutAt: "2099-12-02T12:00:00Z" })],
+      ["padded serviceName", monitor.serviceName, " svc ", monitorBody({ serviceName: " svc " })],
+      ["padded externalRef", monitor.externalRef, " ref ", monitorBody({ externalRef: " ref " })],
+      ["title only", bodyRule, { title: "Task" }, { title: "Task" }],
+      ["description only", bodyRule, { title: "", description: "Do it" }, { title: "", description: "Do it" }],
+    ];
+    for (const [label, fragment, value, body] of accepted) {
+      expect({ label, served: served(fragment, value) }).toEqual({ label, served: true });
+      expect({ label, runtime: createIssueSchema.safeParse(body).success }).toEqual({ label, runtime: true });
+    }
   });
 
   it("serves the generated OpenAPI document", async () => {
