@@ -854,6 +854,7 @@ export function summarySlotService(db: Db) {
       onDeduplicated: (reason) => {
         issueDeduplicated = reason === "idempotency_key";
       },
+      executionPolicySeatRules: "warn",
     });
     let generationIssue = created;
     if (created.id !== generationIssueId) {

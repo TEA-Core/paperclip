@@ -2180,6 +2180,7 @@ export function routineService(
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
+    callerlessPlatformRun?: boolean;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
@@ -2363,11 +2364,13 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        // A scheduled or webhook dispatch has no caller to refuse: a stored
-        // routine whose policy seats the dispatched issue's creator or
-        // assignee still dispatches, and create() logs the conflict. A manual
-        // or API run was judged by runRoutine before anything was written.
-        const dispatchHasCaller = input.source === "manual" || input.source === "api";
+        // A scheduled, webhook or pipeline stage-entry dispatch has no caller
+        // to refuse: a stored routine whose policy seats the dispatched
+        // issue's creator or assignee still dispatches, and create() logs the
+        // conflict. A manual or API run was judged by runRoutine before
+        // anything was written.
+        const dispatchHasCaller =
+          !input.callerlessPlatformRun && (input.source === "manual" || input.source === "api");
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -3482,6 +3485,7 @@ export function routineService(
           (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
         descriptionAppendix: input.descriptionAppendix ?? null,
         actor,
+        callerlessPlatformRun: true,
       });
     },
 

@@ -312,6 +312,7 @@ export function onboardingSeedService(db: Db) {
           ...(goalId ? { goalId } : {}),
           status: "todo",
           idempotencyKey: `onboarding-seed:${companyId}`,
+          executionPolicySeatRules: "warn",
         });
         issueId = created.id;
       }

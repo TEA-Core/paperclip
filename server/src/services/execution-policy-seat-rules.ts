@@ -11,7 +11,8 @@
  *     on the policy the issue will carry (its own or the inherited project or
  *     company default). Issue create, child create, accepted-plan
  *     decomposition, suggest_tasks accept, the runner `create_task` tool,
- *     manual and API routine runs, decision and delegation effects and the
+ *     manual and API routine runs, decision and delegation effects
+ *     (including the delegated issue a status decision creates) and the
  *     plugin host `issues.create` all reach it.
  *   - an existing issue: `assertIssueUpdateSeatsLawful`, called by PATCH
  *     (policy, assignee, or both, including a whole-policy replace and a
@@ -22,9 +23,12 @@
  *
  * Platform producers that warn instead (create with
  * `executionPolicySeatRules: "warn"`, which logs the conflict): scheduled and
- * webhook routine dispatch, inbound email, inbound chat, external-service
- * monitor recovery, exhausted-recovery escalation, task-watchdog review, and
- * the agent chat conversation.
+ * webhook routine dispatch, pipeline stage-entry automation routine runs,
+ * inbound email, inbound chat, external-service monitor recovery,
+ * exhausted-recovery escalation, task-watchdog review, the agent chat
+ * conversation, and the hidden bookkeeping issues (status card compile and
+ * refresh, summary-slot generation, the company-skills test harness issue,
+ * and the onboarding seed task).
  * Platform updates exempt by design (not judged): stage-machine seating of the
  * active participant, recovery reassignment (behind the self-satisfying
  * review-stage gate), task-watchdog reopen, interaction hand-backs, and

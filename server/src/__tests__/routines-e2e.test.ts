@@ -915,6 +915,44 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     }
   }, 15_000);
 
+  it("still dispatches a pipeline stage-entry run whose inherited project default seats its assignee, and logs a warning", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      projectId,
+      title: "Stage-entry automation routine",
+      assigneeAgentId: agentId,
+      responsibleUserId: userId,
+    });
+    await db
+      .update(projects)
+      .set({ defaultExecutionPolicy: selfReviewPolicy(agentId) })
+      .where(eq(projects.id, projectId));
+    const { routineService } = await import("../services/routines.js");
+    const svc = routineService(db);
+    const { logger } = await import("../middleware/logger.js");
+    const warn = vi.spyOn(logger, "warn");
+
+    try {
+      const run = await svc.runPipelineStageEntryRoutine(routineId, { source: "api" });
+      expect(run.status).toBe("issue_created");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, run.linkedIssueId!));
+      expect(issue.assigneeAgentId).toBe(agentId);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          originKind: "routine_execution",
+          originId: routineId,
+          conflicts: [expect.objectContaining({ participantId: agentId, conflictingRole: "assignee" })],
+        }),
+        expect.stringContaining("seats its creator or assignee as reviewer or approver; platform producer warns"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  }, 15_000);
+
   it("refuses a manual run whose assignee override lands on a seated agent, and accepts a lawful one", async () => {
     const { companyId, agentId, projectId } = await seedFixture();
     const reviewerId = await insertAgent(companyId, "Reviewer");

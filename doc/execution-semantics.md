@@ -105,7 +105,8 @@ default: issue create, child create, accepted-plan decomposition, a
 `suggest_tasks` accept, the runner `create_task` tool, a manual or API routine
 run (`POST /api/routines/{id}/run`, judged before anything is created, with the
 effective assignee including a per-run override and a manual runner as
-creator), decision and delegation effects, and the plugin host `issues.create`.
+creator), decision and delegation effects (including the delegated issue a
+status decision creates), and the plugin host `issues.create`.
 Caller-driven update paths use one shared check: `PATCH /api/issues/{id}`
 (assignee, policy, both, the `monitor` alias, and a whole-policy replace),
 checkout, the runner `reassign_task` tool, the decision `assign_issue` effect
@@ -114,9 +115,12 @@ restore apply the same rule to the routine's policy, its assignee and the agent
 that created it.
 
 Platform producers that warn instead (they create the issue and the server
-logs the conflict): scheduled and webhook routine dispatch, inbound email,
-inbound chat, external-service monitor recovery, exhausted-recovery escalation,
-task-watchdog review, and the agent chat conversation.
+logs the conflict): scheduled and webhook routine dispatch, pipeline
+stage-entry automation routine runs, inbound email, inbound chat,
+external-service monitor recovery, exhausted-recovery escalation, task-watchdog
+review, the agent chat conversation, and the hidden bookkeeping issues (status
+card compile and refresh, summary-slot generation, the company-skills test
+harness issue, and the onboarding seed task).
 
 Platform updates exempt by design (not judged): stage-machine seating of the
 active participant, recovery reassignment (behind the self-satisfying
