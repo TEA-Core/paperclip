@@ -6624,9 +6624,9 @@ export function companySkillService(db: Db) {
       .select({
         issueId: costEvents.issueId,
         costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
-        inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::int`,
-        cachedInputTokens: sql<number>`coalesce(sum(${costEvents.cachedInputTokens}), 0)::int`,
-        outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::int`,
+        inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::bigint`.mapWith(Number),
+        cachedInputTokens: sql<number>`coalesce(sum(${costEvents.cachedInputTokens}), 0)::bigint`.mapWith(Number),
+        outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::bigint`.mapWith(Number),
       })
       .from(costEvents)
       .where(and(eq(costEvents.companyId, companyId), inArray(costEvents.issueId, issueIds)))

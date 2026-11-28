@@ -81,6 +81,14 @@ function asNonNegativeNumber(value: unknown): number | null {
 }
 
 /**
+ * `tokens.cache` is optional: absent or null reads as no cache counters. A
+ * present value that is not an object is malformed (null here), never zero.
+ */
+function readCacheRecord(value: unknown): Record<string, unknown> | null {
+  return value === undefined || value === null ? {} : asRecord(value);
+}
+
+/**
  * Read the raw OpenCode counter names (`tokens.input/output/reasoning`,
  * `tokens.cache.read/write`, `cost`) shared by `session.usage.updated` events
  * and the session payload. Missing optional counters count as zero; a present
@@ -90,7 +98,8 @@ function asNonNegativeNumber(value: unknown): number | null {
 function sessionTotalsFromPayload(payload: Record<string, unknown>): OpenCodeSessionTotals | null {
   const tokens = asRecord(payload.tokens);
   if (!tokens) return null;
-  const cache = asRecord(tokens.cache) ?? {};
+  const cache = readCacheRecord(tokens.cache);
+  if (!cache) return null;
 
   const input = asNonNegativeInteger(tokens.input);
   const output = asNonNegativeInteger(tokens.output);
@@ -125,9 +134,9 @@ export function readOpenCodeSessionCounters(payload: unknown): OpenCodeSessionCo
   const record = asRecord(payload);
   const tokens = record ? asRecord(record.tokens) : null;
   if (!record || !tokens) return { counters: {}, complete: false };
-  const cache = asRecord(tokens.cache) ?? {};
+  const cache = readCacheRecord(tokens.cache);
   const counters: OpenCodeSessionCounters = {};
-  let complete = true;
+  let complete = cache !== null;
   const take = (
     key: keyof OpenCodeSessionCounters,
     value: unknown,
@@ -148,8 +157,8 @@ export function readOpenCodeSessionCounters(payload: unknown): OpenCodeSessionCo
   take("input", tokens.input, true, asNonNegativeInteger);
   take("output", tokens.output, true, asNonNegativeInteger);
   take("reasoning", tokens.reasoning, false, asNonNegativeInteger);
-  take("cacheRead", cache.read, false, asNonNegativeInteger);
-  take("cacheWrite", cache.write, false, asNonNegativeInteger);
+  take("cacheRead", cache?.read, false, asNonNegativeInteger);
+  take("cacheWrite", cache?.write, false, asNonNegativeInteger);
   take("cost", record.cost, false, asNonNegativeNumber);
   return { counters, complete };
 }
@@ -236,7 +245,8 @@ export function readOpenCodeStepUsage(part: unknown, label: string): OpenCodeSte
     issues.push(`${label}: no token counters`);
     return { usage, costUsd: 0, issues };
   }
-  const cache = asRecord(tokens.cache) ?? {};
+  const cache = readCacheRecord(tokens.cache);
+  if (!cache) issues.push(`${label}: tokens.cache refused (${JSON.stringify(tokens.cache) ?? String(tokens.cache)})`);
   const read = (name: string, value: unknown, required: boolean): number => {
     if (value === undefined || value === null) {
       if (required) issues.push(`${label}: ${name} missing`);
@@ -252,8 +262,8 @@ export function readOpenCodeStepUsage(part: unknown, label: string): OpenCodeSte
   const input = read("tokens.input", tokens.input, true);
   const output = read("tokens.output", tokens.output, true);
   const reasoning = read("tokens.reasoning", tokens.reasoning, false);
-  const cacheRead = read("tokens.cache.read", cache.read, false);
-  const cacheWrite = read("tokens.cache.write", cache.write, false);
+  const cacheRead = read("tokens.cache.read", cache?.read, false);
+  const cacheWrite = read("tokens.cache.write", cache?.write, false);
   usage.inputTokens = input + cacheWrite;
   usage.cachedInputTokens = cacheRead;
   usage.outputTokens = output + reasoning;
