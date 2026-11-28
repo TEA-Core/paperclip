@@ -242,6 +242,10 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
   };
 }
 
+function recoveredFact(state: IssueExecutionMonitorState | null | undefined) {
+  return state?.exhaustionRecoveredAt ? { exhaustionRecoveredAt: state.exhaustionRecoveredAt } : {};
+}
+
 function blankExecutionState(): IssueExecutionState {
   return {
     status: "idle",
@@ -319,6 +323,8 @@ function derivePersistedMonitorState(input: {
   const scheduledBy =
     scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
+  // The sticky "a recovery already ran" fact lives only in the persisted state.
+  const recovered = recoveredFact(fromState);
 
   if (nextCheckAt) {
     return {
@@ -329,6 +335,7 @@ function derivePersistedMonitorState(input: {
       notes,
       scheduledBy,
       ...metadata,
+      ...recovered,
       clearedAt: null,
       clearReason: null,
     };
@@ -342,6 +349,7 @@ function derivePersistedMonitorState(input: {
       attemptCount,
       lastTriggeredAt,
       ...metadata,
+      ...recovered,
     };
   }
 
@@ -354,6 +362,7 @@ function derivePersistedMonitorState(input: {
       notes,
       scheduledBy,
       ...metadata,
+      ...recovered,
       clearedAt: null,
       clearReason: null,
     };
@@ -374,6 +383,8 @@ function buildScheduledMonitorState(
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
+    // Only a board-armed write ends the epoch; an agent re-arm keeps the fact (it is refused anyway).
+    ...(monitor.scheduledBy === "board" ? {} : recoveredFact(previous)),
     clearedAt: null,
     clearReason: null,
   };
@@ -391,6 +402,7 @@ function buildTriggeredMonitorState(input: {
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
+    ...recoveredFact(input.previous),
     clearedAt: null,
     clearReason: null,
   };
@@ -400,6 +412,8 @@ function buildClearedMonitorState(input: {
   previous: IssueExecutionMonitorState | null;
   clearReason: IssueExecutionMonitorClearReason;
   clearedAt: Date;
+  /** The exhaustion recovery ran for an agent-armed monitor: record the sticky fact. */
+  exhaustionRecovered?: boolean;
 }): IssueExecutionMonitorState {
   return {
     status: "cleared",
@@ -409,6 +423,8 @@ function buildClearedMonitorState(input: {
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
+    ...recoveredFact(input.previous),
+    ...(input.exhaustionRecovered ? { exhaustionRecoveredAt: input.clearedAt.toISOString() } : {}),
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
   };
@@ -2522,7 +2538,30 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         attemptCount: currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
       });
-      if (exhaustedReason) {
+      // Recovery is evaluated only by a due dispatch, and after the last
+      // permitted fire the owner's re-arm is the only way a later dispatch can
+      // exist. So an agent-armed re-arm of a monitor that has fired before and
+      // names a `recoveryPolicy` is persisted like any other schedule (refusing
+      // it would leave the configured recovery unreachable): the due dispatch
+      // sees attemptCount + 1 over the bounds and runs exhaustion + recovery
+      // instead of a check. Board-armed monitors, monitors without an explicit
+      // recoveryPolicy, and the initial arm (nothing fired) keep the refusal.
+      // Once the exhaustion recovery ran (`exhaustionRecoveredAt`, recorded when it
+      // runs and kept by every clear, re-arm and bound change), the owner agent
+      // cannot re-arm this issue's monitor again: one recovery per epoch, so an agent
+      // cannot cycle re-arm -> exhaustion -> recovery. Only a board-armed write
+      // (which drops the fact) starts a new epoch.
+      if (currentMonitorState?.exhaustionRecoveredAt && input.policy.monitor.scheduledBy === "assignee") {
+        throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, {
+          clearReason: exhaustedReason ?? "max_attempts_exhausted",
+          recoveryAlreadyRan: true,
+        });
+      }
+      const exhaustionReachesRecovery =
+        (currentMonitorState?.attemptCount ?? 0) > 0 &&
+        input.policy.monitor.scheduledBy === "assignee" &&
+        input.policy.monitor.recoveryPolicy != null;
+      if (exhaustedReason && !exhaustionReachesRecovery) {
         throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
       }
       patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
@@ -2620,6 +2659,7 @@ export function buildIssueMonitorClearedPatch(input: {
   policy: IssueExecutionPolicy | null;
   clearReason: IssueExecutionMonitorClearReason;
   clearedAt?: Date;
+  exhaustionRecovered?: boolean;
 }) {
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
@@ -2631,6 +2671,7 @@ export function buildIssueMonitorClearedPatch(input: {
     previous: currentMonitorState,
     clearReason: input.clearReason,
     clearedAt: input.clearedAt ?? new Date(),
+    exhaustionRecovered: input.exhaustionRecovered,
   });
 
   return {
