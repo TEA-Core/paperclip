@@ -322,6 +322,12 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
+import {
+  assertExecutionPolicySeatsLawful,
+  assertIssueUpdateSeatsLawful,
+  findExecutionPolicySeatConflicts,
+  newIssueSeatRuleInput,
+} from "./execution-policy-seat-rules.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -2226,6 +2232,15 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
   parkDeliberately?: boolean;
+  /**
+   * Internal only, never part of an API schema. Every create judges the policy
+   * the issue will carry (its own, or the project or company default applied
+   * below): it may not seat the issue's creator or assignee as reviewer or
+   * approver (execution-policy-seat-rules.ts). "enforce" (the default)
+   * refuses with 422. "warn" creates the issue and logs the conflict; only the
+   * platform producers listed in execution-policy-seat-rules.ts use it.
+   */
+  executionPolicySeatRules?: "enforce" | "warn";
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -2536,6 +2551,50 @@ function normalizeAcceptedPlanDecompositionFingerprintChild(
         !ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS.has(key),
     ),
   );
+}
+
+/**
+ * The execution policy an issue created without one inherits: the project
+ * default, else the company default, else none (SUP-10835).
+ */
+async function resolveDefaultIssueExecutionPolicy(
+  dbOrTx: DbReader,
+  companyId: string,
+  projectId: string | null,
+): Promise<ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy>> {
+  let normalized: ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy> = null;
+  if (projectId) {
+    const projectDefaultPolicy = await dbOrTx
+      .select({ defaultExecutionPolicy: projects.defaultExecutionPolicy })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
+    normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
+  }
+  if (!normalized) {
+    const companyDefaultPolicy = await dbOrTx
+      .select({ defaultExecutionPolicy: companies.defaultExecutionPolicy })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
+    normalized = resolveProjectDefaultIssueExecutionPolicy(companyDefaultPolicy);
+  }
+  return normalized;
+}
+
+/**
+ * The execution policy a new issue will carry, as create() resolves it: its
+ * own policy, normalized, else the project or company default.
+ */
+async function resolveNewIssueExecutionPolicy(
+  dbOrTx: DbReader,
+  companyId: string,
+  input: { executionPolicy?: unknown; trustExplicitExecutionPolicy?: boolean; projectId?: string | null },
+) {
+  return normalizeIssueExecutionPolicy(
+    input.executionPolicy ?? null,
+    { preserveEmptyPolicy: input.trustExplicitExecutionPolicy === true },
+  ) ?? await resolveDefaultIssueExecutionPolicy(dbOrTx, companyId, input.projectId ?? null);
 }
 
 function createAcceptedPlanDecompositionRequestFingerprint(input: {
@@ -10341,6 +10400,28 @@ export function issueService(
       };
     },
 
+    /**
+     * Refuses a planned create whose resulting policy (its own, or the
+     * inherited project or company default) seats its creator or assignee:
+     * the rule create() applies, for a caller that must refuse before it
+     * writes anything else (accepted-plan decomposition, a routine run).
+     */
+    assertNewIssueSeatsLawful: async (
+      companyId: string,
+      input: {
+        executionPolicy?: unknown;
+        trustExplicitExecutionPolicy?: boolean;
+        projectId?: string | null;
+        createdByAgentId?: string | null;
+        assigneeAgentId?: string | null;
+      },
+    ) => {
+      assertExecutionPolicySeatsLawful(newIssueSeatRuleInput({
+        ...input,
+        executionPolicy: await resolveNewIssueExecutionPolicy(db, companyId, input),
+      }));
+    },
+
     createChild: async (parentIssueId: string, data: IssueChildCreateInput) => {
       const parent = await db
         .select()
@@ -10496,6 +10577,16 @@ export function issueService(
         .where(eq(issues.id, sourceIssueId))
         .then((rows) => rows[0] ?? null);
       if (!sourceIssue) throw notFound("Source issue not found");
+
+      // Board ruling 2026-11-27: judge every child's resulting policy before
+      // the first child exists. Children are created one transaction each, so
+      // a refusal in create() for child N would leave children 1..N-1 behind.
+      for (const child of data.children) {
+        await issueService(db).assertNewIssueSeatsLawful(sourceIssue.companyId, {
+          ...child,
+          projectId: child.projectId ?? sourceIssue.projectId ?? null,
+        });
+      }
 
       const requestFingerprint =
         createAcceptedPlanDecompositionRequestFingerprint({
@@ -10866,6 +10957,7 @@ export function issueService(
         assertCanReuseIssue,
         onDeduplicated,
         parkDeliberately: _parkDeliberately,
+        executionPolicySeatRules = "enforce",
         ...issueData
       } = data;
       const explicitTitle = issueData.title?.trim();
@@ -11303,25 +11395,25 @@ export function issueService(
         // no path to a terminal state once a disposition is missed (SUP-10835).
         // Project default wins over company default when both are set.
         if (!issueData.executionPolicy) {
-          let normalized: ReturnType<typeof resolveProjectDefaultIssueExecutionPolicy> = null;
-          if (issueData.projectId) {
-            const projectDefaultPolicy = await tx
-              .select({ defaultExecutionPolicy: projects.defaultExecutionPolicy })
-              .from(projects)
-              .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-              .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
-            normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
-          }
-          if (!normalized) {
-            const companyDefaultPolicy = await tx
-              .select({ defaultExecutionPolicy: companies.defaultExecutionPolicy })
-              .from(companies)
-              .where(eq(companies.id, companyId))
-              .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
-            normalized = resolveProjectDefaultIssueExecutionPolicy(companyDefaultPolicy);
-          }
+          const normalized = await resolveDefaultIssueExecutionPolicy(
+            tx,
+            companyId,
+            issueData.projectId ?? null,
+          );
           if (normalized) {
             issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
+          }
+        }
+        const seatRuleInput = newIssueSeatRuleInput(issueData);
+        if (executionPolicySeatRules === "enforce") {
+          assertExecutionPolicySeatsLawful(seatRuleInput);
+        } else {
+          const seatConflicts = findExecutionPolicySeatConflicts(seatRuleInput);
+          if (seatConflicts.length > 0) {
+            logger.warn(
+              { companyId, originKind: issueData.originKind, originId: issueData.originId, conflicts: seatConflicts },
+              "new issue's execution policy seats its creator or assignee as reviewer or approver; platform producer warns, creating anyway",
+            );
           }
         }
         await assertIssueExecutionPolicyAgentReferencesResolve(
@@ -13458,6 +13550,7 @@ export function issueService(
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      options: { enforceExecutionPolicySeatRules?: boolean } = {},
     ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId, status: issues.status })
@@ -13526,7 +13619,13 @@ export function issueService(
       await clearCheckoutRunIfTerminal(id);
 
       return db.transaction(async (tx) => {
-        const lockedIssue = await tx.select({ status: issues.status }).from(issues)
+        const lockedIssue = await tx.select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          createdByAgentId: issues.createdByAgentId,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        }).from(issues)
           .where(and(eq(issues.id, id), eq(issues.companyId, issueCompany.companyId)))
           .for("update").then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
@@ -13534,6 +13633,9 @@ export function issueService(
           throw conflict("Issue cannot be checked out because it is already closed", {
             code: "checkout_refused_terminal_status", issueId: id, status: lockedIssue.status,
           });
+        }
+        if (options.enforceExecutionPolicySeatRules === true) {
+          assertIssueUpdateSeatsLawful(lockedIssue, { assigneeAgentId: agentId });
         }
         // Keep every acquisition read and fallback stamp on this connection.
         const db = tx as unknown as Db;

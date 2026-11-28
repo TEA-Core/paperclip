@@ -497,6 +497,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
+import { assertIssueUpdateSeatsLawful } from "../services/execution-policy-seat-rules.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
@@ -20559,6 +20560,14 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    // Board ruling 2026-11-27: the creator and the assignee never hold a
+    // reviewer or approver seat. Judged on the client's own fields, before the
+    // stage transition below moves the assignee onto a seated participant.
+    const seatRuleWrite = { executionPolicy: updateFields.executionPolicy, assigneeAgentId: normalizedAssigneeAgentId };
+    const seatRulesJudged = seatRuleWrite.executionPolicy !== undefined || seatRuleWrite.assigneeAgentId !== undefined;
+    if (seatRulesJudged) {
+      assertIssueUpdateSeatsLawful({ ...existing, executionPolicy: previousExecutionPolicy }, seatRuleWrite);
+    }
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -22354,6 +22363,8 @@ export function issueRoutes(
       // SUP-16525 / SUP-24000: a policy write is re-checked against the
       // locked row, so it has to run on the transactional path.
       || executionPolicyNeedsLockedRevalidation
+      // The seat rules are re-judged against the locked row.
+      || seatRulesJudged
       // Both monitor spellings must recheck policy and ownership under the lock.
       || monitorKeyExplicit
       || monitorChanged
@@ -22679,6 +22690,12 @@ export function issueRoutes(
                 executionState: parseIssueExecutionState(lockedForInvariant.executionState),
               });
             }
+          }
+
+          if (seatRulesJudged) {
+            const lockedForSeats = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForSeats) return null;
+            assertIssueUpdateSeatsLawful(lockedForSeats, seatRuleWrite);
           }
 
           if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {
@@ -24757,6 +24774,9 @@ export function issueRoutes(
           assigneeAgentId: req.body.agentId,
           assigneeUserId: null,
         });
+        // Board ruling 2026-11-27: a checkout that moves the issue onto the
+        // caller makes it the assignee, which never holds a seat.
+        assertIssueUpdateSeatsLawful(issue, { assigneeAgentId: req.body.agentId });
       }
 
       // SUP-15888 / SUP-15832: a card whose CURRENT status is terminal (done /
@@ -24806,6 +24826,7 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          { enforceExecutionPolicySeatRules: true },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
@@ -27372,6 +27393,9 @@ export function issueRoutes(
         title: `Chat with ${agent.name}`, assigneeAgentId: agent.id,
         conversationAgentId: agent.id, conversationUserId: req.actor.userId,
         conversationState: "waiting", status: "in_review", createdByUserId: req.actor.userId,
+        // A conversation is not review work: opening a chat with an agent the
+        // inherited ladder seats is logged, never refused (execution-policy-seat-rules.ts).
+        executionPolicySeatRules: "warn",
       });
       await logActivity(db, { companyId, actorType: "user", actorId: req.actor.userId,
         boardApiKeyId: getActorInfo(req).boardApiKeyId,

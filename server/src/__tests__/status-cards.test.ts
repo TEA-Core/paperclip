@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   activityLog,
@@ -26,6 +26,7 @@ import {
   STATUS_CARD_AGENT_MAX_INTEREST_PROMPT_LENGTH,
 } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import { statusCardRoutes } from "../routes/status-cards.js";
 import { withBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -676,6 +677,54 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(refresh.status).toBe(403);
     const remove = await request(app).delete(`/api/status-cards/${boardCard.body.id}`);
     expect(remove.status).toBe(403);
+  });
+
+  it("compiles a card requested by an agent the company default seats as reviewer, and logs the seat warning", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    await seedSummarizer(company.id);
+    const author = await db
+      .insert(agents)
+      .values({
+        companyId: company.id,
+        name: "Code Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    await db
+      .update(companies)
+      .set({
+        defaultExecutionPolicy: {
+          mode: "normal",
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: author.id }] }],
+        },
+      })
+      .where(eq(companies.id, company.id));
+    const app = createApp(db, agentActor(company.id, author.id, null));
+    const warn = vi.spyOn(logger, "warn");
+
+    try {
+      const response = await request(app)
+        .post(`/api/companies/${company.id}/status-cards`)
+        .send({ interestPrompt: "Tasks I review" });
+
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      const [generation] = await db.select().from(issues).where(eq(issues.companyId, company.id));
+      expect(generation.createdByAgentId).toBe(author.id);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          companyId: company.id,
+          conflicts: [expect.objectContaining({ participantId: author.id, conflictingRole: "creator" })],
+        }),
+        expect.stringContaining("platform producer warns"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("deduplicates active compile tasks for the same prompt", async () => {

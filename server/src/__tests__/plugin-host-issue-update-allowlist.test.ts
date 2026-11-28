@@ -319,4 +319,25 @@ describeEmbeddedPostgres("plugin-host issues.update patch allow-list", () => {
     ]);
     services.dispose();
   });
+
+  it("refuses a plugin reassign that moves the card into a reviewer seat of its policy", async () => {
+    const { company, maintainer, reviewer } = await seedCompany();
+    const card = await seedIssue(company.id, {
+      assigneeAgentId: maintainer.id,
+      executionPolicy: {
+        mode: "normal",
+        stages: [{ type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: reviewer.id }] }],
+      },
+    });
+    const services = buildHostServices(db, randomUUID(), PLUGIN_KEY, createEventBusStub());
+
+    await expect(
+      services.issues.update({ issueId: card.id, companyId: company.id, patch: { assigneeAgentId: reviewer.id } }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", seat: "reviewer", participantId: reviewer.id, conflictingRole: "assignee" },
+    });
+    expect((await readCard(card.id)).assigneeAgentId).toBe(maintainer.id);
+    services.dispose();
+  });
 });

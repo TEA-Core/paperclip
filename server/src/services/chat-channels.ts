@@ -16092,6 +16092,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               assigneeAgentId: endpoint.assignedAgentId,
               createdByUserId: taskUserId ?? endpoint.sponsorUserId,
               responsibleUserId: taskUserId ?? endpoint.sponsorUserId,
+              // An inbound message has no caller to refuse (execution-policy-seat-rules.ts).
+              executionPolicySeatRules: "warn",
               originKind: "chat_channel",
               originId: `${endpoint.id}:${thread.id}:${sessionGeneration}`,
               idempotencyKey: `chat:${endpoint.id}:${thread.id}:${sessionGeneration}`,

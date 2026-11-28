@@ -713,6 +713,7 @@ export function companySkillRoutes(db: Db) {
             createdByAgentId: actor.agentId,
             createdByUserId: actor.actorType === "user" ? actor.actorId : null,
             actorRunId: actor.runId,
+            executionPolicySeatRules: "warn",
           });
           await logActivity(db, {
             companyId,

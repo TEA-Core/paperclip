@@ -2823,6 +2823,49 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, key))).toHaveLength(1);
   });
 
+  it("refuses a delegated issue whose inherited policy seats the delegate as reviewer", async () => {
+    const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
+    if (!fixture) throw new Error("native corpus fixture missing");
+    const seeded = await seedFixture(fixture);
+    const priorStatus = String(fixture.given.priorIssueStatus ?? "in_progress") as NativeStatusDecision["toStatus"];
+    await db.update(companies).set({
+      defaultExecutionPolicy: {
+        mode: "normal",
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: delegateAgentId }] }],
+      },
+    }).where(eq(companies.id, companyId));
+    try {
+      await expect(commitNativeStatusDecision({
+        db,
+        companyId,
+        issueId: seeded.issueId,
+        runId: seeded.runId,
+        assessmentId: seeded.assessmentId,
+        priorStatus,
+        priorStatusVersion: 0,
+        priorDecisionId: null,
+        decision: {
+          policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+          statusAction: "preserve",
+          toStatus: priorStatus,
+          reasonCode: "delegated_issue_seat_test",
+          unblockDescriptor: null,
+          effects: [{ kind: "create_delegated_issue", agentId: delegateAgentId, summary: "Delegated seated work" }],
+        },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: expect.objectContaining({
+          code: "execution_policy_seat_conflict",
+          participantId: delegateAgentId,
+          conflictingRole: "assignee",
+        }),
+      });
+      expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.parentId, seeded.issueId))).toHaveLength(0);
+    } finally {
+      await db.update(companies).set({ defaultExecutionPolicy: null }).where(eq(companies.id, companyId));
+    }
+  });
+
   it("fails the transaction closed for an unknown status effect", async () => {
     const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
     if (!fixture) throw new Error("native corpus fixture missing");

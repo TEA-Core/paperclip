@@ -392,6 +392,7 @@ export function statusCardService(
       createdByUserId: actor.userId,
       hiddenAt: createdAt,
       idempotencyKey: `status-card-compile:${card.id}:${hash}`,
+      executionPolicySeatRules: "warn",
       onDeduplicated: (reason) => {
         deduplicated = reason === "idempotency_key";
       },
@@ -697,6 +698,7 @@ export function statusCardService(
       createdByUserId: input.actor?.userId ?? null,
       hiddenAt: now,
       idempotencyKey: `status-card-update:${card.id}:${fingerprintHash}`,
+      executionPolicySeatRules: "warn",
       onDeduplicated: (reason) => { deduplicated = reason === "idempotency_key"; },
     });
     const reopened = deduplicated && TERMINAL_ISSUE_STATUSES.has(created.status)

@@ -188,6 +188,8 @@ POST /api/routines/{routineId}/run
 
 Fires a run immediately, bypassing the schedule. Concurrency policy still applies.
 
+A manual run whose issue would seat its creator or assignee agent as a reviewer or approver is refused with `422 execution_policy_seat_conflict` before anything is created. Routine create, update and revision restore apply the same seat rule; see `doc/execution-semantics.md`.
+
 `triggerId` is optional. When supplied, the server validates the trigger belongs to this routine (`403`) and is enabled (`409`), then records the run against that trigger and updates its `lastFiredAt`. Omit it for a generic manual run with no trigger attribution.
 
 ## Fire Public Trigger

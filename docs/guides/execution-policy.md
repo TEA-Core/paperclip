@@ -216,6 +216,8 @@ Executor finishes → approver signs off → done.
 **Multiple reviewers/approvers:**
 Each stage supports multiple participants. The runtime selects one to act, excluding the original executor to prevent self-review.
 
+The server also refuses a write that seats the issue's creator agent or assignee agent as a reviewer or approver (`422 execution_policy_seat_conflict`). See `doc/execution-semantics.md` for the write paths judged and the repair limits.
+
 ## Comment Required Backstop
 
 Independent of review stages, every issue-bound agent run must leave a comment. This is enforced at the runtime level:

@@ -3162,23 +3162,29 @@ describe("agent issue mutation checkout ownership", () => {
       }));
     });
 
-    it("rejects an assigneeAgentId write that would make an incomplete review stage self-satisfiable", async () => {
+    // Board ruling 2026-11-27: an assignee never holds a reviewer or approver
+    // seat. Outside an active stage the seat rule refuses the write before the
+    // SUP-13526 gate runs, whatever the stage's other participants or state.
+    function expectSeatConflict(res: request.Response) {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("execution_policy_seat_conflict");
+      expect(res.body.details).toMatchObject({
+        seat: "reviewer",
+        stageId: gateStageId,
+        participantId: gateReviewerAgentId,
+        conflictingRole: "assignee",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+
+    it("refuses an assigneeAgentId write into a review seat", async () => {
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toContain(gateStageId);
-      expect(res.body.error).toContain("self-satisfiable");
-      expect(res.body.details.guard).toBe("assignee_review_gate");
-      expect(res.body.details.issueStageId).toBe(gateStageId);
-      expect(res.body.details.assigneeAgentId).toBe(gateReviewerAgentId);
-      expect(res.body.details.participantsExcludingAssignee).toBe(0);
-      expect(res.body.details.approvalsNeeded).toBe(1);
-      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expectSeatConflict(res);
     });
 
-    it("rejects the same write when it arrives through the ancestor escape hatch", async () => {
+    it("refuses the same write when it arrives through the ancestor escape hatch", async () => {
       mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
         allowed:
           input.action === "tasks:assign" ||
@@ -3207,31 +3213,17 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(await createApp(ancestorActor))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toContain(gateStageId);
-      expect(res.body.error).toContain("self-satisfiable");
-      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expectSeatConflict(res);
     });
 
-    it("gives a board caller the unchanged base 422, with no seat or next action", async () => {
-      // Changing the stage's participants is the board's own lawful repair, so
-      // the board keeps the base text exactly (re-audit 2026-10-02).
+    it("refuses a board caller too", async () => {
       const res = await request(await createApp(boardActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toBe(
-        `Refusing assigneeAgentId write: ${gateReviewerAgentId} is a participant of incomplete review stage ${gateStageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: 0, approvalsNeeded: 1)`,
-      );
-      expect(res.body.details.guard).toBe("assignee_review_gate");
-      expect(res.body.details).not.toHaveProperty("callerSeat");
-      expect(res.body.details).not.toHaveProperty("nextAction");
-      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expectSeatConflict(res);
     });
 
-    it("allows the write when other participants can clear the stage without the assignee", async () => {
+    it("refuses the write even when other participants could clear the stage", async () => {
       mockIssueService.getById.mockResolvedValue(
         gateIssue({
           executionPolicy: {
@@ -3256,19 +3248,13 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
-        expect.anything(),
-      );
+      expectSeatConflict(res);
     });
 
     it.each([
       ["completed", { completedStageIds: [gateStageId] }],
       ["skipped", { skippedStageIds: [gateStageId] }],
-    ])("allows the same write when the stage is %s", async (_label, stateOverride) => {
+    ])("refuses the same write when the stage is %s: the seat is still the card's", async (_label, stateOverride) => {
       mockIssueService.getById.mockResolvedValue(
         gateIssue({
           executionState: {
@@ -3289,13 +3275,37 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: gateReviewerAgentId });
+      expectSeatConflict(res);
+    });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
-        expect.anything(),
+    it("still applies the SUP-13526 gate to a reassign within the active stage", async () => {
+      // The seat rule lets a participant of the ACTIVE stage hold the card; the
+      // self-satisfiable gate still refuses when no one else could clear it.
+      mockIssueService.getById.mockResolvedValue(
+        gateIssue({
+          status: "blocked",
+          executionState: {
+            status: "pending",
+            currentStageId: gateStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: gateSecondParticipantAgentId },
+            returnAssignee: { type: "agent", agentId: ownerAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        }),
       );
+
+      const res = await request(await createApp(boardActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).not.toBe("execution_policy_seat_conflict");
+      expect(res.body.details?.guard).toBe("assignee_review_gate");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
 

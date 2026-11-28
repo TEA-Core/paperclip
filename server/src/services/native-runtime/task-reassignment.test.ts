@@ -154,6 +154,19 @@ describe("runner task reassignment", () => {
     expect(f.stopTaskForReassignment).not.toHaveBeenCalled();
   });
 
+  it("refuses moving the task into a reviewer seat of its execution policy before interrupting work", async () => {
+    const f = await fixture();
+    await db.update(issues).set({
+      executionPolicy: { mode: "normal", stages: [{ type: "review", participants: [{ type: "agent", agentId: f.nextId }] }] },
+    }).where(eq(issues.id, f.targetId));
+    await expect(f.authority.execute(f.call)).rejects.toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", seat: "reviewer", participantId: f.nextId, conflictingRole: "assignee" },
+    });
+    expect(f.stopTaskForReassignment).not.toHaveBeenCalled();
+    expect(await f.target()).toMatchObject({ assigneeAgentId: f.agentId, statusVersion: 0 });
+  });
+
   it("rejects conversations and the caller’s own task", async () => {
     const f = await fixture();
     await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "test-user", conversationState: "active", status: "in_progress" }).where(eq(issues.id, f.targetId));

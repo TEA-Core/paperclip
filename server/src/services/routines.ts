@@ -70,6 +70,7 @@ import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { assertIssueExecutionWorkspaceOverrideAllowed, issueService, logLostFutureMonitorCheck } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertExecutionPolicySeatsLawful, executionPolicySeatsChanged } from "./execution-policy-seat-rules.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -469,6 +470,29 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
 
 function statusRequiresDefaultAgent(status: string) {
   return status === "active";
+}
+
+/**
+ * The issues a routine dispatches carry its policy and assignee, so the
+ * routine itself may not seat its creator or its assignee as reviewer or
+ * approver. The creator is judged only when the seats change, and the
+ * assignee when the seats or the assignee change, so a stored routine stays
+ * repairable.
+ */
+function assertRoutineExecutionPolicySeatsLawful(
+  next: { executionPolicy: unknown; assigneeAgentId: string | null; createdByAgentId: string | null },
+  previous: { executionPolicy: unknown; assigneeAgentId: string | null } | null,
+) {
+  const seatsChanged = previous === null
+    || executionPolicySeatsChanged(previous.executionPolicy ?? null, next.executionPolicy ?? null);
+  const assigneeChanged = previous === null || previous.assigneeAgentId !== next.assigneeAgentId;
+  assertExecutionPolicySeatsLawful({
+    executionPolicy: next.executionPolicy ?? null,
+    creator: { agentId: next.createdByAgentId },
+    assignee: { agentId: next.assigneeAgentId },
+    judgeCreator: seatsChanged,
+    judgeAssignee: seatsChanged || assigneeChanged,
+  });
 }
 
 function normalizeDraftRoutineStatus(status: string, assigneeAgentId: string | null | undefined) {
@@ -2156,6 +2180,7 @@ export function routineService(
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
+    callerlessPlatformRun?: boolean;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
@@ -2339,6 +2364,13 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // A scheduled, webhook or pipeline stage-entry dispatch has no caller
+        // to refuse: a stored routine whose policy seats the dispatched
+        // issue's creator or assignee still dispatches, and create() logs the
+        // conflict. A manual or API run was judged by runRoutine before
+        // anything was written.
+        const dispatchHasCaller =
+          !input.callerlessPlatformRun && (input.source === "manual" || input.source === "api");
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2371,6 +2403,7 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
             executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
+            executionPolicySeatRules: dispatchHasCaller ? "enforce" : "warn",
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2667,6 +2700,14 @@ export function routineService(
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
+      assertRoutineExecutionPolicySeatsLawful(
+        {
+          executionPolicy: input.executionPolicy ?? null,
+          assigneeAgentId: input.assigneeAgentId ?? null,
+          createdByAgentId: actor.agentId ?? null,
+        },
+        null,
+      );
       const env = input.env === undefined || input.env === null
         ? null
         : await secretsSvc.normalizeEnvBindingsForPersistence(companyId, input.env, {
@@ -2864,6 +2905,8 @@ export function routineService(
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
+
+        assertRoutineExecutionPolicySeatsLawful(candidate, locked);
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
@@ -3241,6 +3284,14 @@ export function routineService(
             currentRevisionId: locked.latestRevisionId,
           });
         }
+        assertRoutineExecutionPolicySeatsLawful(
+          {
+            executionPolicy: routineSnapshot.executionPolicy ?? null,
+            assigneeAgentId: routineSnapshot.assigneeAgentId ?? null,
+            createdByAgentId: locked.createdByAgentId,
+          },
+          locked,
+        );
 
         const currentTriggers = await txDb
           .select({ id: routineTriggers.id })
@@ -3380,6 +3431,16 @@ export function routineService(
       await assertProject(routine.companyId, input.projectId ?? null);
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
+      // A run has a caller: the issue it creates is judged up front, on the
+      // policy it will carry (the routine's, else the inherited project or
+      // company default), before the run or the issue exists.
+      await issueSvc.assertNewIssueSeatsLawful(routine.companyId, {
+        executionPolicy: routine.executionPolicy ?? null,
+        trustExplicitExecutionPolicy: routine.executionPolicy != null,
+        projectId: input.projectId ?? routine.projectId ?? null,
+        createdByAgentId: input.source === "manual" ? actor?.agentId ?? null : null,
+        assigneeAgentId,
+      });
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
       if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
       if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
@@ -3424,6 +3485,7 @@ export function routineService(
           (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
         descriptionAppendix: input.descriptionAppendix ?? null,
         actor,
+        callerlessPlatformRun: true,
       });
     },
 

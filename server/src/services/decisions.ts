@@ -14,6 +14,7 @@ import {
   type IssuePostCommitAction,
 } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
+import { assertIssueUpdateSeatsLawful } from "./execution-policy-seat-rules.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
   descendantCount?: number; descendantIds?: string[]; childCount?: number; attentionArchive?: unknown };
@@ -482,6 +483,8 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
           result = { issueId: updated?.id, status: updated?.status };
         } else if (effect.type === "assign_issue") {
+          // Board ruling 2026-11-27: the same seat rule as a PATCH reassign.
+          assertIssueUpdateSeatsLawful(target, { assigneeAgentId: effect.assigneeAgentId ?? null });
           const updated = await svc.update(
             target.id,
             {

@@ -966,6 +966,37 @@ describe("PaperclipRunnerToolAuthority", () => {
     });
   });
 
+  it("refuses create_task when the inherited company default seats the creating agent", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      workMode: "standard",
+      enqueueWakeup: async () => null,
+    });
+    const childCount = async () => (await db.select().from(issues).where(eq(issues.parentId, issueId))).length;
+    const before = await childCount();
+    await db.update(companies).set({
+      defaultExecutionPolicy: { mode: "normal", stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] },
+    }).where(eq(companies.id, companyId));
+    try {
+      await expect(
+        authority.execute({
+          tool: "create_task",
+          callId: "seated-child",
+          arguments: { idempotencyKey: "seated-child", title: "Child its own creator would review" },
+        }),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { code: "execution_policy_seat_conflict", seat: "reviewer", participantId: agentId, conflictingRole: "creator" },
+      });
+      expect(await childCount()).toBe(before);
+    } finally {
+      await db.update(companies).set({ defaultExecutionPolicy: null }).where(eq(companies.id, companyId));
+    }
+  });
+
   it("creates ordinary children, preserves blockers, and deduplicates across runs", async () => {
     const wakes: Array<{ agentId: string; options: Record<string, unknown> }> =
       [];

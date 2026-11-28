@@ -94,6 +94,52 @@ be completed and the last recorded decision to be approved; a pending post-merge
 stage does not delay that stamp. The review workflow follows stage order and
 waits for post-merge stages before closing `done`.
 
+An issue's creator and its assignee never hold a reviewer or approver seat.
+Every caller-driven create and update path refuses a write that breaks this
+rule; the platform producers listed below warn or are exempt by design. A write
+is judged against the issue as it will be after the write.
+
+Caller-driven create paths are judged inside the issue service on the policy
+the issue will carry, including a policy inherited from the project or company
+default: issue create, child create, accepted-plan decomposition, a
+`suggest_tasks` accept, the runner `create_task` tool, a manual or API routine
+run (`POST /api/routines/{id}/run`, judged before anything is created, with the
+effective assignee including a per-run override and a manual runner as
+creator), decision and delegation effects (including the delegated issue a
+status decision creates), and the plugin host `issues.create`.
+Caller-driven update paths use one shared check: `PATCH /api/issues/{id}`
+(assignee, policy, both, the `monitor` alias, and a whole-policy replace),
+checkout, the runner `reassign_task` tool, the decision `assign_issue` effect
+and the plugin host `issues.update`. Routine create, update and revision
+restore apply the same rule to the routine's policy, its assignee and the agent
+that created it.
+
+Platform producers that warn instead (they create the issue and the server
+logs the conflict): scheduled and webhook routine dispatch, pipeline
+stage-entry automation routine runs, inbound email, inbound chat,
+external-service monitor recovery, exhausted-recovery escalation, task-watchdog
+review, the agent chat conversation, and the hidden bookkeeping issues (status
+card compile and refresh, summary-slot generation, the company-skills test
+harness issue, and the onboarding seed task).
+
+Platform updates exempt by design (not judged): stage-machine seating of the
+active participant, recovery reassignment (behind the self-satisfying
+review-stage gate), task-watchdog reopen, interaction hand-backs, and
+auto-checkout with an unchanged assignee.
+
+The server compares agent ids, never names: an agent participant against
+`createdByAgentId` and `assigneeAgentId`. User participants are not judged,
+matching the agent tools' rule. An assignee equal to the stored one counts as
+left alone. A violation is refused with `422` and the code
+`execution_policy_seat_conflict`; `details` names the seat (`reviewer` or
+`approver`), the stage, the participant id and the conflicting role (`creator`
+or `assignee`). The rule applies to agent and board callers alike, and the
+server never removes a seat to make a write pass. Two limits keep stored cards
+repairable without a migration: the creator is judged only when the write
+changes the seats, and the assignee is not judged while an active stage holds
+the card (it is `in_review`, or blocked with a pending stage whose current
+participant is the assignee) unless the write moves the assignee.
+
 For a native completion review addressed to an agent, the server saves the review
 card and a durable reviewer wake in the same transaction. The reviewer can act
 on the child task even when its own parent task waits for that child. The child

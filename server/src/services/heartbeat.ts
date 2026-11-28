@@ -12923,6 +12923,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: input.claimed.projectId,
             goalId: input.claimed.goalId,
             assigneeAgentId: recoveryAssigneeAgentId,
+            // A recovery sweep has no caller to refuse (execution-policy-seat-rules.ts).
+            executionPolicySeatRules: "warn",
             originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
             originId: input.claimed.id,
             originFingerprint: recoveryFingerprint,
