@@ -29,6 +29,20 @@ Workspace commands can be controlled manually from the UI, and heartbeat runs al
 - You can opt a service out of that auto-start by setting its desired state to `stopped`/`manual` in the runtime config; those services stay UI-controlled.
 - Paperclip does not automatically restart workspace services on server boot — services only come back up when the next run (or a manual start) brings them up.
 
+A managed start, restart, or repair of an execution workspace also checks that its Git checkout still matches its recorded branch. The check runs after restore and provisioning, again immediately before the service process is spawned, and again when readiness completes or startup fails. A mismatch fails the operation with HTTP 409, releases the port and HTTPS exposure that start reserved, stops any service that start created, and records the reason code, the expected branch, the actual ref, the HEAD commit, the canonical checkout path, and the workspace id on the workspace operation. The check never rewrites the recorded branch to the branch found on disk. A managed start, restart, or repair also never switches an operator-owned branch or a checkout that a live run claims; heartbeat dispatch keeps its own branch repair rules. One exception applies before the check runs: when Paperclip created the recorded branch, and the worktree is clean and no live run claims it, the existing branch repair can check the recorded branch out again. For example, it can move the worktree back from another branch at the same commit. A project directory that is not a Git checkout is not required to have a branch.
+
+The recorded branch is always a local branch. The check compares full ref names (`refs/heads/<name>`), so a local branch named `origin/topic` does not match a recorded `topic`, and a branch with a 40-hex name is an ordinary branch. These checkouts are refused:
+
+- HEAD is on another branch (`branch_mismatch`).
+- HEAD is detached at a commit other than the recorded branch tip (`detached_head_off_recorded_tip`). A detached HEAD at that tip starts.
+- The recorded branch has no local ref, for example a deleted branch, a tag, or a remote-only ref (`recorded_ref_missing`). Restore the local branch or reprovision the workspace.
+- A `git_worktree` workspace has no recorded branch (`recorded_branch_metadata_missing`). Reprovision the workspace to record its branch. Other execution workspace strategies are compared only when they record a branch. They are not refused when the recorded branch is empty.
+- Git cannot read the checkout, for example because of its permissions or ownership (`checkout_unreadable`). The refusal records Git's error. The check is never skipped for such a checkout. Only a directory with no `.git` entry in it or in a parent directory is treated as a non-Git directory and is not checked. Restore access to the checkout or reprovision the workspace.
+
+The check does not apply to a project workspace start, because the project primary checkout has no recorded branch. Its default ref is not compared with the checkout, so the project primary checkout can be on any branch. The check also does not apply when an execution-workspace job runs.
+
+This detects drift inside the managed-start flow. It does not lock the checkout against a later `git checkout` from outside that flow.
+
 ## Execution workspace inheritance
 
 Execution workspaces isolate code and runtime state from the project primary workspace.

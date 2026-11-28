@@ -69,6 +69,7 @@ import {
   workspaceLoginHandoffFailureStatus,
 } from "../services/workspace-login-handoff-issuer.js";
 import { conflict, unprocessable } from "../errors.js";
+import { checkoutBranchDriftAsHttpConflict } from "../services/checkout-branch-drift-conflict.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -540,8 +541,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         serviceIndex: selectedServiceIndex,
       },
       run: async (reportProgress) => {
-        const ensureWorkspaceAvailable = async () =>
+        const ensureWorkspaceAvailable = async (options: { preserveRecordedCheckoutBranch: boolean }) =>
           await ensurePersistedExecutionWorkspaceAvailable({
+            db,
             base: {
               baseCwd: projectWorkspace?.cwd ?? workspaceCwd,
               source: existing.mode === "shared_workspace" ? "project_primary" : "task_session",
@@ -551,6 +553,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               repoRef: existing.baseRef,
             },
             workspace: {
+              id: existing.id,
               mode: existing.mode,
               strategyType: existing.strategyType,
               cwd: existing.cwd,
@@ -582,13 +585,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               companyId: existing.companyId,
             },
             recorder,
+            preserveRecordedCheckoutBranch: options.preserveRecordedCheckoutBranch,
           });
 
         if (action === "run") {
           if (!workspaceCommand || workspaceCommand.kind !== "job") {
             throw new Error("Workspace job selection is required");
           }
-          const availableWorkspace = await ensureWorkspaceAvailable();
+          const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: false });
           if (!availableWorkspace) {
             throw new Error("Execution workspace needs a local path before Paperclip can run workspace commands");
           }
@@ -820,7 +824,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             await reportRepairPhase("managed_restart", "started");
             let startedServices: Awaited<ReturnType<typeof startRuntimeServicesForWorkspaceControl>> = [];
             if (repairRestartsRuntimeServices) {
-              const availableWorkspace = await ensureWorkspaceAvailable();
+              const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: true });
               if (!availableWorkspace) {
                 throw new Error("Execution workspace needs a local path before Paperclip can restart it.");
               }
@@ -834,7 +838,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 issue: existing.sourceIssueId
                   ? { id: existing.sourceIssueId, identifier: null, title: existing.name }
                   : null,
-                workspace: availableWorkspace,
+                workspace: {
+                  ...availableWorkspace,
+                  branchName: existing.branchName ?? availableWorkspace.branchName,
+                },
                 executionWorkspaceId: existing.id,
                 config: {
                   workspaceRuntime: effectiveRuntimeConfig,
@@ -846,6 +853,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 adapterEnv: {},
                 onLog,
                 recorder,
+                assertRecordedCheckoutBranch: true,
               });
             }
             runtimeServiceCount = startedServices.length;
@@ -876,7 +884,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         }
 
         if (action === "start" || action === "restart") {
-          const availableWorkspace = await ensureWorkspaceAvailable();
+          const availableWorkspace = await ensureWorkspaceAvailable({ preserveRecordedCheckoutBranch: true });
           if (!availableWorkspace) {
             throw new Error("Execution workspace needs a local path before Paperclip can manage local runtime services");
           }
@@ -896,7 +904,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                     title: existing.name,
                   }
                 : null,
-              workspace: availableWorkspace,
+              workspace: {
+                ...availableWorkspace,
+                branchName: existing.branchName ?? availableWorkspace.branchName,
+              },
               executionWorkspaceId: existing.id,
               config: {
                 workspaceRuntime: effectiveRuntimeConfig,
@@ -910,6 +921,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               recorder,
               serviceIndex: selectedServiceIndex,
               runtimeServiceId: selectedRuntimeServiceId,
+              assertRecordedCheckoutBranch: true,
             });
           } catch (error) {
             // A failed start must leave the workspace stopped and retryable rather than
@@ -1013,7 +1025,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           if (action === "start" || action === "restart" || action === "repair") {
             await reconcileFailedRuntimeStart(error);
           }
-          throw error;
+          throw checkoutBranchDriftAsHttpConflict(error);
         }
       },
     });

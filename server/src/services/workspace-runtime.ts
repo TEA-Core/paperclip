@@ -1805,6 +1805,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
   contentionExcludeExecutionWorkspaceId?: string | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<GitWorktreeBranchIncoherenceEvidence> {
   // SUP-11169: a populated directory with no git metadata of its own resolves
   // UPWARD to the enclosing repository, so every `git` call below would answer
@@ -1923,8 +1924,16 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const plainLanguageReason = inProgressOperation
     ? `${basePlainLanguageReason} An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is still in progress in this worktree.`
     : basePlainLanguageReason;
+  // On managed start, restart, and repair, same-tip and contained-head
+  // repairs also move HEAD, so a live claimant on this checkout keeps that
+  // HEAD. Heartbeat dispatch keeps its earlier repair behaviour.
+  const blockingLiveContention = input.preserveRecordedCheckoutBranch === true ? liveContention : null;
   const canCheckoutRecordedBranch =
-    cleanliness === "clean" && expectedBranchExists && sameHead && registeredBranchMatchesHead;
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    sameHead &&
+    registeredBranchMatchesHead &&
+    !blockingLiveContention;
   const canAdoptForwardActualBranch =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1957,7 +1966,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     registeredBranchMatchesHead &&
     input.actualBranchName !== null &&
     ancestryVerdict !== "ancestor" &&
-    actualHeadContainedInExpectedBranch;
+    actualHeadContainedInExpectedBranch &&
+    !blockingLiveContention;
   // SUP-11207: the containment proof above is only *needed* when the commits on HEAD would
   // otherwise become unreachable — a detached HEAD, or a branch ref that no longer exists. When
   // HEAD is on a live named branch that git still resolves, checking out the recorded branch
@@ -2704,6 +2714,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   persistForwardReconcile?: boolean;
   reconcileOperationPhase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<GitWorktreeBranchCoherenceResult> {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
@@ -2725,6 +2736,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     executionWorkspaceId: input.executionWorkspaceId ?? null,
     contentionExcludeExecutionWorkspaceId:
       input.contentionExcludeExecutionWorkspaceId ?? input.executionWorkspaceId ?? null,
+    preserveRecordedCheckoutBranch: input.preserveRecordedCheckoutBranch === true,
   });
 
   if (evidence.reason === WORKTREE_METADATA_MISSING_REASON) {
@@ -3755,6 +3767,219 @@ export async function inspectManagedGitWorktreeBranch(input: {
     repoRoot,
     actualBranchName,
   };
+}
+
+export type CheckoutBranchDriftReasonCode =
+  | "branch_mismatch"
+  | "detached_head_off_recorded_tip"
+  | "recorded_ref_missing"
+  | "recorded_branch_metadata_missing"
+  | "checkout_unreadable";
+
+export type CheckoutBranchDriftEvidence = {
+  reason: "checkout_branch_drift";
+  reasonCode: CheckoutBranchDriftReasonCode;
+  expectedBranch: string | null;
+  expectedRef: string | null;
+  expectedTipSha: string | null;
+  actualBranch: string | null;
+  actualRef: string | null;
+  headSha: string | null;
+  canonicalCwd: string;
+  executionWorkspaceId: string | null;
+  /** Why Git could not read the checkout; set only for `checkout_unreadable`. */
+  probeError: string | null;
+};
+
+const LOCAL_BRANCH_REF_PREFIX = "refs/heads/";
+
+/**
+ * The full local branch ref for a recorded branch name. A recorded value is
+ * always a local branch name, so the comparison never shortens a ref:
+ * `origin/topic` is `refs/heads/origin/topic`, not `topic`, and a branch
+ * named like a 40-hex commit is an ordinary branch.
+ */
+function recordedBranchFullRef(recorded: string) {
+  return recorded.startsWith(LOCAL_BRANCH_REF_PREFIX) ? recorded : `${LOCAL_BRANCH_REF_PREFIX}${recorded}`;
+}
+
+function shortLocalBranchName(fullRef: string | null) {
+  if (!fullRef) return null;
+  return fullRef.startsWith(LOCAL_BRANCH_REF_PREFIX) ? fullRef.slice(LOCAL_BRANCH_REF_PREFIX.length) : fullRef;
+}
+
+function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence) {
+  const where =
+    `in canonical cwd "${evidence.canonicalCwd}" ` +
+    `(execution workspace ${evidence.executionWorkspaceId ?? "<none>"}).`;
+  const found =
+    `"${evidence.actualRef ?? "<detached>"}" at HEAD ${evidence.headSha ?? "<unresolved>"}`;
+  switch (evidence.reasonCode) {
+    case "checkout_unreadable":
+      return (
+        `Managed checkout branch drift: Git cannot read the checkout ${where} ` +
+        `Its branch cannot be verified against "${evidence.expectedRef ?? "<none recorded>"}" ` +
+        `(${evidence.probeError ?? "unknown error"}). Restore the checkout's permissions or ownership, ` +
+        `or reprovision the execution workspace. The recorded branch was left unchanged.`
+      );
+    case "recorded_branch_metadata_missing":
+      return (
+        `Managed checkout branch drift: the workspace has no recorded branch, so the checkout on ${found} ` +
+        `cannot be verified ${where} Reprovision the execution workspace to record its branch.`
+      );
+    case "recorded_ref_missing":
+      return (
+        `Managed checkout branch drift: the recorded branch "${evidence.expectedBranch}" has no local ref ` +
+        `"${evidence.expectedRef}"; found ${found} ${where} ` +
+        `Restore the local branch or reprovision the execution workspace. The recorded branch was left unchanged.`
+      );
+    case "detached_head_off_recorded_tip":
+      return (
+        `Managed checkout branch drift: expected "${evidence.expectedRef}" at ${evidence.expectedTipSha ?? "<unresolved>"} ` +
+        `but found a detached HEAD ${evidence.headSha ?? "<unresolved>"} ${where} ` +
+        `The recorded branch was left unchanged.`
+      );
+    case "branch_mismatch":
+      return (
+        `Managed checkout branch drift: expected "${evidence.expectedRef}" but found ${found} ${where} ` +
+        `The recorded branch was left unchanged.`
+      );
+  }
+}
+
+type BoundCheckoutGitIdentity =
+  | { kind: "git"; canonicalCwd: string; headRef: string | null; headSha: string | null }
+  | { kind: "not_git"; canonicalCwd: string }
+  | { kind: "unreadable"; canonicalCwd: string; probeError: string };
+
+/**
+ * Whether `dir` or one of its ancestors has a `.git` entry, or one cannot be
+ * ruled out because a directory on the path cannot be read.
+ */
+async function mayBeInsideGitCheckout(dir: string) {
+  let current = dir;
+  for (;;) {
+    try {
+      await fs.lstat(path.join(current, ".git"));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+/**
+ * Read the identity of a bound checkout. Returns null only when the directory
+ * does not exist. A probe that fails is `unreadable` unless the path has no
+ * `.git` entry at all: Git reports "not a git repository" for an unreadable
+ * `.git` directory too, so its message cannot tell a plain directory apart.
+ */
+async function readBoundCheckoutGitIdentity(cwd: string): Promise<BoundCheckoutGitIdentity | null> {
+  let canonicalCwd = cwd;
+  let probed = false;
+  try {
+    if (!await directoryExists(cwd)) return null;
+    canonicalCwd = await resolvePathForWorktreeComparison(cwd);
+    probed = true;
+    await runGit(["rev-parse", "--git-dir"], canonicalCwd);
+  } catch (error) {
+    if (probed && !await mayBeInsideGitCheckout(canonicalCwd)) return { kind: "not_git", canonicalCwd };
+    return {
+      kind: "unreadable",
+      canonicalCwd,
+      probeError: error instanceof Error ? error.message : String(error),
+    };
+  }
+  // Full symbolic ref, never `--short`: a shortened name is ambiguous when a
+  // tag or a remote-tracking ref shares it.
+  const headRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
+  const headSha = await runGit(["rev-parse", "--verify", "--quiet", "HEAD"], canonicalCwd).catch(() => null);
+  return { kind: "git", canonicalCwd, headRef, headSha };
+}
+
+/**
+ * Re-read a bound checkout after restore, provisioning, and service startup.
+ * A Git checkout passes only when HEAD is the recorded local branch, compared
+ * by full ref name, or a detached HEAD at that branch's tip. A recorded branch
+ * with no local ref is refused. A `git_worktree` row with no recorded branch
+ * is a legacy row and is refused with a reprovision remedy. Other strategies
+ * are compared only when they record a branch; an empty value there is not
+ * refused. Ordinary non-Git project directories are left alone, but a checkout
+ * Git cannot read is refused: it is never started unverified.
+ * The recorded branch is not rewritten to whatever HEAD happens to name.
+ */
+async function assertRecordedCheckoutBranchIdentity(input: {
+  cwd: string;
+  expectedBranch: string | null | undefined;
+  strategy?: string | null;
+  executionWorkspaceId?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<void> {
+  const expectedRaw = asString(input.expectedBranch, "").trim();
+  if (!expectedRaw && input.strategy !== "git_worktree") return;
+  const identity = await readBoundCheckoutGitIdentity(input.cwd);
+  if (!identity || identity.kind === "not_git") return;
+
+  const expectedRef = expectedRaw ? recordedBranchFullRef(expectedRaw) : null;
+  let reasonCode: CheckoutBranchDriftReasonCode;
+  let expectedTipSha: string | null = null;
+  if (identity.kind === "unreadable") {
+    reasonCode = "checkout_unreadable";
+  } else if (!expectedRef) {
+    reasonCode = "recorded_branch_metadata_missing";
+  } else {
+    // `show-ref --verify` reads only the exact ref. Revision parsing would fall
+    // back to a tag such as `refs/tags/refs/heads/<name>` when the branch is gone,
+    // and an unborn HEAD can name a branch that has no ref at all.
+    expectedTipSha = await runGit(["show-ref", "--verify", "--hash", expectedRef], identity.canonicalCwd)
+      .catch(() => null);
+    if (!expectedTipSha) {
+      reasonCode = "recorded_ref_missing";
+    } else if (identity.headRef === expectedRef) {
+      return;
+    } else if (identity.headRef === null) {
+      if (identity.headSha === expectedTipSha) return;
+      reasonCode = "detached_head_off_recorded_tip";
+    } else {
+      reasonCode = "branch_mismatch";
+    }
+  }
+
+  const headRef = identity.kind === "git" ? identity.headRef : null;
+  const evidence: CheckoutBranchDriftEvidence = {
+    reason: "checkout_branch_drift",
+    reasonCode,
+    expectedBranch: expectedRef ? shortLocalBranchName(expectedRef) : null,
+    expectedRef,
+    expectedTipSha,
+    actualBranch: shortLocalBranchName(headRef),
+    actualRef: headRef,
+    headSha: identity.kind === "git" ? identity.headSha : null,
+    canonicalCwd: identity.canonicalCwd,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    probeError: identity.kind === "unreadable" ? identity.probeError : null,
+  };
+  const message = formatCheckoutBranchDriftMessage(evidence);
+  if (input.recorder) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: identity.kind === "unreadable" ? "git rev-parse --git-dir" : "git symbolic-ref HEAD",
+      cwd: identity.canonicalCwd,
+      metadata: { checkoutBranchDrift: evidence },
+      run: async () => ({
+        status: "failed",
+        stderr: message,
+        metadata: { checkoutBranchDrift: evidence },
+      }),
+    }).catch(() => undefined);
+  }
+  throw new WorkspaceRuntimeValidationFailure(message, {
+    workspaceValidation: evidence,
+  });
 }
 
 async function validateLinkedGitWorktree(input: {
@@ -5546,6 +5771,46 @@ function liveProjectPrimaryRestoreGuard(
   };
 }
 
+/**
+ * Hygiene must not treat the checkout it is about to restore as a disposable
+ * base when that path is the bound source. Canonical comparison covers a
+ * symlink alias of the same checkout. The hygiene root is the toplevel of the
+ * configured base checkout, so a bound linked worktree configured as that base
+ * is protected only by this guard.
+ */
+function sameSourceCheckoutRestoreGuard(input: {
+  sourceCwd: string;
+  hygieneRoot: string;
+}): BaseRepoRestoreGuard {
+  return async () => {
+    const root = await resolvePathForWorktreeComparison(input.hygieneRoot);
+    const source = await resolvePathForWorktreeComparison(input.sourceCwd);
+    // A workspace can run from a subdirectory of its checkout. The checkout
+    // root is what hygiene would force-checkout, so compare that too.
+    const sourceTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.sourceCwd)
+      .then((value) => resolvePathForWorktreeComparison(value))
+      .catch(() => null);
+    if (source === root || sourceTopLevel === root) {
+      return "it is the bound source checkout, not a disposable base repository";
+    }
+    return null;
+  };
+}
+
+function composeBaseRepoRestoreGuards(
+  guards: Array<BaseRepoRestoreGuard | null | undefined>,
+): BaseRepoRestoreGuard {
+  return async () => {
+    for (const guard of guards) {
+      if (!guard) continue;
+      const reason = await guard();
+      if (reason) return reason;
+    }
+    return null;
+  };
+}
+
+
 export async function prepareBaseRepoForWorkspace(input: {
   repoRoot: string;
   configuredBaseRef: string | null;
@@ -6460,6 +6725,28 @@ export async function realizeExecutionWorkspace(input: {
   };
 }
 
+async function finishPreservedCheckout(
+  realized: RealizedExecutionWorkspace,
+  input: {
+    preserveRecordedCheckoutBranch?: boolean;
+    workspace: { branchName?: string | null; id?: string | null };
+    recorder?: WorkspaceOperationRecorder | null;
+  },
+): Promise<RealizedExecutionWorkspace> {
+  if (input.preserveRecordedCheckoutBranch !== true) return realized;
+  await assertRecordedCheckoutBranchIdentity({
+    cwd: realized.cwd,
+    expectedBranch: input.workspace.branchName,
+    strategy: realized.strategy,
+    executionWorkspaceId: input.workspace.id ?? null,
+    recorder: input.recorder ?? null,
+  });
+  return {
+    ...realized,
+    branchName: input.workspace.branchName ?? realized.branchName,
+  };
+}
+
 export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -6487,6 +6774,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   enableWorkspaceDirtyQuarantineRepair?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
   if (!cwd) return null;
@@ -6519,7 +6807,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     if (!await directoryExists(cwd)) {
       return null;
     }
-    return realized;
+    return finishPreservedCheckout(realized, input);
   }
   // Validate the base checkout before the git spawn. A missing or empty base
   // path makes the "git" spawn fail with a raw "spawn git ENOENT" error. That
@@ -6562,6 +6850,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         persistForwardReconcile: false,
         reconcileOperationPhase: "worktree_prepare",
         recorder: input.recorder ?? null,
+        preserveRecordedCheckoutBranch: input.preserveRecordedCheckoutBranch === true,
       });
       if (coherence.branchName) {
         realized.branchName = coherence.branchName;
@@ -6571,11 +6860,35 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       }
       repairWarnings.push(...coherence.warnings);
     }
-    const validation = await validateLinkedGitWorktree({
+    let validation = await validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reuseWorktreePath,
       expectedBranchName: realized.branchName,
     });
+    if (!validation.valid && input.preserveRecordedCheckoutBranch === true) {
+      // A managed start/restart/repair reports a checkout that already
+      // drifted from its recorded branch as the 409 drift refusal, with its
+      // evidence. It throws only on drift; any other reuse failure falls
+      // through to the error below.
+      await assertRecordedCheckoutBranchIdentity({
+        cwd: reuseWorktreePath,
+        expectedBranch: realized.branchName,
+        strategy: realized.strategy,
+        executionWorkspaceId: input.workspace.id ?? null,
+        recorder: input.recorder ?? null,
+      });
+      // The identity guard compares full refs and accepts only HEAD on
+      // `refs/heads/<recorded>` or detached at the recorded tip. Every
+      // registration check precedes the branch check, so a `branch_mismatch`
+      // that passed the guard is a registered worktree on the recorded branch
+      // (whose short name git disambiguated) or at its tip: it is not drift,
+      // and the managed start leaves the checkout as it is.
+      if (validation.reasonCode === "branch_mismatch") {
+        await assertGitIndexIntegrity(reuseWorktreePath);
+        await assertGitHeadResolvable(reuseWorktreePath);
+        validation = { valid: true };
+      }
+    }
     if (!validation.valid) {
       throw new WorkspaceRuntimeValidationFailure(
         // `repoRoot` is the repository the registration was looked up in, and
@@ -6605,7 +6918,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           configuredBaseRef: reuseBaseRef,
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
-          restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+          restoreGuard: composeBaseRepoRestoreGuards([
+            liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+            sameSourceCheckoutRestoreGuard({ sourceCwd: cwd, hygieneRoot: repoRoot }),
+          ]),
         })
       : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
     if (baseRepoHygiene.divergenceAlert) {
@@ -6655,7 +6971,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       created: false,
       recorder: input.recorder ?? null,
     });
-    return realized;
+    return finishPreservedCheckout(realized, input);
   }
 
   const worktreePath = realized.worktreePath ?? cwd;
@@ -6674,7 +6990,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         configuredBaseRef: restoreBaseRef,
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
-        restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+        restoreGuard: composeBaseRepoRestoreGuards([
+          liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+          sameSourceCheckoutRestoreGuard({ sourceCwd: cwd, hygieneRoot: repoRoot }),
+        ]),
       })
     : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
   if (baseRepoHygiene.divergenceAlert) {
@@ -6791,7 +7110,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     recorder: input.recorder ?? null,
   });
 
-  return {
+  return finishPreservedCheckout({
     ...realized,
     cwd: worktreePath,
     worktreePath,
@@ -6802,7 +7121,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       recordedBaseRefSha
       ?? (created ? restoreWorktreeBaseSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
-  };
+  }, input);
 }
 
 /**
@@ -7580,6 +7899,11 @@ const PORT_ALLOCATION_ATTEMPTS = 12;
 
 export function resetRuntimeServicePortReservationsForTests() {
   inFlightAllocatedPorts.clear();
+}
+
+/** Test-only: the loopback ports an in-flight start still claims in-process. */
+export function listRuntimeServicePortReservationsForTests() {
+  return [...inFlightAllocatedPorts.keys()];
 }
 
 function reservePortIfFree(port: number, now = Date.now()): boolean {
@@ -9048,6 +9372,7 @@ type StartLocalRuntimeServiceInput = {
   reuseKey: string | null;
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
+  assertRecordedCheckoutBranch?: boolean;
 };
 
 type RuntimeProvisionCoordinator = {
@@ -9361,6 +9686,21 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
+  // These checks run while the start transaction holds the execution
+  // workspace row `FOR UPDATE`. A recorder insert on its own connection needs a
+  // key-share lock on that row and would wait on this transaction forever, so
+  // the refusal carries its evidence on the thrown error instead; the outer
+  // workspace operation records it when it fails.
+  const assertSpawnCheckoutBranch = async () => {
+    if (input.assertRecordedCheckoutBranch !== true) return;
+    await assertRecordedCheckoutBranchIdentity({
+      cwd: input.workspace.cwd,
+      expectedBranch: input.workspace.branchName,
+      strategy: input.workspace.strategy,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      recorder: null,
+    });
+  };
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
   const startedByRunId = input.startedByRunId === undefined ? input.runId : input.startedByRunId;
   const identity = resolveRuntimeServiceReuseIdentity({
@@ -9844,14 +10184,23 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     }
   }
 
+  // Every refusal between the reservations above and the spawn below leaves
+  // through this one rollback: release the port claims, and remove the broker
+  // exposure with its persisted row marked stopped instead of "starting".
   try {
     await ensureServerWorkspaceLinksCurrent(serviceCwd, {
       onLog: input.onLog,
     });
+    await assertSpawnCheckoutBranch();
   } catch (error) {
     releasePortReservation(reservedPort);
     releasePortReservation(claimedIdentityPort);
-    if (reservedExposure) await cleanupRecordExposure(record);
+    if (reservedExposure) {
+      record.status = "stopped";
+      record.healthStatus = "unhealthy";
+      record.stoppedAt = new Date().toISOString();
+      await cleanupRecordExposure(record);
+    }
     throw error;
   }
 
@@ -9959,6 +10308,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   ]).then(async () => {
     releasePortReservation(reservedPort);
     releasePortReservation(claimedIdentityPort);
+    // Drift during readiness must be refused before the broker publishes the
+    // backend. The check after publication still catches drift during it.
+    if (record.exposureConfig) await assertSpawnCheckoutBranch();
     if (record.exposureConfig && record.exposureHandle && record.port) {
       const provisioned = await provisionExposure(workspaceRuntimeExposureDeps, {
         runtimeId: record.id,
@@ -10019,6 +10371,8 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         }
       }
     }
+    await assertSpawnCheckoutBranch();
+
     record.status = "running";
     record.healthStatus = "healthy";
     record.lastUsedAt = new Date().toISOString();
@@ -10120,6 +10474,29 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     if (exposureConfig) {
       await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
     }
+    if (err instanceof WorkspaceRuntimeValidationFailure) throw err;
+    try {
+      await assertSpawnCheckoutBranch();
+    } catch (drift) {
+      if (drift instanceof WorkspaceRuntimeValidationFailure) {
+        const wrapped = new WorkspaceRuntimeValidationFailure(
+          `${drift.message} Original startup error: ${failureMessage}`,
+          {
+            ...drift.resultJson,
+            originalError: failureMessage,
+          },
+        );
+        wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
+        throw wrapped;
+      }
+      // An unexpected recheck error did not establish drift. Keep the original
+      // startup failure and its classification below.
+      await input.onLog?.(
+        "stderr",
+        `[service:${serviceName}] checkout branch recheck failed: ${drift instanceof Error ? drift.message : String(drift)}\n`,
+      ).catch(() => undefined);
+    }
+
     if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);
     if (exposureHostCollision && port) {
       // A verified host listener holds the assigned exposure port. Quarantine the
@@ -10157,6 +10534,10 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     );
   });
 
+  // Callers await readiness only after more work, and a deferred start only
+  // after its transaction commits. A service that exits during that work must
+  // not surface as an unhandled rejection; each awaiting caller still gets it.
+  readinessPromise.catch(() => undefined);
   return { record, readiness: readinessPromise };
 }
 
@@ -10280,7 +10661,12 @@ async function startLocalRuntimeService(
       remediation: "Retry the start or configure a different runtime service port.",
     });
   } catch (error) {
-    if (!started && provisioningRecord && provisioningRecord.status === "starting") {
+    if (
+      !started
+      && provisioningRecord
+      && provisioningRecord.status === "starting"
+      && !(await driftRefusalStoppedRuntimeServiceRow(input.db, provisioningRecord.id, error))
+    ) {
       const nowIso = new Date().toISOString();
       provisioningRecord.status = "failed";
       provisioningRecord.healthStatus = "unhealthy";
@@ -10290,6 +10676,25 @@ async function startLocalRuntimeService(
     }
     throw error;
   }
+}
+
+/**
+ * A checkout-drift refusal before spawn that shares the provisioning row id
+ * (HTTPS exposure) already saved that row as stopped, with its exposure state
+ * and broker handle. The stale in-memory provisioning object must not
+ * overwrite it. Every other failed start is still recorded as failed.
+ */
+async function driftRefusalStoppedRuntimeServiceRow(db: Db | undefined, id: string, error: unknown) {
+  if (!db) return false;
+  if (!(error instanceof WorkspaceRuntimeValidationFailure)) return false;
+  const validation = error.resultJson.workspaceValidation as { reason?: unknown } | undefined;
+  if (validation?.reason !== "checkout_branch_drift") return false;
+  const [row] = await db
+    .select({ status: workspaceRuntimeServices.status })
+    .from(workspaceRuntimeServices)
+    .where(eq(workspaceRuntimeServices.id, id))
+    .catch(() => []);
+  return row?.status === "stopped";
 }
 
 function scheduleIdleStop(record: RuntimeServiceRecord) {
@@ -10997,6 +11402,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
   serviceIndex?: number | null;
   runtimeServiceId?: string | null;
   respectDesiredStates?: boolean;
+  assertRecordedCheckoutBranch?: boolean;
 };
 
 type WorkspaceControlStartBatch = {
@@ -11096,6 +11502,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
       reuseKey,
       scopeType,
       scopeId,
+      assertRecordedCheckoutBranch: input.assertRecordedCheckoutBranch === true,
     };
 
     // Manually controlled services are not tied to a heartbeat run lifecycle, so they do not
@@ -11107,10 +11514,14 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     await persistRuntimeServiceRecord(persistenceDb, started.record);
     refs.push(toRuntimeServiceRef(started.record));
 
-    if (options?.deferReadiness && started.record.status === "starting" && !started.record.reused) {
-      // Attach a rejection handler immediately; the caller awaits the same promise after
-      // the DB transaction commits, but transaction failures may skip that wait path.
-      started.readiness.catch(() => undefined);
+    // A branch-checked managed start tracks every deferred start, not only one
+    // still `starting`: a service that exits while the row above is persisted
+    // is already finalized, and its readiness rejection must still fail the
+    // start. Other starts keep tracking only `starting` rows, so such an exit
+    // still resolves with its finalized record; widening that is a known follow-up.
+    const trackReadiness =
+      input.assertRecordedCheckoutBranch === true || started.record.status === "starting";
+    if (options?.deferReadiness && trackReadiness && !started.record.reused) {
       pendingReadiness.push({ ...started, service });
       startedServiceIds.push(started.record.id);
     }
