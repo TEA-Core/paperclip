@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createIssueSchema, updateIssueSchema } from "@paperclipai/shared";
 import {
   LIVE_RUN_CAP_CEILING,
   LIVE_RUN_CAP_RESERVED_SLOTS,
@@ -244,6 +245,21 @@ describe("classifyLiveRunCapRun", () => {
     { label: "a stage with no recorded seat", issueExecutionState: { ...pendingStage(agentId), participantSeat: undefined } },
   ])("treats $label as general", ({ label: _label, ...override }) => {
     expect(classifyLiveRunCapRun({ ...base, ...override })).toBe("general");
+  });
+
+  it("treats a monitor-minted recovery card (fingerprint issue_monitor:) as general, but not other recovery cards", () => {
+    const minted = { issueOriginKind: "stranded_issue_recovery", issueOriginFingerprint: "issue_monitor:timeout_exceeded:2026-04-11T12:31:00.000Z:1" };
+    expect(classifyLiveRunCapRun({ ...base, ...minted })).toBe("general");
+    expect(classifyLiveRunCapRun({ ...base, issueOriginKind: "stranded_issue_recovery", issueOriginFingerprint: "stranded_issue_recovery:abc" })).toBe("review_recovery");
+    expect(classifyLiveRunCapRun({ ...base, issueOriginKind: "stranded_issue_recovery", issueOriginFingerprint: null })).toBe("review_recovery");
+    // A human/board wake keeps its class, and a genuinely seated review on the card keeps its own.
+    expect(classifyLiveRunCapRun({ ...base, ...minted, requestedByActorType: "user" })).toBe("human_board");
+    expect(classifyLiveRunCapRun({ ...base, ...minted, issueExecutionState: pendingStage(agentId) })).toBe("review_recovery");
+  });
+
+  it.each(["originFingerprint", "originKind", "originId"])("cannot be set through the issue API: create and update reject %s", (key) => {
+    expect(createIssueSchema.safeParse({ title: "t", [key]: "issue_monitor:forged" }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({ title: "t", [key]: "issue_monitor:forged" }).success).toBe(false);
   });
 
   it.each(["agent", "system", null])("ignores everything a %s-requested wake could choose", (requestedByActorType) => {

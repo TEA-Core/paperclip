@@ -266,6 +266,30 @@ export interface IssueBlockerDiagnosticsResponse {
   };
 }
 
+/**
+ * Read-only answer for GET /api/issues/{id}/publication-close-eligibility.
+ * Every key is present. A true boolean means the accept path would refuse the
+ * card for that binding. Only `cachedLinkedPullRequestFetchedAt` can be null.
+ */
+export interface PublicationCloseEligibility {
+  deliveryIdentity: boolean;
+  deliveryReceipt: boolean;
+  /**
+   * Cached and advisory. True when the card has a cached GitHub pull-request
+   * mention whose cached state is open or unknown, drafts included. This is the
+   * cached read the accept path uses. The route does not call GitHub, so it does
+   * not refresh that state and does not discover unmentioned pull requests. The
+   * done-close guard does both and can decide differently.
+   */
+  cachedLinkedPullRequest: boolean;
+  /**
+   * ISO-8601 time of the oldest GitHub fetch among the card's cached
+   * pull-request rows that `cachedLinkedPullRequest` reads. Null when there is
+   * no such row or when one of them was never fetched.
+   */
+  cachedLinkedPullRequestFetchedAt: string | null;
+}
+
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";
 
 export interface IssueWakeDiagnosticWakeRequest {
@@ -757,6 +781,12 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Set when the exhaustion recovery ran for an agent-armed monitor. Sticky: no clear,
+   * re-arm or bound change resets it; only a board-armed monitor write does. While it
+   * is set the owner agent cannot re-arm this issue's monitor.
+   */
+  exhaustionRecoveredAt?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }
@@ -871,6 +901,10 @@ export interface IssueExecutionDecision {
   outcome: IssueExecutionDecisionOutcome;
   body: string;
   createdByRunId: string | null;
+  /** The delivered head the decision was made on; null when none was recorded. */
+  deliveredHeadSha: string | null;
+  /** The review round (stage `pendingSince`) the decision was made in; null when none was recorded. */
+  reviewRoundStartedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

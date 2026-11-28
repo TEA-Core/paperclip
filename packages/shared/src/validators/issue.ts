@@ -471,6 +471,24 @@ export const gitCommitShaSchema = z
  */
 export const GIT_COMMIT_SHA_WIRE_PATTERN = new RegExp(`^\\s*${GIT_COMMIT_SHA_DIGITS}\\s*$`);
 
+/**
+ * SUP-25193: board-attached landing proof (`POST /issues/:id/landing-proof`).
+ * Names one merged pull request in the card's project repository and at least
+ * one of its commits; the server verifies every field against GitHub.
+ */
+export const attachIssueLandingProofSchema = z.object({
+  owner: z.string().trim().min(1),
+  repo: z.string().trim().min(1),
+  pullRequestNumber: z.number().int().positive(),
+  mergeCommitSha: gitCommitShaSchema.optional(),
+  headSha: gitCommitShaSchema.optional(),
+  reason: z.string().trim().min(1).max(2000),
+}).strict().refine(
+  (body) => body.mergeCommitSha !== undefined || body.headSha !== undefined,
+  { message: "mergeCommitSha or headSha is required", path: ["mergeCommitSha"] },
+);
+export type AttachIssueLandingProof = z.infer<typeof attachIssueLandingProofSchema>;
+
 // R20: bounds only. The cross-field rule (afterRounds within the resolved
 // round ceiling) needs the server's default ceiling, so it is enforced where
 // every policy write normalizes: normalizeIssueExecutionPolicy.
@@ -548,6 +566,8 @@ export const issueExecutionMonitorStateSchema = z.object({
     .nullable()
     .optional()
     .default(null),
+  // Optional without a default: states that never recovered stay byte-identical.
+  exhaustionRecoveredAt: z.string().datetime().nullable().optional(),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
 });
@@ -1189,6 +1209,20 @@ export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
 
 export type DoneTierDeclaration = z.infer<typeof doneTierDeclarationSchema>;
 
+// This is a request to prove first-review admission, never a close declaration.
+const reviewEntryPreconditionSchema = z.object({
+  kind: z.literal("noRepositoryDelivery"),
+  expectedStatusVersion: z.number().int().nonnegative(),
+  expectedExecutionWorkspaceId: z.string().uuid(),
+  expectedExecutionPolicy: z.record(z.string(), z.unknown()).nullable(),
+  expectedExecutionState: z.record(z.string(), z.unknown()).nullable(),
+  entryRulingRevisionId: z.string().uuid(),
+  artifact: z.object({
+    documentKey: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+    revisionId: z.string().uuid(),
+  }).strict(),
+}).strict();
+
 export const updateIssueObjectSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     watchdog: true,
@@ -1201,6 +1235,7 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
     doneTier: doneTierDeclarationSchema.optional(),
+    reviewEntryPrecondition: reviewEntryPreconditionSchema.optional(),
     commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),

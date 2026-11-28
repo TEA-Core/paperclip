@@ -1122,7 +1122,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     expect(await statusOf(newer!.id)).toBe("running");
   });
 
-  // ─── (r) round 4: an agent's own writes never reach the reserved lane ─────
+  // ─── (r) a monitor-minted recovery card never reaches the reserved lane ───
 
   /**
    * An agent's own card with an external-service monitor that has already
@@ -1158,19 +1158,19 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     return issueId;
   }
 
-  async function recoveryCardsFor(sourceIssueId: string) {
-    return db.select({ id: issues.id }).from(issues).where(and(
-      eq(issues.originKind, "stranded_issue_recovery"),
-      eq(issues.originId, sourceIssueId),
-    ));
-  }
-
   async function runsOf(agentId: string) {
     return db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
   }
 
-  it("(r) F1: an agent's own monitor (create_recovery_issue, then check-now) mints no recovery card, and its run stays in the general lane", async () => {
+  async function recoveryCardFingerprints(sourceIssueId: string) {
+    return db.select({ fingerprint: issues.originFingerprint }).from(issues).where(and(
+      eq(issues.originKind, "stranded_issue_recovery"),
+      eq(issues.originId, sourceIssueId),
+    )).then((rows) => rows.map((row) => row.fingerprint));
+  }
+
+  it("(r) F1: an agent's own monitor (create_recovery_issue, then check-now) mints a recovery card whose run stays in the general lane", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const agent = await seedAgent("SelfMonitor");
     const sourceId = await seedTimedOutMonitorCard(agent, "assignee");
@@ -1179,18 +1179,22 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await heartbeat.triggerIssueMonitor(sourceId, { actorType: "agent", actorId: agent, agentId: agent });
     await heartbeat.resumeQueuedRuns();
 
-    expect(await recoveryCardsFor(sourceId)).toEqual([]);
+    const fingerprints = await recoveryCardFingerprints(sourceId);
+    expect(fingerprints).toHaveLength(1);
+    expect(fingerprints[0]).toMatch(/^issue_monitor:/);
+    // Only reserved slots are free, and the card's run does not use them.
     expect(await statusOf(olderGeneral)).toBe("queued");
     expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
+    expect((await runsOf(agent)).filter((run) => run.status === "queued")).not.toEqual([]);
 
-    // The next general slot goes to the older general run.
+    // The next general slot goes to the older general run, not to the card.
     await finishLiveRuns(1);
     await heartbeat.resumeQueuedRuns();
     expect(await statusOf(olderGeneral)).toBe("running");
     expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
   });
 
-  it("(r) F1: the scheduled sweep of an agent-scheduled monitor mints no recovery card either", async () => {
+  it("(r) F1: the scheduled sweep of an agent-scheduled monitor mints a card that also waits for a general slot", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const agent = await seedAgent("SelfMonitorSweep");
     const sourceId = await seedTimedOutMonitorCard(agent, "assignee");
@@ -1198,12 +1202,12 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await heartbeat.tickTimers(new Date());
     await heartbeat.resumeQueuedRuns();
 
-    expect(await recoveryCardsFor(sourceId)).toEqual([]);
+    expect(await recoveryCardFingerprints(sourceId)).toHaveLength(1);
     expect(await statusOf(olderGeneral)).toBe("queued");
     expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
   });
 
-  it("(r) F1 control: a board-scheduled monitor's scheduled sweep still mints the recovery card, and that recovery run takes a reserved slot", async () => {
+  it("(r) F1: a board-scheduled monitor's card is general too, so it also does not take a reserved slot (accepted cost)", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const agent = await seedAgent("BoardMonitor");
     const sourceId = await seedTimedOutMonitorCard(agent, "board");
@@ -1211,11 +1215,9 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await heartbeat.tickTimers(new Date());
     await heartbeat.resumeQueuedRuns();
 
-    const cards = await recoveryCardsFor(sourceId);
-    expect(cards).toHaveLength(1);
+    expect(await recoveryCardFingerprints(sourceId)).toHaveLength(1);
     expect(await statusOf(olderGeneral)).toBe("queued");
-    const running = (await runsOf(agent)).filter((run) => run.status === "running");
-    expect(running).toHaveLength(1);
+    expect((await runsOf(agent)).filter((run) => run.status === "running")).toEqual([]);
   });
 
   it("(r) F2: a reviewer that moves an unassigned, rewritten card back into review itself does not keep the seat another agent gave it", async () => {

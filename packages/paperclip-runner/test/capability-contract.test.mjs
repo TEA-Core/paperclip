@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { resolve } from "node:path";
-import { decodeInventory } from "../scripts/lib/capability-inventory.mjs";
+import { decodeInventory, LEGACY_MCP_ALIAS_COUNT } from "../scripts/lib/capability-inventory.mjs";
 import { validateRows } from "../scripts/generate-capability-contract.mjs";
 
 const phaseDirectory = resolve(import.meta.dirname, "../generated/capability");
@@ -18,16 +18,11 @@ test("generated Capability inventory has full source coverage", async () => {
     readRows("eval-traceability.yaml"),
   ]);
 
-  // FORK DIVERGENCE (fork-only MCP work-session tools): capabilities follows upstream's
-  // generator (158 -> 162: the three issue-documents reference headings plus SKILL.md's
-  // "task documents and deliverables"; upstream's own literal still reads 161 at the fold
-  // cut, one short of its generated file), but the tool map is upstream's 42 plus the fork's
-  // three work-session tools (paperclipOpenWorkSession / paperclipHeartbeatWorkSession /
-  // paperclipCloseWorkSession), so 45. Both numbers are the generator's own output, not a
-  // guess: `node scripts/generate-capability-contract.mjs` reproduces them exactly.
+  // Skill heading counts follow the generated source contract. MCP aliases use
+  // the shared registry count so each tool is classified in one place.
   assert.equal(capabilities.length, 162);
   assert.equal(capabilities.filter(row => row.sourceAnchor.startsWith("skills/paperclip/references/issue-documents.md#")).length, 3);
-  assert.equal(tools.length, 45);
+  assert.equal(tools.length, LEGACY_MCP_ALIAS_COUNT);
   assert.equal(evals.length, 106);
   assert.equal(new Set(evals.map((row) => row.group)).size, 16);
   for (const row of [...capabilities, ...tools, ...evals]) {

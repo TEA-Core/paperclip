@@ -5,10 +5,13 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { normalizeAgentApiKeyScope, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { loadResponsibleUserMemberships } from "../middleware/auth.js";
 import { logger } from "../middleware/logger.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { createLiveEventIssueVisibility } from "./live-event-issue-visibility.js";
 
 interface WsSocket {
   readyState: number;
@@ -44,6 +47,8 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /** The actor the HTTP API would build for the same credential; per-event reads are decided for it. */
+  actor: AuthorizationActor;
 }
 
 /** Cloud-proxied browser identity resolved from trusted x-paperclip-cloud-* headers. */
@@ -51,6 +56,8 @@ export interface CloudUpgradeActor {
   userId: string;
   /** Companies this actor may subscribe to (primary stack company + real memberships). */
   companyIds: string[];
+  /** The full HTTP actor for this identity, used for per-event read decisions. */
+  authorizationActor?: AuthorizationActor;
 }
 
 interface IncomingMessageWithContext extends IncomingMessage {
@@ -143,6 +150,7 @@ async function authorizeUpgrade(
         companyId,
         actorType: "board",
         actorId: "board",
+        actor: { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" },
       };
     }
 
@@ -161,6 +169,12 @@ async function authorizeUpgrade(
           companyId,
           actorType: "board",
           actorId: cloudActor.userId,
+          actor: cloudActor.authorizationActor ?? {
+            type: "board",
+            userId: cloudActor.userId,
+            companyIds: cloudActor.companyIds,
+            source: "cloud_tenant",
+          },
         };
       }
     }
@@ -180,7 +194,11 @@ async function authorizeUpgrade(
         .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
         .then((rows) => rows[0] ?? null),
       db
-        .select({ companyId: companyMemberships.companyId })
+        .select({
+          companyId: companyMemberships.companyId,
+          membershipRole: companyMemberships.membershipRole,
+          status: companyMemberships.status,
+        })
         .from(companyMemberships)
         .where(
           and(
@@ -198,6 +216,17 @@ async function authorizeUpgrade(
       companyId,
       actorType: "board",
       actorId: userId,
+      // The instance-admin role is left out so every read decision looks it
+      // up again; the socket outlives this upgrade, and a removed role must
+      // stop granting content without a reconnect.
+      actor: {
+        type: "board",
+        userId,
+        sessionId: session?.session?.id ?? null,
+        companyIds: memberships.map((row) => row.companyId),
+        memberships,
+        source: "session",
+      },
     };
   }
 
@@ -217,10 +246,24 @@ async function authorizeUpgrade(
     .set({ lastUsedAt: new Date() })
     .where(eq(agentApiKeys.id, key.id));
 
+  const responsibleUserId = key.responsibleUserId?.trim() || null;
   return {
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    actor: {
+      type: "agent",
+      agentId: key.agentId,
+      companyId: key.companyId,
+      keyId: key.id,
+      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      onBehalfOfUserId: responsibleUserId,
+      onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
+        companyId: key.companyId,
+        userId: responsibleUserId,
+      }),
+      source: "agent_key",
+    },
   };
 }
 
@@ -239,6 +282,7 @@ export function setupLiveEventsWebSocketServer(
   },
 ) {
   const wss = new WebSocketServer({ noServer: true });
+  const liveEventVisibility = createLiveEventIssueVisibility(db);
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
 
@@ -260,9 +304,27 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    // Each event is authorized for this subscriber before it is sent. The
+    // chain keeps delivery in publish order while a decision is pending. A
+    // failed lookup denies inside the filter; any other filter error
+    // withholds the event rather than sending it.
+    const visibleLiveEvent = liveEventVisibility(context.actor);
+    let delivery = Promise.resolve();
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      delivery = delivery.then(async () => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        let visible: LiveEvent;
+        try {
+          visible = await visibleLiveEvent(event);
+        } catch (err) {
+          logger.warn({ err, companyId: context.companyId }, "live event authorization failed; event withheld");
+          return;
+        }
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify(visible));
+      }).catch((err) => {
+        logger.warn({ err, companyId: context.companyId }, "live event delivery failed; event dropped");
+      });
     });
 
     cleanupByClient.set(socket, unsubscribe);

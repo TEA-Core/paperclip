@@ -113,6 +113,12 @@ export const LIVE_RUN_CAP_CLASSES = ["human_board", "review_recovery", "general"
 export type LiveRunCapClass = (typeof LIVE_RUN_CAP_CLASSES)[number];
 
 const RECOVERY_ISSUE_ORIGIN_KINDS: ReadonlySet<string> = new Set(Object.values(RECOVERY_ORIGIN_KINDS));
+/**
+ * Server-generated `originFingerprint` prefix of every card the issue monitor
+ * mints on exhaustion (`create_recovery_issue`). No issue API accepts a
+ * fingerprint, so a caller cannot set or avoid it.
+ */
+export const MONITOR_RECOVERY_FINGERPRINT_PREFIX = "issue_monitor:";
 const REVIEW_STAGE_TYPES: ReadonlySet<string> = new Set(ISSUE_EXECUTION_STAGE_TYPES);
 
 type LiveRunCapPrincipal = { type: "agent"; agentId: string } | { type: "user"; userId: string };
@@ -173,7 +179,8 @@ function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
  *   and was not relayed by a plugin (the plugin host stamps its plugin id on
  *   the wake request payload of every human action it relays).
  * - review/recovery: the run's issue row has a recovery origin kind (the issue
- *   API does not accept an origin kind; plugins are confined to `plugin:*`),
+ *   API does not accept an origin kind; plugins are confined to `plugin:*`)
+ *   and is not a monitor-minted card (fingerprint `issue_monitor:`, general),
  *   or a review/approval stage is pending in front of this agent, seated by
  *   an independent board user (`isSeatedReviewParticipant`).
  * A wake reason is never read, whoever wrote the row (agent, board, plugin or
@@ -185,11 +192,16 @@ export function classifyLiveRunCapRun(input: {
   requestedByActorType: string | null | undefined;
   wakePluginId: string | null | undefined;
   issueOriginKind: string | null | undefined;
+  issueOriginFingerprint?: string | null | undefined;
   issueExecutionState: unknown;
 }): LiveRunCapClass {
   if (input.requestedByActorType === "user" && !input.wakePluginId) return "human_board";
+  // An external-service monitor recovery card can be minted by an agent's own
+  // re-arm after exhaustion, so its recovery origin kind is not evidence of
+  // independent recovery work. It is general, whoever scheduled the monitor.
+  const monitorMinted = input.issueOriginFingerprint?.startsWith(MONITOR_RECOVERY_FINGERPRINT_PREFIX) === true;
   if (
-    (input.issueOriginKind && RECOVERY_ISSUE_ORIGIN_KINDS.has(input.issueOriginKind)) ||
+    (!monitorMinted && input.issueOriginKind && RECOVERY_ISSUE_ORIGIN_KINDS.has(input.issueOriginKind)) ||
     isSeatedReviewParticipant(input.issueExecutionState, input.agentId)
   ) {
     return "review_recovery";
