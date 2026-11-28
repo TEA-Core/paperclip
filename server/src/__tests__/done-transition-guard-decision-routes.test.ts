@@ -3741,6 +3741,56 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       await expectCloseRefusedAsStale(seeded, res, "in_progress");
     });
 
+    // SUP-24240: a `done` close that records no decision compares the execution
+    // snapshot under the issue row lock, exactly as a decided close does. Two
+    // concurrent closes from the same unlocked read cannot both succeed: the one
+    // that reaches the lock second is refused with the decided path's conflict.
+    async function expectStaleCloseRefusedLikeDecidedClose(
+      seeded: SeededCard,
+      stale: request.Response,
+      winner: request.Response,
+    ) {
+      expect(winner.status, JSON.stringify(winner.body)).toBe(200);
+      expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+      expect(stale.body.details).toEqual({
+        code: "review_stall_policy_changed",
+        issueId: seeded.issueId,
+        stageId: null,
+      });
+      expect(await statusOf(seeded.issueId)).toBe("done");
+    }
+
+    it("PATCH: of two concurrent durable-approval closes, the one with the stale snapshot is refused", async () => {
+      const seeded = await seedParticipantApprovedCard("S24240A");
+      let winner: request.Response | undefined;
+
+      const stale = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(async () => {
+          winner = await request(app)
+            .patch(`/api/issues/${seeded.identifier}`)
+            .send({ status: "done", comment: "Concurrent close.", doneTier: TIER2_DONE });
+        }),
+      );
+
+      await expectStaleCloseRefusedLikeDecidedClose(seeded, stale, winner!);
+    });
+
+    it("PATCH: of two concurrent closes on a card with no review ladder, the one with the stale snapshot is refused", async () => {
+      const seeded = await seedIssueAwaitingReview("S24240B");
+      await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, seeded.issueId));
+      let winner: request.Response | undefined;
+
+      const stale = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(async () => {
+          winner = await request(app)
+            .patch(`/api/issues/${seeded.identifier}`)
+            .send({ status: "done", comment: "Concurrent close.", doneTier: TIER2_DONE });
+        }),
+      );
+
+      await expectStaleCloseRefusedLikeDecidedClose(seeded, stale, winner!);
+    });
+
     // Release-assurance B2: the closer of the `done` is a self-approval
     // principal too, and a board stage decision recorded for the return
     // assignee's seat is the return assignee's own approval.

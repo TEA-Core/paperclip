@@ -2495,6 +2495,43 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(0);
   });
 
+  // SUP-24240: the measured close records no decision, so after its own
+  // compare-and-set it still takes the execution-snapshot compare under the lock.
+  it("refuses a measured close whose execution snapshot moved after the unlocked read, with the decided close's conflict", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: fixture.rulerAgentId, userId: null },
+            returnAssignee: null,
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: null,
+            changesRequestedCount: 0,
+          },
+        })
+        .where(eq(issues.id, fixture.issueId));
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed", issueId: fixture.issueId });
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   // The recorded worktree's status is the last step of the measurement, so
   // content written while the GitHub compare runs is still caught.
   it("refuses when the worktree is dirtied during the pre-write measurement's GitHub compare", async () => {

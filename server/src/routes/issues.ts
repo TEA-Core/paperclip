@@ -21826,6 +21826,7 @@ export function issueRoutes(
     // that already-authorized stop is not rolled back.
     const assertPatchExecutionDecisionLock = async (
       tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      { afterNoRepositoryLanding = false }: { afterNoRepositoryLanding?: boolean } = {},
     ) => {
       const readState = parseIssueExecutionState(existing.executionState);
       const recordsDecision = Boolean(transition.decision);
@@ -21837,7 +21838,13 @@ export function issueRoutes(
             nextExecutionPolicy?.stallEscalation ||
             readState?.stallHandoff,
           ));
-      if (!stallLockRequired && !recordsDecision && !durableApprovalClose) return;
+      // SUP-24240: a close to `done` that records no decision (every stage holds
+      // a durable approval, or the card has no review ladder) still writes from
+      // the unlocked read, so it takes the same snapshot compare as a decided
+      // close.
+      const doneSnapshotDeferred = noRepositoryLandingCloser !== null && !afterNoRepositoryLanding;
+      const snapshotCompareRequired = recordsDecision || (isDoneRequest && !doneSnapshotDeferred);
+      if (!stallLockRequired && !snapshotCompareRequired && !durableApprovalClose) return;
       const locked = await svc.getByIdForUpdate(id, tx);
       // SUP-24054 (release-assurance B3): the durable approvals were read
       // without the row lock. Re-read the policy, the execution state and the
@@ -21864,7 +21871,7 @@ export function issueRoutes(
           );
         }
       }
-      if (!stallLockRequired && !recordsDecision) return;
+      if (!stallLockRequired && !snapshotCompareRequired) return;
       const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
       if (
         stallLockRequired && (
@@ -22732,6 +22739,11 @@ export function issueRoutes(
               issueId: existing.id,
               details: noRepositoryLandingAuditDetails(verdict.measurement),
             });
+            // The measured no-repository close refuses a racing close with its
+            // own typed outcome above, so its snapshot compare runs after it.
+            if (!transition.decision) {
+              await assertPatchExecutionDecisionLock(tx, { afterNoRepositoryLanding: true });
+            }
           }
 
           // SUP-24402: compare-and-set against the zero-delta measurement
