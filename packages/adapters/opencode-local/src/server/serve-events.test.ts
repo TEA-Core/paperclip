@@ -130,6 +130,17 @@ describe("mapOpenCodeServeEvent (recorded 2.2.4 streams)", () => {
     expect(parseOpenCodeJsonl([...unusable.lines, ...empty.lines].join("\n"))).toMatchObject({ sessionUsage: null, sessionUsageComplete: false });
   });
 
+  it("does not mark usage complete when an update's tokens.cache is malformed", () => {
+    const state = createOpenCodeServeEventState();
+    const lines = mapOpenCodeServeEvent(
+      { type: "session.usage.updated", data: { sessionID: "ses_1", cost: 0.01, tokens: { input: 5, output: 2, cache: "40" } } },
+      state,
+    ).lines;
+    // The cache counters are unreadable, so the 0 cache this update implies
+    // is not a complete record of the session's usage.
+    expect(parseOpenCodeJsonl(lines.join("\n")).sessionUsageComplete).toBe(false);
+  });
+
   it("merges a partial later update field by field and does not mark it complete", () => {
     const state = createOpenCodeServeEventState();
     const lines = [

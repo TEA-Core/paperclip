@@ -351,4 +351,33 @@ describe("readOpenCodeStepUsage", () => {
       issues: ["step_finish #3: no token counters"],
     });
   });
+
+  it("refuses a malformed tokens.cache instead of reading it as zero cache", () => {
+    expect(readOpenCodeStepUsage({ tokens: { input: 5, output: 2, cache: 7 } }, "step_finish #4").issues).toEqual([
+      "step_finish #4: tokens.cache refused (7)",
+    ]);
+  });
+});
+
+describe("malformed nested cache counters on the session path", () => {
+  const malformed: unknown[] = [7, "7", [1], true];
+
+  it("never reads a malformed tokens.cache as complete zero cache usage", () => {
+    for (const cache of malformed) {
+      const payload = { tokens: { input: 5, output: 2, cache }, cost: 0.01 };
+      // An update that carries it is incomplete, not a complete 0-cache total.
+      expect(readOpenCodeSessionCounters(payload).complete).toBe(false);
+      // A final session record that carries it is unusable, so it cannot
+      // mark the run's usage complete.
+      expect(parseOpenCodeSessionUsageEvent(payload)).toBeNull();
+      expect(parseOpenCodeSessionTotals(JSON.stringify({ data: payload }))).toBeNull();
+    }
+  });
+
+  it("keeps an absent or null tokens.cache as zero cache and complete", () => {
+    for (const tokens of [{ input: 5, output: 2 }, { input: 5, output: 2, cache: null }]) {
+      expect(readOpenCodeSessionCounters({ tokens }).complete).toBe(true);
+      expect(parseOpenCodeSessionUsageEvent({ tokens })).toEqual(totals(5, 0, 2, null));
+    }
+  });
 });

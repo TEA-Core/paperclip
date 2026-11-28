@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  costEvents,
   assets,
   companies,
   companySkillTestRunTemplates,
@@ -51,6 +52,7 @@ describeEmbeddedPostgres("companySkillService skill test runs", () => {
     await db.delete(assets);
     await db.delete(issueDocuments);
     await db.delete(documents);
+    await db.delete(costEvents);
     await db.delete(companySkillTestRuns);
     await db.delete(companySkillTestRunTemplates);
     await db.delete(issues);
@@ -184,6 +186,30 @@ describeEmbeddedPostgres("companySkillService skill test runs", () => {
       .where(eq(issues.id, run.issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.description).toBe(run.harnessIssueDescription);
+  });
+
+  it("reports a test run's token cost above 2^31 without overflowing", async () => {
+    const { companyId, skillId, agentId } = await seedSkillAndAgent();
+    const run = await svc.createTestRun(
+      companyId,
+      skillId,
+      { content: "test this skill", agentId },
+      { type: "user", userId: "local-board" },
+      runDeps(companyId),
+    );
+    const event = { companyId, agentId, issueId: run.issueId, provider: "openai", model: "gpt-5.4", occurredAt: new Date() };
+    await db.insert(costEvents).values([
+      { ...event, inputTokens: 3_000_000_000, cachedInputTokens: 2_500_000_000, outputTokens: 2_200_000_000, costCents: 7 },
+      { ...event, inputTokens: 1_000_000_000, cachedInputTokens: 0, outputTokens: 0, costCents: 3 },
+    ]);
+
+    const detail = await svc.getTestRunDetail(companyId, skillId, run.id);
+    expect(detail?.cost).toEqual({
+      costCents: 10,
+      inputTokens: 4_000_000_000,
+      cachedInputTokens: 2_500_000_000,
+      outputTokens: 2_200_000_000,
+    });
   });
 
   it("honors No template without weakening the clean run snapshot", async () => {

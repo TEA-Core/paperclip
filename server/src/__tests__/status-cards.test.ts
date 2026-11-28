@@ -297,6 +297,25 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(detail.body).toMatchObject({ id: card.id, summaryBody: null, watchedIssueCount: 0 });
   });
 
+  it("reports today's token total above 2^31 without overflowing", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    const card = await statusCardService(db).create(
+      company.id,
+      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual" } },
+      { agentId: null, userId: "board-user" },
+    );
+    // Each row fits the int columns; their sum (4,200,000,000) does not fit int32.
+    await db.insert(statusCardUpdates).values([
+      { cardId: card.id, kind: "full", trigger: "manual", status: "ok", inputTokens: 1_500_000_000, outputTokens: 600_000_000, costCents: 10 },
+      { cardId: card.id, kind: "incremental", trigger: "manual", status: "ok", inputTokens: 1_500_000_000, outputTokens: 600_000_000, costCents: 20 },
+    ]);
+
+    const list = await request(createApp(db, localBoardActor())).get(`/api/companies/${company.id}/status-cards`);
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual([expect.objectContaining({ id: card.id, todayTokens: 4_200_000_000, todayCostCents: 30 })]);
+  });
+
   it("keeps cards readable when a saved query cannot be normalized", async () => {
     const company = await seedCompany();
     await enableStatusCards();
