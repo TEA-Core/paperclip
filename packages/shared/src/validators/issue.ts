@@ -603,6 +603,7 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
+  completedRoundStartedAt: z.string().nullable().optional(),
   // R20 review-stall bookkeeping, written only by the server. The head keys
   // accept any string so an odd stored value never makes the state
   // unparseable; the stall trigger ignores a value that is not a full git sha.

@@ -1597,6 +1597,13 @@ function carriedStallFields(
   };
 }
 
+function completedRoundStart(
+  previous: IssueExecutionState | null,
+): Pick<IssueExecutionState, "completedRoundStartedAt"> {
+  const round = previous?.status === PENDING_STATUS ? previous.pendingSince : previous?.completedRoundStartedAt;
+  return round ? { completedRoundStartedAt: round } : {};
+}
+
 function buildCompletedState(
   previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
@@ -1623,6 +1630,7 @@ function buildCompletedState(
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
     childCarrierClaim: previous?.childCarrierClaim,
+    ...completedRoundStart(previous),
     ...carriedStallFields(previous, null),
   };
 }
@@ -1650,6 +1658,7 @@ function buildStateWithCompletedStages(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
+    ...(input.previous?.status === COMPLETED_STATUS ? completedRoundStart(input.previous) : {}),
     ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
@@ -1677,6 +1686,7 @@ function buildSkippedStageCompletedState(input: {
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
     childCarrierClaim: input.previous?.childCarrierClaim,
+    ...completedRoundStart(input.previous),
     ...carriedStallFields(input.previous, null),
   };
 }

@@ -37,6 +37,11 @@ import { PaperclipApiClient } from "../../../packages/mcp-server/src/client.js";
 import { createToolDefinitions } from "../../../packages/mcp-server/src/tools.js";
 import { issueRoutes } from "../routes/issues.js";
 import { evaluateDoneTransitionGuard, prepareLandingDebtClose } from "../services/done-transition-guard.js";
+import {
+  applyBoardStageDecision,
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.js";
 
 // SUP-25193: a board-attached, GitHub-verified merged-PR landing proof for a
 // delivered card whose completed review stage names only a user and which has no
@@ -295,8 +300,14 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     reviewDecision?:
       | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant"
       | "executor_non_participant" | "old_head" | "unbound" | "old_round" | "unbound_round";
-    /** Whether the completed `executionState` carries the review round (`pendingSince`). Default true for agent stages. */
-    roundInState?: boolean;
+    /**
+     * For a completed agent review stage: how the production builders completed
+     * the pending stage. `reviewer` (default) is the reviewer agent approving it;
+     * `board` is the board approval that reconciles the stage from the reviewer's
+     * durable approval; `legacy` is the reviewer's completion as written before
+     * the completed round start was recorded.
+     */
+    completedBy?: "reviewer" | "board" | "legacy";
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
@@ -345,63 +356,85 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     const participant = options.participant === "agent"
       ? { type: "agent", agentId: reviewerId }
       : { type: "user", userId: "local-board" };
+    const at = (secondsAgo: number) => new Date(now.getTime() - secondsAgo * 1000);
+    const executionPolicy = {
+      mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", participants: [participant] }],
+    };
+    const agentCompletion = options.participant === "agent" && options.workflow !== "pending";
+    const pendingState = {
+      status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: participant, returnAssignee: null, completedStageIds: [], skippedStageIds: [],
+      lastDecisionId: null, lastDecisionOutcome: null, deliveredHeadSha,
+      ...(agentCompletion ? { pendingSince: at(8).toISOString() } : {}),
+    };
     await db.insert(issues).values({
       id: issueId, companyId, identifier, title: "Delivered card with a user-only review stage",
       status: "in_progress", priority: "medium", assigneeAgentId: agentId, createdByUserId: "local-board",
       projectId, projectWorkspaceId, executionWorkspaceId, deliveryRequirement: "repository_delivery",
-      executionPolicy: {
-        mode: "normal", commentRequired: true,
-        stages: [{ id: stageId, type: "review", participants: [participant] }],
-      },
-      executionState: options.workflow === "pending"
-        ? {
-          status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
-          currentParticipant: participant, returnAssignee: null, completedStageIds: [], skippedStageIds: [],
-          lastDecisionId: null, lastDecisionOutcome: null, deliveredHeadSha,
-        }
+      executionPolicy,
+      executionState: options.workflow === "pending" || agentCompletion
+        ? pendingState
         : {
           status: "completed", currentStageId: null, currentStageIndex: null, currentStageType: null,
           currentParticipant: null, returnAssignee: null, completedStageIds: [stageId], skippedStageIds: [],
           lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
-          ...(options.participant === "agent" && options.roundInState !== false
-            ? { pendingSince: new Date(now.getTime() - 8000).toISOString() }
-            : {}),
         },
     });
-    if (options.participant === "agent" && options.workflow !== "pending" && reviewDecision !== "none") {
+    const decisionIds: string[] = [];
+    if (agentCompletion && reviewDecision !== "none") {
       const decision = (over: Partial<typeof issueExecutionDecisions.$inferInsert>) => ({
         companyId, issueId, stageId, stageType: "review", actorAgentId: reviewerId, actorUserId: null,
-        outcome: "approved", body: "Approved.", deliveredHeadSha: HEAD_OF_MERGED, reviewRoundStartedAt: new Date(now.getTime() - 8000),
+        outcome: "approved", body: "Approved.", deliveredHeadSha: HEAD_OF_MERGED, reviewRoundStartedAt: at(8),
         ...over,
       });
-      const at = (secondsAgo: number) => new Date(now.getTime() - secondsAgo * 1000);
+      const insert = async (...rows: Array<ReturnType<typeof decision>>) => {
+        const inserted = await db.insert(issueExecutionDecisions).values(rows).returning({ id: issueExecutionDecisions.id });
+        decisionIds.push(...inserted.map((row) => row.id));
+      };
       if (reviewDecision === "board_user") {
-        await db.insert(issueExecutionDecisions).values(decision({
-          actorAgentId: null, actorUserId: "local-board", createdAt: at(5),
-        }));
+        await insert(decision({ actorAgentId: null, actorUserId: "local-board", createdAt: at(5) }));
       } else if (reviewDecision === "board_in_place") {
-        await db.insert(issueExecutionDecisions).values(decision({ actorUserId: "local-board", createdAt: at(5) }));
+        await insert(decision({ actorUserId: "local-board", createdAt: at(5) }));
       } else if (reviewDecision === "executor_non_participant") {
-        await db.insert(issueExecutionDecisions).values(decision({ actorAgentId: agentId, createdAt: at(5) }));
+        await insert(decision({ actorAgentId: agentId, createdAt: at(5) }));
       } else if (reviewDecision === "non_participant") {
         const strangerId = randomUUID();
         await db.insert(agents).values({
           id: strangerId, companyId, name: "Stranger", role: "reviewer", status: "active", adapterType: "codex_local",
           adapterConfig: {}, runtimeConfig: {}, permissions: {},
         });
-        await db.insert(issueExecutionDecisions).values(decision({ actorAgentId: strangerId, createdAt: at(5) }));
+        await insert(decision({ actorAgentId: strangerId, createdAt: at(5) }));
       } else if (reviewDecision === "superseded") {
-        await db.insert(issueExecutionDecisions).values([
+        await insert(
           decision({ createdAt: at(10) }),
           decision({ outcome: "changes_requested", body: "Reopened.", createdAt: at(5) }),
-        ]);
+        );
       } else {
         const boundHead = reviewDecision === "old_head" ? OTHER_SHA : reviewDecision === "unbound" ? null : HEAD_OF_MERGED;
         const round = reviewDecision === "unbound_round" ? null : reviewDecision === "old_round" ? at(100) : at(8);
-        await db.insert(issueExecutionDecisions).values(decision({
-          createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? round : null,
-        }));
+        await insert(decision({ createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? round : null }));
       }
+    }
+    if (agentCompletion) {
+      const policy = normalizeIssueExecutionPolicy(executionPolicy)!;
+      const pendingIssue = {
+        status: "in_review", assigneeAgentId: reviewerId, assigneeUserId: null, createdByUserId: "local-board",
+        executionPolicy: policy, executionState: pendingState,
+      };
+      const completedBy = options.completedBy ?? "reviewer";
+      const completed = completedBy === "board"
+        ? applyBoardStageDecision({
+          issue: pendingIssue, policy, decision: "approved", commentBody: "Approved.", actorUserId: "local-board",
+          decidedStageIds: [stageId], durableApprovalIds: new Map([[stageId, decisionIds[decisionIds.length - 1]!]]),
+        }).patch.executionState as Record<string, unknown>
+        : applyIssueExecutionPolicyTransition({
+          issue: pendingIssue, policy, requestedStatus: "done", requestedAssigneePatch: {},
+          actor: { agentId: reviewerId }, commentBody: "Approved.",
+        }).patch.executionState as Record<string, unknown>;
+      expect(completed).toMatchObject({ status: "completed", completedStageIds: [stageId] });
+      if (completedBy === "legacy") delete completed.completedRoundStartedAt;
+      await db.update(issues).set({ executionState: completed }).where(eq(issues.id, issueId));
     }
     const card = { companyId, agentId, issueId, identifier };
     const boardLinkedPr = options.boardLinkedPr === undefined ? 501 : options.boardLinkedPr;
@@ -668,11 +701,33 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
+    it("accepts a stage the board completed from the reviewer's durable approval of the current round", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent", completedBy: "board" });
+      const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+      expect(row!.executionState).toMatchObject({ status: "completed", lastDecisionOutcome: "approved" });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      expect(await proofRows(issueId)).toHaveLength(1);
+    });
+
+    it.each([
+      ["the reviewer completed the stage", "reviewer" as const],
+      ["the board completed the stage", "board" as const],
+    ])("refuses an approval from an older review round when %s, and records nothing", async (_label, completedBy) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision: "old_round", completedBy });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
     it.each([
       ["a head-bound independent approval", "independent" as const],
       ["a head-bound approval from an older review round", "old_round" as const],
-    ])("refuses %s when the completed card keeps no current review round start, and records nothing", async (_label, reviewDecision) => {
-      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision, roundInState: false });
+    ])("refuses %s when the card was completed before its review round start was recorded, and records nothing", async (_label, reviewDecision) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision, completedBy: "legacy" });
       await reclassifyRecordOnly(issueId);
       const refused = await attach(issueId, goodProof());
       expect(refused.status, JSON.stringify(refused.body)).toBe(409);

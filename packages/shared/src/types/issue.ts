@@ -847,6 +847,12 @@ export interface IssueExecutionState {
    */
   pendingSince?: string | null;
   /**
+   * The start (ISO) of the review round whose approval completed the workflow:
+   * the completing stage's `pendingSince`. Set only on a `completed` state and
+   * absent on states completed before it was recorded.
+   */
+  completedRoundStartedAt?: string | null;
+  /**
    * Head commit delivered to review for the current round, stamped from the
    * `deliveryIdentity.headSha` recorded on the `in_review` transition. Cleared
    * when a changes-requested decision hands the round back, so a re-delivery
