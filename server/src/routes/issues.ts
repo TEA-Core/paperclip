@@ -13253,12 +13253,15 @@ export function issueRoutes(
 
         // SUP-24612: deciding a stage while its participant is still pending on it
         // makes that participant's verdict inert (it arrives after the stage
-        // closed). The board must say why. Refused before any write.
-        const displacedPendingState = resolveDisplacedParticipantPendingState(
-          previousState,
-          result.targetStage,
-          result.displacedParticipant,
-        );
+        // closed). The board must say why. Refused before any write. A reconciled
+        // stage displaces nobody: its participant already approved it on this round.
+        const displacedPendingState = result.reconciledDecisionId
+          ? null
+          : resolveDisplacedParticipantPendingState(
+              previousState,
+              result.targetStage,
+              result.displacedParticipant,
+            );
         if (displacedPendingState && !displacementReason) {
           throw new BoardDecisionRejection(
             "displacement_reason_required",

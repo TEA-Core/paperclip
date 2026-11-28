@@ -1280,7 +1280,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approve the current head" });
+      .send({ decision: "approved", comment: "board: approve the current head", displacementReason: PENDING_REVIEWER_REASON });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.stageId).toBe(STAGE_ID);
@@ -2007,7 +2007,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
         .send({ decision: "changes_requested", comment: "board: needs work" });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "stageId", "stageType"]);
+      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "reconciled", "stageId", "stageType"]);
 
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(row!.status).toBe("todo");
@@ -2032,7 +2032,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
         .send({ decision: "approved", comment: "board: the requested changes landed" });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "stageId", "stageType"]);
+      expect(Object.keys(res.body).sort()).toEqual(["commentId", "decisionId", "executionState", "outcome", "reconciled", "stageId", "stageType"]);
 
       const rows = await overrideRows(issueId);
       expect(rows.decisions).toHaveLength(1);
