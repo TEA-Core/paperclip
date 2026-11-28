@@ -1985,7 +1985,9 @@ export interface PluginAuthorizationClient {
   /**
    * Search activity entries. Requires `authorization.audit.read`. Without
    * `issues.read`, an entry about an issue carries only the issue title and
-   * metadata in `details`, and an entry about a run loses its error text (see
+   * metadata in `details`; an entry about a run on an issue carries only its
+   * metadata, one about a run with no issue loses its `error` and `message`
+   * text, and one about an environment lease loses its `failureReason` (see
    * PLUGIN_SPEC.md).
    */
   audit: {
