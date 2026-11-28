@@ -302,7 +302,7 @@ describeEmbeddedPostgres("status card routes", () => {
     await enableStatusCards();
     const card = await statusCardService(db).create(
       company.id,
-      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual" } },
+      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual", triggers: { statusTransitions: true, membershipChanges: true, humanComments: true, assigneeChanges: true, anyUpdate: false } } },
       { agentId: null, userId: "board-user" },
     );
     // Each row fits the int columns; their sum (4,200,000,000) does not fit int32.
@@ -323,7 +323,7 @@ describeEmbeddedPostgres("status card routes", () => {
     const service = statusCardService(db);
     const card = await service.create(
       company.id,
-      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual" } },
+      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual", triggers: { statusTransitions: true, membershipChanges: true, humanComments: true, assigneeChanges: true, anyUpdate: false } } },
       { agentId: null, userId: "board-user" },
     );
     await db.update(statusCards).set({
