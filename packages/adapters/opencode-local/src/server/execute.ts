@@ -70,6 +70,10 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
+  reconcileOpenCodeRunUsage,
+  type OpenCodeRunUsageReconciliation,
+} from "./session-usage.js";
+import {
   OPENCODE_MCP_QUIESCENCE_MS,
   OPENCODE_MCP_READY_DEADLINE_MS,
 } from "./mcp-readiness-gate.js";
@@ -1608,10 +1612,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               runLogTail: paperclipBridge?.runLogTail,
               settleRunDisposition: paperclipBridge?.settleRunDisposition,
             });
+        const parsed = parseOpenCodeJsonl(proc.stdout);
         return {
           proc,
           rawStderr: proc.stderr,
-          parsed: parseOpenCodeJsonl(proc.stdout),
+          parsed,
+          // Only the serve transport carries the durable session usage records;
+          // the CLI paths keep the legacy step-sum reporting (no usageBasis).
+          usageReconciliation: useServeTransport
+            ? reconcileOpenCodeRunUsage({
+                sessionUsage: parsed.sessionUsage,
+                sessionUsageComplete: parsed.sessionUsageComplete,
+                sessionUsageFinal: parsed.sessionUsageFinal,
+                resumedSession: Boolean(resumeSessionId),
+                // Validated step sums with cache writes counted as input; the
+                // legacy parsed.usage stays the V1 CLI contract.
+                stepUsage: parsed.stepUsage,
+                stepCostUsd: parsed.stepCostUsd,
+                stepUsageIssues: parsed.stepUsageIssues,
+              })
+            : null,
         };
       } finally {
         databaseGuard?.stop();
@@ -1648,6 +1668,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
+        // Serve-transport runs reconcile per-run usage from the session's
+        // cumulative records; null keeps the legacy step-sum reporting.
+        usageReconciliation: OpenCodeRunUsageReconciliation | null;
       },
       clearSessionOnMissingSession = false,
       errorCode: string | null = null,
@@ -1655,6 +1678,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // exit status cannot express (currently: the database growth guard).
       errorMessageOverride: string | null = null,
     ): Promise<AdapterExecutionResult> => {
+      // Reconciled usage wins when the serve transport produced it: it is
+      // scoped to this run (session totals for a run that started the session,
+      // its own validated step sums for a resumed one) and is
+      // reported with `usageBasis: "per_run"` so the server passes it through.
+      // Otherwise the step sums stand, exactly as before (no usageBasis).
+      const reconciled = attempt.usageReconciliation;
+      const usage = reconciled
+        ? {
+            inputTokens: reconciled.usage.inputTokens,
+            outputTokens: reconciled.usage.outputTokens,
+            cachedInputTokens: reconciled.usage.cachedInputTokens,
+          }
+        : {
+            inputTokens: attempt.parsed.usage.inputTokens,
+            outputTokens: attempt.parsed.usage.outputTokens,
+            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
+          };
+      const costUsd = reconciled ? reconciled.costUsd : attempt.parsed.costUsd;
+      // Record how the usage was derived and whether a final record backs it,
+      // so an incomplete or refused reading is visible on the run.
+      const usageResultFields = reconciled
+        ? {
+            usageSource: reconciled.source,
+            usageComplete: reconciled.complete,
+            ...(reconciled.issues.length > 0 ? { usageIssues: reconciled.issues } : {}),
+          }
+        : {};
       const terminalBillingError = isOpenCodeTerminalBillingError(
         "",
         attempt.proc.stderr,
@@ -1667,11 +1717,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timedOut: false,
           finishReason: attempt.parsed.finalStepReason,
           errorMessage: `Terminal provider billing/usage error: ${terminalBillingError}`,
-          usage: {
-            inputTokens: attempt.parsed.usage.inputTokens,
-            outputTokens: attempt.parsed.usage.outputTokens,
-            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
-          },
+          usage,
+          ...(reconciled ? { usageBasis: "per_run" as const } : {}),
           sessionId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
           sessionParams: null,
           sessionDisplayId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
@@ -1679,11 +1726,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(billingModelId)),
           model: billingModelId,
           billingType: "unknown",
-          costUsd: attempt.parsed.costUsd,
+          costUsd,
           resultJson: {
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
             paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
+            ...usageResultFields,
           },
           summary: attempt.parsed.summary,
           clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
@@ -1732,15 +1780,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               : {}),
           },
           finishReason: attempt.parsed.finalStepReason,
-          usage: {
-            inputTokens: attempt.parsed.usage.inputTokens,
-            outputTokens: attempt.parsed.usage.outputTokens,
-            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
-          },
+          usage,
+          ...(reconciled ? { usageBasis: "per_run" as const } : {}),
           sessionId: resolvedSessionId,
           sessionParams: resolvedSessionParams,
           sessionDisplayId: resolvedSessionId,
-          costUsd: attempt.parsed.costUsd,
+          costUsd,
           clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
         };
         await emitAdapterFailureLog(result);
@@ -1797,11 +1842,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ((synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage)),
         errorCode: errorCode ?? classifiedErrorCode ?? attempt.proc.errorCode ?? null,
         errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
-        usage: {
-          inputTokens: attempt.parsed.usage.inputTokens,
-          outputTokens: attempt.parsed.usage.outputTokens,
-          cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
-        },
+        usage,
+        ...(reconciled ? { usageBasis: "per_run" as const } : {}),
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,
@@ -1809,7 +1851,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(modelId)),
         model: modelId,
         billingType: "unknown",
-        costUsd: attempt.parsed.costUsd,
+        costUsd,
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
@@ -1817,6 +1859,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: synthesizedExitCode,
           errorCode: errorCode ?? classifiedErrorCode ?? attempt.proc.errorCode ?? null,
           ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
+          ...usageResultFields,
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

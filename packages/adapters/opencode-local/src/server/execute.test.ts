@@ -1065,7 +1065,10 @@ describe("execute — OpenCode V2 serve transport", () => {
   const token = "serve-runtime-mcp-secret";
   const mcpServer = { name: "Paperclip projects", url: "https://paperclip.example/mcp", token, connectionId: "connection-serve" };
 
-  async function runServe(fake: Record<string, string> = {}, { mcp = true }: { mcp?: boolean } = {}) {
+  async function runServe(
+    fake: Record<string, string> = {},
+    { mcp = true, sessionId = null, timeoutSec }: { mcp?: boolean; sessionId?: string | null; timeoutSec?: number } = {},
+  ) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-serve-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "opencode");
@@ -1084,12 +1087,13 @@ describe("execute — OpenCode V2 serve transport", () => {
       const result = await execute({
         runId: `run-v2-serve-${Math.random().toString(36).slice(2)}`,
         agent: { id: "agent-v2-serve", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        runtime: { sessionId, sessionParams: sessionId ? { sessionId, cwd: path.join(path.dirname(commandPath), "workspace") } : null, sessionDisplayId: null, taskKey: null },
         config: {
           command: commandPath,
           cliVersion: "2.2.4",
           cwd: workspace,
           model: "openai/gpt-5",
+          ...(timeoutSec !== undefined ? { timeoutSec } : {}),
           env: { OPENCODE_ALLOW_ALL_MODELS: "1", FAKE_LOG: logFile, FAKE_MCP_NAME: mcpServer.name, ...fake },
         },
         context: {},
@@ -1119,6 +1123,81 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(logs).not.toContain("one-shot");
     expect(JSON.stringify({ logs, result })).not.toContain(token);
   });
+
+  it("reports per-run usage from the session's usage records, not the step sums", async () => {
+    const { result } = await runServe();
+
+    // The turn's step also reports 5/2/1, but the session.usage.updated events
+    // (partial 2/1/0, then cumulative 5/2/1, last one winning) are the record
+    // the result must carry, marked per_run so the server does not delta it.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    // The unpriced fixture model reports cost 0 with tokens spent: unpriced,
+    // not free.
+    expect(result.costUsd).toBeNull();
+    expect((result.resultJson as Record<string, unknown>).usageSource).toBe("session_usage");
+  });
+
+  it("reports a priced turn's session cost as the run's cost", async () => {
+    const { result } = await runServe({ FAKE_USAGE_COST: "0.001" });
+
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.costUsd).toBe(0.001);
+    expect(result.usageBasis).toBe("per_run");
+  });
+
+  it("charges a resumed session its own step sums", async () => {
+    const { result, requests } = await runServe({}, { sessionId: "ses_known" });
+
+    expect(requests.some((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toBe(true);
+    // The run resumed a session (500/60/40 already spent), so a sibling run
+    // could move its cumulative total; only this run's own steps (5/2/1) are
+    // charged, never the cumulative total or its delta.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBeNull();
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.usageSource).toBe("step_finish");
+    expect(resultJson.usageIssues).toEqual(["resumed session; this run's own step sums used"]);
+  });
+
+  it("reports the final session record when the last usage update was partial", async () => {
+    const { result } = await runServe({ FAKE_USAGE_PARTIAL_LAST: "1", FAKE_USAGE_COST: "0.001" });
+
+    // Events: full 5/1/2, then a partial update with only output 7. The
+    // post-turn session read carries the real final 9/1/7, so the later usage
+    // is kept and the result counts as complete.
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 7, cachedInputTokens: 1 });
+    expect(result.costUsd).toBe(0.001);
+    expect(result.usageBasis).toBe("per_run");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.usageComplete).toBe(true);
+    expect(resultJson.usageIssues).toBeUndefined();
+  });
+
+  it("flags usage incomplete when a partial last update has no final record", async () => {
+    const { result } = await runServe({ FAKE_USAGE_PARTIAL_LAST: "1", FAKE_NO_FINAL_SESSION_USAGE: "1" });
+
+    // The partial output 7 is kept (not the earlier 2), and the run says the
+    // usage is not backed by a final record.
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 7, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.usageComplete).toBe(false);
+    expect(resultJson.usageIssues).toEqual(["last session usage update was partial and no final session record was read"]);
+  });
+
+  it("keeps the usage already spent when a serve run times out", async () => {
+    // The turn hangs forever, so only the wall-clock timeout ends the run.
+    // Skip the MCP readiness gate and leave a wide margin so, even on a loaded
+    // host, startup and the turn's usage records land before the timeout fires
+    // (a 1s timeout could cut the run off before the turn began).
+    const { result } = await runServe({ FAKE_HANG_TURN: "1" }, { mcp: false, timeoutSec: 3 });
+
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, cachedInputTokens: 1 });
+    expect(result.usageBasis).toBe("per_run");
+  }, 20_000);
 
   it("says PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path, once", async () => {
     const { result, logs, metadata } = await runServe({ PAPERCLIP_OPENCODE_PRINT_LOGS: "1" });

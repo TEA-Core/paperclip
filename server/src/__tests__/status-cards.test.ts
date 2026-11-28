@@ -297,6 +297,58 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(detail.body).toMatchObject({ id: card.id, summaryBody: null, watchedIssueCount: 0 });
   });
 
+  it("reports today's token total above 2^31 without overflowing", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    const card = await statusCardService(db).create(
+      company.id,
+      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual", triggers: { statusTransitions: true, membershipChanges: true, humanComments: true, assigneeChanges: true, anyUpdate: false } } },
+      { agentId: null, userId: "board-user" },
+    );
+    // Each row fits the int columns; their sum (4,200,000,000) does not fit int32.
+    await db.insert(statusCardUpdates).values([
+      { cardId: card.id, kind: "full", trigger: "manual", status: "ok", inputTokens: 1_500_000_000, outputTokens: 600_000_000, costCents: 10 },
+      { cardId: card.id, kind: "incremental", trigger: "manual", status: "ok", inputTokens: 1_500_000_000, outputTokens: 600_000_000, costCents: 20 },
+    ]);
+
+    const list = await request(createApp(db, localBoardActor())).get(`/api/companies/${company.id}/status-cards`);
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual([expect.objectContaining({ id: card.id, todayTokens: 4_200_000_000, todayCostCents: 30 })]);
+  });
+
+  it("sums a single update row whose input plus output exceeds 2^31", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    await seedSummarizer(company.id);
+    const service = statusCardService(db);
+    const card = await service.create(
+      company.id,
+      { interestPrompt: "Spend overview", titlePinned: false, refreshPolicy: { mode: "manual", triggers: { statusTransitions: true, membershipChanges: true, humanComments: true, assigneeChanges: true, anyUpdate: false } } },
+      { agentId: null, userId: "board-user" },
+    );
+    await db.update(statusCards).set({
+      state: "active",
+      queries: [{ scope: "issues", status: ["blocked"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 }] as typeof card.queries,
+    }).where(eq(statusCards.id, card.id));
+    await db.insert(statusCardUpdates).values({
+      cardId: card.id,
+      kind: "full",
+      trigger: "manual",
+      status: "ok",
+      finishedAt: new Date(),
+      inputTokens: 1_500_000_000,
+      outputTokens: 1_000_000_000,
+      costCents: 10,
+    });
+
+    const list = await request(createApp(db, localBoardActor())).get(`/api/companies/${company.id}/status-cards`);
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual([expect.objectContaining({ id: card.id, todayTokens: 2_500_000_000 })]);
+
+    const refresh = await service.requestRefresh(card.id, { actor: { agentId: null, userId: "board-user" } });
+    expect(refresh.generatingIssue).toBeTruthy();
+  });
+
   it("keeps cards readable when a saved query cannot be normalized", async () => {
     const company = await seedCompany();
     await enableStatusCards();
@@ -1034,6 +1086,58 @@ describeEmbeddedPostgres("status card routes", () => {
 
     await db.update(statusCards).set({ nextEvalAt: new Date(Date.now() - 1000) }).where(eq(statusCards.id, created.body.id));
     expect(await service.tickDueStatusCards(new Date())).toMatchObject({ evaluated: 1, enqueued: [] });
+  });
+
+  it("writes a summary with clamped token counts when the run's cost events exceed 2^31", async () => {
+    const company = await seedCompany();
+    await enableStatusCards();
+    const summarizer = await seedSummarizer(company.id);
+    const boardApp = createApp(db, localBoardActor());
+    const created = await request(boardApp)
+      .post(`/api/companies/${company.id}/status-cards`)
+      .send({ interestPrompt: "Blocked launch tasks updated this week" });
+    const generationIssueId = created.body.generatingIssueId as string;
+    const run = await seedRun(company.id, summarizer.id);
+    await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, generationIssueId));
+    const writerApp = createApp(db, agentActor(company.id, summarizer.id, run.id));
+    const queryWrite = await request(writerApp).put(`/api/status-cards/${created.body.id}/query`).send({
+      queries: [{ scope: "issues", status: ["blocked"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 }],
+      title: "Recent launch blockers",
+      changeSummary: "Compiled one blocker query.",
+      generationIssueId,
+    });
+    expect(queryWrite.status).toBe(200);
+    const costEvent = {
+      companyId: company.id,
+      agentId: summarizer.id,
+      issueId: generationIssueId,
+      heartbeatRunId: run.id,
+      provider: "openai",
+      model: "gpt-5.4",
+      costCents: 2,
+      occurredAt: new Date(),
+    };
+    await db.insert(costEvents).values([
+      { ...costEvent, inputTokens: 2_000_000_000, outputTokens: 1_500_000_000 },
+      { ...costEvent, inputTokens: 1_000_000_000, outputTokens: 1_000_000_000 },
+    ]);
+
+    const summaryWrite = await request(writerApp).put(`/api/status-cards/${created.body.id}/summary`).send({
+      markdown: "**Decide:** unblock launch approval.",
+      title: "Recent launch blockers",
+      changeSummary: "Created the first full status summary.",
+      generationIssueId,
+      model: "gpt-5.4",
+    });
+    expect(summaryWrite.status).toBe(200);
+    expect(summaryWrite.body.card).toMatchObject({ state: "active", generatingIssueId: null });
+    expect(summaryWrite.body.document.latestBody).toContain("**Decide:**");
+    expect(await db.select().from(statusCardUpdates).then((rows) => rows.find((row) => row.kind === "full"))).toMatchObject({
+      status: "ok",
+      inputTokens: 2_147_483_647,
+      outputTokens: 2_147_483_647,
+      costCents: 4,
+    });
   });
 
   it("writes a compiled query and first summary, dry-runs live rows, and bumps the version after recompile", async () => {

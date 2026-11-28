@@ -178,9 +178,39 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     const seen = await requests();
     const switched = seen.find((entry) => entry.path === "/api/session/ses_known/model")!;
     expect(JSON.parse(switched.body)).toEqual({ model: { providerID: "fx", id: "m1", variant: "high" } });
-    expect(seen.filter((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toHaveLength(2);
+    // Each run reads the session before the prompt (to confirm it exists) and
+    // after the turn (final usage record).
+    expect(seen.filter((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toHaveLength(4);
     expect(seen.filter((entry) => entry.method === "POST" && entry.path === "/api/session/ses_known/prompt")).toHaveLength(2);
     expect(seen.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(false);
+  });
+
+  it("reads the session after the turn and emits it as the final usage record", async () => {
+    const result = await runOpenCodeServeProcess(input({ resumeSessionId: "ses_known" }));
+    expect(result.exitCode).toBe(0);
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    expect(parsed.sessionUsageFinal).toEqual({ usage: { inputTokens: 505, cachedInputTokens: 41, outputTokens: 62 }, costUsd: 0.05 });
+    const seen = await requests();
+    const prompt = seen.findIndex((entry) => entry.path === "/api/session/ses_known/prompt");
+    expect(seen.slice(prompt + 1).some((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toBe(true);
+  });
+
+  it("keeps a partial later usage update instead of the earlier total", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_USAGE_PARTIAL_LAST: "1" }) }));
+    expect(result.exitCode).toBe(0);
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    // The partial update moved output to 7; input stays at the last known 5.
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0 });
+    expect(parsed.sessionUsageComplete).toBe(false);
+    // The post-turn session read carries the real final total.
+    expect(parsed.sessionUsageFinal).toEqual({ usage: { inputTokens: 9, cachedInputTokens: 1, outputTokens: 7 }, costUsd: 0 });
+  });
+
+  it("reports a fresh session's cumulative usage from its usage events", async () => {
+    const result = await runOpenCodeServeProcess(input());
+    expect(result.exitCode).toBe(0);
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, costUsd: 0 });
   });
 
   it("never leaks the server password, its Authorization header or the MCP bearer token", async () => {
@@ -205,6 +235,10 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   it("keeps the wall-clock timeout and frees the server", async () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_TURN: "1" }), timeoutSec: 1 }));
     expect(result.timedOut).toBe(true);
+    // The turn's usage records were already emitted; a timed-out run keeps
+    // them so the result can still report what was spent.
+    const parsed = parseOpenCodeJsonl(result.stdout);
+    expect(parsed.sessionUsage).toEqual({ usage: { inputTokens: 5, cachedInputTokens: 1, outputTokens: 2 }, costUsd: 0 });
     await expectServerStopped();
   });
 

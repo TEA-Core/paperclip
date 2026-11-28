@@ -46,6 +46,7 @@ type StatusCardWriter = { agentId: string | null; runId: string | null };
 type StatusCardRow = typeof statusCards.$inferSelect;
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const STATUS_CARD_UPDATE_MAX_TOKENS = 2_147_483_647;
 
 function promptHash(prompt: string) {
   return createHash("sha256").update(prompt).digest("hex");
@@ -178,7 +179,7 @@ export function statusCardService(
           .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
       db.select({
-        tokens: sql<number>`coalesce(sum(coalesce(${statusCardUpdates.inputTokens}, 0) + coalesce(${statusCardUpdates.outputTokens}, 0)), 0)::int`,
+        tokens: sql<number>`coalesce(sum(coalesce(${statusCardUpdates.inputTokens}, 0)::bigint + coalesce(${statusCardUpdates.outputTokens}, 0)::bigint), 0)::bigint`.mapWith(Number),
         costCents: sql<number>`coalesce(sum(${statusCardUpdates.costCents}), 0)::int`,
       })
         .from(statusCardUpdates)
@@ -644,7 +645,7 @@ export function statusCardService(
     const dayStart = new Date(now);
     dayStart.setUTCHours(0, 0, 0, 0);
     const recent = await db.select().from(statusCardUpdates).where(and(eq(statusCardUpdates.cardId, card.id), gte(statusCardUpdates.startedAt, hourAgo)));
-    const daily = await db.select({ tokens: sql<number>`coalesce(sum(${statusCardUpdates.inputTokens} + ${statusCardUpdates.outputTokens}), 0)::int` })
+    const daily = await db.select({ tokens: sql<number>`coalesce(sum(${statusCardUpdates.inputTokens}::bigint + ${statusCardUpdates.outputTokens}::bigint), 0)::bigint`.mapWith(Number) })
       .from(statusCardUpdates)
       .where(and(eq(statusCardUpdates.cardId, card.id), gte(statusCardUpdates.startedAt, dayStart)));
     const pendingChangeHash = statusCardChangesHash(changes);
@@ -875,14 +876,24 @@ export function statusCardService(
       if (!next) throw conflict("Status-card generation was superseded by a newer task");
       const usage = actor.runId
         ? await tx.select({
-          inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::int`,
-          outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::int`,
+          inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::bigint`.mapWith(Number),
+          outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::bigint`.mapWith(Number),
           costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
         }).from(costEvents).where(eq(costEvents.heartbeatRunId, actor.runId))
         : [];
       const existingUpdate = await tx.select().from(statusCardUpdates)
         .where(eq(statusCardUpdates.generationIssueId, input.generationIssueId))
         .then((rows) => rows.find((row) => row.kind !== "compile") ?? null);
+      const observedInputTokens = Number(usage[0]?.inputTokens ?? 0);
+      const observedOutputTokens = Number(usage[0]?.outputTokens ?? 0);
+      const inputTokens = Math.min(observedInputTokens, STATUS_CARD_UPDATE_MAX_TOKENS);
+      const outputTokens = Math.min(observedOutputTokens, STATUS_CARD_UPDATE_MAX_TOKENS);
+      if (inputTokens !== observedInputTokens || outputTokens !== observedOutputTokens) {
+        logger.warn(
+          { cardId: current.id, runId: actor.runId, observedInputTokens, observedOutputTokens, inputTokens, outputTokens },
+          "status card update token counts exceed the integer column range and were clamped",
+        );
+      }
       const updateValues = {
         runId: actor.runId,
         finishedAt: now,
@@ -890,8 +901,8 @@ export function statusCardService(
         model: input.model ?? null,
         queryVersion: current.queryVersion,
         changeSummary: input.changeSummary,
-        inputTokens: Number(usage[0]?.inputTokens ?? 0),
-        outputTokens: Number(usage[0]?.outputTokens ?? 0),
+        inputTokens,
+        outputTokens,
         costCents: Number(usage[0]?.costCents ?? 0),
       };
       if (existingUpdate) {

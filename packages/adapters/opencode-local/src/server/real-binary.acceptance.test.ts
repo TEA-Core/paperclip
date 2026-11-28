@@ -194,7 +194,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
         res.writeHead(200, { "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream" });
         const call = { index: 0, id: "call_1", type: "function", function: { name: toolCall.name, arguments: JSON.stringify(toolCall.args) } };
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [call] }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 18, completion_tokens: 4 } })}\n\n`);
         res.end("data: [DONE]\n\n");
         return;
       }
@@ -207,7 +207,15 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
         "content-type": "text/event-stream",
       });
       res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "fixture response" }, finish_reason: null }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`);
+      // The provider reports real usage on the terminal chunk — the only place
+      // a stream's token counts exist — so the binary's session usage records
+      // (and the run's per-run usage) are a real measurement.
+      res.write(`data: ${JSON.stringify({
+        id: "chatcmpl-paperclip",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        usage: { prompt_tokens: 24, completion_tokens: finishReason === "length" ? 9 : 6, prompt_tokens_details: { cached_tokens: 3 } },
+      })}\n\n`);
       res.end("data: [DONE]\n\n");
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -326,7 +334,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(result.checks).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "opencode_command_resolvable" }),
     ]));
-  });
+  }, 60_000);
 
   it("discovers a non-empty real catalog that contains the configured model", async () => {
     resetOpenCodeModelsCacheForTests();
@@ -348,7 +356,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     });
     expect(available.map((entry) => entry.id)).toContain(model);
     expect(available.length).toBeGreaterThan(1);
-  });
+  }, 60_000);
 
   it("rejects a configured model that the real catalog does not list", async () => {
     resetOpenCodeModelsCacheForTests();
@@ -376,13 +384,20 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       env: emptyCatalogEnv,
       model,
     })).rejects.toThrow(`OpenCode V2 model discovery returned no models for "${model}".`);
-  });
+  }, 60_000);
 
   it("executes a real V2 run and resumes its session", async () => {
     const first = await execute(context({ runId: "acceptance-first" }));
     expect(first.exitCode).toBe(0);
     expect(first.errorMessage).toBeNull();
     expect(first.sessionId).toEqual(expect.any(String));
+    // The fixture model is unpriced, so the cost stays null (unpriced, not
+    // free), but the real binary's session usage records make the run's
+    // per-run tokens a real measurement.
+    expect(first.usage?.inputTokens ?? 0).toBeGreaterThan(0);
+    expect(first.usage?.outputTokens ?? 0).toBeGreaterThan(0);
+    expect(first.usageBasis).toBe("per_run");
+    expect(first.costUsd).toBeNull();
     const commandArgs: string[][] = [];
     const second = await execute(context({
       runId: "acceptance-resume",
@@ -404,6 +419,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(second.sessionId).toBe(first.sessionId);
     expect(mainRequests.length).toBeGreaterThanOrEqual(2);
     expect(mainRequests.at(-1)!.messageCount).toBeGreaterThan(mainRequests[0]!.messageCount);
+    // The resumed run reports only what it spent itself — its own step sums,
+    // not the session's cumulative total — so its usage is a positive per-run
+    // number.
+    expect(second.usageBasis).toBe("per_run");
+    expect(second.usage?.inputTokens ?? 0).toBeGreaterThan(0);
+    expect(second.usage?.outputTokens ?? 0).toBeGreaterThan(0);
   }, 90_000);
 
   // SUP-19141: the session guards read the database this very binary wrote, not
@@ -637,6 +658,10 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(result.exitCode).toBe(1);
     expect(result.finishReason).toBe("length");
     expect(result.errorMessage).toEqual(expect.stringMatching(/output token limit|output-token cap/i));
+    // The capped turn still spent tokens, and the usage already emitted is
+    // carried on the failed result as per-run usage.
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.usage?.outputTokens ?? 0).toBeGreaterThan(0);
     // OpenCode 2.2.3+ names the cap itself, so the failure is not only the
     // adapter's own reading of a `length` finish reason.
     const stdout = String(result.resultJson?.stdout ?? "");

@@ -669,12 +669,15 @@ IDs; older runs are not included in this thread response.
 - `provider` text not null
 - `model` text not null
 - `cost_status` text not null default `reported`; `unpriced` when usage exists but no price was reported
-- `input_tokens` int not null default 0
-- `output_tokens` int not null default 0
+- `input_tokens` bigint not null default 0
+- `cached_input_tokens` bigint not null default 0
+- `output_tokens` bigint not null default 0
 - `cost_cents` int not null
 - `occurred_at` timestamptz not null
 
 Invariant: each event must attach to agent and company; rollups are aggregation, never manually edited.
+A counter beyond what its column can store is rejected, not allowed to fail the insert: the event is kept with the counter bounded to the column limit (0 for a negative or non-numeric value) and a `cost_event.counters_rejected` activity entry records the rejected value.
+Ingestion also refreshes the cached `agents`/`companies` `spent_monthly_cents` totals; a total above the int column limit is saturated at that limit (recorded as a `cost_event.spent_monthly_saturated` activity entry) rather than failing ingestion, and budget evaluation still runs because it sums `cost_events` directly.
 
 ## 7.10 `approvals`
 

@@ -1038,10 +1038,10 @@ server/src/__tests__/slack-conversation-lifecycle.test.ts(86,87): TS2339
 server/src/__tests__/status-cards.test.ts(134,49): TS2322
 server/src/__tests__/status-cards.test.ts(245,19): TS2769
 server/src/__tests__/status-cards.test.ts(271,9): TS2741
-server/src/__tests__/status-cards.test.ts(309,9): TS2741
-server/src/__tests__/status-cards.test.ts(316,18): TS2352
-server/src/__tests__/status-cards.test.ts(400,7): TS2322
-server/src/__tests__/status-cards.test.ts(590,9): TS2741
+server/src/__tests__/status-cards.test.ts(361,9): TS2741
+server/src/__tests__/status-cards.test.ts(368,18): TS2352
+server/src/__tests__/status-cards.test.ts(452,7): TS2322
+server/src/__tests__/status-cards.test.ts(642,9): TS2741
 server/src/__tests__/summary-slots.test.ts(703,29): TS18047
 server/src/__tests__/summary-slots.test.ts(707,50): TS2339
 server/src/__tests__/summary-slots.test.ts(718,28): TS2339
