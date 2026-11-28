@@ -7,6 +7,7 @@ import {
   BoardStageSelfApprovalError,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  resolveDisplacedParticipantPendingState,
 } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 
@@ -921,5 +922,56 @@ describe("executionDecisionBinding (SUP-25518 head/round binding)", () => {
     expect(executionDecisionBindingMatches({ deliveredHeadSha: null, reviewRoundStartedAt: null }, current, null)).toBe(false);
     expect(executionDecisionBindingMatches({ deliveredHeadSha: headA, reviewRoundStartedAt: null }, current, null)).toBe(false);
     expect(executionDecisionBindingMatches(bound, executionDecisionBinding(pendingAt(null, null)), null)).toBe(false);
+  });
+});
+
+describe("resolveDisplacedParticipantPendingState (SUP-24612)", () => {
+  const policy = twoStagePolicy();
+  const reviewStage = policy.stages[0]!;
+  const approvalStage = policy.stages[1]!;
+  const cto = { type: "user" as const, agentId: null, userId: ctoUserId };
+  const qa = { type: "agent" as const, agentId: qaAgentId, userId: null };
+
+  function state(overrides: Record<string, unknown>) {
+    return parseIssueExecutionState({
+      status: "pending",
+      currentStageId: approvalStage.id,
+      currentStageIndex: 1,
+      currentStageType: "approval",
+      currentParticipant: cto,
+      returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+      deliveryAuthor: null,
+      completedStageIds: [reviewStage.id],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      changesRequestedCount: 0,
+      pendingSince: "2026-11-01T10:00:00.000Z",
+      ...overrides,
+    });
+  }
+
+  it("returns the pending state of a participant still pending on the decided stage", () => {
+    expect(resolveDisplacedParticipantPendingState(state({}), approvalStage, cto)).toEqual({
+      status: "pending",
+      stageId: approvalStage.id,
+      stageIndex: 1,
+      stageType: "approval",
+      participant: cto,
+      pendingSince: "2026-11-01T10:00:00.000Z",
+    });
+  });
+
+  it("returns null when the participant already decided or the stage is not the pending one", () => {
+    expect(resolveDisplacedParticipantPendingState(state({ status: "changes_requested" }), approvalStage, cto)).toBeNull();
+    expect(resolveDisplacedParticipantPendingState(state({ status: "completed" }), approvalStage, cto)).toBeNull();
+    expect(resolveDisplacedParticipantPendingState(state({}), reviewStage, cto)).toBeNull();
+    expect(resolveDisplacedParticipantPendingState(null, approvalStage, cto)).toBeNull();
+  });
+
+  it("returns null when the board displaces nobody or someone other than the pending participant", () => {
+    expect(resolveDisplacedParticipantPendingState(state({}), approvalStage, null)).toBeNull();
+    expect(resolveDisplacedParticipantPendingState(state({}), approvalStage, qa)).toBeNull();
+    expect(resolveDisplacedParticipantPendingState(state({ currentParticipant: null }), approvalStage, cto)).toBeNull();
   });
 });

@@ -241,6 +241,7 @@ This prevents silent completions where an agent finishes work but leaves no trac
 - Non-participants who attempt to transition the issue receive a `422 Unprocessable Entity` error.
 - Both approvals and change requests **require a comment** — empty or whitespace-only comments are rejected.
 - The decision comment must be included in the same `PATCH /api/issues/{issueId}` request that changes the status. A prior `POST /api/issues/{issueId}/comments` entry remains normal discussion and does not satisfy the review/approval decision guard.
+- Board stage override (`POST /api/issues/{issueId}/execution-stage/board-decision`, flag-gated by `PAPERCLIP_BOARD_STAGE_OVERRIDE`, board owner/admin only): when the decided stage is still `pending` on its `currentParticipant` (agent or user), the request must carry a non-empty `displacementReason` (at most 2000 characters; whitespace-only counts as missing). Without one the route returns `409` with `reason: "displacement_reason_required"` and writes nothing. With one, the `issue.board_stage_override` activity row also records `pendingState` (stage id, index, type, participant, `pendingSince`) and `reason`. An override that displaces nobody, or a participant that already decided, is unchanged. The displaced participant's later comment stays a plain comment.
 
 ## API Usage
 
