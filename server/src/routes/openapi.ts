@@ -1472,6 +1472,7 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  "GET /api/issues/{id}/review-entry-blockers",
   // Added upstream in the 2026-09-19 slice-2d fold range (#13284, Agent Chat).
   // Every ai-connections handler calls assertBoard() unconditionally, so the
   // fork's SUP-16341 regression guard requires them listed here.
@@ -4375,6 +4376,37 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/publication-close-eligibility",
+  tags: ["issues"],
+  summary: "Read publication close eligibility for an issue",
+  description:
+    "Read-only. Requires issue:read on the issue, the same actor that can read the issue and its runs. " +
+    "Does not require company_scope:read and is not board-only. Every key is always present. Each boolean is never null. " +
+    "deliveryIdentity is true when the parsed execution-state delivery block is present. " +
+    "deliveryReceipt is true when any delivery receipt exists for this company and issue, in any state. " +
+    "cachedLinkedPullRequest is cached and advisory: it is true when the card has a cached GitHub pull-request mention " +
+    "whose cached state is open or unknown, including drafts. It is the cached read the accept path uses. " +
+    "This route does not call GitHub, so it does not refresh pull-request state and does not discover unmentioned pull requests. " +
+    "The done-close guard does both, so the close can decide differently. " +
+    "cachedLinkedPullRequestFetchedAt is the oldest GitHub fetch time among the cached pull-request rows that field reads. " +
+    "It is null when there is no such row or when one of them was never fetched. " +
+    "A true boolean means the accept path would refuse the card for that binding. This route never writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      deliveryIdentity: z.boolean(),
+      deliveryReceipt: z.boolean(),
+      cachedLinkedPullRequest: z.boolean(),
+      cachedLinkedPullRequestFetchedAt: z.string().datetime().nullable(),
+    }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
@@ -4401,7 +4433,8 @@ registry.registerPath({
     "Closing to done or cancelled still clears the monitor. If its prior nextCheckAt is later than the close write, issue.monitor_cleared records details.previousNextCheckAt, details.recoveryPolicy (nullable), details.reason=cleared_by_close_future_check and the existing actorType/actorId/agentId/runId attribution. This records cancellation of the future check; it does not re-register it. Past-due monitors retain their ordinary clear behavior. " +
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
-    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
+    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee. " +
+    "reviewEntryPrecondition is an entry-only conditional request for the current assignee's recorded deliverable. Send only status=done, comment and the precondition, with the exact stored policy/state, status version, workspace and independent ruling/artifact revision IDs. A clean card-owned isolated Git worktree must be positively covered by a trusted published base. Its Git admin-directory pathname and device/inode must match the server-recorded provisioning identity; missing legacy identities require fresh provisioning. Another registered worktree HEAD symref to the same branch refuses. Admission is entry-checked and optimistic; the receipt records observed state and does not exclude later writers or unregistered copied-tree/gitfile aliases (including a hand-written commondir that shares the branch). Shared primary directories, repository debt, re-entry and mixed mutations refuse with review_entry_* conflicts. The transaction commits in_review, the reviewer, inline comment and an immutable receipt together; reviewEntryReceiptId is returned. This is not close-tier or approval evidence. Reconcile unknown transport outcomes through the issue and review-entry-receipts reads.",
   request: {
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
@@ -4507,6 +4540,26 @@ registry.registerPath({
     },
     422: r.unprocessable,
   },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-receipts",
+  tags: ["issues"],
+  summary: "Read immutable first-review entry receipts",
+  description: "Company-scoped historical admission evidence. Retains the pinned ruling and reviewed artifact revisions and server-owned isolated-worktree, repository/base, actor/run and stage identities. A receipt is not an approval or reusable terminal-close proof.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-blockers",
+  tags: ["issues"],
+  summary: "Inspect company-scoped first-review entry blockers",
+  description: "Board-operator diagnostic for an active isolated-worktree binding; viewer sessions and read-only board keys are refused. Returns this company's blockers only: source table, row id, recorded path (or null), review_entry_* code and reason. Admission checks concrete managed-tree writers across companies without exposing foreign identities; valid broad ancestors at or above the managed projects root are company-scoped. Missing paths resolve symlink targets before dot-dot segments; uncertainty reaching the managed root refuses even when the link is outside it. This read performs no Git command/provider proof, locks or mutation and grants no admission token.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
