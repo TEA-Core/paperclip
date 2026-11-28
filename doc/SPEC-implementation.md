@@ -325,7 +325,9 @@ participant of that stage (an agent-reviewed card). The approving agent must not
 be the card's executor, assignee, return assignee, delivery author or creating
 agent, and the board must not have recorded the decision in its place. An old
 board-user approval, a self-review and a stage with no participants do not
-qualify. It records no
+qualify. The approving decision must also be bound to the merged pull request:
+its recorded `delivered_head_sha` must equal the pull request head the server
+verified live. An unbound, legacy or old-head decision does not qualify. It records no
 `deliveryIdentity`. For such a card a board actor may call
 `POST /api/issues/:id/landing-proof` with one merged pull request in the card's
 project repository, its merge or head commit, and a reason. An agent key is

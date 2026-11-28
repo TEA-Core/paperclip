@@ -11312,7 +11312,8 @@ registerCurrentRoute({
     "execution workflow is completed and either has at least one completed review stage naming only users, or is `record_only` " +
     "with every stage approved or skipped and at least one completed review stage whose latest durable decision is an approval " +
     "recorded by an agent participant of that stage who is not the card's executor, assignee or author and was not replaced by a " +
-    "board user (an old board-user approval, a self-review and an empty participant list do not qualify), " +
+    "board user (an old board-user approval, a self-review and an empty participant list do not qualify), whose recorded " +
+    "`delivered_head_sha` equals the live-verified pull request head (an unbound, legacy or old-head decision does not qualify), " +
     "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
