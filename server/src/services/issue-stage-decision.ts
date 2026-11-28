@@ -4,6 +4,7 @@ import type { IssueExecutionDecisionOutcome } from "@paperclipai/shared";
 import {
   applyIssueExecutionPolicyTransition,
   assertExecutionDecisionSnapshotCurrent,
+  executionDecisionBinding,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -197,6 +198,7 @@ export async function applyReviewEscalationDecision(args: {
       outcome: decision.outcome,
       body: decision.body,
       createdByRunId: actor.runId ?? null,
+      ...executionDecisionBinding(existingState),
     });
     return issueService(db).update(
       issue.id,

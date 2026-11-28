@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -46,6 +46,7 @@ import {
   inheritedExecutionWorkspaceBranchDeclined,
   inheritedExecutionWorkspaceBranchExempt,
 } from "./execution-workspace-policy.js";
+import { PROVISIONED_GIT_ADMIN_IDENTITY_KEY } from "./worktree-git-admin-identity.js";
 
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
 
@@ -420,6 +421,13 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
     expect(persistedRows).toHaveLength(1);
     expect(persistedRows[0]!.status).toBe("active");
+    const adminPath = await realpath(execSync("git rev-parse --absolute-git-dir", {
+      cwd: result.executionWorkspace.cwd, encoding: "utf8",
+    }).trim());
+    const admin = await lstat(adminPath, { bigint: true });
+    expect(persistedRows[0]!.metadata?.[PROVISIONED_GIT_ADMIN_IDENTITY_KEY]).toEqual({
+      path: adminPath, device: admin.dev.toString(), inode: admin.ino.toString(),
+    });
 
     const issueRows = await db
       .select({ executionWorkspaceId: issues.executionWorkspaceId })

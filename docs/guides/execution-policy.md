@@ -80,6 +80,8 @@ interface IssueExecutionDecision {
   outcome: "approved" | "changes_requested";
   body: string;              // required comment explaining the decision
   createdByRunId: string | null;
+  deliveredHeadSha: string | null;    // delivered head the decision was made on
+  reviewRoundStartedAt: Date | null;  // review round (stage pendingSince) it was made in
   createdAt: Date;
 }
 ```

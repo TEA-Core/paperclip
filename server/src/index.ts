@@ -1027,7 +1027,7 @@ async function startServerWithDatabaseTeardown(
         cloudActorHeaderSourceFromHeaders(req.headers),
       );
       if (!actor?.userId || !actor.companyIds) return null;
-      return { userId: actor.userId, companyIds: actor.companyIds };
+      return { userId: actor.userId, companyIds: actor.companyIds, authorizationActor: actor };
     },
   });
 
