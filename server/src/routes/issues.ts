@@ -475,6 +475,7 @@ import {
   assertPatchableExecutionPolicyWrite,
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
+  certifiedExecutionDecisionBinding,
   diagnoseMissingApprovalStage,
   executionDecisionBinding,
   executionDecisionBindingMatches,
@@ -13206,7 +13207,7 @@ export function issueRoutes(
         // reconcile a stage still pending on it; an unbound or stale row is never
         // reused, so the board approval is recorded afresh on the current round.
         const latestDecisionByStage = latestDecisionPerStage(decidedRows);
-        const currentBinding = executionDecisionBinding(previousState);
+        const stateBinding = executionDecisionBinding(previousState);
         const certifiedHeadSha =
           finalDeliveryPrefetch?.resolution.repoBacked && finalDeliveryPrefetch.resolution.verdict.kind === "resolved"
             ? finalDeliveryPrefetch.resolution.verdict.headSha
@@ -13214,7 +13215,7 @@ export function issueRoutes(
         const durableApprovalIds = new Map<string, string>();
         for (const stageId of decidedStageIds) {
           const row = latestDecisionByStage.get(stageId)!;
-          if (executionDecisionBindingMatches(row, currentBinding, certifiedHeadSha)) {
+          if (executionDecisionBindingMatches(row, stateBinding, certifiedHeadSha)) {
             durableApprovalIds.set(stageId, row.id);
           }
         }
@@ -13312,7 +13313,7 @@ export function issueRoutes(
             outcome: result.decision.outcome,
             body: result.decision.body,
             createdByRunId: actor.runId ?? null,
-            ...currentBinding,
+            ...certifiedExecutionDecisionBinding(previousState, nextExecutionState, decisionId),
           });
         }
 
@@ -15276,7 +15277,7 @@ export function issueRoutes(
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
-                ...executionDecisionBinding(lockedIssue.executionState),
+                ...certifiedExecutionDecisionBinding(lockedIssue.executionState, updateFields.executionState, decisionId),
               });
               if (transition.stallEscalation) {
                 await logActivityInTransaction(tx as unknown as Db, {
@@ -22914,7 +22915,7 @@ export function issueRoutes(
               outcome: decision.outcome,
               body: decision.body,
               createdByRunId: actor.runId ?? null,
-              ...executionDecisionBinding(existing.executionState),
+              ...certifiedExecutionDecisionBinding(existing.executionState, updated.executionState, decisionId),
             });
             // R20: the hand-off to the stall arbiter commits with the
             // reviewer's decision that triggered it, never without it.
@@ -25971,6 +25972,7 @@ export function issueRoutes(
         // the pointer via the engine's `in_review` patch.
         finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
         deferredPostCommit,
+        certifiedFinalDelivery: escalationCertifiedDelivery,
       });
       const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
       const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept
@@ -28002,7 +28004,7 @@ export function issueRoutes(
               outcome: transition.decision.outcome,
               body: transition.decision.body,
               createdByRunId: actor.runId ?? null,
-              ...executionDecisionBinding(currentExecutionState),
+              ...certifiedExecutionDecisionBinding(currentExecutionState, updated.executionState, decisionId),
             });
           }
 

@@ -4,7 +4,7 @@ import type { IssueExecutionDecisionOutcome } from "@paperclipai/shared";
 import {
   applyIssueExecutionPolicyTransition,
   assertExecutionDecisionSnapshotCurrent,
-  executionDecisionBinding,
+  certifiedExecutionDecisionBinding,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -85,6 +85,9 @@ export async function applyReviewEscalationDecision(args: {
   // The caller already compared the full snapshot, status included, under the
   // issue row lock it still holds, and its own resolver wrote the status since.
   skipStatusCompare?: boolean;
+  // The final delivery this request's preflight certified, stamped with the
+  // decision's id after it commits. The decision is bound to its head.
+  certifiedFinalDelivery?: Record<string, unknown> | null;
 }): Promise<{
   id: string;
   status: string;
@@ -198,7 +201,13 @@ export async function applyReviewEscalationDecision(args: {
       outcome: decision.outcome,
       body: decision.body,
       createdByRunId: actor.runId ?? null,
-      ...executionDecisionBinding(existingState),
+      ...certifiedExecutionDecisionBinding(
+        existingState,
+        args.certifiedFinalDelivery
+          ? { approvalStatus: { finalDelivery: { ...args.certifiedFinalDelivery, decisionId } } }
+          : null,
+        decisionId,
+      ),
     });
     return issueService(db).update(
       issue.id,

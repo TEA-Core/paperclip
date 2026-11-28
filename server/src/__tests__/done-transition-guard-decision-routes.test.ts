@@ -2293,6 +2293,80 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(typeof approvalStatus?.publishedAt).toBe("string");
   });
 
+  const MOVED_HEAD_A = "a1".repeat(20);
+  const MOVED_HEAD_B = "b2".repeat(20);
+  const MOVED_ROUND = "2026-11-20T10:00:00.000Z";
+
+  async function recordStateHead(issueId: string, headSha: string) {
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          ...(row!.executionState as Record<string, unknown>),
+          deliveredHeadSha: headSha,
+          pendingSince: MOVED_ROUND,
+        },
+      })
+      .where(eq(issues.id, issueId));
+  }
+
+  async function expectDecisionAndCertificationShareHead(issueId: string, headSha: string) {
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      outcome: "approved",
+      deliveredHeadSha: headSha,
+      reviewRoundStartedAt: new Date(MOVED_ROUND),
+    });
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const approvalStatus = (row!.executionState as Record<string, any>).approvalStatus;
+    expect(approvalStatus?.approvedHeadSha).toBe(headSha);
+    expect(approvalStatus?.finalDelivery).toMatchObject({ headSha, decisionId: decisions[0]!.id });
+  }
+
+  it("PATCH: binds the agent's final approval to the head the preflight certifies when the head moved", async () => {
+    // The state records head A; the live PR head was force-pushed to B (same
+    // tree) before the reviewer approved. The preflight reads the head once and
+    // both the decision row and the certification carry that value.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D25518P");
+    await recordStateHead(issueId, MOVED_HEAD_A);
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockUnmergedBranch();
+    certifiedDelivery.headSha = MOVED_HEAD_B;
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectDecisionAndCertificationShareHead(issueId, MOVED_HEAD_B);
+  });
+
+  it("POST comment: binds the auto-approval to the head the preflight certifies when the head moved", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D25518C");
+    await recordStateHead(issueId, MOVED_HEAD_A);
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockUnmergedBranch();
+    certifiedDelivery.headSha = MOVED_HEAD_B;
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expectDecisionAndCertificationShareHead(issueId, MOVED_HEAD_B);
+  });
+
   it("POST comment: an ambiguous two-PR approval is refused before the decision lands (SUP-14602, SUP-19860)", async () => {
     // The card is approved while two linked PRs are open. A terminal approval
     // owes one unambiguous owner delivery, so the real final-delivery preflight
@@ -2793,6 +2867,23 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(tier2Rows[0]?.details).toMatchObject({ tierForm: "record-only", closingRunId: runId, observed: "2026-11-04T09:15:00Z" });
+    });
+
+    it("recovery-action close: binds the agent's final approval to the head the preflight certifies when the head moved", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598H");
+      await recordStateHead(issueId, MOVED_HEAD_A);
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockUnmergedBranch();
+      certifiedDelivery.headSha = MOVED_HEAD_B;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      await expectDecisionAndCertificationShareHead(issueId, MOVED_HEAD_B);
     });
   });
 

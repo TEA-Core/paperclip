@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -9,10 +9,13 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueComments,
   issueExecutionDecisions,
   issues,
+  projectWorkspaces,
+  projects,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -25,6 +28,29 @@ import {
   findBoardStageOverrideEchoComment,
   issueRoutes,
 } from "../routes/issues.js";
+
+// The final delivery preflight resolves the live PR head over the network. Tests
+// that set `finalDeliveryPreflight.headSha` get a resolved verdict for that head;
+// every other test keeps the real resolver (a card with no repo context never
+// calls it).
+const finalDeliveryPreflight = vi.hoisted(() => ({ headSha: null as string | null, calls: 0 }));
+
+vi.mock("../services/merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/merge-arming.js")>();
+  return {
+    ...actual,
+    preflightFinalDelivery: async (...args: Parameters<typeof actual.preflightFinalDelivery>) => {
+      if (finalDeliveryPreflight.headSha === null) return actual.preflightFinalDelivery(...args);
+      finalDeliveryPreflight.calls += 1;
+      return {
+        kind: "resolved" as const,
+        headSha: finalDeliveryPreflight.headSha,
+        displayName: "TEA-Core/paperclip#42",
+        pr: { owner: "TEA-Core", repo: "paperclip", number: 42 },
+      };
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -86,6 +112,11 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    finalDeliveryPreflight.headSha = null;
+    finalDeliveryPreflight.calls = 0;
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -159,6 +190,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     changesRequestedStageId?: string;
     /** Seed the pending round's delivered head and arm time (SUP-25518 decision binding). */
     binding?: { headSha: string; round: string };
+    /** Back the card with a GitHub repo so the final delivery preflight runs. */
+    repoBacked?: boolean;
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -293,12 +326,44 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             ...(opts.binding ? { deliveredHeadSha: opts.binding.headSha, pendingSince: opts.binding.round } : {}),
           };
 
+    const executionWorkspaceId = opts.repoBacked ? "77777777-7777-4777-8777-777777777777" : null;
+    if (executionWorkspaceId) {
+      const projectId = "88888888-8888-4888-8888-888888888888";
+      const projectWorkspaceId = "99999999-9999-4999-8999-999999999999";
+      await db.insert(projects).values({ id: projectId, companyId, name: "Repo Project", status: "active" });
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary",
+        cwd: "/tmp/test",
+        isPrimary: true,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: null,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "SUP-15805-1-test-branch",
+        status: "active",
+        cwd: "/tmp/test",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        baseRef: "main",
+        branchName: "SUP-15805-1-test-branch",
+        providerType: "git_worktree",
+        providerRef: "/tmp/test",
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
       identifier: "SUP-15805-1",
       issueNumber: 1,
       title: "Board stage decision target",
+      ...(executionWorkspaceId ? { executionWorkspaceId } : {}),
       status: opts.issueStatus ?? "in_review",
       priority: "medium",
       assigneeAgentId: reviewerAgentId,
@@ -1301,6 +1366,76 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       .from(activityLog)
       .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_reconciled")));
     expect(reconciledActivity).toHaveLength(0);
+  });
+
+  it("binds the fresh approval to the head the final delivery preflight certifies when the head moved", async () => {
+    // The state records head A, but the live PR head was force-pushed to B (same
+    // tree) before the board decided. The head is read once, by the preflight,
+    // and both the recorded decision and the certification carry that value.
+    const { companyId, issueId } = await seedIssue({
+      binding: { headSha: HEAD_A, round: ROUND_ONE },
+      repoBacked: true,
+    });
+    currentActor = boardActor(companyId);
+    finalDeliveryPreflight.headSha = HEAD_B;
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the force-pushed head" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(finalDeliveryPreflight.calls).toBe(1);
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      id: res.body.decisionId,
+      deliveredHeadSha: HEAD_B,
+      reviewRoundStartedAt: new Date(ROUND_ONE),
+    });
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const approvalStatus = (issueRow!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+    expect(approvalStatus.approvedHeadSha).toBe(HEAD_B);
+    expect(approvalStatus.finalDelivery).toMatchObject({ headSha: HEAD_B, decisionId: decisions[0]!.id });
+  });
+
+  it("binds a non-final board approval to the state head, not the live head, when the head moved", async () => {
+    // The approval advances to a later stage, so it certifies no head: the
+    // decision keeps the head the state recorded for the round.
+    const { companyId, issueId } = await seedIssue({
+      twoStages: true,
+      binding: { headSha: HEAD_A, round: ROUND_ONE },
+      repoBacked: true,
+    });
+    currentActor = boardActor(companyId);
+    finalDeliveryPreflight.headSha = HEAD_B;
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the first stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      id: res.body.decisionId,
+      deliveredHeadSha: HEAD_A,
+      reviewRoundStartedAt: new Date(ROUND_ONE),
+    });
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const approvalStatus = (issueRow!.executionState as Record<string, unknown>).approvalStatus as
+      | Record<string, unknown>
+      | undefined;
+    expect(approvalStatus?.finalDelivery).toBeUndefined();
   });
 
   it("wakes the return assignee when a board decision requests changes", async () => {
