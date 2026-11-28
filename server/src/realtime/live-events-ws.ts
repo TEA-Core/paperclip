@@ -305,8 +305,9 @@ export function setupLiveEventsWebSocketServer(
     }
 
     // Each event is authorized for this subscriber before it is sent. The
-    // chain keeps delivery in publish order while a decision is pending, and
-    // a failed decision withholds the event rather than sending it.
+    // chain keeps delivery in publish order while a decision is pending. A
+    // failed lookup denies inside the filter; any other filter error
+    // withholds the event rather than sending it.
     const visibleLiveEvent = liveEventVisibility(context.actor);
     let delivery = Promise.resolve();
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {

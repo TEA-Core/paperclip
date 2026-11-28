@@ -4892,4 +4892,30 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
+
+  it("records the deleted issue's title and read-decision columns on issue.deleted", async () => {
+    mockIssueService.remove.mockResolvedValue(makeIssue({ status: "cancelled", createdByAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(boardActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.deleted",
+        entityType: "issue",
+        entityId: issueId,
+        details: {
+          identifier: "PAP-1649",
+          title: "Owned active issue",
+          projectId: null,
+          parentId: null,
+          assigneeAgentId: ownerAgentId,
+          assigneeUserId: null,
+          status: "cancelled",
+          createdByAgentId: ownerAgentId,
+        },
+      }),
+    );
+  });
 });
