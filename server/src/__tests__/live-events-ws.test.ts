@@ -1,9 +1,19 @@
 import { EventEmitter } from "node:events";
-import type { IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
+import { WebSocket } from "ws";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { LiveEvent } from "@paperclipai/shared";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
+import { publishLiveEvent } from "../services/live-events.js";
+
+const visibleLiveEvent = vi.hoisted(() => vi.fn(async (event: unknown) => event));
+
+vi.mock("../realtime/live-event-issue-visibility.js", () => ({
+  createLiveEventIssueVisibility: () => () => visibleLiveEvent,
+}));
 
 vi.mock("../middleware/logger.js", () => ({
   logger: {
@@ -179,5 +189,37 @@ describe("setupLiveEventsWebSocketServer", () => {
 
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
+  });
+
+  it("withholds an event whose visibility filter fails instead of sending it in full", async () => {
+    const content = "Issue content a failed filter must not release";
+    visibleLiveEvent.mockImplementation(async (event: unknown) => {
+      if ((event as LiveEvent).type === "activity.logged") throw new Error("filter failed");
+      return event;
+    });
+    const httpServer = createServer();
+    setupLiveEventsWebSocketServer(httpServer, {} as never, { deploymentMode: "local_trusted" });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = httpServer.address() as AddressInfo;
+    const client = new WebSocket(`ws://127.0.0.1:${port}/api/companies/company-1/events/ws`);
+    const received: LiveEvent[] = [];
+    client.on("message", (data) => received.push(JSON.parse(data.toString()) as LiveEvent));
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once("open", () => resolve());
+        client.once("error", reject);
+      });
+      publishLiveEvent({ companyId: "company-1", type: "activity.logged", payload: { details: { description: content } } });
+      // A later event that passes the filter proves the failed one was processed.
+      publishLiveEvent({ companyId: "company-1", type: "agent.status", payload: { agentId: "agent-1", status: "idle" } });
+      await vi.waitFor(() => expect(received).toHaveLength(1));
+
+      expect(received.map((event) => event.type)).toEqual(["agent.status"]);
+      expect(JSON.stringify(received)).not.toContain(content);
+    } finally {
+      client.terminate();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
   });
 });

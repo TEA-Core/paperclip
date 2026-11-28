@@ -44,3 +44,11 @@ export function unprocessable(message: string, details?: unknown) {
 export function tooManyRequests(message = "Too many requests", details?: unknown) {
   return new HttpError(429, message, details);
 }
+
+/** A first review-entry receipt retains its issue, company and pinned revisions. */
+export function reviewEntryReceiptRetained(subject: "Company" | "Issue" | "Document", receiptId: string | null) {
+  return conflict(
+    `${subject} cannot be deleted because review-entry receipt ${receiptId ?? "evidence"} retains its evidence.`,
+    { code: "review_entry_receipt_retained", receiptId },
+  );
+}

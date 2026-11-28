@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { publishLiveEvent } from "../services/live-events.js";
 
 const mockWakeup = vi.hoisted(() => vi.fn());
@@ -98,16 +99,80 @@ describe("plugin agent sessions", () => {
       },
     });
 
-    expect(notifyWorker).toHaveBeenCalledWith(
-      "agents.sessions.event",
-      expect.objectContaining({
-        sessionId,
-        runId: "run-1",
-        eventType: "done",
-        message: "Hello! How can I help?",
-      }),
+    // A plugin without issues.read still gets its own session's output: this
+    // run names no issue.
+    await vi.waitFor(() =>
+      expect(notifyWorker).toHaveBeenCalledWith(
+        "agents.sessions.event",
+        expect.objectContaining({
+          sessionId,
+          runId: "run-1",
+          eventType: "done",
+          message: "Hello! How can I help?",
+        }),
+      ),
     );
 
+    services.dispose();
+  });
+
+  async function startSession(capabilities: string[]) {
+    const notifyWorker = vi.fn();
+    mockWakeup.mockReset();
+    mockWakeup.mockResolvedValue({ id: "run-1" });
+    const services = buildHostServices(
+      createSessionLookupDb({
+        id: "session-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        taskKey: "plugin:paperclip.gateway:session:session-1",
+      }),
+      "plugin-record-id",
+      "paperclip.gateway",
+      createEventBusStub(),
+      notifyWorker,
+      { manifest: { id: "paperclip.gateway", capabilities } as unknown as PaperclipPluginManifestV1 },
+    );
+    await services.agentSessions.sendMessage({ sessionId: "session-1", companyId: "company-1", prompt: "hello" });
+    return { notifyWorker, services };
+  }
+
+  const log = { runId: "run-1", issueId: "issue-restricted", seq: 1, stream: "stdout", chunk: "Restricted chunk" };
+  const status = { runId: "run-1", issueId: "issue-restricted", status: "succeeded", finalText: "Restricted final text" };
+
+  it("sends a plugin without issues.read only the metadata of session output about an issue", async () => {
+    const { notifyWorker, services } = await startSession(["agent.sessions.send"]);
+
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.log", payload: log });
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.status", payload: status });
+
+    await vi.waitFor(() => expect(notifyWorker).toHaveBeenCalledTimes(2));
+    expect(JSON.stringify(notifyWorker.mock.calls)).not.toContain("Restricted");
+    expect(notifyWorker.mock.calls.map((call) => call[1])).toEqual([
+      expect.objectContaining({
+        eventType: "chunk",
+        message: null,
+        payload: { runId: "run-1", issueId: "issue-restricted", seq: 1, stream: "stdout" },
+      }),
+      expect.objectContaining({
+        eventType: "done",
+        message: null,
+        payload: { runId: "run-1", issueId: "issue-restricted", status: "succeeded" },
+      }),
+    ]);
+    services.dispose();
+  });
+
+  it("sends a plugin with issues.read session output unchanged", async () => {
+    const { notifyWorker, services } = await startSession(["agent.sessions.send", "issues.read"]);
+
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.log", payload: log });
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.status", payload: status });
+
+    expect(notifyWorker.mock.calls.map((call) => call[1])).toEqual([
+      expect.objectContaining({ eventType: "chunk", message: "Restricted chunk", payload: log }),
+      expect.objectContaining({ eventType: "done", message: "Restricted final text", payload: status }),
+    ]);
     services.dispose();
   });
 });

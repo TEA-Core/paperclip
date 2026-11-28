@@ -65,6 +65,7 @@ import {
   issueWatchdogs,
   issuePlanDecompositions,
   issueRecoveryActions,
+  issueReviewEntryReceipts,
   issueRelations,
   issueComments,
   issueDocuments,
@@ -110,7 +111,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound, reviewEntryReceiptRetained, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../config.js";
 import { logger } from "../middleware/logger.js";
@@ -5678,6 +5679,7 @@ const issueListSelect = {
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
   monitorAttemptCount: issues.monitorAttemptCount,
+  monitorArmGeneration: issues.monitorArmGeneration,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
   executionWorkspaceId: issues.executionWorkspaceId,
@@ -13378,6 +13380,9 @@ export function issueService(
           eq(issues.id, id), eq(issues.companyId, carrier.companyId),
         )).for("update");
         if (!lockedCarrier) return null;
+        const [entryReceipt] = await tx.select({ id: issueReviewEntryReceipts.id }).from(issueReviewEntryReceipts)
+          .where(and(eq(issueReviewEntryReceipts.companyId, carrier.companyId), eq(issueReviewEntryReceipts.issueId, id))).limit(1);
+        if (entryReceipt) throw reviewEntryReceiptRetained("Issue", entryReceipt.id);
         const parks = await tx.select({ status: issueTreeHolds.status, actionStatus: issueRecoveryActions.status,
           actionSourceId: issueRecoveryActions.sourceIssueId }).from(issueTreeHolds).leftJoin(issueRecoveryActions, and(
           eq(issueRecoveryActions.companyId, carrier.companyId),

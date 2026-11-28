@@ -1,5 +1,11 @@
 import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
+import {
+  assertReviewEntryRequest,
+  listReviewEntryBlockers,
+  prepareReviewEntry,
+  verifyReviewEntryAtTransition,
+} from "../services/review-entry-precondition.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -40,6 +46,7 @@ import {
   gt,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   sql,
@@ -74,6 +81,7 @@ import {
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
+  issueReviewEntryReceipts,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -268,10 +276,12 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
+import { readPublicationCloseEligibility } from "../services/publication-close-eligibility.js";
 import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../services/release-ladder.js";
 import {
   evaluateStageIntegrity,
   resolveSelfApprovalPrincipals,
+  latestDecisionPerStage,
   listDurablyApprovedStageIds,
   readApprovalHeadDelta,
   readApprovalPullRequest,
@@ -466,6 +476,8 @@ import {
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
   diagnoseMissingApprovalStage,
+  executionDecisionBinding,
+  executionDecisionBindingMatches,
   listCurrentPolicyApprovedStageIds,
   type DurableApprovalIssue,
   isReviewChangesRequestedTransition,
@@ -546,6 +558,12 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import {
+  deletedIssueActivityDetails,
+  issueAccessDecisionInput,
+  type IssueAccessAction,
+  type IssueAccessTarget,
+} from "../services/issue-access-input.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 // Strip must be re-applied after `.extend()`: the handler below rest-spreads the parsed body into
@@ -3062,7 +3080,8 @@ export const BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS = 60;
  *   1. this PATCH closes the issue: it was not terminal before (`wasClosed` false), the new
  *      status is done/cancelled, and the caller is a user;
  *   2. the newest non-system, non-deleted comment on the thread is the comment an
- *      `issue.board_stage_override` activity row of this issue recorded (`details.commentId`),
+ *      `issue.board_stage_override` or `issue.board_stage_reconciled` activity row of this issue
+ *      recorded (`details.commentId`),
  *      and that row is inside the window — a comment posted since keeps the close note visible;
  *   3. that comment was authored by the same user as the closing request; and
  *   4. the closing note — trimmed and redacted exactly as `addComment` stores it — is
@@ -3111,7 +3130,7 @@ export async function findBoardStageOverrideEchoComment(
       and(
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, input.issueId),
-        eq(activityLog.action, "issue.board_stage_override"),
+        inArray(activityLog.action, ["issue.board_stage_override", "issue.board_stage_reconciled"]),
         sql`${activityLog.details} ->> 'commentId' = ${latest.id}`,
         sql`${activityLog.createdAt} > now() - (${BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS}::int * interval '1 second')`,
       ),
@@ -8036,42 +8055,13 @@ export function issueRoutes(
 
   async function decideIssueAccess(
     req: Request,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-      status: string;
-      createdByAgentId: string | null;
-    },
-    action: "issue:comment" | "issue:read" | "issue:mutate",
+    issue: IssueAccessTarget,
+    action: IssueAccessAction,
     options: { allowCreatorDocumentWrite?: boolean } = {},
   ) {
     return access.decide({
       actor: req.actor,
-      action,
-      resource: {
-        type: "issue",
-        companyId: issue.companyId,
-        issueId: issue.id,
-        projectId: issue.projectId,
-        parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
-        status: issue.status,
-        createdByAgentId: issue.createdByAgentId,
-      },
-      scope: {
-        issueId: issue.id,
-        projectId: issue.projectId,
-        parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
-        createdByAgentId: issue.createdByAgentId,
-        ...(options.allowCreatorDocumentWrite ? { issueDocumentWrite: true } : {}),
-      },
+      ...issueAccessDecisionInput(issue, action, options),
     });
   }
 
@@ -12941,6 +12931,19 @@ export function issueRoutes(
   router.get("/issues/:id/merge-arming/head-review", (req, res) => reviewCompletedIssueHead(req, res, false));
   router.post("/issues/:id/merge-arming/approve-head", (req, res) => reviewCompletedIssueHead(req, res, true));
 
+  router.get("/issues/:id/publication-close-eligibility", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(
+      req,
+      res,
+      getIssueById(req, id),
+      "Issue not found",
+    );
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    res.json(await readPublicationCloseEligibility(db, issue));
+  });
+
   router.get("/issues/:id/runner-goal", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -13111,6 +13114,7 @@ export function issueRoutes(
       updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
       result: ReturnType<typeof applyBoardStageDecision>;
       commentRow: Awaited<ReturnType<typeof svc.addComment>>;
+      recordedDecisionId: string;
       previousState: ReturnType<typeof parseIssueExecutionState>;
       nextExecutionState: Record<string, unknown>;
       previousAssigneeAgentId: string | null;
@@ -13185,6 +13189,8 @@ export function issueRoutes(
             stageId: issueExecutionDecisions.stageId,
             outcome: issueExecutionDecisions.outcome,
             createdAt: issueExecutionDecisions.createdAt,
+            deliveredHeadSha: issueExecutionDecisions.deliveredHeadSha,
+            reviewRoundStartedAt: issueExecutionDecisions.reviewRoundStartedAt,
           })
           .from(issueExecutionDecisions)
           .where(
@@ -13194,6 +13200,24 @@ export function issueRoutes(
             ),
           );
         const decidedStageIds = listDurablyApprovedStageIds(decidedRows, policyStageIdSet);
+        // SUP-25518: the row behind each durably approved stage, kept only when
+        // it is bound to the current delivered head and review round, and to the
+        // head the final delivery preflight certifies. Only such a row can
+        // reconcile a stage still pending on it; an unbound or stale row is never
+        // reused, so the board approval is recorded afresh on the current round.
+        const latestDecisionByStage = latestDecisionPerStage(decidedRows);
+        const currentBinding = executionDecisionBinding(previousState);
+        const certifiedHeadSha =
+          finalDeliveryPrefetch?.resolution.repoBacked && finalDeliveryPrefetch.resolution.verdict.kind === "resolved"
+            ? finalDeliveryPrefetch.resolution.verdict.headSha
+            : null;
+        const durableApprovalIds = new Map<string, string>();
+        for (const stageId of decidedStageIds) {
+          const row = latestDecisionByStage.get(stageId)!;
+          if (executionDecisionBindingMatches(row, currentBinding, certifiedHeadSha)) {
+            durableApprovalIds.set(stageId, row.id);
+          }
+        }
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -13203,6 +13227,7 @@ export function issueRoutes(
             decision,
             commentBody: comment,
             decidedStageIds,
+            durableApprovalIds,
             actorUserId: boardUserId,
           });
         } catch (err) {
@@ -13215,13 +13240,14 @@ export function issueRoutes(
           throw err;
         }
 
+        const recordedDecisionId = result.reconciledDecisionId ?? decisionId;
         const rawExecutionState = result.patch.executionState;
         if (!rawExecutionState || typeof rawExecutionState !== "object") {
           throw new Error("Board stage decision patch is missing executionState");
         }
         result.patch.executionState = {
           ...(rawExecutionState as Record<string, unknown>),
-          lastDecisionId: decisionId,
+          lastDecisionId: recordedDecisionId,
         };
         await preflightTerminalApproval(
           lockedIssue,
@@ -13272,18 +13298,23 @@ export function issueRoutes(
         );
         if (!updated) return null;
 
-        await tx.insert(issueExecutionDecisions).values({
-          id: decisionId,
-          companyId: updated.companyId,
-          issueId: updated.id,
-          stageId: result.decision.stageId,
-          stageType: result.decision.stageType,
-          actorAgentId: null,
-          actorUserId: boardUserId,
-          outcome: result.decision.outcome,
-          body: result.decision.body,
-          createdByRunId: actor.runId ?? null,
-        });
+        // SUP-25518: a reconciled approval records the existing durable row as
+        // `lastDecisionId`; the decision itself is already on the table.
+        if (!result.reconciledDecisionId) {
+          await tx.insert(issueExecutionDecisions).values({
+            id: decisionId,
+            companyId: updated.companyId,
+            issueId: updated.id,
+            stageId: result.decision.stageId,
+            stageType: result.decision.stageType,
+            actorAgentId: null,
+            actorUserId: boardUserId,
+            outcome: result.decision.outcome,
+            body: result.decision.body,
+            createdByRunId: actor.runId ?? null,
+            ...currentBinding,
+          });
+        }
 
         // SUP-15805 CR-2: the visible comment shares the decision's transaction —
         // a comment referencing a decision that then rolls back (or a decision
@@ -13310,7 +13341,7 @@ export function issueRoutes(
             actorType: actor.actorType,
             boardApiKeyId: actor.boardApiKeyId,
             actorId: boardUserId,
-            action: "issue.board_stage_override",
+            action: result.reconciledDecisionId ? "issue.board_stage_reconciled" : "issue.board_stage_override",
             entityType: "issue",
             entityId: updated.id,
             agentId: null,
@@ -13321,6 +13352,7 @@ export function issueRoutes(
               decision: result.decision.outcome,
               displacedParticipant: result.displacedParticipant,
               commentId: commentRow.id,
+              ...(result.reconciledDecisionId ? { reconciledDecisionId: result.reconciledDecisionId } : {}),
             },
           },
           postCommitActivityPublications,
@@ -13330,6 +13362,7 @@ export function issueRoutes(
           updated,
           result,
           commentRow,
+          recordedDecisionId,
           previousState,
           nextExecutionState,
           previousAssigneeAgentId,
@@ -13430,7 +13463,8 @@ export function issueRoutes(
       outcome: outcome.result.decision.outcome,
       stageId: outcome.result.targetStage.id,
       stageType: outcome.result.targetStage.type,
-      decisionId,
+      decisionId: outcome.recordedDecisionId,
+      reconciled: outcome.result.reconciledDecisionId !== null,
       commentId: outcome.commentRow.id,
       executionState: outcome.nextExecutionState,
     });
@@ -15243,6 +15277,7 @@ export function issueRoutes(
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
+                ...executionDecisionBinding(lockedIssue.executionState),
               });
               if (transition.stallEscalation) {
                 await logActivityInTransaction(tx as unknown as Db, {
@@ -17595,6 +17630,37 @@ export function issueRoutes(
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, decisions));
   });
 
+  router.get("/issues/:id/review-entry-receipts", async (req, res) => {
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const receipts = await db.select().from(issueReviewEntryReceipts).where(and(
+      eq(issueReviewEntryReceipts.companyId, issue.companyId),
+      eq(issueReviewEntryReceipts.issueId, issue.id),
+    ));
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, receipts));
+  });
+
+  router.get("/issues/:id/review-entry-blockers", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    if (req.actor.boardKeyScope === "read_only") {
+      throw forbidden("Review-entry blockers require a board operator, not a read-only key.");
+    }
+    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+      const [operator] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, issue.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, req.actor.userId ?? ""),
+        eq(companyMemberships.status, "active"),
+        ne(companyMemberships.membershipRole, "viewer"),
+      )).limit(1);
+      if (!operator) throw forbidden("Review-entry blockers require an active board company operator.");
+    }
+    const blockers = await listReviewEntryBlockers(db, issue);
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, blockers));
+  });
+
   router.post(
     "/issues/:id/approvals",
     validate(linkIssueApprovalSchema),
@@ -19805,6 +19871,7 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
+    if (req.body.reviewEntryPrecondition !== undefined) assertReviewEntryRequest(req.body);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({
@@ -19883,7 +19950,7 @@ export function issueRoutes(
         } else if (boundaryDecision.allowed) {
           mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing, {
             allowVisibleIssueWrite: true,
-            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined,
+            noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined || req.body.reviewEntryPrecondition !== undefined,
           });
           if (!mutationAccess) return;
         } else if (
@@ -19992,6 +20059,7 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
       doneTier,
+      reviewEntryPrecondition,
       deliveryIdentity: requestedDeliveryIdentity,
       // SUP-16525 §4: request-level flag, not an issue column — keep it out of
       // `updateFields` so it never reaches svc.update as a spurious write.
@@ -20696,6 +20764,14 @@ export function issueRoutes(
       requestedStatus: requestedTransitionStatus,
       closer: doneCloser,
     });
+    const reviewEntryActor = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId ?? null,
+    };
+    const preparedReviewEntry = reviewEntryPrecondition === undefined ? null : await prepareReviewEntry(
+      db, existing, reviewEntryPrecondition, reviewEntryActor,
+    );
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -20795,6 +20871,11 @@ export function issueRoutes(
         updateFields.assigneeUserId = null;
         wikiHandoffAutoAdoption = true;
       }
+    }
+    // Reject a precondition that would otherwise degrade to close, auto-skip or
+    // a reviewer decision before any goal/run side effect can occur.
+    if (preparedReviewEntry && (transition.patch.status !== "in_review" || transition.decision)) {
+      throw conflict("Conditional first entry must produce an independent review handoff.", { code: "review_entry_precondition_failed" });
     }
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
     // will persist. The gate is keyed on the request explicitly supplying an
@@ -21974,11 +22055,13 @@ export function issueRoutes(
     const issueMutationStopId = randomUUID();
     if (assigneeWillChange && existing.assigneeAgentId) {
       rejectExpectedUpdatedAtBeforeSideEffect();
-      await stopRunnerGoalForOwnershipChange({
-        companyId: existing.companyId,
-        issueId: existing.id,
-        agentId: existing.assigneeAgentId,
-      });
+      if (!preparedReviewEntry) {
+        await stopRunnerGoalForOwnershipChange({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          agentId: existing.assigneeAgentId,
+        });
+      }
       // SUP-23801: every retained reassignment stop is deferred until the
       // issue update commits. Only the execution run link carries
       // cancellation authority: target a run that still holds the execution
@@ -22322,6 +22405,7 @@ export function issueRoutes(
     let commentDeduplicated = false;
     let deduplicatedFromCommentId: string | null = null;
     let commentHandledInTransaction = false;
+    let reviewEntryReceiptId: string | undefined;
     let attachmentCommentSourceTrust;
     try {
       attachmentCommentSourceTrust = commentAttachmentIds?.length
@@ -22390,6 +22474,7 @@ export function issueRoutes(
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
+      || preparedReviewEntry !== null
       // SUP-24402: a zero-delta close re-checks its measured worktree inside the write.
       || zeroDeltaCloseMeasurement !== null
       // SUP-24429: a record_only request reads the stored requirement under the
@@ -22450,6 +22535,20 @@ export function issueRoutes(
       }
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
+          let entryProof;
+          if (preparedReviewEntry && reviewEntryPrecondition) {
+            await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
+            const locked = await svc.getByIdForUpdate(existing.id, tx);
+            if (!locked) return null;
+            entryProof = await verifyReviewEntryAtTransition(
+              tx as unknown as Db, locked, reviewEntryPrecondition, reviewEntryActor, preparedReviewEntry, commentBody!,
+            );
+            // Recompute from the locked state; never persist an unlocked
+            // stage selection even if its expected policy still matches.
+            Object.assign(issueUpdateData, entryProof.transition.patch);
+            Object.assign(updateFields, entryProof.transition.patch);
+            Object.assign(transition, entryProof.transition);
+          }
           // SUP-24429: re-read the stored requirement and status under the issue
           // row lock. A request that changed either after the unlocked read above
           // must not let this write store `done` together with record_only on a
@@ -22816,6 +22915,25 @@ export function issueRoutes(
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
+          if (entryProof && reviewEntryPrecondition && preparedReviewEntry) {
+            const [receipt] = await tx.insert(issueReviewEntryReceipts).values({
+              companyId: updated.companyId, issueId: updated.id,
+              beforeStatusVersion: reviewEntryPrecondition.expectedStatusVersion,
+              afterStatusVersion: updated.statusVersion,
+              rulingRevisionId: reviewEntryPrecondition.entryRulingRevisionId,
+              artifactRevisionId: reviewEntryPrecondition.artifact.revisionId,
+              evidence: entryProof.evidence, capturedAt: preparedReviewEntry.capturedAt,
+              recordedAt: sql`clock_timestamp()`,
+            }).returning({ id: issueReviewEntryReceipts.id });
+            reviewEntryReceiptId = receipt!.id;
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId,
+              boardApiKeyId: actor.boardApiKeyId,
+              agentId: actor.agentId, runId: actor.runId,
+              action: "issue.review_entry_accepted", entityType: "issue", entityId: updated.id, issueId: updated.id,
+              details: { receiptId: reviewEntryReceiptId, stageId: entryProof.evidence.stageId },
+            }, postCommitActivityPublications);
+          }
           if (updated.status === "done") await finalizePatchLandingDebt?.(tx as unknown as Db, updated);
           // SUP-23925: the tier1/tier2 close rows commit on THIS transaction,
           // only after the terminal write landed, so a refused or raced close
@@ -22911,6 +23029,7 @@ export function issueRoutes(
               outcome: decision.outcome,
               body: decision.body,
               createdByRunId: actor.runId ?? null,
+              ...executionDecisionBinding(existing.executionState),
             });
             // R20: the hand-off to the stall arbiter commits with the
             // reviewer's decision that triggered it, never without it.
@@ -23062,6 +23181,12 @@ export function issueRoutes(
       }
     } catch (err) {
       await rewakeSuppressedReassignmentRun();
+      const databaseError = err as { code?: string; cause?: { code?: string } };
+      if (preparedReviewEntry && ["55P03", "40P01", "57014"].includes(databaseError.cause?.code ?? databaseError.code ?? "")) {
+        throw conflict("Review-entry authority is busy or changed; read the issue and receipts before submitting again.", {
+          code: "review_entry_workspace_busy",
+        });
+      }
       if (recordOnlyCloseFlipLockedStored !== null) {
         await recordRecordOnlyCloseFlipRefusal(recordOnlyCloseFlipLockedStored, "locked_recheck");
       }
@@ -23210,6 +23335,11 @@ export function issueRoutes(
     // compensation scope above is disarmed.
     suppressedReassignmentCancelledRun = null;
     recordDeferredGuardSkipDisposition?.();
+    if (preparedReviewEntry && existing.assigneeAgentId) {
+      await stopRunnerGoalForOwnershipChange({
+        companyId: existing.companyId, issueId: existing.id, agentId: existing.assigneeAgentId,
+      });
+    }
     if (pendingReassignmentStopRunId) {
       let cancellationFailed = false;
       let cancellationError: unknown;
@@ -24635,6 +24765,7 @@ export function issueRoutes(
       comment != null || commentDeduplicated
         ? { commentDeduplicated, deduplicatedFromCommentId }
         : {};
+    const entryReceipt = reviewEntryReceiptId ? { reviewEntryReceiptId } : {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
       res.json({
@@ -24644,10 +24775,11 @@ export function issueRoutes(
         changes,
         comment,
         ...commentReceipt,
+        ...entryReceipt,
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment, ...commentReceipt });
+    res.json({ ...issueResponse, changes, comment, ...commentReceipt, ...entryReceipt });
   });
 
   router.delete("/issues/:id", async (req, res) => {
@@ -24691,6 +24823,7 @@ export function issueRoutes(
       action: "issue.deleted",
       entityType: "issue",
       entityId: issue.id,
+      details: deletedIssueActivityDetails(issue),
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
@@ -27984,6 +28117,7 @@ export function issueRoutes(
               outcome: transition.decision.outcome,
               body: transition.decision.body,
               createdByRunId: actor.runId ?? null,
+              ...executionDecisionBinding(currentExecutionState),
             });
           }
 
