@@ -665,3 +665,15 @@ column. It holds ACCESS EXCLUSIVE on `issues` for its whole transaction. With
 0.81 s with 1,000 armed issues, and 18.4 s with 50,000 armed issues (about
 0.35 ms per armed issue, with every `issues` index updated). An `ALTER COLUMN ...
 TYPE bigint` rewrote the same table in 86-95 s.
+
+On the same dataset, migration 0333 holds ACCESS EXCLUSIVE on `issues` for
+10-16 ms. It does not rewrite the table and does not backfill rows. The new
+column has a constant default, and `pg_relation_filenode('issues')` does not
+change.
+
+The 1,000,000-row dataset is synthetic. A synthetic dataset is the accepted
+method for a production-size measurement. The operator measured the real
+production scale with read-only queries: 16,408 issues, of which 35 are armed
+(`monitor_next_check_at` is set). Production is far below the 1,000,000-row and
+50,000-armed test sizes. Thus, by extrapolation and not by measurement, the
+0335 window in production is expected to be in the low milliseconds.
