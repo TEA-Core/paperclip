@@ -36,16 +36,14 @@ import { GitAdminIdentity, readGitAdminDirectoryIdentity } from "./worktree-git-
 //     `core.sshCommand`, `remote.*.uploadpack` or any other transport helper;
 //   - is killed after a timeout, together with every process it started (it
 //     leads its own process group, and the whole group is killed).
-// The pre-existing fail-open probes opt out of the from-scratch environment
-// (`inheritEnvironment`) so the server's safe.directory and global
-// configuration keep applying; they lose only the three redirecting variables,
-// and, as before, carry no timeout.
 // The record_only no-repository probe additionally never computes a worktree
 // status against the repository's own git dir: it runs against a private
 // snapshot git dir (a copy of the index, the HEAD commit, the shared object
 // store as an alternate, and a server-written config), so no repository-local
 // configuration — and therefore no filter driver, whatever its name or however
 // late it is written — is read by the process that reads worktree content.
+// SUP-23163: the pre-existing repository_delivery probes run through the same
+// runner, environment, snapshot status and timeout (`runLegacyWorktreeProbe`).
 
 const TRUSTED_GIT_BINARY_PATHS = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"] as const;
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -94,11 +92,19 @@ function excludeHasOnlyServerWrittenRules(exclude: string): boolean {
 
 export class HardenedGitError extends Error {
   constructor(
-    readonly kind: "unavailable" | "failed" | "timeout",
+    readonly kind: "unavailable" | "failed" | "timeout" | "refused",
     message: string,
   ) {
     super(message);
     this.name = "HardenedGitError";
+  }
+}
+
+/** The process printed more than its output limit; its kind stays "failed" for every caller that does not ask. */
+export class HardenedGitOutputOverflow extends HardenedGitError {
+  constructor() {
+    super("failed", "git output exceeded the buffer");
+    this.name = "HardenedGitOutputOverflow";
   }
 }
 
@@ -132,7 +138,8 @@ export function resolveTrustedGitBinary(): string | null {
   return trustedGitBinary;
 }
 
-function hardenedGitEnv(ceilingDirectory: string | null): NodeJS.ProcessEnv {
+function hardenedGitEnv(ceilingDirectory: string | null, safeDirectories: readonly string[] = []): NodeJS.ProcessEnv {
+  const config = [...FORCED_CONFIG, ...safeDirectories.map((directory) => ["safe.directory", directory] as const)];
   const env: NodeJS.ProcessEnv = {
     PATH: "/usr/bin:/bin",
     LC_ALL: "C",
@@ -143,9 +150,9 @@ function hardenedGitEnv(ceilingDirectory: string | null): NodeJS.ProcessEnv {
     GIT_GRAFT_FILE: "/dev/null",
     GIT_ALLOW_PROTOCOL: "",
     GIT_NO_LAZY_FETCH: "1",
-    GIT_CONFIG_COUNT: String(FORCED_CONFIG.length),
+    GIT_CONFIG_COUNT: String(config.length),
   };
-  FORCED_CONFIG.forEach(([key, value], index) => {
+  config.forEach(([key, value], index) => {
     env[`GIT_CONFIG_KEY_${index}`] = key;
     env[`GIT_CONFIG_VALUE_${index}`] = value;
   });
@@ -189,23 +196,27 @@ export interface HardenedGitOptions {
   /** Stops repository discovery above this directory. */
   ceilingDirectory?: string | null;
   /**
-   * For the pre-existing fail-open probes only. Keeps the server's own
-   * environment and git configuration (global and system config, `GIT_CONFIG_*`
-   * `safe.directory` entries, PATH), minus the `GIT_DIR`, `GIT_WORK_TREE` and
-   * `GIT_INDEX_FILE` variables that redirect which repository is read; forces
-   * fsmonitor and hooks off on the command line; runs `git` from PATH when no
-   * trusted binary exists; and applies no timeout unless `timeoutMs` is given. A
-   * probe that gates a close must leave this unset.
+   * `safe.directory` values passed as command-line configuration in the
+   * from-scratch environment: the server's own, read by `runLegacyWorktreeProbe`.
+   */
+  safeDirectories?: readonly string[];
+  /**
+   * Only for reading the server's own configuration or checkout, never a
+   * workspace an agent can write. Keeps the server's own environment and git
+   * configuration (global and system config, `GIT_CONFIG_*` entries, PATH),
+   * minus the `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` variables that
+   * redirect which repository is read; forces fsmonitor and hooks off on the
+   * command line; runs `git` from PATH when no trusted binary exists; and
+   * applies no timeout unless `timeoutMs` or `deadline` is given.
    */
   inheritEnvironment?: boolean;
   /** Written to the process's standard input. */
   input?: string;
   /** Exit codes other than 0 that still mean success (`check-ignore` exits 1 when nothing matched). */
   successExitCodes?: readonly number[];
+  /** Standard-output limit in bytes; defaults to 16 MiB. */
+  maxBuffer?: number;
 }
-
-/** How the pre-existing repository_delivery probes run git (done-transition-guard.ts `runGit`). */
-export const LEGACY_WORKTREE_GIT_OPTIONS: Readonly<HardenedGitOptions> = { cwd: "/", inheritEnvironment: true };
 
 /**
  * Run `file` and resolve its standard output. With a timeout the process leads
@@ -215,8 +226,16 @@ export const LEGACY_WORKTREE_GIT_OPTIONS: Readonly<HardenedGitOptions> = { cwd: 
 export function runBoundedProcess(
   file: string,
   args: readonly string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string; successExitCodes?: readonly number[] },
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    input?: string;
+    successExitCodes?: readonly number[];
+    maxBuffer?: number;
+  },
 ): Promise<string> {
+  const maxBuffer = options.maxBuffer ?? MAX_BUFFER;
   return new Promise((resolve, reject) => {
     const killGroup = options.timeoutMs > 0;
     const child = spawn(file, args, {
@@ -253,9 +272,9 @@ export function runBoundedProcess(
     }
     child.stdout!.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BUFFER) {
+      if (size > maxBuffer) {
         kill();
-        finish(new HardenedGitError("failed", "git output exceeded the buffer"));
+        finish(new HardenedGitOutputOverflow());
         return;
       }
       chunks.push(chunk);
@@ -292,10 +311,11 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
   }
   const run = runBoundedProcess(trustedGit ?? "git", [...guardArgs, "--no-optional-locks", ...args], {
     cwd: options.cwd,
-    env: inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null),
+    env: inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null, options.safeDirectories),
     timeoutMs,
     input: options.input,
     successExitCodes: options.successExitCodes,
+    maxBuffer: options.maxBuffer,
   });
   if (!deadline) return run;
   return run.catch((error: unknown) => {
@@ -509,21 +529,219 @@ async function listIndexEntries(
   return entries;
 }
 
-/** `status --porcelain=v1 -z --untracked-files=all` through the snapshot git dir, one entry per NUL-separated record. */
+/** `status --porcelain=v1 -z` through the snapshot git dir, one entry per NUL-separated record. */
 async function snapshotStatusRecords(
   snapshotGitDir: string,
   workTree: string,
   ignoreSubmodules: "all" | "dirty",
   options: HardenedGitOptions,
+  untrackedFiles: "all" | "normal" = "all",
 ): Promise<string[]> {
   const raw = await runHardenedGit(
     [
       "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
-      "status", "--porcelain=v1", "-z", "--untracked-files=all", `--ignore-submodules=${ignoreSubmodules}`,
+      "status", "--porcelain=v1", "-z", `--untracked-files=${untrackedFiles}`, `--ignore-submodules=${ignoreSubmodules}`,
     ],
     options,
   );
   return raw.split("\0").filter((record) => record.length > 0);
+}
+
+// SUP-23163: the pre-existing repository_delivery probes (done-transition-guard.ts
+// `countIssueAttributableCommits` and `worktreeHasUncommittedContent`) read the
+// same agent-writable workspaces, so they run under the same hardening as the
+// record_only probe: the root-owned git, the from-scratch environment (no
+// inherited `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND` or any other
+// `GIT_*` variable, no transport and no lazy fetch, so neither an inherited nor
+// a repository-named promisor or transport helper runs), the forced
+// configuration, the snapshot git dir for the worktree status (so no
+// repository-named filter driver runs) and one shared timeout that kills the
+// whole process group. The one thing carried over from the server's own
+// configuration is its `safe.directory` list, so a workspace owned by another
+// uid is measured exactly when it was before.
+//
+// The outcome keeps the callers' fail-open contract for a git that ran and
+// could not answer (null), but a probe that could not run safely or to
+// completion is unverified, and the callers fail closed on it: the timeout
+// fired, no root-owned git is installed, the worktree holds more initialized
+// submodules than the probe measures or a submodule reached through a symlink
+// or naming another work tree (each initialized submodule is measured by the
+// same hardened probe, never by Git recursing into it), a repository file the
+// snapshot reads (`info/exclude`, the index, a shared index) is not a regular
+// file within its size limit or the snapshot could not be built, or the server
+// process inherits `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY`. The full list
+// of cases is owned by docs/approval-final-delivery-preflight.md.
+
+const LEGACY_PROBE_BUDGET_MS = DEFAULT_TIMEOUT_MS;
+const LEGACY_SUBMODULE_LIMIT = 64;
+const LEGACY_REFUSED_INHERITED_VARIABLES = ["GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] as const;
+const PROTECTED_CONFIG_SCOPES: ReadonlySet<string> = new Set(["system", "global", "command"]);
+
+/** A legacy probe that could not run safely or to completion: callers fail closed. */
+export interface LegacyProbeUnverified {
+  unverified: true;
+  reason: string;
+}
+
+/** A legacy probe's value, null when git ran and could not answer (fail open), or unverified (fail closed). */
+export type LegacyProbeResult<T> = T | null | LegacyProbeUnverified;
+
+export function isLegacyProbeUnverified(value: unknown): value is LegacyProbeUnverified {
+  return typeof value === "object" && value !== null && (value as { unverified?: unknown }).unverified === true;
+}
+
+/**
+ * The server's own `safe.directory` entries (system, global and command-line
+ * scope: the scopes Git reads that key from), in order, so the from-scratch
+ * environment trusts the same workspaces the server's configuration does.
+ */
+async function readServerSafeDirectories(deadline: ProbeDeadline): Promise<string[]> {
+  const out = await runHardenedGit(["config", "--show-scope", "--get-all", "safe.directory"], {
+    cwd: "/",
+    inheritEnvironment: true,
+    deadline,
+    successExitCodes: [1],
+  });
+  return out.split("\n").flatMap((line) => {
+    const tab = line.indexOf("\t");
+    return tab > 0 && PROTECTED_CONFIG_SCOPES.has(line.slice(0, tab)) ? [line.slice(tab + 1)] : [];
+  });
+}
+
+/**
+ * Runs one legacy repository_delivery probe under the hardened runner with one
+ * shared budget for every Git process and file copy it makes.
+ */
+export async function runLegacyWorktreeProbe<T>(
+  probe: (options: HardenedGitOptions) => Promise<T>,
+  budgetMs: number = LEGACY_PROBE_BUDGET_MS,
+): Promise<LegacyProbeResult<T>> {
+  for (const variable of LEGACY_REFUSED_INHERITED_VARIABLES) {
+    if (process.env[variable] !== undefined) {
+      return {
+        unverified: true,
+        reason: `the server process inherits ${variable}, which would redirect the repository the probe reads`,
+      };
+    }
+  }
+  if (!resolveTrustedGitBinary()) {
+    return { unverified: true, reason: "no root-owned git binary is installed at a fixed system path" };
+  }
+  const deadline: ProbeDeadline = { at: performance.now() + budgetMs, expired: false };
+  try {
+    const safeDirectories = await readServerSafeDirectories(deadline);
+    return await probe({ cwd: "/", deadline, safeDirectories });
+  } catch (error) {
+    if (deadline.expired || (error instanceof HardenedGitError && error.kind === "timeout")) {
+      return { unverified: true, reason: `timed out after ${budgetMs} ms (its git process group was killed)` };
+    }
+    if (error instanceof HardenedGitError && (error.kind === "refused" || error.kind === "unavailable")) {
+      return { unverified: true, reason: error.message };
+    }
+    return null;
+  }
+}
+
+/**
+ * Whether the worktree holding `worktreePath` has modified, staged or
+ * untracked (not ignored) content: the answer `git status --porcelain` gives,
+ * read through a snapshot git dir. The repository's `info/exclude` still
+ * applies; its configuration does not. A submodule whose recorded commit
+ * differs is dirty; each initialized submodule (at most
+ * `LEGACY_SUBMODULE_LIMIT` in all, nested ones included) is measured by the
+ * same probe, and an uninitialized one is clean, as in Git.
+ */
+export async function legacyWorktreeIsDirty(worktreePath: string, options: HardenedGitOptions): Promise<boolean> {
+  return legacyTreeIsDirty(worktreePath, null, options, { remaining: LEGACY_SUBMODULE_LIMIT });
+}
+
+async function legacyTreeIsDirty(
+  worktreePath: string,
+  expectedTopLevel: string | null,
+  options: HardenedGitOptions,
+  submodules: { remaining: number },
+): Promise<boolean> {
+  const identity = await readWorktreeIdentity(worktreePath, options);
+  if (expectedTopLevel !== null && identity.topLevel !== expectedTopLevel) {
+    throw new HardenedGitError("refused", `the submodule at ${expectedTopLevel} names another work tree`);
+  }
+  const headSha = await readHeadCommit(worktreePath, options);
+  let exclude: string | null;
+  try {
+    exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
+  } catch (error) {
+    throw refusedSnapshotInput("the repository's info/exclude", error);
+  }
+  let snapshotReady = false;
+  let measured: { dirty: true } | { dirty: false; gitlinks: string[] };
+  try {
+    measured = await withSnapshotGitDir(
+      { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: options.deadline },
+      async (snapshot) => {
+        snapshotReady = true;
+        try {
+          if ((await snapshotStatusRecords(snapshot, identity.topLevel, "dirty", options, "normal")).length > 0) {
+            return { dirty: true };
+          }
+        } catch (error) {
+          if (error instanceof HardenedGitOutputOverflow) return { dirty: true };
+          throw error;
+        }
+        let entries: IndexEntry[];
+        try {
+          entries = await listIndexEntries(snapshot, identity.topLevel, options);
+        } catch (error) {
+          if (error instanceof HardenedGitOutputOverflow) {
+            throw new HardenedGitError("refused", "the worktree's index listing exceeded the probe's output limit");
+          }
+          throw error;
+        }
+        const gitlinks = [...new Set(entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path))];
+        return { dirty: false, gitlinks };
+      },
+    );
+  } catch (error) {
+    if (snapshotReady) throw error;
+    throw refusedSnapshotInput("the snapshot git dir (the worktree's index and shared indexes)", error);
+  }
+  if (measured.dirty) return true;
+  for (const gitlink of measured.gitlinks) {
+    const submodulePath = path.join(identity.topLevel, gitlink);
+    if (!(await isInitializedSubmodule(submodulePath))) continue;
+    submodules.remaining -= 1;
+    if (submodules.remaining < 0) {
+      throw new HardenedGitError(
+        "refused",
+        `the worktree has more than ${LEGACY_SUBMODULE_LIMIT} initialized submodules, the probe's bound`,
+      );
+    }
+    if (await legacyTreeIsDirty(submodulePath, submodulePath, options, submodules)) return true;
+  }
+  return false;
+}
+
+async function isInitializedSubmodule(submodulePath: string): Promise<boolean> {
+  let resolved: string;
+  let marker;
+  try {
+    resolved = await realpath(submodulePath);
+    marker = await lstat(path.join(submodulePath, ".git"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+    throw new HardenedGitError("refused", `could not inspect the submodule at ${submodulePath}`);
+  }
+  if (resolved !== submodulePath || !(marker.isFile() || marker.isDirectory())) {
+    throw new HardenedGitError("refused", `the submodule at ${submodulePath} is reached through a symlink`);
+  }
+  return true;
+}
+
+function refusedSnapshotInput(what: string, error: unknown): HardenedGitError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new HardenedGitError(
+    "refused",
+    `could not read ${what} safely (a symlink, FIFO, non-regular or oversize file, or a file that changed while it was copied): ${detail}`,
+  );
 }
 
 /**

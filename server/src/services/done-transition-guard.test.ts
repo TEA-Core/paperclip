@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
@@ -397,9 +399,31 @@ const ownDeliveryBranch = (branch: string) => ({
 
 const ghFetchMock = vi.mocked(ghFetch);
 
+// The legacy status probe reads the worktree through a snapshot git dir
+// (hardened-git-probe.ts `legacyWorktreeIsDirty`, SUP-23163): its identity,
+// HEAD and index-listing calls are answered with an empty real directory, so
+// the stubbed `status` output decides.
+const snapshotProbeGitDir = mkdtempSync(path.join(os.tmpdir(), "paperclip-guard-probe-gitdir-"));
+function answerSnapshotStatusCall(args: string[], cb: (err: Error | null, stdout: string) => void): boolean {
+  if (args.includes("--show-object-format")) {
+    cb(null, `${snapshotProbeGitDir}\n${snapshotProbeGitDir}\n${snapshotProbeGitDir}\nsha1\n`);
+    return true;
+  }
+  if (args.includes("HEAD^{commit}")) {
+    cb(null, `${"a".repeat(40)}\n`);
+    return true;
+  }
+  if (args.includes("ls-files")) {
+    cb(null, "");
+    return true;
+  }
+  return false;
+}
+
 function mockGitProbe(aheadCount: string, attributableCount: string, statusOutput = " M server/src/x.ts") {
   mockExecFile.mockImplementation(
     (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+      if (answerSnapshotStatusCall(args, cb)) return;
       if (args.includes("status")) {
         cb(null, statusOutput);
         return;
@@ -407,6 +431,19 @@ function mockGitProbe(aheadCount: string, attributableCount: string, statusOutpu
       cb(null, args.includes("--grep") ? attributableCount : aheadCount);
     },
   );
+}
+
+// A legacy probe refuses to run while the server inherits GIT_OBJECT_DIRECTORY
+// (SUP-23163), so it reports unverified without spawning git.
+async function withInheritedObjectDirectory<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.GIT_OBJECT_DIRECTORY;
+  process.env.GIT_OBJECT_DIRECTORY = "/elsewhere/objects";
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.GIT_OBJECT_DIRECTORY;
+    else process.env.GIT_OBJECT_DIRECTORY = saved;
+  }
 }
 
 function mockGitProbeUnavailable() {
@@ -4468,6 +4505,128 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    const foreignCompareFetch = async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+      }
+      if (url.includes("/search/issues")) {
+        return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    };
+
+    it("refuses, instead of failing open, when the foreign-branch attribution probe cannot run safely (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0", "");
+      ghFetchMock.mockImplementation(foreignCompareFetch);
+      const result = await withInheritedObjectDirectory(() => evaluateDoneTransitionGuard(mockDb, issue, null));
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.mechanism).toBe("delivery");
+      expect(result.reason).toContain("attribution probe");
+      expect(result.reason).toContain("GIT_OBJECT_DIRECTORY");
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(result.skipReason).toContain("legacy_worktree_probe_unverified:attribution");
+    });
+
+    it("refuses, instead of failing open, when the foreign-branch worktree status probe cannot run safely (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          if (args.includes("ls-files")) {
+            cb(null, `H 160000 ${"b".repeat(40)} 0\tvendor-link\0`);
+            return;
+          }
+          if (answerSnapshotStatusCall(args, cb)) return;
+          if (args.includes("status")) {
+            cb(null, "");
+            return;
+          }
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
+      ghFetchMock.mockImplementation(foreignCompareFetch);
+      const submoduleTarget = mkdtempSync(path.join(os.tmpdir(), "paperclip-guard-submodule-"));
+      mkdirSync(path.join(submoduleTarget, "sub"));
+      writeFileSync(path.join(submoduleTarget, "sub", ".git"), "gitdir: elsewhere\n");
+      const link = path.join(snapshotProbeGitDir, "vendor-link");
+      symlinkSync(path.join(submoduleTarget, "sub"), link);
+      let result: Awaited<ReturnType<typeof evaluateDoneTransitionGuard>>;
+      try {
+        result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      } finally {
+        rmSync(link, { force: true });
+        rmSync(submoduleTarget, { recursive: true, force: true });
+      }
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("worktree status probe");
+      expect(result.reason).toContain("reached through a symlink");
+      expect(result.reason).not.toContain("Retry");
+      expect(result.skipReason).toContain("legacy_worktree_probe_unverified:status");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({ reason: "legacy_worktree_probe_unverified:status" }),
+        }),
+      );
+    });
+
+    it("refuses, naming the bound, when the foreign-branch worktree holds more than 64 initialized submodules (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      const top = realpathSync(mkdtempSync(path.join(os.tmpdir(), "paperclip-guard-submodules-")));
+      const names = Array.from({ length: 65 }, (_, i) => `lib${i}`);
+      for (const name of names) {
+        mkdirSync(path.join(top, name));
+        writeFileSync(path.join(top, name, ".git"), "gitdir: elsewhere\n");
+      }
+      const measured: string[] = [];
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          const dir = args[args.indexOf("-C") + 1] ?? "";
+          const tree = dir.startsWith(`${top}${path.sep}`) ? dir : top;
+          if (args.includes("--show-object-format")) {
+            if (tree !== top) measured.push(tree);
+            cb(null, `${tree}\n${tree}\n${tree}\nsha1\n`);
+            return;
+          }
+          if (args.includes("HEAD^{commit}")) {
+            cb(null, `${"a".repeat(40)}\n`);
+            return;
+          }
+          if (args.includes("ls-files")) {
+            cb(null, tree === top ? names.map((name) => `H 160000 ${"b".repeat(40)} 0\t${name}\0`).join("") : "");
+            return;
+          }
+          if (args.includes("status")) {
+            cb(null, "");
+            return;
+          }
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
+      ghFetchMock.mockImplementation(foreignCompareFetch);
+      let result: Awaited<ReturnType<typeof evaluateDoneTransitionGuard>>;
+      try {
+        result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      } finally {
+        rmSync(top, { recursive: true, force: true });
+      }
+      expect(measured).toHaveLength(64);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("more than 64 initialized submodules");
+      expect(result.reason).not.toMatch(/retry/i);
+      expect(result.skipReason).toContain("legacy_worktree_probe_unverified:status");
+    });
+
     it("fails open when the foreign-branch worktree status probe cannot be measured (SUP-13873)", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
@@ -4757,6 +4916,53 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(false);
     });
 
+    it("refuses, instead of failing open, when the branch-absent attribution probe cannot run safely (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+      });
+      const result = await withInheritedObjectDirectory(() => evaluateDoneTransitionGuard(mockDb, issue, null));
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("GIT_OBJECT_DIRECTORY");
+      expect(result.skipReason).toContain("legacy_worktree_probe_unverified:attribution");
+      expect(result.skipReason ?? "").not.toContain("branch_absent_on_remote:");
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(true);
+    });
+
+    it("allows a branch-absent close with landingVerified when a merged carrier PR names the issue, even though the attribution probe cannot run safely (SUP-23163)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 1, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await withInheritedObjectDirectory(() => evaluateDoneTransitionGuard(mockDb, issue, null));
+      expect(result.allowed).toBe(true);
+      expect(result.landingVerified).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_landed_via_merged_pr:SUP-12345:1");
+      expect(result.skipReason ?? "").not.toContain("legacy_worktree_probe_unverified");
+    });
+
     it("allows transition when compare API returns 404 and the worktree carries zero issue-attributable commits despite being several commits ahead (base drift only)", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
@@ -4902,7 +5108,7 @@ describe("evaluateDoneTransitionGuard", () => {
       const ranges: string[] = [];
       mockExecFile.mockImplementation(
         (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
-          ranges.push(args[args.length - 1] as string);
+          if (args.includes("rev-list")) ranges.push(args[args.length - 1] as string);
           cb(null, args.includes("--grep") ? "0" : "5");
         },
       );

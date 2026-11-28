@@ -8,7 +8,7 @@ import {
   captureReviewEntryWorktree,
   HardenedGitError,
   IGNORED_ARTIFACT_DIRECTORY_NAMES,
-  LEGACY_WORKTREE_GIT_OPTIONS,
+  legacyWorktreeIsDirty,
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
@@ -16,6 +16,7 @@ import {
   recheckReviewEntryWorktree,
   resolveTrustedGitBinary,
   runHardenedGit,
+  runLegacyWorktreeProbe,
 } from "./hardened-git-probe.js";
 
 /**
@@ -269,12 +270,12 @@ describe("hardened git runner (SUP-22880)", () => {
   });
 });
 
-// The pre-existing repository_delivery dirty probe is `git status --porcelain`
-// through this runner under the options done-transition-guard.ts runGit uses;
-// the guard-level wiring is driven in done-transition-guard-legacy-worktree-probes.test.ts.
-const WORKTREE_STATUS_OPTIONS = LEGACY_WORKTREE_GIT_OPTIONS;
-async function worktreeStatus(repo: string): Promise<string> {
-  return runHardenedGit(["-C", repo, "status", "--porcelain"], WORKTREE_STATUS_OPTIONS);
+// The pre-existing repository_delivery dirty probe (done-transition-guard.ts
+// worktreeHasUncommittedContent) is this snapshot status under the legacy
+// probe runner (SUP-23163); the guard-level wiring is driven in
+// done-transition-guard-legacy-worktree-probes.test.ts.
+async function worktreeStatus(repo: string) {
+  return runLegacyWorktreeProbe((options) => legacyWorktreeIsDirty(repo, options));
 }
 
 describe("pre-existing repository_delivery status probe under the hardened runner (SUP-22880)", () => {
@@ -282,7 +283,7 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     const repo = plainRepo("repo");
     git(repo, "config", "core.fsmonitor", planted);
     writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
-    expect(await worktreeStatus(repo)).toContain("a.txt");
+    expect(await worktreeStatus(repo)).toBe(true);
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -292,7 +293,7 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n`);
     git(repo, "config", "include.path", included);
     writeFileSync(path.join(repo, "b.txt"), "untracked\n");
-    expect(await worktreeStatus(repo)).toContain("b.txt");
+    expect(await worktreeStatus(repo)).toBe(true);
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -306,12 +307,12 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     }
     git(repo, "config", "core.hooksPath", hooks);
     writeFileSync(path.join(repo, "b.txt"), "untracked\n");
-    expect(await worktreeStatus(repo)).toContain("b.txt");
+    expect(await worktreeStatus(repo)).toBe(true);
     expect(existsSync(marker)).toBe(false);
   });
 
   it("reports a clean worktree as empty output", async () => {
-    expect(await worktreeStatus(plainRepo("repo"))).toBe("");
+    expect(await worktreeStatus(plainRepo("repo"))).toBe(false);
   });
 
   it("ignores GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE inherited by the server process", async () => {
@@ -323,7 +324,7 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     process.env.GIT_WORK_TREE = clean;
     process.env.GIT_INDEX_FILE = path.join(clean, ".git", "index");
     try {
-      expect(await worktreeStatus(dirty)).toContain("a.txt");
+      expect(await worktreeStatus(dirty)).toBe(true);
     } finally {
       for (const [key, value] of [["GIT_DIR", saved.dir], ["GIT_WORK_TREE", saved.tree], ["GIT_INDEX_FILE", saved.index]] as const) {
         if (value === undefined) delete process.env[key];
@@ -332,11 +333,9 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     }
   });
 
-  describe("keeps the server's own git configuration, so a dubiously owned workspace is still measured", () => {
-    // GIT_TEST_ASSUME_DIFFERENT_OWNER makes git treat every repository as owned
-    // by another uid, the state a workspace shared across uids is in. The host's
-    // own system/global git config is shut out by default: CI images ship
-    // `safe.directory = *`, which would mark every repository safe.
+  describe("carries only the server's own safe.directory list into the from-scratch environment", () => {
+    // The host's own system/global git config is shut out by default: CI images
+    // ship `safe.directory = *`.
     async function withEnv<T>(overrides: Record<string, string>, fn: () => Promise<T>): Promise<T> {
       const vars = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...overrides };
       const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
@@ -351,45 +350,52 @@ describe("pre-existing repository_delivery status probe under the hardened runne
       }
     }
 
-    it("refuses to read the workspace when nothing marks it safe", async () => {
-      const repo = plainRepo("repo");
-      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
-      await withEnv({ GIT_TEST_ASSUME_DIFFERENT_OWNER: "1" }, async () => {
-        await expect(worktreeStatus(repo)).rejects.toMatchObject({ kind: "failed" } satisfies Partial<HardenedGitError>);
-      });
-    });
+    function probeConfig(...args: string[]) {
+      return runLegacyWorktreeProbe((options) => runHardenedGit(["config", ...args], options));
+    }
 
-    it("measures it when safe.directory is supplied through GIT_CONFIG_COUNT/KEY/VALUE", async () => {
-      const repo = plainRepo("repo");
-      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+    it("passes safe.directory entries supplied through GIT_CONFIG_COUNT/KEY/VALUE, in order", async () => {
       await withEnv(
         {
-          GIT_TEST_ASSUME_DIFFERENT_OWNER: "1",
-          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_COUNT: "2",
           GIT_CONFIG_KEY_0: "safe.directory",
-          GIT_CONFIG_VALUE_0: repo,
+          GIT_CONFIG_VALUE_0: "/srv/first",
+          GIT_CONFIG_KEY_1: "safe.directory",
+          GIT_CONFIG_VALUE_1: "/srv/second",
         },
         async () => {
-          expect(await worktreeStatus(repo)).toContain("a.txt");
+          expect(await probeConfig("--get-all", "safe.directory")).toBe("/srv/first\n/srv/second\n");
         },
       );
     });
 
-    it("measures it when safe.directory is supplied through global git configuration", async () => {
-      const repo = plainRepo("repo");
-      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+    it("passes safe.directory entries supplied through global git configuration", async () => {
       const globalConfig = path.join(root, "global.gitconfig");
-      writeFileSync(globalConfig, `[safe]\n\tdirectory = ${repo}\n`);
-      await withEnv({ GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: globalConfig }, async () => {
-        expect(await worktreeStatus(repo)).toContain("a.txt");
+      writeFileSync(globalConfig, "[safe]\n\tdirectory = /srv/global\n");
+      await withEnv({ GIT_CONFIG_GLOBAL: globalConfig }, async () => {
+        expect(await probeConfig("--get-all", "safe.directory")).toBe("/srv/global\n");
       });
+    });
+
+    it("passes no other inherited configuration", async () => {
+      const globalConfig = path.join(root, "global.gitconfig");
+      writeFileSync(globalConfig, `[core]\n\tfsmonitor = ${planted}\n[user]\n\tname = inherited\n`);
+      await withEnv(
+        { GIT_CONFIG_GLOBAL: globalConfig, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.email", GIT_CONFIG_VALUE_0: "x@example.com" },
+        async () => {
+          expect(await probeConfig("--get", "user.name")).toBeNull();
+          expect(await probeConfig("--get", "user.email")).toBeNull();
+          expect(await probeConfig("--get", "core.fsmonitor")).toBe("false\n");
+        },
+      );
     });
 
     it("leaves the close-gating runner fully stripped of that inherited configuration", async () => {
       await withEnv(
         { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "/inherited/path" },
         async () => {
-          expect(await runHardenedGit(["config", "--get-all", "safe.directory"], WORKTREE_STATUS_OPTIONS)).toContain("/inherited/path");
+          expect(await runHardenedGit(["config", "--get-all", "safe.directory"], { cwd: "/", inheritEnvironment: true }))
+            .toContain("/inherited/path");
           await expect(runHardenedGit(["config", "--get-all", "safe.directory"], { cwd: "/" }))
             .rejects.toMatchObject({ kind: "failed" } satisfies Partial<HardenedGitError>);
         },
