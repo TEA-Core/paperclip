@@ -2450,25 +2450,14 @@ export function buildHostServices(
               }),
           )
         ).filter((block): block is NonNullable<typeof block> => block !== null);
-        const canReadIssues = pluginCanReadIssues(options.manifest);
         return {
           issueId: rootIssue.id,
           companyId,
           subtreeIssueIds,
-          relations: Object.fromEntries(
-            canReadIssues
-              ? relationPairs
-              : relationPairs.map(([issueId, relation]) => [
-                issueId,
-                {
-                  blockedBy: relation.blockedBy.map(pluginIssueRecordForRecipient),
-                  blocks: relation.blocks.map(pluginIssueRecordForRecipient),
-                },
-              ]),
-          ),
+          relations: Object.fromEntries(relationPairs),
           approvals: approvalRows,
-          runs: canReadIssues ? runs : runs.map(pluginIssueRecordForRecipient),
-          costs: canReadIssues ? costsSummary : { ...costsSummary, billingCode: params.billingCode ?? null },
+          runs: pluginCanReadIssues(options.manifest) ? runs : runs.map(pluginIssueRecordForRecipient),
+          costs: costsSummary,
           openBudgetIncidents,
           invocationBlocks,
         };

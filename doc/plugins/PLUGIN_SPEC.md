@@ -946,7 +946,7 @@ The same rule covers these read paths when a plugin has the path's own capabilit
 - `ctx.issues.getSubtree` (`issue.subtree.read`): each issue, relation summary and document summary carries only its title and allow-listed metadata, without `description` or any other content field; each active run summary carries only its metadata, without `error`. Assignee summaries describe agents and are unchanged.
 - `ctx.issues.listComments` (`issue.comments.read`): each comment carries only its allow-listed metadata (ids, author, timestamps), without `body`.
 - `ctx.authorization.audit.search` (`authorization.audit.read`): the `details` of an entry about an issue carry only the issue title and allow-listed metadata, and the `details` of an entry about a run follow the run rule above. Entries about other entities are unchanged.
-- `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, without `error`, each relation summary carries only its title and allow-listed metadata, and the cost summary reports the issue's own billing code only when the plugin passed it as `billingCode`. Approvals, cost totals, budget incidents and invocation blocks are unchanged.
+- `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, without `error`. Relations, approvals, costs, budget incidents and invocation blocks are unchanged.
 
 Issue documents, interactions and attachments are governed by their own capabilities (`issue.documents.read`, `issue.interactions.read`, `issue.attachments.read`), pending a separate decision.
 
