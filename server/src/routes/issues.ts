@@ -13212,15 +13212,6 @@ export function issueRoutes(
           finalDeliveryPrefetch?.resolution.repoBacked && finalDeliveryPrefetch.resolution.verdict.kind === "resolved"
             ? finalDeliveryPrefetch.resolution.verdict.headSha
             : null;
-        // The delivered head is read once, by the final delivery preflight. A
-        // fresh decision is bound to that same head the certification stamps, so
-        // a head that moved after the state recorded it (a same-tree force-push)
-        // cannot leave the decision on one head and the certification on another.
-        // Without a resolved preflight head the state's recorded head binds it.
-        const currentBinding = {
-          ...stateBinding,
-          deliveredHeadSha: certifiedHeadSha ?? stateBinding.deliveredHeadSha,
-        };
         const durableApprovalIds = new Map<string, string>();
         for (const stageId of decidedStageIds) {
           const row = latestDecisionByStage.get(stageId)!;
@@ -13322,7 +13313,7 @@ export function issueRoutes(
             outcome: result.decision.outcome,
             body: result.decision.body,
             createdByRunId: actor.runId ?? null,
-            ...currentBinding,
+            ...certifiedExecutionDecisionBinding(previousState, nextExecutionState, decisionId),
           });
         }
 
@@ -25981,6 +25972,7 @@ export function issueRoutes(
         // the pointer via the engine's `in_review` patch.
         finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
         deferredPostCommit,
+        certifiedFinalDelivery: escalationCertifiedDelivery,
       });
       const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
       const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept

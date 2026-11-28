@@ -1370,6 +1370,36 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }]);
   });
 
+  it("binds an escalation accept to the head the preflight certifies when the head moved", async () => {
+    const fixture = await pendingDelivery();
+    const interaction = await seedEscalation(fixture);
+    const recordedHead = "a1".repeat(20);
+    const round = "2026-11-20T10:00:00.000Z";
+    expect(fixture.pr.head.sha).not.toBe(recordedHead);
+    const initial = await fixture.read();
+    await db.update(issues).set({
+      executionState: { ...initial.executionState, deliveredHeadSha: recordedHead, pendingSince: round },
+    }).where(eq(issues.id, fixture.issue.id));
+
+    const response = await request(createApp(db, boardActor(fixture.company)))
+      .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+    const decisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, fixture.issue.id));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      outcome: "approved",
+      deliveredHeadSha: fixture.pr.head.sha,
+      reviewRoundStartedAt: new Date(round),
+    });
+    const state = (await fixture.read()).executionState as Record<string, unknown>;
+    expect((state.approvalStatus as Record<string, unknown>).finalDelivery).toMatchObject({
+      headSha: fixture.pr.head.sha,
+      decisionId: decisions[0]!.id,
+    });
+  });
+
   it("keeps a final review escalation pending when status changes after external preflight", async () => {
     const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
     const interaction = await seedEscalation(fixture);

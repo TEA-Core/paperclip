@@ -1403,6 +1403,41 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(approvalStatus.finalDelivery).toMatchObject({ headSha: HEAD_B, decisionId: decisions[0]!.id });
   });
 
+  it("binds a non-final board approval to the state head, not the live head, when the head moved", async () => {
+    // The approval advances to a later stage, so it certifies no head: the
+    // decision keeps the head the state recorded for the round.
+    const { companyId, issueId } = await seedIssue({
+      twoStages: true,
+      binding: { headSha: HEAD_A, round: ROUND_ONE },
+      repoBacked: true,
+    });
+    currentActor = boardActor(companyId);
+    finalDeliveryPreflight.headSha = HEAD_B;
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the first stage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      id: res.body.decisionId,
+      deliveredHeadSha: HEAD_A,
+      reviewRoundStartedAt: new Date(ROUND_ONE),
+    });
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const approvalStatus = (issueRow!.executionState as Record<string, unknown>).approvalStatus as
+      | Record<string, unknown>
+      | undefined;
+    expect(approvalStatus?.finalDelivery).toBeUndefined();
+  });
+
   it("wakes the return assignee when a board decision requests changes", async () => {
     const { companyId, issueId, returnAssigneeAgentId } = await seedIssue();
     currentActor = boardActor(companyId);
