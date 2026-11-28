@@ -175,4 +175,38 @@ describe("plugin agent sessions", () => {
     ]);
     services.dispose();
   });
+
+  const issuelessEvent = {
+    runId: "run-1",
+    seq: 2,
+    eventType: "adapter.message",
+    message: "Free-form session message",
+    error: "Free-form session error",
+  };
+
+  it("withholds error and message text of session output with no issue from a plugin without issues.read", async () => {
+    const { notifyWorker, services } = await startSession(["agent.sessions.send"]);
+
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.event", payload: issuelessEvent });
+
+    await vi.waitFor(() => expect(notifyWorker).toHaveBeenCalledTimes(1));
+    expect(JSON.stringify(notifyWorker.mock.calls)).not.toContain("Free-form");
+    expect(notifyWorker.mock.calls[0]![1]).toMatchObject({
+      eventType: "chunk",
+      message: null,
+      payload: { runId: "run-1", seq: 2, eventType: "adapter.message" },
+    });
+    services.dispose();
+  });
+
+  it("sends a plugin with issues.read the error and message text of session output with no issue", async () => {
+    const { notifyWorker, services } = await startSession(["agent.sessions.send", "issues.read"]);
+
+    publishLiveEvent({ companyId: "company-1", type: "heartbeat.run.event", payload: issuelessEvent });
+
+    expect(notifyWorker.mock.calls.map((call) => call[1])).toEqual([
+      expect.objectContaining({ eventType: "chunk", message: "Free-form session message", payload: issuelessEvent }),
+    ]);
+    services.dispose();
+  });
 });

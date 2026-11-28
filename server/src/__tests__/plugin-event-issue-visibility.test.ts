@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { pluginCanReadIssues, pluginEventForRecipient } from "../services/plugin-event-issue-visibility.js";
+import {
+  pluginCanReadIssues,
+  pluginEventForRecipient,
+  pluginRunPayloadForRecipient,
+} from "../services/plugin-event-issue-visibility.js";
 
 function event(overrides: Partial<PluginEvent>): PluginEvent {
   return {
@@ -178,12 +182,51 @@ describe("plugin issue event visibility", () => {
       issueId: "issue-1",
     });
     expect(pluginEventForRecipient(original, true)).toBe(original);
+  });
+
+  it("withholds the error text of a run with no issue from a plugin without issues.read", () => {
     const issueless = event({
       eventType: "agent.run.failed",
       entityType: "heartbeat_run",
-      payload: { runId: "run-2", status: "failed", error: "Run error", issueId: null },
+      entityId: "run-2",
+      payload: { runId: "run-2", status: "failed", error: "Run error naming issue content", errorCode: "adapter_failed", issueId: null },
     });
-    expect(pluginEventForRecipient(issueless, false)).toBe(issueless);
+    expect(pluginEventForRecipient(issueless, false).payload).toEqual({
+      runId: "run-2",
+      status: "failed",
+      errorCode: "adapter_failed",
+      issueId: null,
+    });
+    expect(pluginEventForRecipient(issueless, true)).toBe(issueless);
+  });
+
+  it("withholds error and message text of session output with no issue and keeps the output itself", () => {
+    const runEvent = { runId: "run-3", seq: 2, eventType: "adapter.message", message: "Free-form message", error: "Free-form error" };
+    expect(pluginRunPayloadForRecipient(runEvent, false, null)).toEqual({ runId: "run-3", seq: 2, eventType: "adapter.message" });
+    expect(pluginRunPayloadForRecipient(runEvent, true, null)).toBe(runEvent);
+    const log = { runId: "run-3", seq: 3, stream: "stdout", chunk: "Session output" };
+    expect(pluginRunPayloadForRecipient(log, false, null)).toBe(log);
+  });
+
+  it("withholds fields outside the metadata allow-list even when their names look like metadata", () => {
+    const original = event({
+      payload: {
+        identifier: "PAP-1",
+        status: "todo",
+        assigneeAgentId: "agent-1",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        internalNoteKey: "Restricted note",
+        reviewerNoteIdentifier: "Restricted reviewer note",
+        draftSavedAt: "Restricted draft",
+      },
+    });
+    expect(pluginEventForRecipient(original, false).payload).toEqual({
+      identifier: "PAP-1",
+      status: "todo",
+      assigneeAgentId: "agent-1",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    expect(pluginEventForRecipient(original, true)).toBe(original);
   });
 
   it("leaves events about other entities unchanged", () => {

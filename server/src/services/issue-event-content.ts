@@ -9,48 +9,73 @@ const ISSUE_SUMMARY_LIST_FIELDS = new Set([
 ]);
 
 /**
- * Metadata keys whose scalar values a recipient that cannot read the issue may
- * still receive: identifiers, states, enums, counters and timestamps. Every
- * other key is withheld.
+ * The explicit allow-list of metadata keys whose scalar values a recipient
+ * that cannot read an issue may still receive: identifiers, states, enums,
+ * counters and timestamps of issue events, issue rows, comments, document
+ * summaries, activity entries and runs. A key not listed here is withheld,
+ * whatever its name looks like; add a key only after checking that its values
+ * never carry free-form text.
  */
-const METADATA_KEYS = new Set([
-  "id",
-  "identifier",
-  "status",
-  "previousStatus",
-  "priority",
-  "kind",
-  "action",
-  "type",
-  "source",
-  "outcome",
-  "format",
-  "key",
-  "revision",
-  "revisionNumber",
-  "seq",
-  "ts",
-  "truncated",
-  "phase",
-  "stream",
-  "level",
-  "color",
-  "eventType",
-  "errorCode",
-  "invocationSource",
-  "triggerDetail",
-  "currentToolName",
-  "interactionKind",
-  "interactionStatus",
-  "prState",
-  "provider",
-  "adapterType",
-  "headSha",
-  "workingNow",
+export const ISSUE_METADATA_KEYS: ReadonlySet<string> = new Set([
+  // states, enums and revisions
+  "action", "actorType", "adapterType", "allowed", "authorType", "color", "currentToolName", "decision",
+  "deletedByType", "entityType", "errorCode", "eventType", "format", "headSha", "id", "identifier",
+  "interactionKind", "interactionStatus", "invocationSource", "issueNumber", "key", "kind",
+  "latestRevisionNumber", "level", "originKind", "outcome", "parentLinkKind", "phase", "prState",
+  "previousStatus", "priority", "provider", "requestDepth", "revision", "revisionNumber", "seq", "source",
+  "status", "stream", "triggerDetail", "truncated", "ts", "type", "workMode", "workingNow",
+  // identifiers and keys
+  "acceptedPlanRevisionId", "actionId", "actionRequestId", "activeRunId", "actorAgentId", "actorId",
+  "actorUserId", "addedBlockedByIssueIds", "addresseeAgentId", "addresseeUserId", "agentId",
+  "ancestorIssueId", "applicationId", "approvalId", "arbiterAgentId", "assigneeAgentId", "assigneeUserId",
+  "attachmentId", "attachmentIds", "authorAgentId", "authorUserId", "baseRevisionId", "blockedByIssueIds",
+  "blockerIssueId", "blockerIssueIds", "boardApiKeyId", "boundaryCommentId", "cancelledIssueIds",
+  "cancelledRunId", "catalogEntryId", "checkoutRunId", "childIdentifier", "childIssueId", "childIssueIds",
+  "ciRunIds", "clearedCheckoutRunId", "clearedExecutionRunId", "commentId", "companyId", "completedStageIds",
+  "completionContractId", "connectionId", "continuationIdentityContextId", "conversationAgentId",
+  "conversationBoundaryCommentId", "conversationId", "conversationUserId", "correctiveRunId",
+  "createdByAgentId", "createdByRunId", "createdByUserId", "currentChildIssueId", "currentStageId",
+  "decisionId", "decisionInteractionId", "decompositionId", "defaultParentId", "defaultSelectedOptionIds",
+  "deferredRunId", "deletedAnnotationCommentIds", "deletedByAgentId", "deletedByRunId", "deletedByUserId",
+  "derivedAuthorAgentId", "derivedCreatedByRunId", "documentId", "documentKey", "droppedStageIds",
+  "endpointId", "entityId", "entryRulingRevisionId", "environmentId", "eventId", "excludedChildIdentifiers",
+  "executionHoldRecoveryActionId", "executionRunId", "executionWorkspaceId", "expectedExecutionWorkspaceId",
+  "expiredInteractionIds", "gatedDependentIssueIds", "goalId", "hasBlockedByIssueIds", "holdId",
+  "holderRunId", "inheritExecutionWorkspaceFromIssueId", "inheritedExecutionWorkspaceFromIssueId",
+  "interactionId", "interruptedRunId", "invocationId", "issueCommentId", "issueId", "issueIdentifier",
+  "labelId", "labelIds", "ladderedChildIdentifiers", "lastDecisionId", "lastStatusDecisionId",
+  "latestRevisionId", "latestRunId", "leaseId", "lockedByAgentId", "lockedByUserId", "nativeResultId",
+  "newlyCreatedChildIssueIds", "onBehalfOfUserId", "optionIds", "orderedCommentIds", "originId",
+  "originIdentityContextId", "originRunId", "ownerAgentId", "ownerUserId", "parentId", "parentIdentifier",
+  "parentIssueId", "prevCheckoutRunId", "prevExecutionRunId", "previousAssigneeAgentId",
+  "previousBlockedByIssueIds", "previousCheckoutRunId", "previousOwnerAgentId", "previousRunIds",
+  "projectId", "projectWorkspaceId", "promotedWorkProductId", "proposalId", "providerMessageId",
+  "publicationId", "questionId", "queueId", "queueTargetRunId", "raAgentId", "receiptId",
+  "reclassificationActivityId", "recoveryActionId", "recoveryActionIds", "recoveryIdentifier",
+  "recoveryIssueId", "recoveryOwnerAgentId", "recoveryRunId", "relatedIssueId", "releasedCancelHoldIds",
+  "removedBlockedByIssueIds", "requestId", "requestingAgentId", "resolvedAnnotationThreadIds",
+  "resolvedBlockerIssueId", "resolvedByAgentId", "resolvedByRunId", "resolvedByUserId", "responseCommentId",
+  "responseUserId", "responsibleUserId", "restoredFromRevisionId", "restoredIssueIds", "resultId",
+  "retryRunId", "returnAssigneeAgentId", "returnOwnerAgentId", "reviewInteractionId", "revisionId",
+  "rootIssueId", "runId", "runtimeRequestId", "sampleIssueIdentifier", "scheduledRunId", "selectedOptionIds",
+  "sessionId", "skillId", "skippedStageIds", "snapshotId", "sourceAttachmentId", "sourceCommentId",
+  "sourceIdentifier", "sourceIssueId", "sourceRunId", "stageId", "supersededByIdentifier",
+  "supersededByInteractionId", "supersededByIssueId", "targetAgentId", "targetId", "targetIssueId",
+  "targetRunId", "threadId", "toAgentId", "turnId", "updatedByAgentId", "updatedByUserId", "userId",
+  "wakeupRunId", "watchdogAgentId", "watchdogId", "watchdogIssueId", "watchdogParentIssueId",
+  "workProductId",
+  // timestamps
+  "archivedAt", "blockedOwnerNotifiedAt", "blockedTransitionAt", "boardMonitorNextCheckAt", "cancelledAt",
+  "clearedAt", "completedAt", "createdAt", "deletedAt", "executionLockedAt", "expiresAt", "finishedAt",
+  "handedOffAt", "hiddenAt", "holderStartedAt", "lastAttemptAt", "lastEventAt", "lastReadAt",
+  "lastRealActivityAt", "lastTriggeredAt", "lockedAt", "monitorLastTriggeredAt", "monitorNextCheckAt",
+  "monitorWakeRequestedAt", "nextCheckAt", "observedAt", "previousNextCheckAt", "resolvedAt", "retryAt",
+  "startedAt", "stoppedSinceAt", "timeoutAt", "updatedAt",
+  // counters
+  "answeredQuestionCount", "attemptCount", "cancelledIssueCount", "changesRequestedCount", "commitCount",
+  "consumedCount", "ladderedChildCount", "liveDescendantCount", "maxCount", "memberCount",
+  "monitorAttemptCount", "reArmCount", "requestedChildCount", "restoredIssueCount",
 ]);
-
-/** Identifier, key, timestamp and counter keys (`agentId`, `labelIds`, `childIdentifiers`, `documentKey`, `updatedAt`, `attemptCount`). */
-const METADATA_KEY_PATTERN = /(?:Id|Ids|Identifier|Identifiers|Key|At|Count)$/;
 
 type MetadataScope = { topLevel: boolean; underMetadataKey: boolean };
 
@@ -65,8 +90,13 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isScalar(value: unknown): value is string | number | boolean | null {
-  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+/** A value a metadata key may carry as is; database rows carry timestamps as `Date`. */
+function isScalar(value: unknown): value is string | number | boolean | null | Date {
+  return value === null
+    || typeof value === "string"
+    || typeof value === "number"
+    || typeof value === "boolean"
+    || value instanceof Date;
 }
 
 /** The ids of the issues that summary lists in `record` (and its `_previous`) name. */
@@ -128,13 +158,14 @@ function metadataOnly(
       });
       continue;
     }
-    const metadataKey = METADATA_KEYS.has(key)
-      || METADATA_KEY_PATTERN.test(key)
+    const metadataKey = ISSUE_METADATA_KEYS.has(key)
       || (scope.topLevel && key === "title")
       || (scope.underMetadataKey && (key === "from" || key === "to"));
     if (key === "_previous" && isRecord(value)) {
       const previous = metadataOnly(value, summarizedIssue, TOP_LEVEL);
       if (Object.keys(previous).length > 0) visible[key] = previous;
+    } else if (value instanceof Date) {
+      if (metadataKey) visible[key] = value;
     } else if (isRecord(value)) {
       // A nested value under a metadata key (`changes.status`) keeps its
       // `from`/`to`; under any other key only nested metadata keys remain.
@@ -158,12 +189,12 @@ function metadataOnly(
 }
 
 /**
- * An issue event payload for a recipient that cannot read the issue. Only
- * metadata passes (identifiers, states, enums, counters, timestamps, and the
- * top-level title); every other field is withheld, including the content of
- * nested objects, whose own metadata keys are kept. Summary entries keep their
- * id and identifier, and their title only when the recipient can read the
- * issue they name.
+ * An issue event payload, or an issue, comment, document or activity row, for
+ * a recipient that cannot read the issue. Only keys in `ISSUE_METADATA_KEYS`
+ * and the top-level title pass; every other field is withheld, including the
+ * content of nested objects, whose own allow-listed keys are kept. Summary
+ * entries keep their id and identifier, and their title only when the
+ * recipient can read the issue they name.
  */
 export function issueEventMetadata(
   record: Record<string, unknown>,

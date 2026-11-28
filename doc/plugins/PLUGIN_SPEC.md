@@ -803,7 +803,9 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `project.workspaces.read`
 - `issues.read`
 - `issue.comments.read`
-- `issue.documents.read`
+- `issue.documents.read`: an explicit content grant; the plugin receives issue documents in full, even without `issues.read`
+- `issue.interactions.read`: an explicit content grant; the plugin receives issue interactions in full, even without `issues.read`
+- `issue.attachments.read`: an explicit content grant; the plugin receives issue attachments in full, even without `issues.read`
 - `issue.relations.read`
 - `issue.subtree.read`
 - `agents.read`
@@ -939,7 +941,18 @@ Each event must include:
 - primary entity metadata
 - typed payload
 
-An issue event payload can carry issue content. The host delivers an `issue.*` event in full only to a plugin that can read issues, by the same check as `issues.get`, which requires the `issues.read` capability. A plugin has no per-issue read grant, so a plugin without `issues.read` gets the same reduced payload for every issue, ordinary or restricted: the issue title and the payload's metadata only. The title is the top-level `title` (the issue's own title, or the document title on `issue.document.*`) and, on `issue.comment.created`, `issueTitle`. The metadata is identifiers (`id`, `identifier`, and keys ending in `Id`, `Ids`, `Identifier`, `Identifiers` or `Key`), timestamps, counters, states and enums. Every other field, such as `description`, the comment `bodySnippet`, a document body or an annotation `quote`, is withheld, also under `_previous`, and nested objects keep only their own metadata keys. Issue summary entries (`addedReferencedIssues`, `blockedByIssues` and the like) keep `id` and `identifier` without `title`. The same rule applies to `agent.run.*` events and to `agents.sessions.event` notifications for a run whose issue is known (`issueId`, else the run's context): a plugin without `issues.read` receives only their metadata. Run output of a run with no issue, such as the plugin's own session, is delivered unchanged. A plugin that can read issues receives every event unchanged. Live-events subscribers follow a separate per-issue rule: a subscriber that cannot read an issue gets only its metadata and top-level `title`, without `issueTitle`.
+An issue event payload can carry issue content. The host delivers an `issue.*` event in full only to a plugin that can read issues, by the same check as `issues.get`, which requires the `issues.read` capability. A plugin has no per-issue read grant, so a plugin without `issues.read` gets the same reduced payload for every issue, ordinary or restricted: the issue title and the payload's metadata only. The title is the top-level `title` (the issue's own title, or the document title on `issue.document.*`) and, on `issue.comment.created`, `issueTitle`. The metadata is the keys in one explicit allow-list, `ISSUE_METADATA_KEYS` in `server/src/services/issue-event-content.ts`: identifiers, timestamps, counters, states and enums. A key that is not on the list is withheld, whatever its name looks like, so a new field stays withheld until it is reviewed and added. Every other field, such as `description`, the comment `bodySnippet`, a document body or an annotation `quote`, is withheld, also under `_previous`, and nested objects keep only their own allow-listed keys. Issue summary entries (`addedReferencedIssues`, `blockedByIssues` and the like) keep `id` and `identifier` without `title`. The same rule applies to `agent.run.*` events and to `agents.sessions.event` notifications for a run whose issue is known (`issueId`, else the run's context): a plugin without `issues.read` receives only their metadata. A run with no issue is protected too: a plugin without `issues.read` receives its events without the free-form `error` and `message` text, and keeps the run's other output, such as the log chunks and final text of the plugin's own session. A plugin that can read issues receives every event unchanged. Live-events subscribers follow a separate per-issue rule: a subscriber that cannot read an issue gets only its metadata and top-level `title`, without `issueTitle`.
+
+The same rule covers these read paths when a plugin has the path's own capability but not `issues.read`: `getSubtree`, `listComments`, audit search and the orchestration summary. Such a plugin is not refused; it receives the reduced records:
+
+- `ctx.issues.getSubtree` (`issue.subtree.read`): each issue, relation summary and document summary carries only its title and allow-listed metadata, and `description` and every other content field are `null`; each active run summary carries only its metadata, and `error` is `null`. Assignee summaries describe agents and are unchanged.
+- `ctx.issues.listComments` (`issue.comments.read`): each comment carries only its allow-listed metadata (ids, author, timestamps), and `body` and every other content field are `null`.
+- `ctx.authorization.audit.search` (`authorization.audit.read`): the `details` of an entry about an issue carry only the issue title and allow-listed metadata, and the `details` of an entry about a run follow the run rule above, with the run's issue taken from `details.issueId`, else the run's context. An entry about an environment lease loses its `failureReason`, which carries the run's error text. Entries about other entities are unchanged.
+- `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, and `error` is `null`. Relations, approvals, costs, budget incidents and invocation blocks are unchanged.
+
+Issue documents, interactions and attachments are governed by their own capabilities (`issue.documents.read`, `issue.interactions.read`, `issue.attachments.read`). Granting one of them is an explicit content grant: a plugin with that capability receives the documents, interactions or attachments in full, even without `issues.read`.
+
+A plugin with `issues.read` receives every read path unchanged.
 
 ### 16.1 Event Filtering
 

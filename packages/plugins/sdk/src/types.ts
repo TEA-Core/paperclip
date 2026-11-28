@@ -1234,6 +1234,12 @@ export interface PluginIssueMutationActor {
   actorRunId?: string | null;
 }
 
+/** A comment as `ctx.issues.listComments` returns it to a plugin. */
+export type PluginIssueComment = Omit<IssueComment, "body"> & {
+  /** `null` when withheld from a plugin without `issues.read`. */
+  body: string | null;
+};
+
 export interface PluginIssueRelationSummary {
   blockedBy: IssueRelationIssueSummary[];
   blocks: IssueRelationIssueSummary[];
@@ -1400,7 +1406,9 @@ export interface PluginIssueSubtree {
 export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
-   * issue or issue subtree. Requires `issues.orchestration.read`.
+   * issue or issue subtree. Requires `issues.orchestration.read`. Without
+   * `issues.read`, run summaries carry only their metadata, and `error` is `null`
+   * (see PLUGIN_SPEC.md).
    */
   getOrchestration(input: {
     issueId: string;
@@ -1524,7 +1532,10 @@ export interface PluginIssuesClient {
   }): Promise<PluginIssueCheckoutOwnership>;
   /**
    * Read a root issue's descendants with optional relation/document/run/assignee
-   * summaries. Requires `issue.subtree.read`.
+   * summaries. Requires `issue.subtree.read`. Without `issues.read`, issues,
+   * relation and document summaries carry only their titles and metadata, and
+   * run summaries only their metadata; every other field, such as an issue's
+   * `description` or a run's `error`, is `null` (see PLUGIN_SPEC.md).
    */
   getSubtree(
     issueId: string,
@@ -1549,7 +1560,13 @@ export interface PluginIssuesClient {
       idempotencyKeyPrefix?: string | null;
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
-  listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
+  /**
+   * List an issue's comments. Requires `issue.comments.read`. Without
+   * `issues.read`, each comment carries only its metadata, and `body` and
+   * every other content field are `null`
+   * (see PLUGIN_SPEC.md).
+   */
+  listComments(issueId: string, companyId: string): Promise<PluginIssueComment[]>;
   /**
    * Post a comment on an issue.
    *
@@ -1965,6 +1982,14 @@ export interface PluginAuthorizationClient {
     previewAssignment(input: PluginAssignmentPreviewInput): Promise<PluginAuthorizationDecisionResult>;
     explainAssignment(input: PluginAssignmentPreviewInput): Promise<PluginAuthorizationDecisionResult>;
   };
+  /**
+   * Search activity entries. Requires `authorization.audit.read`. Without
+   * `issues.read`, an entry about an issue carries only the issue title and
+   * metadata in `details`; an entry about a run on an issue carries only its
+   * metadata, one about a run with no issue loses its `error` and `message`
+   * text, and one about an environment lease loses its `failureReason` (see
+   * PLUGIN_SPEC.md).
+   */
   audit: {
     search(input: {
       companyId: string;

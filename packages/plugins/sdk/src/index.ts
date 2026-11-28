@@ -265,6 +265,7 @@ export type {
   PluginBudgetIncidentSummary,
   PluginIssueInvocationBlockSummary,
   PluginIssueOrchestrationSummary,
+  PluginIssueComment,
   PluginIssueSubtreeOptions,
   PluginIssueAssigneeSummary,
   PluginIssueSubtree,
