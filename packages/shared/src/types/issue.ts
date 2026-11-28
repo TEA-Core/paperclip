@@ -888,6 +888,10 @@ export interface IssueExecutionDecision {
   outcome: IssueExecutionDecisionOutcome;
   body: string;
   createdByRunId: string | null;
+  /** The delivered head the decision was made on; null when none was recorded. */
+  deliveredHeadSha: string | null;
+  /** The review round (stage `pendingSince`) the decision was made in; null when none was recorded. */
+  reviewRoundStartedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

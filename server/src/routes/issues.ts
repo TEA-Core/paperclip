@@ -476,6 +476,8 @@ import {
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
   diagnoseMissingApprovalStage,
+  executionDecisionBinding,
+  executionDecisionBindingMatches,
   listCurrentPolicyApprovedStageIds,
   type DurableApprovalIssue,
   isReviewChangesRequestedTransition,
@@ -13186,6 +13188,8 @@ export function issueRoutes(
             stageId: issueExecutionDecisions.stageId,
             outcome: issueExecutionDecisions.outcome,
             createdAt: issueExecutionDecisions.createdAt,
+            deliveredHeadSha: issueExecutionDecisions.deliveredHeadSha,
+            reviewRoundStartedAt: issueExecutionDecisions.reviewRoundStartedAt,
           })
           .from(issueExecutionDecisions)
           .where(
@@ -13195,13 +13199,24 @@ export function issueRoutes(
             ),
           );
         const decidedStageIds = listDurablyApprovedStageIds(decidedRows, policyStageIdSet);
-        // SUP-25518: the row behind each durably approved stage, so an approval
-        // that finds its current stage still pending on that row reconciles the
-        // projection from it instead of writing a second row.
+        // SUP-25518: the row behind each durably approved stage, kept only when
+        // it is bound to the current delivered head and review round, and to the
+        // head the final delivery preflight certifies. Only such a row can
+        // reconcile a stage still pending on it; an unbound or stale row is never
+        // reused, so the board approval is recorded afresh on the current round.
         const latestDecisionByStage = latestDecisionPerStage(decidedRows);
-        const durableApprovalIds = new Map(
-          decidedStageIds.map((stageId) => [stageId, latestDecisionByStage.get(stageId)!.id]),
-        );
+        const currentBinding = executionDecisionBinding(previousState);
+        const certifiedHeadSha =
+          finalDeliveryPrefetch?.resolution.repoBacked && finalDeliveryPrefetch.resolution.verdict.kind === "resolved"
+            ? finalDeliveryPrefetch.resolution.verdict.headSha
+            : null;
+        const durableApprovalIds = new Map<string, string>();
+        for (const stageId of decidedStageIds) {
+          const row = latestDecisionByStage.get(stageId)!;
+          if (executionDecisionBindingMatches(row, currentBinding, certifiedHeadSha)) {
+            durableApprovalIds.set(stageId, row.id);
+          }
+        }
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -13296,6 +13311,7 @@ export function issueRoutes(
             outcome: result.decision.outcome,
             body: result.decision.body,
             createdByRunId: actor.runId ?? null,
+            ...currentBinding,
           });
         }
 
@@ -15259,6 +15275,7 @@ export function issueRoutes(
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
+                ...executionDecisionBinding(lockedIssue.executionState),
               });
               if (transition.stallEscalation) {
                 await logActivityInTransaction(tx as unknown as Db, {
@@ -22896,6 +22913,7 @@ export function issueRoutes(
               outcome: decision.outcome,
               body: decision.body,
               createdByRunId: actor.runId ?? null,
+              ...executionDecisionBinding(existing.executionState),
             });
             // R20: the hand-off to the stall arbiter commits with the
             // reviewer's decision that triggered it, never without it.
@@ -27982,6 +28000,7 @@ export function issueRoutes(
               outcome: transition.decision.outcome,
               body: transition.decision.body,
               createdByRunId: actor.runId ?? null,
+              ...executionDecisionBinding(currentExecutionState),
             });
           }
 
