@@ -108,7 +108,7 @@ async function resolveLegacyRunResponsibleUserId(
   return normalizeOptionalString(run?.responsibleUserId);
 }
 
-async function loadResponsibleUserMemberships(
+export async function loadResponsibleUserMemberships(
   db: Db,
   input: { companyId: string; userId: string | null },
 ) {

@@ -1,5 +1,5 @@
 {
-  "id": "fb0a8ab5-fa26-49f7-a340-c697098303c7",
+  "id": "af3e94a1-552e-4385-a0e3-b3253dc5d2ee",
   "prevId": "d37c26e9-1437-4241-ad76-bc2391a125ab",
   "version": "7",
   "dialect": "postgresql",
@@ -16037,21 +16037,21 @@
         },
         "input_tokens": {
           "name": "input_tokens",
-          "type": "bigint",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "default": 0
         },
         "cached_input_tokens": {
           "name": "cached_input_tokens",
-          "type": "bigint",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "default": 0
         },
         "output_tokens": {
           "name": "output_tokens",
-          "type": "bigint",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "default": 0
@@ -29491,6 +29491,157 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.issue_monitor_recovery_claims": {
+      "name": "issue_monitor_recovery_claims",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "arm_generation": {
+          "name": "arm_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "clear_reason": {
+          "name": "clear_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scheduled_at": {
+          "name": "scheduled_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recovery_policy": {
+          "name": "recovery_policy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recovery_outcome": {
+          "name": "recovery_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_issue_id": {
+          "name": "recovery_issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_wake_queued": {
+          "name": "recovery_wake_queued",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "issue_monitor_recovery_claims_issue_arm_generation_uq": {
+          "name": "issue_monitor_recovery_claims_issue_arm_generation_uq",
+          "columns": [
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "arm_generation",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issue_monitor_recovery_claims_company_issue_idx": {
+          "name": "issue_monitor_recovery_claims_company_issue_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "issue_monitor_recovery_claims_company_id_companies_id_fk": {
+          "name": "issue_monitor_recovery_claims_company_id_companies_id_fk",
+          "tableFrom": "issue_monitor_recovery_claims",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "issue_monitor_recovery_claims_issue_id_issues_id_fk": {
+          "name": "issue_monitor_recovery_claims_issue_id_issues_id_fk",
+          "tableFrom": "issue_monitor_recovery_claims",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.issue_plan_decompositions": {
       "name": "issue_plan_decompositions",
       "schema": "",
@@ -33194,6 +33345,13 @@
         },
         "monitor_attempt_count": {
           "name": "monitor_attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "monitor_arm_generation": {
+          "name": "monitor_arm_generation",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
