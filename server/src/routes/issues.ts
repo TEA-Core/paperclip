@@ -13206,15 +13206,24 @@ export function issueRoutes(
         // reconcile a stage still pending on it; an unbound or stale row is never
         // reused, so the board approval is recorded afresh on the current round.
         const latestDecisionByStage = latestDecisionPerStage(decidedRows);
-        const currentBinding = executionDecisionBinding(previousState);
+        const stateBinding = executionDecisionBinding(previousState);
         const certifiedHeadSha =
           finalDeliveryPrefetch?.resolution.repoBacked && finalDeliveryPrefetch.resolution.verdict.kind === "resolved"
             ? finalDeliveryPrefetch.resolution.verdict.headSha
             : null;
+        // The delivered head is read once, by the final delivery preflight. A
+        // fresh decision is bound to that same head the certification stamps, so
+        // a head that moved after the state recorded it (a same-tree force-push)
+        // cannot leave the decision on one head and the certification on another.
+        // Without a resolved preflight head the state's recorded head binds it.
+        const currentBinding = {
+          ...stateBinding,
+          deliveredHeadSha: certifiedHeadSha ?? stateBinding.deliveredHeadSha,
+        };
         const durableApprovalIds = new Map<string, string>();
         for (const stageId of decidedStageIds) {
           const row = latestDecisionByStage.get(stageId)!;
-          if (executionDecisionBindingMatches(row, currentBinding, certifiedHeadSha)) {
+          if (executionDecisionBindingMatches(row, stateBinding, certifiedHeadSha)) {
             durableApprovalIds.set(stageId, row.id);
           }
         }
