@@ -14494,7 +14494,9 @@ export function issueRoutes(
       const [locked] = await tx.select().from(issueRows)
         .where(and(eq(issueRows.id, existing.id), eq(issueRows.companyId, existing.companyId)))
         .for("update");
-      const lockedIneligible = locked ? await boardLandingProofIneligibility(tx as unknown as Db, locked) : "the card no longer exists";
+      const lockedIneligible = locked
+        ? await boardLandingProofIneligibility(tx as unknown as Db, locked, proof.headSha)
+        : "the card no longer exists";
       if (lockedIneligible) return { kind: "ineligible" as const, reason: lockedIneligible };
       if (
         locked!.projectId !== existing.projectId ||

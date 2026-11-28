@@ -519,11 +519,16 @@ type ParticipantRef = { type?: unknown; agentId?: unknown };
  * deliveryIdentity is recorded, and the card is not closed. Either at least one
  * completed review stage names only users, or the card is `record_only`, every
  * stage is completed or skipped, and an agent-reviewed completed review stage
- * carries a durable independent approval (see
- * {@link agentReviewedStageHasIndependentApproval}). Returns null when
- * eligible, else the refusal reason.
+ * carries a durable independent approval ({@link judgeAgentReviewedStages}).
+ * With `mergedHeadSha` (the live-verified PR head) the approval must also be
+ * bound to that head; the caller passes it once the PR is verified. Returns null
+ * when eligible, else the refusal reason.
  */
-export async function boardLandingProofIneligibility(db: Db, issue: EligibilityIssue): Promise<string | null> {
+export async function boardLandingProofIneligibility(
+  db: Db,
+  issue: EligibilityIssue,
+  mergedHeadSha?: string,
+): Promise<string | null> {
   if (issue.status === "done" || issue.status === "cancelled") {
     return `the card is already ${issue.status}`;
   }
@@ -576,30 +581,39 @@ export async function boardLandingProofIneligibility(db: Db, issue: EligibilityI
   if (!everyStageSettled) {
     return "the card's review workflow still has a stage that is neither approved nor skipped";
   }
-  if (!(await agentReviewedStageHasIndependentApproval(db, issue, policy, rawState, agentReviewedStages))) {
+  const judged = await judgeAgentReviewedStages(db, issue, policy, rawState, agentReviewedStages, mergedHeadSha);
+  if (judged === "no_independent_approval") {
     return "the card has no completed agent review stage whose latest decision is an approval by an agent participant " +
       "other than the card's executor, assignee or author, recorded by that agent and not by the board in its place";
+  }
+  if (judged === "not_bound_to_merged_head") {
+    return "the card's agent approval is not bound to the merged pull request head; an unbound, legacy or old-head approval does not qualify";
   }
   return null;
 }
 
 /**
- * True when some completed agent-reviewed stage was genuinely reviewed: the
- * stage's LATEST durable decision is `approved`, it names an agent that is a
- * participant of that stage, the board did not record it in the agent's place
- * (no `actorUserId`), and that agent is not the card's executor. The executor
- * set is the self-approval principal union (policy and state return assignee,
- * delivery author, creating agent) plus the current assignee and the agents of
- * the card's execution and checkout runs. A stage with no decision row, a
- * superseded approval and a board-user approval all fail.
+ * Judges the agent review of a completed agent-reviewed stage. Genuine review
+ * means the stage's LATEST durable decision is `approved`, names an agent that is
+ * a participant of that stage, was not recorded by the board in the agent's
+ * place (no `actorUserId`), and the agent is not the card's executor. The
+ * executor set is the self-approval principal union (policy and state return
+ * assignee, delivery author, creating agent) plus the current assignee and the
+ * agents of the card's execution and checkout runs. A stage with no decision
+ * row, a superseded approval and a board-user approval all fail.
+ *
+ * When `mergedHeadSha` is given, the approval must also be bound to that head:
+ * its `deliveredHeadSha` (the head the decision recorded) equals the merged PR
+ * head. An unbound or legacy decision has no head and fails.
  */
-async function agentReviewedStageHasIndependentApproval(
+async function judgeAgentReviewedStages(
   db: Db,
   issue: EligibilityIssue,
   policy: { stages?: unknown } | null,
   rawState: Record<string, unknown> | null,
   agentReviewedStages: Array<{ id: string; agentIds: Set<string> }>,
-): Promise<boolean> {
+  mergedHeadSha: string | undefined,
+): Promise<"ok" | "no_independent_approval" | "not_bound_to_merged_head"> {
   const decisions = await db
     .select({
       id: issueExecutionDecisions.id,
@@ -607,6 +621,7 @@ async function agentReviewedStageHasIndependentApproval(
       outcome: issueExecutionDecisions.outcome,
       actorAgentId: issueExecutionDecisions.actorAgentId,
       actorUserId: issueExecutionDecisions.actorUserId,
+      deliveredHeadSha: issueExecutionDecisions.deliveredHeadSha,
       createdAt: issueExecutionDecisions.createdAt,
     })
     .from(issueExecutionDecisions)
@@ -629,15 +644,23 @@ async function agentReviewedStageHasIndependentApproval(
       .where(and(eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, runIds)));
     for (const run of runs) executors.add(run.agentId);
   }
-  return agentReviewedStages.some((stage) => {
+  const independentApprovals = agentReviewedStages.flatMap((stage) => {
     const decision = latest.get(stage.id);
-    return !!decision &&
-      decision.outcome === "approved" &&
-      decision.actorUserId === null &&
-      typeof decision.actorAgentId === "string" &&
-      stage.agentIds.has(decision.actorAgentId) &&
-      !executors.has(decision.actorAgentId);
+    return decision &&
+        decision.outcome === "approved" &&
+        decision.actorUserId === null &&
+        typeof decision.actorAgentId === "string" &&
+        stage.agentIds.has(decision.actorAgentId) &&
+        !executors.has(decision.actorAgentId)
+      ? [decision]
+      : [];
   });
+  if (independentApprovals.length === 0) return "no_independent_approval";
+  if (mergedHeadSha === undefined) return "ok";
+  const mergedHead = normalizeSha(mergedHeadSha);
+  return mergedHead !== null && independentApprovals.some((decision) => normalizeSha(decision.deliveredHeadSha) === mergedHead)
+    ? "ok"
+    : "not_bound_to_merged_head";
 }
 
 export interface AttachedBoardLandingProof {

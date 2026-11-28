@@ -283,10 +283,12 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     /**
      * For an agent review stage: the durable decision on the completed stage.
      * `independent` (default) is an approval recorded by a separate reviewer agent
-     * that is a stage participant. The others are the shapes the proof must refuse.
+     * that is a stage participant and bound to the merged PR head. The others are
+     * the shapes the proof must refuse.
      */
     reviewDecision?:
-      | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant";
+      | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant"
+      | "old_head" | "unbound";
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
@@ -358,7 +360,8 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     if (options.participant === "agent" && options.workflow !== "pending" && reviewDecision !== "none") {
       const decision = (over: Partial<typeof issueExecutionDecisions.$inferInsert>) => ({
         companyId, issueId, stageId, stageType: "review", actorAgentId: reviewerId, actorUserId: null,
-        outcome: "approved", body: "Approved.", ...over,
+        outcome: "approved", body: "Approved.", deliveredHeadSha: HEAD_OF_MERGED, reviewRoundStartedAt: new Date(now.getTime() - 8000),
+        ...over,
       });
       const at = (secondsAgo: number) => new Date(now.getTime() - secondsAgo * 1000);
       if (reviewDecision === "board_user") {
@@ -375,7 +378,10 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
           decision({ outcome: "changes_requested", body: "Reopened.", createdAt: at(5) }),
         ]);
       } else {
-        await db.insert(issueExecutionDecisions).values(decision({ createdAt: at(5) }));
+        const boundHead = reviewDecision === "old_head" ? OTHER_SHA : reviewDecision === "unbound" ? null : HEAD_OF_MERGED;
+        await db.insert(issueExecutionDecisions).values(decision({
+          createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? at(8) : null,
+        }));
       }
     }
     const card = { companyId, agentId, issueId, identifier };
@@ -637,6 +643,8 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       ["the approval was superseded by a later changes_requested decision", "superseded" as const],
       ["an agent that is not a stage participant approved", "non_participant" as const],
       ["no decision is recorded on the completed stage", "none" as const],
+      ["the independent approval is bound to an old head, not the merged PR head", "old_head" as const],
+      ["the independent approval is unbound (a legacy decision with no head)", "unbound" as const],
     ])("refuses when %s, and records nothing", async (_label, reviewDecision) => {
       const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision });
       await reclassifyRecordOnly(issueId);
