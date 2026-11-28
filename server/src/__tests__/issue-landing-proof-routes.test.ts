@@ -668,11 +668,18 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
-    it("accepts an approval bound to the merged head when the completed state keeps no review round", async () => {
-      const { issueId } = await seedStuckCard({ participant: "agent", roundInState: false });
+    it.each([
+      ["a head-bound independent approval", "independent" as const],
+      ["a head-bound approval from an older review round", "old_round" as const],
+    ])("refuses %s when the completed card keeps no current review round start, and records nothing", async (_label, reviewDecision) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision, roundInState: false });
       await reclassifyRecordOnly(issueId);
-      const attached = await attach(issueId, goodProof());
-      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(refused.body.error).toContain("board");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
     });
 
     it.each([

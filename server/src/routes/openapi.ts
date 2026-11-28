@@ -11313,8 +11313,9 @@ registerCurrentRoute({
     "with every stage approved or skipped and at least one completed review stage whose latest durable decision is an approval " +
     "recorded by an agent participant of that stage who is not the card's executor, assignee or author and was not replaced by a " +
     "board user (an old board-user approval, a self-review and an empty participant list do not qualify), whose recorded " +
-    "`delivered_head_sha` equals the live-verified pull request head and whose recorded `review_round_started_at` is set and " +
-    "equals the current review round when the state carries one (an unbound, legacy, old-head or old-round decision does not qualify), " +
+    "`delivered_head_sha` equals the live-verified pull request head and whose recorded `review_round_started_at` equals the " +
+    "card's current review round start (when the state records no round start the call is 409 `landing_proof_not_applicable`: " +
+    "fail closed, close the card through the board route instead; an unbound, legacy, old-head or old-round decision does not qualify), " +
     "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +

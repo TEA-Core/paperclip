@@ -600,8 +600,13 @@ export async function boardLandingProofIneligibility(
     return "the card has no completed agent review stage whose latest decision is an approval by an agent participant " +
       "other than the card's executor, assignee or author, recorded by that agent and not by the board in its place";
   }
+  if (judged === "no_current_round") {
+    return "the card's current review round start is not recorded, so no approval can be bound to it; " +
+      "the landing proof cannot be attached, and the board closes the card through its own board route instead";
+  }
   if (judged === "not_bound_to_merged_head") {
-    return "the card's agent approval is not bound to the merged pull request head; an unbound, legacy or old-head approval does not qualify";
+    return "the card's agent approval is not bound to the merged pull request head and current review round; " +
+      "an unbound, legacy, old-head or old-round approval does not qualify";
   }
   return null;
 }
@@ -618,8 +623,9 @@ export async function boardLandingProofIneligibility(
  *
  * When `mergedHeadSha` is given, the approval must also be bound to that head
  * and to the review round: its `deliveredHeadSha` equals the merged PR head and
- * its `reviewRoundStartedAt` is recorded, and equals the current round when the
- * state carries one. An unbound or legacy decision has no head or round and fails.
+ * its `reviewRoundStartedAt` equals the card's current round (`pendingSince`).
+ * A card whose state records no current round fails closed ("no_current_round").
+ * An unbound or legacy decision has no head or round and fails.
  */
 async function judgeAgentReviewedStages(
   db: Db,
@@ -628,7 +634,7 @@ async function judgeAgentReviewedStages(
   rawState: Record<string, unknown> | null,
   agentReviewedStages: Array<{ id: string; agentIds: Set<string> }>,
   mergedHeadSha: string | undefined,
-): Promise<"ok" | "no_independent_approval" | "not_bound_to_merged_head"> {
+): Promise<"ok" | "no_independent_approval" | "no_current_round" | "not_bound_to_merged_head"> {
   const decisions = await db
     .select({
       id: issueExecutionDecisions.id,
@@ -673,16 +679,18 @@ async function judgeAgentReviewedStages(
       : [];
   });
   if (independentApprovals.length === 0) return "no_independent_approval";
+  // Fail closed: without the card's current review round start there is nothing
+  // to bind an approval to, and a guess would let an older round's approval pass.
+  if (currentRoundMs === null) return "no_current_round";
   if (mergedHeadSha === undefined) return "ok";
   const mergedHead = normalizeSha(mergedHeadSha);
-  // Bound to the merged head AND to the review round: an approval from an older
-  // round on the same head is not this review. A decision with no recorded round
-  // never qualifies. When the state still carries the current round
-  // (`pendingSince`), the decision's round must be that round.
+  // Bound to the merged head AND to the current review round: an approval from an
+  // older round on the same head is not this review, and a decision with no
+  // recorded round never qualifies.
   return mergedHead !== null && independentApprovals.some((decision) =>
       normalizeSha(decision.deliveredHeadSha) === mergedHead &&
       decision.reviewRoundStartedAt !== null &&
-      (currentRoundMs === null || decision.reviewRoundStartedAt.getTime() === currentRoundMs))
+      decision.reviewRoundStartedAt.getTime() === currentRoundMs)
     ? "ok"
     : "not_bound_to_merged_head";
 }
