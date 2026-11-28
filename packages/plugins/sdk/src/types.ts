@@ -1400,7 +1400,10 @@ export interface PluginIssueSubtree {
 export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
-   * issue or issue subtree. Requires `issues.orchestration.read`.
+   * issue or issue subtree. Requires `issues.orchestration.read`. Without
+   * `issues.read`, run summaries carry only their metadata, without `error`,
+   * relation summaries only their titles and metadata, and the cost summary
+   * omits the issue's billing code unless passed (see PLUGIN_SPEC.md).
    */
   getOrchestration(input: {
     issueId: string;

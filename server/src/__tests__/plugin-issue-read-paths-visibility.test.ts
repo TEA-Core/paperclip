@@ -3,10 +3,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   activityLog,
+  agents,
   companies,
   createDb,
   type Db,
   documents,
+  heartbeatRuns,
   issueComments,
   issueDocuments,
   issueRelations,
@@ -35,7 +37,12 @@ function manifest(capabilities: string[]) {
   return { id: "paperclip.test", capabilities } as unknown as PaperclipPluginManifestV1;
 }
 
-const WITHOUT_ISSUES_READ = ["issue.subtree.read", "issue.comments.read", "authorization.audit.read"];
+const WITHOUT_ISSUES_READ = [
+  "issue.subtree.read",
+  "issue.comments.read",
+  "authorization.audit.read",
+  "issues.orchestration.read",
+];
 const WITH_ISSUES_READ = [...WITHOUT_ISSUES_READ, "issues.read"];
 
 describeEmbeddedPostgres("plugin issue read paths for plugins without issues.read", () => {
@@ -53,7 +60,9 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     await db.delete(issueDocuments);
     await db.delete(documents);
     await db.delete(issueRelations);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -139,7 +148,30 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
         createdAt: new Date("2026-01-03T00:00:00Z"),
       },
     ]);
-    return { companyId, rootId, childId };
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId: rootId },
+      error: `${RESTRICTED} run error text`,
+      startedAt: new Date("2026-01-04T00:00:00Z"),
+      finishedAt: new Date("2026-01-04T00:01:00Z"),
+    });
+    return { companyId, rootId, childId, agentId };
   }
 
   it("returns subtree titles and allow-listed metadata only to a plugin without issues.read", async () => {
@@ -236,6 +268,32 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     expect(entries.find((entry) => entry.entityType === "heartbeat_run")?.details).toMatchObject({
       error: `${RESTRICTED} run error`,
     });
+    host.dispose();
+  });
+
+  it("strips run error text and relation content from the orchestration summary for a plugin without issues.read", async () => {
+    const { companyId, rootId, childId, agentId } = await seedTree();
+    const host = services(WITHOUT_ISSUES_READ);
+
+    const summary = await host.issues.getOrchestrationSummary({ issueId: rootId, companyId, includeSubtree: true });
+
+    expect(JSON.stringify(summary)).not.toContain(RESTRICTED);
+    expect(summary.runs).toHaveLength(1);
+    expect(summary.runs[0]).toMatchObject({ issueId: rootId, agentId, status: "failed", invocationSource: "assignment" });
+    expect(summary.runs[0]).not.toHaveProperty("error");
+    expect(summary.relations[rootId]?.blocks).toEqual([
+      expect.objectContaining({ id: childId, identifier: "RP-2", title: "Child title", status: "blocked" }),
+    ]);
+    host.dispose();
+  });
+
+  it("returns run error text in the orchestration summary to a plugin with issues.read", async () => {
+    const { companyId, rootId } = await seedTree();
+    const host = services(WITH_ISSUES_READ);
+
+    const summary = await host.issues.getOrchestrationSummary({ issueId: rootId, companyId });
+
+    expect(summary.runs[0]).toMatchObject({ error: `${RESTRICTED} run error text` });
     host.dispose();
   });
 });
