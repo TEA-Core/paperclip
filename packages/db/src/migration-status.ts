@@ -1,5 +1,9 @@
 import { inspectMigrations } from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
+import { captureOperatorEnv, loadBootEnv } from "@paperclipai/shared/boot-env";
+
+captureOperatorEnv();
+loadBootEnv({ cwd: process.cwd() });
 
 const jsonMode = process.argv.includes("--json");
 

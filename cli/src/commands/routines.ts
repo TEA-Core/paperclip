@@ -13,7 +13,6 @@ import {
   routines,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
-import { loadPaperclipEnvFile } from "../config/env.js";
 import { readConfig, resolveConfigPath } from "../config/store.js";
 
 type RoutinesDisableAllOptions = {
@@ -236,7 +235,6 @@ export async function disableAllRoutinesInConfig(
   options: Pick<RoutinesDisableAllOptions, "config" | "companyId">,
 ): Promise<DisableAllRoutinesResult> {
   const configPath = resolveConfigPath(options.config);
-  loadPaperclipEnvFile(configPath);
   const companyId =
     nonEmpty(options.companyId)
     ?? nonEmpty(process.env.PAPERCLIP_COMPANY_ID)

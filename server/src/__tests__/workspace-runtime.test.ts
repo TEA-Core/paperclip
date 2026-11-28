@@ -94,7 +94,6 @@ import {
   type Environment,
   type EnvironmentLease,
 } from "@paperclipai/shared";
-import { resolvePaperclipConfigPath } from "../paths.ts";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
@@ -3521,8 +3520,14 @@ describe("realizeExecutionWorkspace", () => {
       expect(envVars.PAPERCLIP_IN_WORKTREE).toBe("true");
       expect(envVars.PAPERCLIP_WORKTREE_NAME).toBe("PAP-885-show-worktree-banner");
 
-      process.chdir(workspace.cwd);
-      expect(resolvePaperclipConfigPath()).toBe(configPath);
+      // A provisioned worktree is discovered by its next process, not by
+      // replacing the source plan of this already-running server.
+      const coldBoot = spawnSync(process.execPath, [
+        "--import", import.meta.resolve("tsx"), "--input-type=module", "--eval",
+        `import { resolvePaperclipConfigPath } from ${JSON.stringify(new URL("../paths.ts", import.meta.url).href)};
+         process.stdout.write(resolvePaperclipConfigPath());`,
+      ], { cwd: workspace.cwd, env: process.env, encoding: "utf8" });
+      expect(coldBoot.stdout, coldBoot.stderr).toBe(configPath);
 
       const preservedPort = 39999;
       await fs.writeFile(

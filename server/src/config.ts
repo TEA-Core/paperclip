@@ -1,12 +1,13 @@
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
-import { config as loadDotenv } from "dotenv";
-import { resolvePaperclipEnvPath } from "./paths.js";
-import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
-import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
+import {
+  bootEnvOrigin,
+  captureOperatorEnv,
+  currentBootEnvPlan,
+  loadBootEnv,
+} from "@paperclipai/shared/boot-env";
+import { maybeRepairLegacyWorktreeConfigAndEnvFiles, readWorktreeBootIsolation } from "./worktree-config.js";
 import {
   AUTH_BASE_URL_MODES,
   BIND_MODES,
@@ -31,22 +32,8 @@ import {
   resolveHomeAwarePath,
 } from "./home-paths.js";
 
-const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
-if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
-  loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
-}
-
-const CWD_ENV_PATH = resolve(process.cwd(), ".env");
-const cwdEnvExists = existsSync(CWD_ENV_PATH);
-const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
-  ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
-  : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
-if (shouldLoadWorkingDirectoryEnv({
-  cwdEnvExists,
-  isPaperclipEnvFile: isSameFile,
-})) {
-  loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
-}
+captureOperatorEnv(process.env);
+loadBootEnv({ cwd: process.cwd() });
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
@@ -149,8 +136,23 @@ export function pendingReviewParticipantGraceMsFromEnv(): number {
   return Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_PARTICIPANT_GRACE_MS) || 30 * 60 * 1000);
 }
 
+function worktreeDatabaseUrl(fileDbUrl: string | undefined, isolation: boolean): string | undefined {
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree") {
+    return bootEnvOrigin("DATABASE_URL") === "operator" ? process.env.DATABASE_URL : undefined;
+  }
+  return process.env.DATABASE_URL ?? (isolation ? undefined : fileDbUrl);
+}
+
+function worktreeMigrationUrl(): string | undefined {
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree" && bootEnvOrigin("DATABASE_MIGRATION_URL") !== "operator") return undefined;
+  return process.env.DATABASE_MIGRATION_URL;
+}
+
 export function loadConfig(): Config {
-  const fileConfig = readConfigFile();
+  const isolation = readWorktreeBootIsolation();
+  const fileConfig = isolation ?? readConfigFile();
   const fileDatabaseMode =
     (fileConfig?.database.mode === "postgres" ? "postgres" : "embedded-postgres") as DatabaseMode;
 
@@ -421,8 +423,8 @@ export function loadConfig(): Config {
     ),
     authDisableSignUp,
     databaseMode: fileDatabaseMode,
-    databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
-    databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    databaseUrl: worktreeDatabaseUrl(fileDbUrl, isolation !== null),
+    databaseMigrationUrl: worktreeMigrationUrl(),
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -451,9 +453,13 @@ export function loadConfig(): Config {
     secretsStrictMode,
     secretsMasterKeyFilePath:
       resolveHomeAwarePath(
-        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE ??
+        (currentBootEnvPlan()?.mode === "worktree" && bootEnvOrigin("PAPERCLIP_SECRETS_MASTER_KEY_FILE") !== "operator"
+          ? undefined
+          : process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE) ??
           fileSecrets?.localEncrypted.keyFilePath ??
-          resolveDefaultSecretsKeyFilePath(),
+          (currentBootEnvPlan()?.mode === "worktree"
+            ? `/etc/paperclip/worktrees/${process.env.PAPERCLIP_INSTANCE_ID}/master.key`
+            : resolveDefaultSecretsKeyFilePath()),
       ),
     secretsDirWatchIntervalMs: Math.max(
       30_000,

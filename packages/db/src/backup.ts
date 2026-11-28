@@ -1,12 +1,16 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { formatDatabaseBackupResult, runDatabaseBackup } from "./backup-lib.js";
+import { vettedEnvEntries } from "./runtime-config.js";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
-  resolvePaperclipConfigPathForInstance,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
+import { captureOperatorEnv, loadBootEnv } from "@paperclipai/shared/boot-env";
+
+captureOperatorEnv();
+const { plan } = loadBootEnv({ cwd: process.cwd() });
 
 type PartialConfig = {
   database?: {
@@ -36,35 +40,11 @@ function asPositiveInt(value: unknown): number | null {
   return rounded > 0 ? rounded : null;
 }
 
-function readEnvFileEntries(envPath: string): Record<string, string> {
-  if (!existsSync(envPath)) return {};
-  const entries: Record<string, string> = {};
-  for (const rawLine of readFileSync(envPath, "utf8").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    const value = rawValue.trim();
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      entries[key] = value.slice(1, -1);
-    } else {
-      entries[key] = value.replace(/\s+#.*$/, "").trim();
-    }
-  }
-  return entries;
-}
-
 function resolveConnectionString(configPath: string, config: PartialConfig | null): string {
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) return envUrl;
-
   const envPath = resolvePaperclipEnvPathForConfig(configPath);
-  const envEntries = readEnvFileEntries(envPath);
-  const fileEnvUrl = envEntries.DATABASE_URL?.trim();
+  const fileEnvUrl = vettedEnvEntries(envPath)?.DATABASE_URL?.trim();
   if (fileEnvUrl) return fileEnvUrl;
 
   if (config?.database?.mode === "postgres" && typeof config.database.connectionString === "string") {
@@ -94,7 +74,7 @@ function resolveRetentionDays(config: PartialConfig | null): number {
 }
 
 async function main() {
-  const configPath = resolvePaperclipConfigPathForInstance();
+  const configPath = plan.configPath;
   const config = readConfig(configPath);
   const connectionString = resolveConnectionString(configPath, config);
   const backupDir = resolveBackupDir(config);

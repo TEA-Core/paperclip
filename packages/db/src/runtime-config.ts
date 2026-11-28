@@ -3,11 +3,9 @@ import path from "node:path";
 import {
   expandHomePrefix,
   resolveDefaultEmbeddedPostgresDir,
-  resolvePaperclipConfigPathForInstance,
   resolvePaperclipEnvPathForConfig,
 } from "@paperclipai/shared/home-paths";
-
-const CONFIG_BASENAME = "config.json";
+import { captureOperatorEnv, currentBootEnvPlan, readEnvFileVetted, resolveBootEnvPlan } from "@paperclipai/shared/boot-env";
 
 type PartialConfig = {
   database?: {
@@ -41,65 +39,26 @@ function resolveHomeAwarePath(value: string): string {
   return path.resolve(expandHomePrefix(value));
 }
 
-function findConfigFileFromAncestors(startDir: string): string | null {
-  let currentDir = path.resolve(startDir);
-
-  while (true) {
-    const candidate = path.resolve(currentDir, ".paperclip", CONFIG_BASENAME);
-    if (existsSync(candidate)) return candidate;
-
-    const nextDir = path.resolve(currentDir, "..");
-    if (nextDir === currentDir) return null;
-    currentDir = nextDir;
-  }
-}
-
 function resolvePaperclipConfigPath(): string {
-  if (process.env.PAPERCLIP_CONFIG?.trim()) {
-    return path.resolve(process.env.PAPERCLIP_CONFIG.trim());
-  }
-  return findConfigFileFromAncestors(process.cwd()) ?? resolvePaperclipConfigPathForInstance();
+  return (currentBootEnvPlan() ?? resolveBootEnvPlan({ cwd: process.cwd() })).configPath;
 }
 
 function resolvePaperclipEnvPath(configPath: string): string {
   return resolvePaperclipEnvPathForConfig(configPath);
 }
 
-function parseEnvFile(contents: string): Record<string, string> {
-  const entries: Record<string, string> = {};
-
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-
-    const match = rawLine.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-
-    const [, key, rawValue] = match;
-    const value = rawValue.trim();
-    if (!value) {
-      entries[key] = "";
-      continue;
-    }
-
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      entries[key] = value.slice(1, -1);
-      continue;
-    }
-
-    entries[key] = value.replace(/\s+#.*$/, "").trim();
+// Non-boot reads never stage another file into the boot ledger.
+export function vettedEnvEntries(envPath: string): Record<string, string> | null {
+  const read = readEnvFileVetted(envPath);
+  if (read.status === "refused") return null;
+  const plan = currentBootEnvPlan();
+  if (plan?.mode === "worktree" && plan.sources.some((source) => source.path === path.resolve(envPath))) {
+    const { DATABASE_URL: _databaseUrl, DATABASE_MIGRATION_URL: _migrationUrl, ...entries } = read.entries;
+    return entries;
   }
-
-  return entries;
+  return read.entries;
 }
 
-function readEnvEntries(envPath: string): Record<string, string> {
-  if (!existsSync(envPath)) return {};
-  return parseEnvFile(readFileSync(envPath, "utf8"));
-}
 
 function migrateLegacyConfig(raw: unknown): PartialConfig | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -182,9 +141,10 @@ function readConfig(configPath: string): PartialConfig | null {
 }
 
 export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
+  captureOperatorEnv();
   const configPath = resolvePaperclipConfigPath();
   const envPath = resolvePaperclipEnvPath(configPath);
-  const envEntries = readEnvEntries(envPath);
+  const vettedEntries = vettedEnvEntries(envPath);
 
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) {
@@ -197,7 +157,7 @@ export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
     };
   }
 
-  const fileEnvUrl = envEntries.DATABASE_URL?.trim();
+  const fileEnvUrl = vettedEntries?.DATABASE_URL?.trim();
   if (fileEnvUrl) {
     return {
       mode: "postgres",

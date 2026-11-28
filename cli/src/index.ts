@@ -29,7 +29,8 @@ import { registerSecretCommands } from "./commands/client/secrets.js";
 import { registerSkillsCommands } from "./commands/client/skills.js";
 import { registerTeamCommands } from "./commands/client/teams.js";
 import { applyDataDirOverride, type DataDirOptionLike } from "./config/data-dir.js";
-import { loadPaperclipEnvFile } from "./config/env.js";
+import path from "node:path";
+import { captureOperatorEnv, loadBootEnv, noteOperatorFlag } from "@paperclipai/shared/boot-env";
 import { initTelemetryFromConfigFile, flushTelemetry } from "./telemetry.js";
 import { registerWorktreeCommands } from "./commands/worktree.js";
 import { registerPluginCommands } from "./commands/client/plugin.js";
@@ -102,7 +103,10 @@ program
   .action(updateCommand);
 
 program.hook("preAction", async (_thisCommand, actionCommand) => {
+  captureOperatorEnv();
   const options = actionCommand.optsWithGlobals() as DataDirOptionLike & TestDriveOptions;
+  if (options.config) noteOperatorFlag("PAPERCLIP_CONFIG", path.resolve(options.config));
+  if (options.instance) noteOperatorFlag("PAPERCLIP_INSTANCE_ID", options.instance);
   let dataDirOptions: DataDirOptionLike = options;
   if (actionCommand.name() === "test-drive") {
     redactTestDriveArgv(options.apiKey);
@@ -117,7 +121,7 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
     hasConfigOption: optionNames.has("config"),
     hasContextOption: optionNames.has("context"),
   });
-  loadPaperclipEnvFile(options.config);
+  loadBootEnv({ cwd: process.cwd() });
   if (actionCommand.name() === "test-drive") {
     assertTestDriveDatabaseIsolation(options.config);
   }

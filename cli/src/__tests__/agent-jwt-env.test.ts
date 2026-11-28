@@ -11,6 +11,7 @@ import {
   resolveAgentJwtEnvFile,
 } from "../config/env.js";
 import { agentJwtSecretCheck } from "../checks/agent-jwt-secret-check.js";
+import { bootEnvOrigin, captureOperatorEnv, loadBootEnv, operatorEnvValue, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -23,6 +24,7 @@ function tempConfigPath(): string {
 
 describe("agent jwt env helpers", () => {
   beforeEach(() => {
+    resetBootEnvForTests();
     process.env = { ...ORIGINAL_ENV };
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
@@ -44,6 +46,35 @@ describe("agent jwt env helpers", () => {
     expect(contents).toContain("PAPERCLIP_AGENT_JWT_SECRET=");
   });
 
+  it("publishes a newly minted secret for the frozen boot target without operator promotion", () => {
+    const configPath = tempConfigPath();
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: path.dirname(configPath) });
+
+    const result = ensureAgentJwtSecret(configPath);
+
+    expect(result.created).toBe(true);
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET === result.secret).toBe(true);
+    expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBe("boot");
+    expect(operatorEnvValue("PAPERCLIP_AGENT_JWT_SECRET")).toBeUndefined();
+  });
+
+  it("does not publish a newly minted secret for a different config into the boot target", () => {
+    const configPath = tempConfigPath();
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: path.dirname(configPath) });
+    const otherConfig = tempConfigPath();
+
+    const result = ensureAgentJwtSecret(otherConfig);
+
+    expect(result.created).toBe(true);
+    expect(readPaperclipEnvEntries(resolveAgentJwtEnvFile(otherConfig)).PAPERCLIP_AGENT_JWT_SECRET === result.secret).toBe(true);
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+    expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBeNull();
+  });
+
   it("creates an independent tool-action signing secret next to the config", () => {
     const configPath = tempConfigPath();
     const result = ensureToolActionSigningSecret(configPath);
@@ -62,7 +93,7 @@ describe("agent jwt env helpers", () => {
 
     const loaded = readAgentJwtSecretFromEnv(configPath);
     expect(loaded).toBe("test-secret");
-    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBe("test-secret");
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
   });
 
   it("doctor check passes when secret exists in adjacent .env", () => {
@@ -128,6 +159,24 @@ describe("agent jwt env helpers", () => {
       "",
     ].join("\r\n"));
     expect(updated.replaceAll("\r\n", "")).not.toContain("\n");
+  });
+
+  it("fails with one message naming the env file when the writer refuses, leaving it unchanged", () => {
+    const configPath = tempConfigPath();
+    const envPath = resolveAgentJwtEnvFile(configPath);
+    const original = [
+      'FOO.BAR="alpha',
+      "PAPERCLIP_AGENT_JWT_SECRET=hidden",
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "",
+    ].join("\n");
+    fs.writeFileSync(envPath, original, { mode: 0o600 });
+
+    expect(() => mergePaperclipEnvEntries({ PAPERCLIP_AGENT_JWT_SECRET: "new-secret" }, envPath)).toThrow(
+      expect.objectContaining({ message: expect.stringContaining(envPath) }),
+    );
+    expect(fs.readFileSync(envPath, "utf8")).toBe(original);
   });
 
   it("does not replace the env file when managed values are already current", () => {

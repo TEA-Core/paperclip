@@ -5,7 +5,7 @@ import {
   resolveDefaultContextPath,
   resolvePaperclipInstanceId,
 } from "./home.js";
-
+import { noteOperatorFlag } from "@paperclipai/shared/boot-env";
 export interface DataDirOptionLike {
   dataDir?: string;
   config?: string;
@@ -26,21 +26,21 @@ export function applyDataDirOverride(
   if (!rawDataDir) return null;
 
   const resolvedDataDir = path.resolve(expandHomePrefix(rawDataDir));
-  process.env.PAPERCLIP_HOME = resolvedDataDir;
+  noteOperatorFlag("PAPERCLIP_HOME", resolvedDataDir);
 
   if (support.hasConfigOption) {
     const hasConfigOverride = Boolean(options.config?.trim()) || Boolean(process.env.PAPERCLIP_CONFIG?.trim());
     if (!hasConfigOverride) {
       const instanceId = resolvePaperclipInstanceId(options.instance);
-      process.env.PAPERCLIP_INSTANCE_ID = instanceId;
-      process.env.PAPERCLIP_CONFIG = resolveDefaultConfigPath(instanceId);
+      noteOperatorFlag("PAPERCLIP_INSTANCE_ID", instanceId);
+      noteOperatorFlag("PAPERCLIP_CONFIG", resolveDefaultConfigPath(instanceId));
     }
   }
 
   if (support.hasContextOption) {
     const hasContextOverride = Boolean(options.context?.trim()) || Boolean(process.env.PAPERCLIP_CONTEXT?.trim());
     if (!hasContextOverride) {
-      process.env.PAPERCLIP_CONTEXT = resolveDefaultContextPath();
+      noteOperatorFlag("PAPERCLIP_CONTEXT", resolveDefaultContextPath());
     }
   }
 

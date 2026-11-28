@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { config as loadDotenv, parse as parseEnvFileContents } from "dotenv";
+import { parse as parseEnvFileContents } from "dotenv";
 import { updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "@paperclipai/shared/env-file";
+import { currentBootEnvPlan, readEnvFileVetted, setBootDerivedEnv } from "@paperclipai/shared/boot-env";
 import { resolveConfigPath } from "./store.js";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
@@ -15,7 +16,6 @@ const PAPERCLIP_OWNED_ENV_KEY_PATTERN = /^PAPERCLIP_[A-Z0-9_]+$/;
 function resolveEnvFilePath(configPath?: string) {
   return path.resolve(path.dirname(resolveConfigPath(configPath)), ".env");
 }
-const loadedEnvFiles = new Set<string>();
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -53,30 +53,15 @@ export function resolveAgentJwtEnvFile(configPath?: string): string {
   return resolveEnvFilePath(configPath);
 }
 
-export function loadPaperclipEnvFile(configPath?: string): void {
-  loadAgentJwtEnvFile(resolveEnvFilePath(configPath));
-}
-
-export function loadAgentJwtEnvFile(filePath = resolveEnvFilePath()): void {
-  if (loadedEnvFiles.has(filePath)) return;
-
-  if (!fs.existsSync(filePath)) return;
-  loadedEnvFiles.add(filePath);
-  loadDotenv({ path: filePath, override: false, quiet: true });
-}
 
 export function readAgentJwtSecretFromEnv(configPath?: string): string | null {
-  loadAgentJwtEnvFile(resolveEnvFilePath(configPath));
-  const raw = process.env[JWT_SECRET_ENV_KEY];
-  return isNonEmpty(raw) ? raw!.trim() : null;
+  const raw = process.env[JWT_SECRET_ENV_KEY]
+    ?? readEnvFileVetted(resolveEnvFilePath(configPath)).entries[JWT_SECRET_ENV_KEY];
+  return isNonEmpty(raw) ? raw.trim() : null;
 }
 
 export function readAgentJwtSecretFromEnvFile(filePath = resolveEnvFilePath()): string | null {
-  if (!fs.existsSync(filePath)) return null;
-
-  const raw = fs.readFileSync(filePath, "utf-8");
-  const values = parseEnvFile(raw);
-  const value = values[JWT_SECRET_ENV_KEY];
+  const value = readEnvFileVetted(filePath).entries[JWT_SECRET_ENV_KEY];
   return isNonEmpty(value) ? value!.trim() : null;
 }
 
@@ -93,20 +78,22 @@ export function ensureAgentJwtSecret(configPath?: string): { secret: string; cre
 
   if (!existingFile) {
     writeAgentJwtEnv(secret, envFilePath);
+    if (currentBootEnvPlan()?.sources[0]?.path === envFilePath) {
+      setBootDerivedEnv(JWT_SECRET_ENV_KEY, secret);
+    }
   }
 
   return { secret, created };
 }
 
 export function ensureToolActionSigningSecret(configPath?: string): { secret: string; created: boolean } {
-  loadAgentJwtEnvFile(resolveEnvFilePath(configPath));
   const existingEnv = process.env[TOOL_ACTION_SIGNING_SECRET_ENV_KEY];
   if (isNonEmpty(existingEnv)) {
     return { secret: existingEnv.trim(), created: false };
   }
 
   const envFilePath = resolveEnvFilePath(configPath);
-  const existingFile = readPaperclipEnvEntries(envFilePath)[TOOL_ACTION_SIGNING_SECRET_ENV_KEY];
+  const existingFile = readEnvFileVetted(envFilePath).entries[TOOL_ACTION_SIGNING_SECRET_ENV_KEY];
   const secret = isNonEmpty(existingFile) ? existingFile.trim() : randomBytes(32).toString("hex");
   const created = !isNonEmpty(existingFile);
 
@@ -170,9 +157,17 @@ export function readPaperclipEnvEntries(filePath = resolveEnvFilePath()): Record
 
 export function writePaperclipEnvEntries(entries: Record<string, string>, filePath = resolveEnvFilePath()): void {
   const previousContents = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : null;
-  const nextContents = updateEnvFileContents(previousContents ?? emptyEnvFileContents(), paperclipOwnedEntries(entries), {
-    valueEncoding: "minimal",
-  });
+  let nextContents: string;
+  try {
+    nextContents = updateEnvFileContents(previousContents ?? emptyEnvFileContents(), paperclipOwnedEntries(entries), {
+      valueEncoding: "minimal",
+    });
+  } catch (error) {
+    throw new Error(
+      `Cannot update env file ${filePath}: ${error instanceof Error ? error.message : String(error)} ` +
+        `The file was left unchanged. Rewrite the conflicting assignment in that file in canonical KEY=value form, then retry.`,
+    );
+  }
   writeEnvFileAtomicallyIfChanged(filePath, previousContents, nextContents);
 }
 

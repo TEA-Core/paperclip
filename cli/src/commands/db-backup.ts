@@ -1,8 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import { vettedEnvEntries } from "@paperclipai/db/runtime-config";
 import { resolvePaperclipEnvPathForConfig } from "@paperclipai/shared/home-paths";
 import {
   expandHomePrefix,
@@ -20,36 +20,13 @@ type DbBackupOptions = {
   json?: boolean;
 };
 
-function readEnvFileEntries(envPath: string): Record<string, string> {
-  if (!existsSync(envPath)) return {};
-  const entries: Record<string, string> = {};
-  for (const rawLine of readFileSync(envPath, "utf8").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    const value = rawValue.trim();
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      entries[key] = value.slice(1, -1);
-    } else {
-      entries[key] = value.replace(/\s+#.*$/, "").trim();
-    }
-  }
-  return entries;
-}
-
 function resolveConnectionString(configPath?: string): { value: string; source: string } {
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) return { value: envUrl, source: "DATABASE_URL" };
 
   const resolvedConfigPath = configPath ?? resolveConfigPath();
   const envPath = resolvePaperclipEnvPathForConfig(resolvedConfigPath);
-  const envEntries = readEnvFileEntries(envPath);
-  const fileEnvUrl = envEntries.DATABASE_URL?.trim();
+  const fileEnvUrl = vettedEnvEntries(envPath)?.DATABASE_URL?.trim();
   if (fileEnvUrl) return { value: fileEnvUrl, source: "paperclip-env" };
 
   const config = readConfig(configPath);

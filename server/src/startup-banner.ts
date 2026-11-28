@@ -1,8 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { BindMode, DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 
-import { parse as parseEnvFileContents } from "dotenv";
+import { bootEnvReport } from "@paperclipai/shared/boot-env";
 
 type UiMode = "none" | "static" | "vite-dev";
 
@@ -68,6 +67,7 @@ function redactConnectionString(raw: string): string {
 
 function resolveAgentJwtSecretStatus(
   envFilePath: string,
+  refusals: ReturnType<typeof bootEnvReport>["refusals"],
 ): {
   status: "pass" | "warn";
   message: string;
@@ -80,15 +80,8 @@ function resolveAgentJwtSecretStatus(
     };
   }
 
-  if (existsSync(envFilePath)) {
-    const parsed = parseEnvFileContents(readFileSync(envFilePath, "utf-8"));
-    const fileValue = typeof parsed.PAPERCLIP_AGENT_JWT_SECRET === "string" ? parsed.PAPERCLIP_AGENT_JWT_SECRET.trim() : "";
-    if (fileValue) {
-      return {
-        status: "warn",
-        message: `found in ${envFilePath} but not loaded`,
-      };
-    }
+  if (refusals.some((refusal) => refusal.path === envFilePath)) {
+    return { status: "warn", message: `env file refused: ${envFilePath}` };
   }
 
   return {
@@ -104,7 +97,8 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const uiUrl = opts.uiMode === "none" ? "disabled" : baseUrl;
   const configPath = resolvePaperclipConfigPath();
   const envFilePath = resolvePaperclipEnvPath();
-  const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath);
+  const refusals = bootEnvReport().refusals;
+  const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath, refusals);
 
   const dbMode =
     opts.db.mode === "embedded-postgres"
@@ -162,6 +156,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
         ? color(agentJwtSecret.message, "green")
         : color(agentJwtSecret.message, "yellow"),
     ),
+    refusals.length > 0
+      ? row("Env files", color(`refused: ${refusals.map(({ path, kind }) => `${path} (${kind})`).join("; ")}`, "yellow"))
+      : null,
     row("Heartbeat", heartbeat),
     row("DB Backup", dbBackup),
     row("Backup Dir", opts.databaseBackupDir),

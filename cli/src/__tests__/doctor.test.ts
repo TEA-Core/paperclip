@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { doctor } from "../commands/doctor.js";
+import { bootEnvOrigin, captureOperatorEnv, loadBootEnv, operatorEnvValue, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 import { writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
 
@@ -88,6 +89,7 @@ function createTempConfig(serverPort: number): string {
 
 describe("doctor", () => {
   beforeEach(() => {
+    resetBootEnvForTests();
     process.env = { ...ORIGINAL_ENV };
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
@@ -100,6 +102,9 @@ describe("doctor", () => {
 
   it("re-runs repairable checks so repaired failures do not remain blocking", async () => {
     const configPath = createTempConfig(await availablePort());
+    process.env.PAPERCLIP_CONFIG = configPath;
+    captureOperatorEnv();
+    loadBootEnv({ cwd: path.dirname(configPath) });
 
     const summary = await doctor({
       config: configPath,
@@ -110,5 +115,7 @@ describe("doctor", () => {
     expect(summary.failed).toBe(0);
     expect(summary.warned).toBe(0);
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeTruthy();
+    expect(bootEnvOrigin("PAPERCLIP_AGENT_JWT_SECRET")).toBe("boot");
+    expect(operatorEnvValue("PAPERCLIP_AGENT_JWT_SECRET")).toBeUndefined();
   });
 });

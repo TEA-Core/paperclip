@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyDataDirOverride } from "../config/data-dir.js";
+import { captureOperatorEnv, resetBootEnvForTests } from "@paperclipai/shared/boot-env";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -12,6 +13,8 @@ describe("applyDataDirOverride", () => {
     delete process.env.PAPERCLIP_CONFIG;
     delete process.env.PAPERCLIP_CONTEXT;
     delete process.env.PAPERCLIP_INSTANCE_ID;
+    resetBootEnvForTests();
+    captureOperatorEnv();
   });
 
   afterEach(() => {

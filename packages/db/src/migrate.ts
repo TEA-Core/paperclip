@@ -1,5 +1,9 @@
 import { applyPendingMigrations, inspectMigrations } from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
+import { captureOperatorEnv, loadBootEnv } from "@paperclipai/shared/boot-env";
+
+captureOperatorEnv();
+loadBootEnv({ cwd: process.cwd() });
 
 async function main(): Promise<void> {
   const resolved = await resolveMigrationConnection();

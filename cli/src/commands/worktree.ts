@@ -79,10 +79,10 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
 } from "@paperclipai/db";
 import type { Command } from "commander";
-import { ensureAgentJwtSecret, ensureDecisionSigningSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readDecisionSigningSecretFromEnvFile, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
+import { ensureAgentJwtSecret, ensureDecisionSigningSecret, ensureToolActionSigningSecret, mergePaperclipEnvEntries, readDecisionSigningSecretFromEnvFile, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
 import { expandHomePrefix } from "../config/home.js";
 import type { PaperclipConfig } from "../config/schema.js";
-import { readConfig, resolveConfigPath, writeConfig } from "../config/store.js";
+import { readConfig, resolveConfigPath, resolveSeedSourceConfigPath, writeConfig } from "../config/store.js";
 import { printPaperclipCliBanner } from "../utils/banner.js";
 import { resolveRuntimeLikePath } from "../utils/path-resolver.js";
 import {
@@ -886,7 +886,7 @@ export function resolveSourceConfigPath(opts: WorktreeInitOptions): string {
   if (opts.sourceConfigPathOverride) return path.resolve(opts.sourceConfigPathOverride);
   if (opts.fromConfig) return path.resolve(opts.fromConfig);
   if (!opts.fromDataDir && !opts.fromInstance) {
-    return resolveConfigPath();
+    return resolveSeedSourceConfigPath();
   }
   const sourceHome = path.resolve(expandHomePrefix(opts.fromDataDir ?? "~/.paperclip"));
   const sourceInstanceId = sanitizeWorktreeInstanceId(opts.fromInstance ?? "default");
@@ -2741,7 +2741,6 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   ensureAgentJwtSecret(paths.configPath);
   ensureToolActionSigningSecret(paths.configPath);
   ensureDecisionSigningSecret(paths.configPath, preservedDecisionSigningSecret);
-  loadPaperclipEnvFile(paths.configPath);
   const copiedGitHooks = copyGitHooksToWorktreeGitDir(cwd);
 
   let seedSummary: string | null = null;
