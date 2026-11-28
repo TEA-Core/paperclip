@@ -1288,6 +1288,7 @@ test.describe("Board send delivery refresh", () => {
 test.describe("Exact failed chat run retry", () => {
   let seed: Seed;
   let issue: { id: string; identifier: string; title: string };
+  let agentUrlKey: string;
 
   const failedRunId = "11111111-aaaa-4aaa-8aaa-111111111111";
   const actionId = "22222222-bbbb-4bbb-8bbb-222222222222";
@@ -1302,6 +1303,16 @@ test.describe("Exact failed chat run retry", () => {
       }),
       "create exact-retry task",
     );
+    // Open the agent run by its canonical URL key. A UUID route renders the
+    // run before the company list resolves, then refetches the agent under a
+    // new query key (and redirects to the URL key), remounting the run view.
+    // A Retry click that lands before that remount loses its denial message.
+    agentUrlKey = (
+      await json<{ urlKey: string }>(
+        await request.get(`/api/agents/${seed.agentId}`),
+        "read agent url key",
+      )
+    ).urlKey;
   });
 
   for (const surface of ["agent run", "Inbox", "Legacy Inbox"] as const) {
@@ -1435,7 +1446,7 @@ test.describe("Exact failed chat run retry", () => {
 
         const startPath =
           surface === "agent run"
-            ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
+            ? `/${seed.prefix}/agents/${agentUrlKey}/runs/${failedRunId}`
             : `/${seed.prefix}/inbox/all`;
         await page.goto(startPath);
         const retry = page
@@ -1467,15 +1478,8 @@ test.describe("Exact failed chat run retry", () => {
             await expect(toast).toHaveCSS("opacity", "1");
             await expect(toast).toBeInViewport();
           }
-          // Agent routes canonicalize the UUID to its human-readable URL key.
-          // The selected failed run must remain unchanged across that redirect.
-          await expect(page).toHaveURL(
-            surface === "agent run"
-              ? new RegExp(
-                  `/${seed.prefix}/agents/(${seed.agentId}|maya)/runs/${failedRunId}$`,
-                )
-              : new RegExp(`${startPath}$`),
-          );
+          // A denied retry must keep the operator on the selected failed run.
+          await expect(page).toHaveURL(new RegExp(`${startPath}$`));
           await expect(retry).toBeEnabled();
           await testInfo.attach(`${surface}-retry-denied`, {
             body: await page.screenshot(),
