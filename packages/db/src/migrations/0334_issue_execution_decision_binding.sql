@@ -1,0 +1,2 @@
+ALTER TABLE "issue_execution_decisions" ADD COLUMN "delivered_head_sha" text;--> statement-breakpoint
+ALTER TABLE "issue_execution_decisions" ADD COLUMN "review_round_started_at" timestamp with time zone;

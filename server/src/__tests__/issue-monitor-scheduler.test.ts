@@ -19,6 +19,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueDocuments,
+  issueMonitorRecoveryClaims,
   issues,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
@@ -27,9 +28,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
+import { activityService } from "../services/activity.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { issueService } from "../services/issues.ts";
+import { applyIssueExecutionPolicyTransition, buildIssueMonitorClearedPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, setIssueExecutionPolicyMonitorScheduledBy } from "../services/issue-execution-policy.ts";
 
 const recoveryActionHook = vi.hoisted(() => ({
   afterUpsert: null as null | (() => Promise<void>),
@@ -159,7 +163,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review" | "blocked";
+    issueStatus?: "backlog" | "todo" | "in_progress" | "in_review" | "blocked";
     unassigned?: boolean;
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -171,7 +175,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     const monitorAttemptCount = input?.monitorAttemptCount ?? 0;
-    const monitor = {
+    const monitor: Record<string, unknown> = {
       nextCheckAt: nextCheckAt.toISOString(),
       notes: "Check deploy",
       scheduledBy: "assignee",
@@ -291,6 +295,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+    expect(activity).not.toContain("issue.monitor_unfireable");
   });
 
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {
@@ -566,6 +571,917 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
   });
 
+  // SUP-23786: the legal arm -> fire -> re-arm sequence through exhaustion. The
+  // re-arm after the last permitted fire used to be refused, so the configured
+  // recoveryPolicy could never run and the monitor went silently dormant.
+  describe("exhaustion of an agent-rearmed monitor (SUP-23786)", () => {
+    const firstTickAt = new Date("2026-04-11T12:31:00.000Z");
+    const rearmCheckAt = "2026-04-11T13:00:00.000Z";
+    const recoveryTickAt = new Date("2026-04-11T13:01:00.000Z");
+
+    async function readIssue(issueId: string) {
+      return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function exhaustionRows(issueId: string) {
+      return db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows.filter((row) => row.action === "issue.monitor_exhausted"));
+    }
+
+    async function allWakeups(agentId: string) {
+      return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    }
+
+    async function recoveryWakeups(agentId: string) {
+      return db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        // A recovery wake can coalesce into the owner's active run (reason rewritten),
+        // so identify it by its idempotency key.
+        .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("issue-monitor-recovery:")));
+    }
+
+    // Applies the owner's policy PATCH the way the issues route does: stamp the
+    // actor's scheduledBy, run the policy transition, persist policy + patch.
+    async function rearm(issueId: string, scheduledBy: "assignee" | "board", monitor: Record<string, unknown>) {
+      const issue = await readIssue(issueId);
+      const policy = setIssueExecutionPolicyMonitorScheduledBy(
+        normalizeIssueExecutionPolicy({ stages: [], monitor: { nextCheckAt: rearmCheckAt, ...monitor } }),
+        scheduledBy,
+      );
+      const { patch } = applyIssueExecutionPolicyTransition({
+        issue,
+        policy,
+        previousPolicy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+        requestedAssigneePatch: {},
+        actor: { agentId: issue.assigneeAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+      await db
+        .update(issues)
+        .set({ executionPolicy: policy as unknown as Record<string, unknown>, ...patch })
+        .where(eq(issues.id, issueId));
+    }
+
+    async function armFireAndSettle(monitor: Record<string, unknown>) {
+      const fixture = await seedFixture({ monitor });
+      const heartbeat = heartbeatService(db);
+      expect((await heartbeat.tickTimers(firstTickAt)).enqueued).toBe(1);
+      await heartbeat.drainActiveRunExecutions();
+      const fired = await readIssue(fixture.issueId);
+      expect(fired.monitorAttemptCount).toBe(1);
+      expect(fired.monitorNextCheckAt).toBeNull();
+      return { ...fixture, heartbeat };
+    }
+
+    it("wake_owner: the re-arm after the last permitted fire runs the owner recovery wake once", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+
+      await rearm(issueId, "assignee", monitor);
+      const rearmed = await readIssue(issueId);
+      expect(rearmed.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+      expect(rearmed.monitorAttemptCount).toBe(1);
+
+      const tick = await heartbeat.tickTimers(recoveryTickAt);
+      expect(tick.skipped).toBe(1);
+
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "cleared",
+        clearReason: "max_attempts_exhausted",
+        attemptCount: 1,
+      });
+
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ actorType: "system", actorId: "heartbeat_scheduler" });
+      expect(rows[0]!.details).toMatchObject({
+        clearReason: "max_attempts_exhausted",
+        attemptCount: 1,
+        attemptedAttemptCount: 2,
+        maxAttempts: 1,
+        recoveryPolicy: "wake_owner",
+        recoveryOutcome: "owner_wake_queued",
+      });
+
+      // Recovery targets the monitor owner as the system actor, never the re-arming principal.
+      const wakeups = await recoveryWakeups(agentId);
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]).toMatchObject({ requestedByActorType: "system", requestedByActorId: "heartbeat_scheduler" });
+      expect(wakeups[0]!.payload).toMatchObject({ issueId, clearReason: "max_attempts_exhausted", maxAttempts: 1 });
+
+      // A second tick (and a manual trigger) neither records a second exhaustion nor recovers again.
+      expect((await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"))).skipped).toBe(0);
+      await expect(heartbeat.triggerIssueMonitor(issueId)).rejects.toThrow("Issue has no scheduled monitor");
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+      expect(await recoveryWakeups(agentId)).toHaveLength(1);
+    });
+
+    it("create_recovery_issue: opens one recovery issue assigned to the monitor owner", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+
+      await rearm(issueId, "assignee", monitor);
+      expect((await heartbeat.tickTimers(recoveryTickAt)).skipped).toBe(1);
+      await heartbeat.drainActiveRunExecutions();
+      await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+
+      const recoveryIssues = await db
+        .select()
+        .from(issues)
+        .then((rows) => rows.filter((row) => row.companyId === companyId && row.originId === issueId));
+      expect(recoveryIssues).toHaveLength(1);
+      expect(recoveryIssues[0]).toMatchObject({
+        parentId: issueId,
+        assigneeAgentId: agentId,
+        originKind: "stranded_issue_recovery",
+      });
+
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({
+        clearReason: "max_attempts_exhausted",
+        attemptCount: 1,
+        maxAttempts: 1,
+        recoveryPolicy: "create_recovery_issue",
+        recoveryOutcome: "recovery_issue_created",
+      });
+    });
+
+    it("escalate_to_board: records one board escalation comment", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "escalate_to_board" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+
+      await rearm(issueId, "assignee", monitor);
+      expect((await heartbeat.tickTimers(recoveryTickAt)).skipped).toBe(1);
+      expect((await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"))).skipped).toBe(0);
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("maximum attempt count was reached");
+
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.filter((row) => row.action === "issue.monitor_escalated_to_board")).toHaveLength(1);
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({
+        recoveryPolicy: "escalate_to_board",
+        recoveryOutcome: "escalated_to_board",
+      });
+    });
+
+    // The recovery must not be re-armable: after it ran, the same agent's next
+    // exhausted re-arm is refused, so each recoveryPolicy acts once per arming
+    // epoch no matter how many times the agent re-arms (SUP-23786).
+    it.each([
+      ["wake_owner", { maxAttempts: 1 }],
+      ["create_recovery_issue", { maxAttempts: 1 }],
+      ["escalate_to_board", { maxAttempts: 1 }],
+      ["escalate_to_board", { timeoutAt: "2026-04-11T12:45:00.000Z" }],
+    ] as const)("%s runs once across three arm -> exhaustion cycles (%j)", async (recoveryPolicy, bound) => {
+      const monitor = { ...bound, recoveryPolicy };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      const recoveryIssueRows = () =>
+        db
+          .select()
+          .from(issues)
+          .then((rows) => rows.filter((row) => row.companyId === companyId && row.originId === issueId));
+      const effects = async () => ({
+        exhaustions: (await exhaustionRows(issueId)).length,
+        wakeups: (await recoveryWakeups(agentId)).length,
+        recoveryIssues: (await recoveryIssueRows()).length,
+        comments: (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).length,
+      });
+
+      await rearm(issueId, "assignee", monitor);
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.drainActiveRunExecutions();
+      const afterFirstCycle = await effects();
+      expect(afterFirstCycle.exhaustions).toBe(1);
+      const before = await readIssue(issueId);
+      expect(before.monitorAttemptCount).toBe(1);
+
+      for (const cycle of [2, 3]) {
+        // Closing the recovery work must not re-open the loop.
+        await db.update(issues).set({ status: "done" }).where(eq(issues.originId, issueId));
+        await expect(rearm(issueId, "assignee", monitor)).rejects.toMatchObject({
+          status: 422,
+          message: "Monitor bounds are already exhausted",
+        });
+        await heartbeat.tickTimers(new Date(`2026-04-11T13:0${cycle}:00.000Z`));
+        await heartbeat.drainActiveRunExecutions();
+        expect(await effects()).toEqual(afterFirstCycle);
+      }
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt).toBeNull();
+      expect(after.monitorAttemptCount).toBe(before.monitorAttemptCount);
+    });
+
+    async function recoveryEffects(issueId: string, agentId: string, companyId: string) {
+      const created = await db
+        .select()
+        .from(issues)
+        .then((rows) => rows.filter((row) => row.companyId === companyId && row.originId === issueId));
+      return {
+        exhaustions: (await exhaustionRows(issueId)).length,
+        wakeups: (await recoveryWakeups(agentId)).length,
+        recoveryIssues: created.length,
+        comments: (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).length,
+      };
+    }
+
+    async function clearMonitorAs(issueId: string, clearReason: Parameters<typeof buildIssueMonitorClearedPatch>[0]["clearReason"]) {
+      const issue = await readIssue(issueId);
+      const patch = buildIssueMonitorClearedPatch({
+        issue,
+        policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+        clearReason,
+      });
+      await db.update(issues).set(patch).where(eq(issues.id, issueId));
+    }
+
+    // The bound is a sticky persisted fact, not a function of the last clearReason or of
+    // the bounds the agent writes next: nothing an agent does gets a second recovery.
+    it.each(["wake_owner", "create_recovery_issue", "escalate_to_board"] as const)(
+      "%s: clears and re-arms with any bounds never run a second recovery",
+      async (recoveryPolicy) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        const afterFirstRecovery = await recoveryEffects(issueId, agentId, companyId);
+        expect(afterFirstRecovery.exhaustions).toBe(1);
+        expect((await readIssue(issueId)).executionState).toMatchObject({
+          monitor: { exhaustionRecoveredAt: recoveryTickAt.toISOString() },
+        });
+
+        let minute = 2;
+        for (const clearReason of ["manual", "dispatch_skipped", "invalid_status"] as const) {
+          await clearMonitorAs(issueId, clearReason);
+          for (const bounds of [{ maxAttempts: 1 }, { maxAttempts: 5 }, { timeoutAt: "2026-12-31T00:00:00.000Z" }]) {
+            await expect(rearm(issueId, "assignee", { ...bounds, recoveryPolicy })).rejects.toMatchObject({
+              status: 422,
+              message: "Monitor bounds are already exhausted",
+            });
+          }
+          await heartbeat.tickTimers(new Date(`2026-04-11T13:${String(minute).padStart(2, "0")}:00.000Z`));
+          await heartbeat.drainActiveRunExecutions();
+          minute += 1;
+          expect(await recoveryEffects(issueId, agentId, companyId)).toEqual(afterFirstRecovery);
+        }
+        const after = await readIssue(issueId);
+        expect(after.monitorNextCheckAt).toBeNull();
+        expect(after.monitorAttemptCount).toBe(1);
+      },
+    );
+
+    it("only a board-armed write ends the epoch; board and no-policy exhaustion leave no sticky fact", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.drainActiveRunExecutions();
+
+      await rearm(issueId, "board", { maxAttempts: 5, recoveryPolicy: "wake_owner" });
+      const reset = await readIssue(issueId);
+      expect(reset.executionState).toMatchObject({ monitor: { status: "scheduled", attemptCount: 1 } });
+      expect(reset.executionState).not.toHaveProperty("monitor.exhaustionRecoveredAt");
+      await rearm(issueId, "assignee", { maxAttempts: 5, recoveryPolicy: "wake_owner" });
+
+      // Control: a board-armed monitor that exhausts at dispatch keeps its state shape.
+      const boardArmed = await seedFixture({
+        monitorAttemptCount: 1,
+        monitor: { scheduledBy: "board", maxAttempts: 1, recoveryPolicy: "wake_owner" },
+      });
+      await heartbeat.tickTimers(new Date("2026-04-11T13:10:00.000Z"));
+      const boardIssue = await readIssue(boardArmed.issueId);
+      expect(boardIssue.executionState).toMatchObject({ monitor: { status: "cleared", clearReason: "max_attempts_exhausted" } });
+      expect(boardIssue.executionState).not.toHaveProperty("monitor.exhaustionRecoveredAt");
+      expect((await exhaustionRows(boardArmed.issueId)).length).toBe(1);
+    });
+
+    // The exhaustion dispatch must not lose the recovery nor claim an effect that did not happen.
+    it("a paused owner defers the recovery: the monitor stays armed, nothing is cleared or recorded, then it recovers once", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      const wakeRowsBeforeDeferral = (await allWakeups(agentId)).length;
+      const warn = vi.spyOn(logger, "warn");
+
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.tickTimers(new Date("2026-04-11T13:01:30.000Z"));
+      const deferralLogs = warn.mock.calls.filter((call) => call[1] === "issue monitor recovery deferred");
+      warn.mockRestore();
+      expect(deferralLogs).toHaveLength(2);
+      expect(deferralLogs[0]![0]).toMatchObject({ issueId, status: 409, reason: "paused" });
+      expect(await allWakeups(agentId)).toHaveLength(wakeRowsBeforeDeferral);
+      const deferred = await readIssue(issueId);
+      expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+      expect(deferred.monitorWakeRequestedAt).toBeNull();
+      expect(deferred.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+
+      await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+      await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+      await heartbeat.drainActiveRunExecutions();
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+      expect(await recoveryWakeups(agentId)).toHaveLength(1);
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+    });
+
+    it.each(["company", "agent"] as const)(
+      "a budget-stopped owner (%s paused for budget) defers the recovery with the monitor armed, then recovers once",
+      async (scope) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        if (scope === "company") {
+          await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, companyId));
+        } else {
+          await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, agentId));
+        }
+        const wakeRowsBeforeDeferral = (await allWakeups(agentId)).length;
+
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:01:30.000Z"));
+        expect(await allWakeups(agentId)).toHaveLength(wakeRowsBeforeDeferral);
+        const deferred = await readIssue(issueId);
+        expect(deferred.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        expect(deferred.monitorWakeRequestedAt).toBeNull();
+        expect(deferred.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+        expect(await exhaustionRows(issueId)).toHaveLength(0);
+        expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(0);
+
+        if (scope === "company") {
+          await db.update(companies).set({ status: "active", pauseReason: null }).where(eq(companies.id, companyId));
+        } else {
+          await db.update(agents).set({ status: "active", pauseReason: null }).where(eq(agents.id, agentId));
+        }
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        // Recovered once. The outcome label depends on whether the owner's wake was
+        // admitted or parked behind an unrelated execution hold, so only the count is
+        // asserted here; the truthful-outcome cells cover the label.
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.details).toMatchObject({ recoveryPolicy: "wake_owner" });
+        expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped").length).toBeLessThanOrEqual(1);
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    it("an owner that does not accept on-demand wakes gets a truthful outcome, not a queued claim", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await db
+        .update(agents)
+        .set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } })
+        .where(eq(agents.id, agentId));
+
+      await heartbeat.tickTimers(recoveryTickAt);
+
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({ recoveryPolicy: "wake_owner", recoveryOutcome: "owner_wake_not_queued" });
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+      expect(activity.map((row) => row.action)).not.toContain("issue.monitor_recovery_wake_queued");
+      const queued = (await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped");
+      expect(queued).toHaveLength(0);
+    });
+
+    it("a terminated owner permanently refuses the wake: recovery completes once with owner_wake_not_queued", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+
+      await heartbeat.tickTimers(recoveryTickAt);
+
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(issue.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({ recoveryPolicy: "wake_owner", recoveryOutcome: "owner_wake_not_queued" });
+      const wakeRowsAfterRecovery = (await recoveryWakeups(agentId)).length;
+      expect(wakeRowsAfterRecovery).toBeLessThanOrEqual(1);
+      expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(0);
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+      expect(await recoveryWakeups(agentId)).toHaveLength(wakeRowsAfterRecovery);
+    });
+
+    it.each(["owner_terminated", "ancestor_terminated"] as const)(
+      "create_recovery_issue with a permanently unassignable owner (%s) opens an unassigned recovery issue and clears once",
+      async (scenario) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        if (scenario === "owner_terminated") {
+          await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+        } else {
+          const managerId = randomUUID();
+          await db.insert(agents).values({
+            id: managerId,
+            companyId,
+            name: "Terminated Manager",
+            role: "engineer",
+            status: "terminated",
+            adapterType: "process",
+            adapterConfig: {},
+            permissions: {},
+          });
+          seededAgentIds.add(managerId);
+          await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, agentId));
+        }
+
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+
+        const recoveryIssues = await db
+          .select()
+          .from(issues)
+          .then((rows) => rows.filter((row) => row.companyId === companyId && row.originId === issueId));
+        expect(recoveryIssues).toHaveLength(1);
+        expect(recoveryIssues[0]).toMatchObject({ parentId: issueId, assigneeAgentId: null, originKind: "stranded_issue_recovery" });
+
+        const issue = await readIssue(issueId);
+        expect(issue.monitorNextCheckAt).toBeNull();
+        expect(issue.executionState).toMatchObject({
+          monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+        });
+        expect(issue.executionState).toHaveProperty("monitor.exhaustionRecoveredAt");
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.details).toMatchObject({
+          recoveryPolicy: "create_recovery_issue",
+          recoveryOutcome: "recovery_issue_created",
+        });
+      },
+    );
+
+    it.each([
+      ["escalate_to_board", "issue_comments", ""],
+      ["create_recovery_issue", "issues", "when (new.origin_kind = 'stranded_issue_recovery')"],
+    ] as const)(
+      "%s: a failing recovery effect leaves the monitor armed and retries instead of losing the recovery",
+      async (recoveryPolicy, table, when) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected fault'; end $$;
+          create trigger sup23786_fault before insert on ${table} for each row ${when} execute function sup23786_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          const failed = await readIssue(issueId);
+          expect(failed.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+          expect(failed.monitorWakeRequestedAt).toBeNull();
+          expect(failed.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+          expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, comments: 0, recoveryIssues: 0 });
+        } finally {
+          await db.execute(sql.raw(`drop trigger if exists sup23786_fault on ${table}; drop function if exists sup23786_fault();`));
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        const effects = await recoveryEffects(issueId, agentId, companyId);
+        expect(effects.exhaustions).toBe(1);
+        expect(recoveryPolicy === "escalate_to_board" ? effects.comments : effects.recoveryIssues).toBe(1);
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    // A failure after the recovery effect but before the completion transaction
+    // commits must not make the retry repeat a consumer-visible effect: the next
+    // tick records the exhaustion once and every recovery effect stays single.
+    it.each([
+      ["wake_owner", "issue.monitor_recovery_wake_queued"],
+      ["create_recovery_issue", "issue.monitor_recovery_issue_created"],
+      ["escalate_to_board", "issue.monitor_escalated_to_board"],
+    ] as const)(
+      "%s: a completion failure after the effect does not repeat the effect on the next tick",
+      async (recoveryPolicy, effectAction) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        const effectActivity = async () =>
+          (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).filter(
+            (row) => row.action === effectAction,
+          ).length;
+        const queuedRecoveryWakeups = async () =>
+          (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).filter(
+            (row) =>
+              row.status !== "skipped" &&
+              (row.idempotencyKey?.startsWith("issue-monitor-recovery:") ||
+                row.idempotencyKey?.startsWith("issue-monitor-recovery-issue:")),
+          ).length;
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected completion fault'; end $$;
+          create trigger sup23786_completion_fault before insert on activity_log for each row
+            when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          await heartbeat.drainActiveRunExecutions();
+          const failed = await readIssue(issueId);
+          expect(failed.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+          expect(failed.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+          expect(await exhaustionRows(issueId)).toHaveLength(0);
+        } finally {
+          await db.execute(
+            sql.raw(
+              "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+            ),
+          );
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+
+        const effects = await recoveryEffects(issueId, agentId, companyId);
+        expect(effects.exhaustions).toBe(1);
+        expect(await effectActivity()).toBe(1);
+        expect(effects.comments).toBe(recoveryPolicy === "escalate_to_board" ? 1 : 0);
+        expect(effects.recoveryIssues).toBe(recoveryPolicy === "create_recovery_issue" ? 1 : 0);
+        expect(await queuedRecoveryWakeups()).toBe(recoveryPolicy === "escalate_to_board" ? 0 : 1);
+        if (recoveryPolicy === "create_recovery_issue") {
+          expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+          const created = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).find(
+            (row) => row.action === effectAction,
+          );
+          expect(created?.details).toMatchObject({ recoveryIssueReused: false });
+        }
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    // The recovery issue is the per-exhaustion record for create_recovery_issue: it
+    // carries the exhaustion in its origin fingerprint. While completion keeps failing,
+    // resolving that issue must not let a retry open a second one for the same exhaustion.
+    it.each(["done", "cancelled"] as const)(
+      "create_recovery_issue: a recovery issue resolved (%s) during a persistent completion failure is not opened again",
+      async (resolvedStatus) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected completion fault'; end $$;
+          create trigger sup23786_completion_fault before insert on activity_log for each row
+            when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          await heartbeat.drainActiveRunExecutions();
+          expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 1 });
+
+          await db.update(issues).set({ status: resolvedStatus }).where(eq(issues.originId, issueId));
+
+          await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+          await heartbeat.drainActiveRunExecutions();
+          const failed = await readIssue(issueId);
+          expect(failed.monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+          expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 1 });
+        } finally {
+          await db.execute(
+            sql.raw(
+              "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+            ),
+          );
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+
+        const effects = await recoveryEffects(issueId, agentId, companyId);
+        expect(effects.exhaustions).toBe(1);
+        expect(effects.recoveryIssues).toBe(1);
+        const queuedRecoveryIssueWakeups = (
+          await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))
+        ).filter((row) => row.status !== "skipped" && row.idempotencyKey?.startsWith("issue-monitor-recovery-issue:"));
+        expect(queuedRecoveryIssueWakeups.length).toBeLessThanOrEqual(1);
+        expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    // The per-exhaustion claim does not live on the recovery issue: deleting that issue
+    // while the completion keeps failing must not let a retry create a second one.
+    it("create_recovery_issue: a recovery issue deleted during a persistent completion failure is not created again", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'sup23786 injected completion fault'; end $$;
+        create trigger sup23786_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        const [created] = await db.select().from(issues).where(eq(issues.originId, issueId));
+        expect(created).toBeDefined();
+        expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 1 });
+
+        await issueService(db).remove(created!.id);
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 0, recoveryIssues: 0 });
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+          ),
+        );
+      }
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      await heartbeat.drainActiveRunExecutions();
+      const effects = await recoveryEffects(issueId, agentId, companyId);
+      expect(effects).toMatchObject({ exhaustions: 1, recoveryIssues: 0 });
+      expect((await exhaustionRows(issueId))[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+    });
+
+    // A later, separate exhaustion of the same monitor is a new episode even when it
+    // reuses the same schedule time and clear reason: it gets its own recovery.
+    it.each(["wake_owner", "create_recovery_issue", "escalate_to_board"] as const)(
+      "%s: exhaustion, recovery, re-arm and a second exhaustion at the same schedule run a second recovery",
+      async (recoveryPolicy) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        const first = await recoveryEffects(issueId, agentId, companyId);
+        expect(first.exhaustions).toBe(1);
+        await db.update(issues).set({ status: "done" }).where(eq(issues.originId, issueId));
+
+        // The board starts a new epoch with a higher bound; attempt 2 fires normally.
+        await rearm(issueId, "board", { maxAttempts: 2, recoveryPolicy });
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+        expect((await exhaustionRows(issueId))).toHaveLength(1);
+
+        // The owner's exhausted re-arm reuses the same nextCheckAt; it exhausts again
+        // with the same clear reason.
+        await rearm(issueId, "assignee", { maxAttempts: 2, recoveryPolicy });
+        expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(rearmCheckAt);
+        await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(2);
+        expect(rows.map((row) => (row.details as Record<string, unknown>).nextCheckAt)).toEqual([rearmCheckAt, rearmCheckAt]);
+        expect(rows.map((row) => (row.details as Record<string, unknown>).clearReason)).toEqual([
+          "max_attempts_exhausted",
+          "max_attempts_exhausted",
+        ]);
+        const second = await recoveryEffects(issueId, agentId, companyId);
+        if (recoveryPolicy === "wake_owner") {
+          expect((await recoveryWakeups(agentId)).filter((row) => row.status !== "skipped")).toHaveLength(2);
+          expect(rows.map((row) => (row.details as Record<string, unknown>).recoveryOutcome)).toEqual([
+            "owner_wake_queued",
+            "owner_wake_queued",
+          ]);
+        } else if (recoveryPolicy === "create_recovery_issue") {
+          expect(second.recoveryIssues).toBe(2);
+          expect(rows.map((row) => (row.details as Record<string, unknown>).recoveryOutcome)).toEqual([
+            "recovery_issue_created",
+            "recovery_issue_created",
+          ]);
+        } else {
+          expect(second.comments).toBe(2);
+        }
+      },
+    );
+
+    // The episode is keyed on the arm. A re-arm while an earlier exhaustion's completion
+    // is still failing starts a new episode: the next exhaustion gets its own recovery
+    // and never replays the effect recorded for the stuck one.
+    it.each([
+      ["board", "wake_owner"],
+      ["board", "create_recovery_issue"],
+      ["assignee", "wake_owner"],
+      ["assignee", "create_recovery_issue"],
+    ] as const)(
+      "%s re-arm during a stuck %s completion gets a new recovery, not a replay",
+      async (rearmedBy, recoveryPolicy) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        const queuedWakeups = async () =>
+          (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).filter(
+            (row) =>
+              row.status !== "skipped" &&
+              (recoveryPolicy === "wake_owner"
+                ? row.idempotencyKey?.startsWith("issue-monitor-recovery:")
+                : row.idempotencyKey?.startsWith("issue-monitor-recovery-issue:")),
+          ).length;
+
+        await db.execute(sql.raw(`
+          create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+          begin raise exception 'sup23786 injected completion fault'; end $$;
+          create trigger sup23786_completion_fault before insert on activity_log for each row
+            when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+        `));
+        try {
+          await heartbeat.tickTimers(recoveryTickAt);
+          await heartbeat.drainActiveRunExecutions();
+          expect(await exhaustionRows(issueId)).toHaveLength(0);
+          expect(await queuedWakeups()).toBe(1);
+          await db.update(issues).set({ status: "done" }).where(eq(issues.originId, issueId));
+
+          if (rearmedBy === "board") {
+            await rearm(issueId, "board", { maxAttempts: 2, recoveryPolicy, nextCheckAt: "2026-04-11T13:30:00.000Z" });
+          } else {
+            await rearm(issueId, "assignee", { ...monitor, nextCheckAt: "2026-04-11T13:30:00.000Z" });
+          }
+        } finally {
+          await db.execute(
+            sql.raw(
+              "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+            ),
+          );
+        }
+
+        await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        if (rearmedBy === "board") {
+          // The board's higher bound lets attempt 2 fire normally; the owner's exhausted
+          // re-arm then reaches the recovery.
+          expect((await readIssue(issueId)).monitorAttemptCount).toBe(2);
+          await rearm(issueId, "assignee", { maxAttempts: 2, recoveryPolicy, nextCheckAt: "2026-04-11T14:00:00.000Z" });
+          await heartbeat.tickTimers(new Date("2026-04-11T14:01:00.000Z"));
+          await heartbeat.drainActiveRunExecutions();
+        }
+
+        const rows = await exhaustionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(await queuedWakeups()).toBe(2);
+        if (recoveryPolicy === "wake_owner") {
+          expect(rows[0]!.details).toMatchObject({ recoveryOutcome: "owner_wake_queued" });
+        } else {
+          expect((await recoveryEffects(issueId, agentId, companyId)).recoveryIssues).toBe(2);
+          expect(rows[0]!.details).toMatchObject({ recoveryOutcome: "recovery_issue_created" });
+        }
+        expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      },
+    );
+
+    it("a plain retry of the same arm after a completion failure reuses its single claim", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'sup23786 injected completion fault'; end $$;
+        create trigger sup23786_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function sup23786_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_completion_fault on activity_log; drop function if exists sup23786_completion_fault();",
+          ),
+        );
+      }
+      await heartbeat.tickTimers(new Date("2026-04-11T13:03:00.000Z"));
+      await heartbeat.drainActiveRunExecutions();
+
+      const claims = await db
+        .select()
+        .from(issueMonitorRecoveryClaims)
+        .where(eq(issueMonitorRecoveryClaims.issueId, issueId));
+      expect(claims).toHaveLength(1);
+      expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
+    });
+
+    // A re-arm that commits while the recovery effect runs must survive: the completion
+    // clear is guarded on the claimed arm and rolls back instead of overwriting it.
+    it("a re-arm committed during the recovery effect is kept and the exhaustion is not recorded", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      const rearmedAt = "2026-04-11T15:00:00.000Z";
+
+      await db.execute(sql.raw(`
+        create or replace function sup23786_rearm_during_effect() returns trigger language plpgsql as $$
+        begin
+          update issues set monitor_next_check_at = '${rearmedAt}' where id = new.origin_id::uuid;
+          return new;
+        end $$;
+        create trigger sup23786_rearm_during_effect after insert on issues for each row
+          when (new.origin_id = '${issueId}') execute function sup23786_rearm_during_effect();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists sup23786_rearm_during_effect on issues; drop function if exists sup23786_rearm_during_effect();",
+          ),
+        );
+      }
+
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
+
+    it("timeout: an agent re-arm after timeoutAt still reaches the recovery", async () => {
+      const monitor = {
+        timeoutAt: "2026-04-11T12:45:00.000Z",
+        recoveryPolicy: "escalate_to_board",
+      };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+
+      await rearm(issueId, "assignee", monitor);
+      expect((await heartbeat.tickTimers(recoveryTickAt)).skipped).toBe(1);
+
+      const rows = await exhaustionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({ clearReason: "timeout_exceeded", recoveryOutcome: "escalated_to_board" });
+    });
+
+    it.each([
+      ["board-armed", "board", { maxAttempts: 1, recoveryPolicy: "wake_owner" }],
+      ["no recoveryPolicy", "assignee", { maxAttempts: 1 }],
+    ] as const)("%s monitors still refuse the exhausted re-arm and record nothing", async (_label, scheduledBy, monitor) => {
+      const { issueId, agentId, heartbeat } = await armFireAndSettle(monitor);
+      const before = await readIssue(issueId);
+
+      await expect(rearm(issueId, scheduledBy, monitor)).rejects.toMatchObject({
+        status: 422,
+        message: "Monitor bounds are already exhausted",
+        details: { clearReason: "max_attempts_exhausted" },
+      });
+
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt).toBeNull();
+      expect(after.executionPolicy).toEqual(before.executionPolicy);
+      expect(after.executionState).toEqual(before.executionState);
+      expect((await heartbeat.tickTimers(recoveryTickAt)).skipped).toBe(0);
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+      expect(await recoveryWakeups(agentId)).toHaveLength(0);
+    });
+
+    it("records one exhaustion when overlapping ticks both claim the due monitor", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitorAttemptCount: 1,
+        monitor: { maxAttempts: 1, recoveryPolicy: "wake_owner" },
+      });
+      const heartbeat = heartbeatService(db);
+      // The later tick's clock is past the first claim's staleness window, so it
+      // claims the same row too; only the guarded clear keeps recovery single.
+      await Promise.all([
+        heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z")),
+        heartbeat.tickTimers(new Date("2026-04-11T12:40:00.000Z")),
+      ]);
+
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+      expect(await recoveryWakeups(agentId)).toHaveLength(1);
+    });
+  });
+
   it("triggers a due monitor on a blocked issue and wakes the assignee", async () => {
     const { issueId, agentId, nextCheckAt } = await seedFixture({ issueStatus: "blocked" });
     const heartbeat = heartbeatService(db);
@@ -807,7 +1723,14 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         expect(issue.monitorWakeRequestedAt).toBeNull();
         expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
         expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
-        expect(await activityActions(issueId)).toEqual([]);
+        // Untouched, but not silent: the issue activity names why it cannot fire.
+        const rows = await activityService(db).forIssue(issueId);
+        expect(rows.map((row) => row.action)).toEqual(["issue.monitor_unfireable"]);
+        expect(rows[0]?.details).toMatchObject({
+          reason: "no_assignee_agent",
+          recoveryPolicy,
+          nextCheckAt: nextCheckAt.toISOString(),
+        });
       },
     );
 
@@ -829,6 +1752,150 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(wakeup?.reason).toBe("issue_monitor_due");
       expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
       expect(await activityActions(issueId)).toContain("issue.monitor_triggered");
+    });
+  });
+
+  describe("due monitor the dispatcher cannot select", () => {
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    async function readIssue(issueId: string) {
+      return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function unfireableRows(issueId: string) {
+      // Read through the same service the issue activity API returns.
+      const rows = await activityService(db).forIssue(issueId);
+      return rows.filter((row) => row.action === "issue.monitor_unfireable");
+    }
+
+    it("records one unfireable row for a released, unassigned todo issue and keeps the monitor armed", async () => {
+      // SUP-25284 shape: an agent release moved the issue to todo and dropped
+      // the assignee, leaving the wake_owner monitor scheduled.
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      const heartbeat = heartbeatService(db);
+
+      const first = await heartbeat.tickTimers(tickAt);
+      expect(first.enqueued).toBe(0);
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ actorType: "system", actorId: "heartbeat_scheduler", entityType: "issue" });
+      expect(rows[0]?.details).toMatchObject({
+        status: "todo",
+        assigneeAgentId: null,
+        nextCheckAt: nextCheckAt.toISOString(),
+        attemptCount: 0,
+        notes: "Check deploy",
+        recoveryPolicy: "wake_owner",
+        reason: "status_not_dispatchable",
+        reasons: ["status_not_dispatchable"],
+        source: "scheduled",
+      });
+
+      // Detection only: no wake, no recovery action, schedule unchanged.
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+      expect(issue.monitorAttemptCount).toBe(0);
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+
+      // A later tick does not repeat the report for the same schedule.
+      await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000));
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+    });
+
+    it("reports a re-armed schedule again once it comes due", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.tickTimers(tickAt);
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+
+      const rearmedAt = new Date("2026-04-11T13:30:00.000Z");
+      await db.update(issues).set({ monitorNextCheckAt: rearmedAt }).where(eq(issues.id, issueId));
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:00:00.000Z"));
+      expect(await unfireableRows(issueId)).toHaveLength(1);
+
+      await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(2);
+      expect(rows.map((row) => (row.details as { nextCheckAt?: string }).nextCheckAt)).toContain(rearmedAt.toISOString());
+    });
+
+    it("records an assigned todo issue without waking its agent", async () => {
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "todo" });
+
+      await heartbeatService(db).tickTimers(tickAt);
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.details).toMatchObject({ status: "todo", reason: "status_not_dispatchable" });
+      expect((await readIssue(issueId)).monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    });
+
+    it("does not repeat the report for a schedule stored with sub-millisecond precision", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+      await db.execute(sql`update issues set monitor_next_check_at = '2026-04-11T12:30:00.123456Z' where id = ${issueId}`);
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.tickTimers(tickAt);
+      await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000));
+
+      const rows = await unfireableRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.details).toMatchObject({ nextCheckAt: "2026-04-11T12:30:00.123Z" });
+    });
+
+    it("writes exactly one row per due monitor when two ticks overlap", async () => {
+      const issueIds: string[] = [];
+      for (let index = 0; index < 30; index += 1) {
+        const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+        issueIds.push(issueId);
+      }
+      const first = heartbeatService(db);
+      const second = heartbeatService(db);
+
+      await Promise.all([first.tickTimers(tickAt), second.tickTimers(tickAt)]);
+      // A later tick picks up anything the skipped overlapping tick left.
+      await first.tickTimers(new Date(tickAt.getTime() + 30_000));
+
+      const rows = await db
+        .select({ entityId: activityLog.entityId })
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.monitor_unfireable"));
+      const counts = new Map<string, number>();
+      for (const row of rows) counts.set(row.entityId, (counts.get(row.entityId) ?? 0) + 1);
+      expect(rows).toHaveLength(issueIds.length);
+      for (const issueId of issueIds) expect(counts.get(issueId)).toBe(1);
+    });
+
+    it("does not report a fireable monitor whose wake claim is still fresh", async () => {
+      // Eligible and due, but the scheduler claimed it a minute ago: an
+      // in-flight wake, not an unfireable monitor.
+      const { issueId, nextCheckAt } = await seedFixture({ issueStatus: "in_progress" });
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: new Date(tickAt.getTime() - 60_000) })
+        .where(eq(issues.id, issueId));
+
+      const result = await heartbeatService(db).tickTimers(tickAt);
+
+      expect(result.enqueued).toBe(0);
+      expect(await unfireableRows(issueId)).toHaveLength(0);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+    });
+
+    it("records nothing before the schedule comes due", async () => {
+      const { issueId } = await seedFixture({ issueStatus: "todo", unassigned: true });
+
+      await heartbeatService(db).tickTimers(new Date("2026-04-11T12:29:00.000Z"));
+
+      expect(await unfireableRows(issueId)).toHaveLength(0);
     });
   });
 });

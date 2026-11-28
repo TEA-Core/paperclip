@@ -17,9 +17,15 @@ export function createPaperclipMcpServer(config: PaperclipMcpConfig = readConfig
   for (const tool of tools) {
     // Issue create/update register the full strict object so the SDK refuses
     // unknown top-level fields (e.g. monitorNextCheckAt) instead of stripping
-    // them. Other tools keep the shape, which ignores stray keys.
-    const inputSchema = STRICT_INPUT_TOOLS.has(tool.name) ? tool.schema : tool.schema.shape;
-    server.registerTool(tool.name, { description: tool.description, inputSchema }, tool.execute);
+    // them. Tools with an output schema register the full object too. Other
+    // tools keep the shape, which ignores stray keys.
+    const inputSchema =
+      STRICT_INPUT_TOOLS.has(tool.name) || tool.outputSchema ? tool.schema : tool.schema.shape;
+    server.registerTool(tool.name, {
+      description: tool.description,
+      inputSchema,
+      ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+    }, tool.execute);
   }
 
   return {

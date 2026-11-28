@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   applyBoardStageDecision,
+  executionDecisionBinding,
+  executionDecisionBindingMatches,
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
   normalizeIssueExecutionPolicy,
@@ -367,7 +369,7 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     ).not.toThrow();
   });
 
-  it("skips a stage carrying a durable approved row even when its projection was cleared", () => {
+  it("records a fresh approval on a pending stage whose durable approval is not bound to the current round", () => {
     const policy = twoStagePolicy();
     const reviewStage = policy.stages[0];
     const approvalStage = policy.stages[1];
@@ -395,20 +397,156 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
       },
       policy,
       decision: "approved",
-      commentBody: "board: re-approving after a cleared projection",
+      commentBody: "board: approving the current round",
+      // S1 carries a durable approved row, but no row is bound to the current
+      // head and round (durableApprovalIds is empty).
       decidedStageIds: [reviewStage.id],
     });
 
-    // S1's projection is empty but it carries a durable approved row: the board
-    // acts on the next undecided stage instead of silently superseding it. The
-    // completed projection must also carry the durably-decided S1 id — otherwise
-    // the cleared projection would let a later decision re-target and supersede
-    // it (SUP-15805 addendum item 3 regression).
-    expect(result.targetStage.id).toBe(approvalStage.id);
+    // The old approval is never reused: the board approval is a fresh decision
+    // on S1, and S2 re-pends for its own approver instead of being decided too.
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.reconciledDecisionId).toBeNull();
+    expect(result.decision).toMatchObject({ stageId: reviewStage.id, outcome: "approved" });
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStage.id,
+      currentParticipant: { type: "user", userId: ctoUserId, agentId: null },
+      completedStageIds: [reviewStage.id],
+    });
+  });
+
+  it("does not reconcile a bound durable approval when the current stage is not pending", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+
+    expect(() =>
+      applyBoardStageDecision({
+        issue: {
+          status: "todo",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "changes_requested",
+            currentStageId: reviewStage.id,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+            returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+            deliveryAuthor: null,
+            completedStageIds: [],
+            skippedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: "changes_requested",
+            changesRequestedCount: 1,
+          },
+        },
+        policy,
+        decision: "approved",
+        commentBody: "board: approve a bounced round",
+        decidedStageIds: [reviewStage.id],
+        durableApprovalIds: new Map([[reviewStage.id, "d1000000-0000-4000-8000-000000000003"]]),
+      }),
+    ).toThrowError(BoardStageNoUndecidedStageError);
+  });
+
+  it("reconciles a pending stage from its durable approved row when no undecided stage remains", () => {
+    const policy = reviewOnlyPolicy({ returnAssigneeAgentId: coderAgentId });
+    const reviewStage = policy.stages[0];
+    const durableDecisionId = "d1000000-0000-4000-8000-000000000001";
+    const makeInput = (decision: "approved" | "changes_requested") => ({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision,
+      commentBody: "board: reconcile",
+      decidedStageIds: [reviewStage.id],
+      durableApprovalIds: new Map([[reviewStage.id, durableDecisionId]]),
+    });
+
+    const result = applyBoardStageDecision(makeInput("approved"));
+
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.reconciledDecisionId).toBe(durableDecisionId);
     expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
     expect(result.patch.executionState).toMatchObject({
       status: "completed",
-      completedStageIds: [reviewStage.id, approvalStage.id],
+      completedStageIds: [reviewStage.id],
+    });
+
+    // A bounce is a new verdict, not the recorded approval: nothing to reconcile.
+    expect(() => applyBoardStageDecision(makeInput("changes_requested"))).toThrowError(
+      BoardStageNoUndecidedStageError,
+    );
+  });
+
+  it("reconciles a drifted non-final stage and re-pends the next stage for its own participant", () => {
+    const policy = twoStagePolicy();
+    const reviewStage = policy.stages[0];
+    const approvalStage = policy.stages[1];
+    const durableDecisionId = "d1000000-0000-4000-8000-000000000002";
+
+    const result = applyBoardStageDecision({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStage.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+          deliveryAuthor: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+        },
+      },
+      policy,
+      decision: "approved",
+      commentBody: "board: reconcile stage 1",
+      decidedStageIds: [reviewStage.id],
+      durableApprovalIds: new Map([[reviewStage.id, durableDecisionId]]),
+    });
+
+    expect(result.targetStage.id).toBe(reviewStage.id);
+    expect(result.decision.stageId).toBe(reviewStage.id);
+    expect(result.reconciledDecisionId).toBe(durableDecisionId);
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeUserId).toBe(ctoUserId);
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStage.id,
+      currentStageType: "approval",
+      currentParticipant: { type: "user", userId: ctoUserId, agentId: null },
+      completedStageIds: [reviewStage.id],
     });
   });
 
@@ -729,5 +867,59 @@ describe("applyBoardStageDecision (SUP-15805)", () => {
     expect(result.patch.status).toBe("in_progress");
     expect(result.patch.assigneeAgentId).toBe(coderAgentId);
     expect(result.patch.executionState).toMatchObject({ status: "completed" });
+  });
+});
+
+describe("executionDecisionBinding (SUP-25518 head/round binding)", () => {
+  const headA = "a".repeat(40);
+  const headB = "b".repeat(40);
+  const roundOne = "2026-11-27T09:00:00.000Z";
+  const roundTwo = "2026-11-27T10:01:06.208Z";
+  const pendingAt = (head: string | null, round: string | null, via: "delivery" | "stall" = "delivery") => ({
+    status: "pending",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    pendingSince: round,
+    ...(via === "delivery" ? { delivery: { headSha: head } } : { deliveredHeadSha: head }),
+  });
+
+  it("reads the delivery head, else the stall head, and the round from pendingSince", () => {
+    expect(executionDecisionBinding(pendingAt(headA, roundOne))).toEqual({
+      deliveredHeadSha: headA,
+      reviewRoundStartedAt: new Date(roundOne),
+    });
+    expect(executionDecisionBinding(pendingAt(headB, roundTwo, "stall"))).toEqual({
+      deliveredHeadSha: headB,
+      reviewRoundStartedAt: new Date(roundTwo),
+    });
+    expect(executionDecisionBinding(pendingAt(null, null))).toEqual({
+      deliveredHeadSha: null,
+      reviewRoundStartedAt: null,
+    });
+    expect(executionDecisionBinding(null)).toEqual({ deliveredHeadSha: null, reviewRoundStartedAt: null });
+  });
+
+  it("matches only a row bound to the current head, round, and certified head", () => {
+    const current = executionDecisionBinding(pendingAt(headA, roundOne));
+    const bound = { deliveredHeadSha: headA, reviewRoundStartedAt: new Date(roundOne) };
+
+    expect(executionDecisionBindingMatches(bound, current, null)).toBe(true);
+    expect(executionDecisionBindingMatches(bound, current, headA)).toBe(true);
+    // The head moved after the approval.
+    expect(executionDecisionBindingMatches(bound, executionDecisionBinding(pendingAt(headB, roundOne)), null)).toBe(false);
+    // Same head, re-armed round.
+    expect(executionDecisionBindingMatches(bound, executionDecisionBinding(pendingAt(headA, roundTwo)), null)).toBe(false);
+    // The head the final delivery preflight would certify is not the bound head.
+    expect(executionDecisionBindingMatches(bound, current, headB)).toBe(false);
+    // Unbound (legacy) rows and a state with no binding never match.
+    expect(executionDecisionBindingMatches({ deliveredHeadSha: null, reviewRoundStartedAt: null }, current, null)).toBe(false);
+    expect(executionDecisionBindingMatches({ deliveredHeadSha: headA, reviewRoundStartedAt: null }, current, null)).toBe(false);
+    expect(executionDecisionBindingMatches(bound, executionDecisionBinding(pendingAt(null, null)), null)).toBe(false);
   });
 });

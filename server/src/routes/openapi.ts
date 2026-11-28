@@ -52,6 +52,7 @@ import {
   testAdapterEnvironmentSchema,
   // Issue
   createIssueInputSchema,
+  issueActivityResponseSchema,
   setIssueTitleSchema,
   updateIssueObjectSchema,
   approveIssueHeadSchema,
@@ -230,6 +231,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
+  attachIssueLandingProofSchema,
   cancelIssueThreadInteractionSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
@@ -1373,6 +1375,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1391,6 +1394,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -1486,6 +1490,7 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  "GET /api/issues/{id}/review-entry-blockers",
   // Added upstream in the 2026-09-19 slice-2d fold range (#13284, Agent Chat).
   // Every ai-connections handler calls assertBoard() unconditionally, so the
   // fork's SUP-16341 regression guard requires them listed here.
@@ -1751,6 +1756,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/recovery-actions/resolve",
   "POST /api/issues/{id}/recovery-actions/retry-workspace-export",
+  "POST /api/issues/{id}/landing-proof",
   "GET /api/companies/{companyId}/chats",
   "POST /api/issues/{id}/scheduled-retry/retry-now",
   "POST /api/issues/{id}/stalled-review-decision",
@@ -4403,6 +4409,37 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/publication-close-eligibility",
+  tags: ["issues"],
+  summary: "Read publication close eligibility for an issue",
+  description:
+    "Read-only. Requires issue:read on the issue, the same actor that can read the issue and its runs. " +
+    "Does not require company_scope:read and is not board-only. Every key is always present. Each boolean is never null. " +
+    "deliveryIdentity is true when the parsed execution-state delivery block is present. " +
+    "deliveryReceipt is true when any delivery receipt exists for this company and issue, in any state. " +
+    "cachedLinkedPullRequest is cached and advisory: it is true when the card has a cached GitHub pull-request mention " +
+    "whose cached state is open or unknown, including drafts. It is the cached read the accept path uses. " +
+    "This route does not call GitHub, so it does not refresh pull-request state and does not discover unmentioned pull requests. " +
+    "The done-close guard does both, so the close can decide differently. " +
+    "cachedLinkedPullRequestFetchedAt is the oldest GitHub fetch time among the cached pull-request rows that field reads. " +
+    "It is null when there is no such row or when one of them was never fetched. " +
+    "A true boolean means the accept path would refuse the card for that binding. This route never writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      deliveryIdentity: z.boolean(),
+      deliveryReceipt: z.boolean(),
+      cachedLinkedPullRequest: z.boolean(),
+      cachedLinkedPullRequestFetchedAt: z.string().datetime().nullable(),
+    }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
@@ -4426,9 +4463,11 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
+    "Closing to done or cancelled still clears the monitor. If its prior nextCheckAt is later than the close write, issue.monitor_cleared records details.previousNextCheckAt, details.recoveryPolicy (nullable), details.reason=cleared_by_close_future_check and the existing actorType/actorId/agentId/runId attribution. This records cancellation of the future check; it does not re-register it. Past-due monitors retain their ordinary clear behavior. " +
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
     "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
-    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
+    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee. " +
+    "reviewEntryPrecondition is an entry-only conditional request for the current assignee's recorded deliverable. Send only status=done, comment and the precondition, with the exact stored policy/state, status version, workspace and independent ruling/artifact revision IDs. A clean card-owned isolated Git worktree must be positively covered by a trusted published base. Its Git admin-directory pathname and device/inode must match the server-recorded provisioning identity; missing legacy identities require fresh provisioning. Another registered worktree HEAD symref to the same branch refuses. Admission is entry-checked and optimistic; the receipt records observed state and does not exclude later writers or unregistered copied-tree/gitfile aliases (including a hand-written commondir that shares the branch). Shared primary directories, repository debt, re-entry and mixed mutations refuse with review_entry_* conflicts. The transaction commits in_review, the reviewer, inline comment and an immutable receipt together; reviewEntryReceiptId is returned. This is not close-tier or approval evidence. Reconcile unknown transport outcomes through the issue and review-entry-receipts reads.",
   request: {
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
@@ -4475,7 +4514,7 @@ registry.registerPath({
         .strict()
         .optional()
         .describe(
-          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and, without PR fields, `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). To bind an existing pull request (AS-05), send `prNumber` and `prUrl` TOGETHER (exactly one of them is 422 `delivery_identity_write_rejected`): `branch` is then the pull request's head branch, the server verifies the exact open, non-draft PR — canonical URL, live head branch, live head SHA — with the same verifier approval time uses (any mismatch or missing GitHub token is 422 `delivery_identity_write_rejected`), and stamps `kind=as05_bound_pr` plus the control-plane-derived `cardBranch` server-side; `kind`/`cardBranch` are server-owned and rejected if client-supplied. The live write-time verification and the AS-05 stamp apply to the lease-holding run's entry-into-review write; a board refresh on a card already `in_review` keeps the exact-branch rule above for a both-fields record — it is stored as sent, without a live write-time PR check and without the AS-05 stamp, and approval time re-verifies the binding as usual. `sourceIssueId` is optional and must name this card when supplied. `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is refused with 422 `workspace_issue_override_disallowed` whether or not the request names an `executionWorkspaceId`: the route re-supplies the stored workspace id on that write, and the policy check counts it as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are each optional in this schema but must be sent together: a record with exactly one of them is refused at write time with 422 `delivery_identity_write_rejected`, before anything is persisted. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
+          "Record this card's delivery identity (ADR-091 D1). Writable by the agent run holding the issue's lease on a transition into `in_review`, or by a board actor refreshing a card that is already `in_review` (422 `delivery_identity_write_rejected` otherwise). A board refresh that also changes `status` in the same request is refused with the same 422 `delivery_identity_write_rejected`: refresh the record first, then issue the verdict in a second PATCH. `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and, without PR fields, `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). To bind an existing pull request (AS-05), send `prNumber` and `prUrl` TOGETHER (exactly one of them is 422 `delivery_identity_write_rejected`): `branch` is then the pull request's head branch, the server verifies the exact open, non-draft PR — canonical URL, live head branch, live head SHA — with the same verifier approval time uses (any mismatch or missing GitHub token is 422 `delivery_identity_write_rejected`), and stamps `kind=as05_bound_pr` plus the control-plane-derived `cardBranch` server-side; `kind`/`cardBranch` are server-owned and rejected if client-supplied. The live write-time verification and the AS-05 stamp apply to the lease-holding run's entry-into-review write; a board refresh on a card already `in_review` keeps the exact-branch rule above for a both-fields record — it is stored as sent, without a live write-time PR check and without the AS-05 stamp, and approval time re-verifies the binding as usual. `sourceIssueId` is optional and must name this card when supplied. `branch` must also be a name git would accept as a branch (`git check-ref-format` rules, also after decoding well-formed `%HH` escapes; a lone `%` is an ordinary character), else 422 `delivery_identity_branch_write_rejected`. A request that carries `deliveryIdentity` and also changes `executionWorkspaceId` is refused with the same 422 `delivery_identity_branch_write_rejected`. Do the two as separate PATCHes, rebind first, but only where the rebind actually binds (the rebind is subject to the gates listed for the terminal-carrier arm below). Under the default configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so rebind-first does not work in the `project_primary` arm: the stamp is written onto the `project_primary` row the card already holds, with no rebind. With `enableIsolatedWorkspaces` on and a project policy that sets `executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary` stamp that writes the branch onto the card's branchless row is accepted: the route re-supplies the stored workspace id on that write, and the policy check does not count an `executionWorkspaceId` equal to the one the card already holds as an override. This applies to the board refresh and to the agent's entry-into-review write alike. With the flag off the id is dropped from the patch before that policy check and the stamp proceeds on the row the card already holds. When the rebind does bind, the record is validated against the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but a rebind does not revalidate a stored record, so the approval-time resolver can refuse it (`delivery_identity_unresolved`): in the `project_primary` arm when the new row has a null or different branch, and in the orphan arm (no execution workspace) unless the new row's branch equals the recorded branch. The terminal-carrier arm is narrower still: the record is accepted only while the card is bound to the terminal carrier row, and a record sent before the card is bound to that row is refused with 422 `delivery_identity_branch_write_rejected`. Whether a rebind onto the carrier row binds depends on three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off, the rebind is silently dropped (200, the old pointer is cleared, so the workspace pointer is null) and an identity PATCH sent after it is refused with 422 `delivery_identity_branch_write_rejected`; with it on, the pointer keeps the row id. (2) The binding coherence check on an explicit rebind: a row that is neither a `shared_workspace` row nor sourced by the card itself is refused with 422 `workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is sourced by an ancestor card, so a rebind onto it is refused and the only route is to record while the card still holds the carrier row; a `shared_workspace` carrier passes this check. (3) The project policy: with `executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on), any explicit `executionWorkspaceId` other than the one the card already holds is refused with 422 `workspace_issue_override_disallowed`. When all three pass, the rebind binds and an identity PATCH sent after it returns 200. Rebinding away from the carrier row after the record is written returns 200 and leaves the record in place, but the approval-time resolver then refuses it. So write the record while the card is bound to the carrier row and do not rebind afterwards. `prNumber` and `prUrl` are each optional in this schema but must be sent together: a record with exactly one of them is refused at write time with 422 `delivery_identity_write_rejected`, before anything is persisted. A board refresh may also stamp `branch` onto this card's own `project_primary` execution-workspace row when that row has no branch, and may record a card with no execution workspace only when the record binds a PR (`prNumber` and `prUrl`); in both cases `branch` must carry the card's identifier prefix (422 `delivery_identity_branch_write_rejected` otherwise). A board refresh may also record the exact branch of an ADR-083 carrier whose owner is already done/cancelled when the record binds a PR (`prNumber` and `prUrl`). At approval time a record with no execution workspace, or one on a carrier whose owner is already done/cancelled, is accepted only as a completed delivery: the bound PR must be merged and its merge commit proven on the card's own control-plane base. With an execution workspace row (the terminal-carrier shape) that base is the row's `baseRef`, and a null `baseRef` does not fall back to the project default; a card with no execution workspace has no such row, so the base is the project workspace `defaultRef`, else its `repoRef`. A card that resolves no base is refused. `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
       expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
         "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
@@ -4534,6 +4573,26 @@ registry.registerPath({
     },
     422: r.unprocessable,
   },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-receipts",
+  tags: ["issues"],
+  summary: "Read immutable first-review entry receipts",
+  description: "Company-scoped historical admission evidence. Retains the pinned ruling and reviewed artifact revisions and server-owned isolated-worktree, repository/base, actor/run and stage identities. A receipt is not an approval or reusable terminal-close proof.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/review-entry-blockers",
+  tags: ["issues"],
+  summary: "Inspect company-scoped first-review entry blockers",
+  description: "Board-operator diagnostic for an active isolated-worktree binding; viewer sessions and read-only board keys are refused. Returns this company's blockers only: source table, row id, recorded path (or null), review_entry_* code and reason. Admission checks concrete managed-tree writers across companies without exposing foreign identities; valid broad ancestors at or above the managed projects root are company-scoped. Missing paths resolve symlink targets before dot-dot segments; uncertainty reaching the managed root refuses even when the link is outside it. This read performs no Git command/provider proof, locks or mutation and grants no admission token.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -6056,7 +6115,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List company activity",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(issueActivityResponseSchema), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -6176,7 +6235,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List activity for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(issueActivityResponseSchema), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -8602,8 +8661,14 @@ registry.registerPath({
     "configured agent participant is unresponsive or absent. Flag-gated: unless " +
     "PAPERCLIP_BOARD_STAGE_OVERRIDE is true/1 the route responds 404 before any read. `approved` " +
     "completes the stage (and re-pends the next stage when one exists) without closing the card; " +
-    "`changes_requested` returns it to the return assignee and resets the round counter. A policy " +
-    "with no undecided stage returns 409 reason no_undecided_stage.",
+    "`changes_requested` returns it to the return assignee and resets the round counter. An `approved` " +
+    "decision on a card whose current stage is still pending although its latest durable decision row is " +
+    "already `approved` acts on that stage before any later stage. When that row is bound to the current " +
+    "delivered head and review round (and to the head the final delivery preflight certifies), the route " +
+    "reconciles the execution state from it: it records the row's id as lastDecisionId, writes no second " +
+    "decision row, logs issue.board_stage_reconciled and responds with `reconciled: true`. An unbound or " +
+    "stale row is never reused: the approval is recorded as a fresh decision by the board user, bound to the " +
+    "current head and round. Any other policy with no undecided stage returns 409 reason no_undecided_stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(
@@ -11268,6 +11333,47 @@ registerCurrentRoute({
   summary: "Retry only workspace export for a repaired accepted native result",
   body: retryWorkspaceExportSchema,
   responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/landing-proof",
+  tags: ["issues"],
+  summary: "Attach a GitHub-verified merged-PR landing proof to a delivered card (board only)",
+  description:
+    "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
+    "execution workflow is completed with at least one completed review stage naming only users, and which records no " +
+    "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
+    "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
+    "with no merged PR or a foreign branch. When the card owes no landing debt, or the done guard refuses the close for such another " +
+    "reason, the call is 409 `landing_proof_cannot_close` before the submitted proof is verified and nothing is recorded. The body names one pull request in the card's " +
+    "project repository (`owner`, `repo`, `pullRequestNumber`), at least one of `mergeCommitSha` / `headSha` (full shas), and a " +
+    "`reason`. The server verifies the proof live against GitHub: the repository is the card's project repository " +
+    "(422 `landing_proof_wrong_repo`), the card resolves a control-plane base branch (422 `landing_proof_no_base`), the PR exists " +
+    "(422 `landing_proof_pr_not_found`), it is merged (422 `landing_proof_pr_not_merged`, or `landing_proof_pr_closed_unmerged` " +
+    "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), " +
+    "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
+    "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
+    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
+    "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
+    "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
+    "or a board user's comment on the card naming the PR, or a head or merge " +
+    "commit recorded on such a work product that is the PR head or merge commit or one of the PR's own commits; links, comments " +
+    "and delivery identities an agent wrote do not count, and a head branch name is not a tie; otherwise 422 " +
+    "`landing_proof_not_card_delivery`), and the " +
+    "merge commit is contained in the base branch (422 `landing_proof_not_on_base`, only for a readable compare that shows it is " +
+    "not contained). A missing credential, a network error, a non-OK GitHub answer or an unresolvable base branch is 422 " +
+    "`landing_proof_unverifiable`, which may succeed on retry. A refusal records nothing. On success (201) the server records an " +
+    "`issue.landing_proof_attached` activity row naming the actor and the evidence, plus a `pull_request` work product with the " +
+    "merge and head commits. The call is idempotent for retries: replaying the same evidence returns 200 with `replayed: true` " +
+    "and the recorded proof, and writes nothing. Attaching discharges no landing debt. A later board `PATCH /api/issues/{id}` with " +
+    "`status: done` re-verifies the latest attached proof and discharges the repository landing debt (for example from a " +
+    "`record_only` reclassification) atomically with that accepted close. Non-board close doors do not accept the proof.",
+  body: attachIssueLandingProofSchema,
+  responses: {
+    200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: r.conflict, 422: r.unprocessable,
+  },
 });
 
 registerCurrentRoute({

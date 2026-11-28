@@ -84,6 +84,9 @@ export const issues = pgTable(
     monitorWakeRequestedAt: timestamp("monitor_wake_requested_at", { withTimezone: true }),
     monitorLastTriggeredAt: timestamp("monitor_last_triggered_at", { withTimezone: true }),
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
+    // Incremented by a trigger (migration 0333) on every monitor arm or re-arm; keys the
+    // exhaustion recovery claim, so each arm recovers at most once.
+    monitorArmGeneration: integer("monitor_arm_generation").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
     executionWorkspaceId: uuid("execution_workspace_id")

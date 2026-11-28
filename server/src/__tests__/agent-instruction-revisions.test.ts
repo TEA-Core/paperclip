@@ -7,6 +7,12 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, agentApiKeys, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns,
   agentInstructionRevisions, agentInstructionHeads, issueThreadInteractions, issues, createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { assignableAgentsGid, withAgentsGid } from "./helpers/agents-gid.js";
+
+vi.mock("node:child_process", async (importOriginal) =>
+  (await import("./helpers/agents-gid.js")).mockAgentsGroupLookup(await importOriginal()));
+
+const agentsGid = assignableAgentsGid();
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { instructionBytes, instructionPath, materializeInstructionBytes, readInstructionBytes } from "../services/agent-instruction-files.js";
@@ -66,6 +72,84 @@ describe("canonical instruction revisions", () => {
   async function save(content: string, baseRevisionId: string | null) {
     return service.commit({ ...target(), entryFile, content, baseRevisionId, source: "cleanup" }, actor);
   }
+  it.skipIf(agentsGid === undefined)("copies bundle files and creates the managed root without group write under umask 002", async () => {
+    const externalRoot = await fs.mkdtemp(path.join(home, "external-import-"));
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "# Imported entry\n");
+    await fs.mkdir(path.join(externalRoot, "doctrine"));
+    await fs.writeFile(path.join(externalRoot, "doctrine", "mission.md"), "# Mission\n");
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).updateBundle({
+        ...agent,
+        adapterConfig: { instructionsBundleMode: "external", instructionsRootPath: externalRoot, instructionsEntryFile: "AGENTS.md" },
+      }, { mode: "managed" }));
+      expect(result.bundle.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect((await fs.stat(path.join(root, "doctrine"))).mode & 0o7777).toBe(0o750);
+      for (const [relative, content] of [["AGENTS.md", "# Imported entry\n"], ["doctrine/mission.md", "# Mission\n"]]) {
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(content);
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+        expect((await fs.stat(path.join(root, relative))).gid).toBe(agentsGid);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("migrates the legacy prompt entry and creates its root without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).ensureManagedBundle({
+        ...agent, adapterConfig: { promptTemplate: "# Legacy prompt" },
+      }));
+      expect(result.state.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("# Legacy prompt");
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).gid).toBe(agentsGid);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("imports bundle files and creates their root without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const files = { "AGENTS.md": "# Imported entry\n", "doctrine/mission.md": "# Mission\n" };
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).materializeManagedBundle(agent, files));
+      expect(result.bundle.rootPath).toBe(root);
+      expect((await fs.stat(root)).mode & 0o7777).toBe(0o750);
+      expect((await fs.stat(root)).gid).toBe(agentsGid);
+      expect((await fs.stat(path.join(root, "doctrine"))).mode & 0o7777).toBe(0o750);
+      for (const [relative, content] of Object.entries(files)) {
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(content);
+        expect((await fs.stat(path.join(root, relative))).mode & 0o7777).toBe(0o640);
+        expect((await fs.stat(path.join(root, relative))).gid).toBe(agentsGid);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+  it.skipIf(agentsGid === undefined)("creates an empty imported entry without group write under umask 002", async () => {
+    await fs.rm(root, { recursive: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const previousUmask = process.umask(0o002);
+    try {
+      const result = await withAgentsGid(agentsGid!, () => agentInstructionsService(db).materializeManagedBundle(agent, {}));
+      expect(result.bundle.rootPath).toBe(root);
+      expect(await fs.readFile(path.join(root, "AGENTS.md"), "utf8")).toBe("");
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).mode & 0o7777).toBe(0o640);
+      expect((await fs.stat(path.join(root, "AGENTS.md"))).gid).toBe(agentsGid);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
   it.each(["current", "history", "revision", "diff", "candidates"])("denies peer %s reads without a configuration grant or responsible-user target access", async (operation) => {
     const first = await base();
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId));

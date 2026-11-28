@@ -540,6 +540,56 @@ describeEmbeddedPostgres("routine execution supersede on terminal done", () => {
     expect(auditRows).toHaveLength(1);
   });
 
+  it("records a future monitor check lost by retirement and leaves past-due checks unrecorded", async () => {
+    const { companyId, agentId, projectId, routine, issueSvc } = await seedCompany();
+    const futureCheckAt = "2099-12-01T12:00:00.000Z";
+    const pastDueCheckAt = "2020-01-01T00:00:00.000Z";
+    const futureSibling = await seedRoutineIssue({
+      companyId, projectId, agentId, routineId: routine.id, identifier: "SWP-F",
+      status: "in_progress", createdAt: new Date("2026-08-20T00:00:00.000Z"),
+    });
+    const pastDueSibling = await seedRoutineIssue({
+      companyId, projectId, agentId, routineId: routine.id, identifier: "SWP-P",
+      status: "in_progress", createdAt: new Date("2026-08-20T06:00:00.000Z"),
+    });
+    for (const [sibling, nextCheckAt] of [[futureSibling, futureCheckAt], [pastDueSibling, pastDueCheckAt]] as const) {
+      await db.update(issues).set({
+        executionPolicy: { monitor: { nextCheckAt, recoveryPolicy: "wake_owner", notes: "Verify tomorrow" } },
+        monitorNextCheckAt: new Date(nextCheckAt),
+        monitorNotes: "Verify tomorrow",
+      }).where(eq(issues.id, sibling.id));
+    }
+    const later = await seedRoutineIssue({
+      companyId, projectId, agentId, routineId: routine.id, identifier: "SWP-L",
+      status: "in_progress", createdAt: new Date("2026-08-21T00:00:00.000Z"),
+    });
+
+    await issueSvc.update(later.id, { status: "done", actorUserId: "user-1" });
+
+    const [futureAfter] = await db.select().from(issues).where(eq(issues.id, futureSibling.id));
+    const [pastDueAfter] = await db.select().from(issues).where(eq(issues.id, pastDueSibling.id));
+    expect(futureAfter.status).toBe("cancelled");
+    expect(futureAfter.monitorNextCheckAt).toBeNull();
+    expect(pastDueAfter.status).toBe("cancelled");
+    expect(pastDueAfter.monitorNextCheckAt).toBeNull();
+    const clears = await db.select().from(activityLog).where(eq(activityLog.action, "issue.monitor_cleared"));
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toMatchObject({
+      entityId: futureSibling.id,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      details: {
+        identifier: "SWP-F",
+        previousNextCheckAt: futureCheckAt,
+        recoveryPolicy: "wake_owner",
+        reason: "cleared_by_close_future_check",
+        notes: "Verify tomorrow",
+      },
+    });
+  });
+
   it("ignores non-routine superseding issues", async () => {
     const { companyId, agentId, projectId, routine } = await seedCompany();
     const t0 = new Date("2026-08-20T00:00:00.000Z");
