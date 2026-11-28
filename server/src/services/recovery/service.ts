@@ -10416,6 +10416,8 @@ export function recoveryService(
         ...(overrideDisallowedByProject ? {} : { executionWorkspacePreference: "agent_default" as const }),
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
+        // A recovery sweep has no caller to refuse (execution-policy-seat-rules.ts).
+        executionPolicySeatRules: "warn",
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
         originId: input.issue.id,
         originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,

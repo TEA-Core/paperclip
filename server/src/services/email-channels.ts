@@ -1318,6 +1318,8 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
               priority: "medium",
               assigneeAgentId: endpoint.assignedAgentId,
               responsibleUserId: endpoint.sponsorUserId,
+              // An inbound message has no caller to refuse (execution-policy-seat-rules.ts).
+              executionPolicySeatRules: "warn",
               originKind: "chat_channel",
               originId: `email:${endpoint.id}:${message.thread_id}`,
               idempotencyKey: `email:${endpoint.id}:${message.thread_id}`,

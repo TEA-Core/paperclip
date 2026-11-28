@@ -95,20 +95,28 @@ stage does not delay that stamp. The review workflow follows stage order and
 waits for post-merge stages before closing `done`.
 
 An issue's creator and its assignee never hold a reviewer or approver seat.
-Every API write that sets the policy or the assignee is judged against the
-issue as it will be after the write: issue create (including a policy inherited
-from the project or company default), child create, accepted-plan
-decomposition, `PATCH /api/issues/{id}` (assignee, policy, both, the `monitor`
-alias, and a whole-policy replace) and checkout. The server compares agent ids,
-never names: an agent participant against `createdByAgentId` and
-`assigneeAgentId`. User participants are not judged, matching the agent tools'
-rule. Routine create, update and revision restore apply the same rule to the
-routine's policy, its assignee and the agent that created it. A run requested
-through `POST /api/routines/{id}/run` is judged as the issue it would create
-(the stored policy, the effective assignee including a per-run override, and a
-manual runner as creator) and refused before anything is created; a scheduled
-or webhook dispatch of a routine stored before the rule still creates the issue,
-and the server logs a warning naming the routine. A violation is refused with `422` and the code
+Every write that sets the policy or the assignee is judged against the issue
+as it will be after the write. Every issue create is judged inside the issue
+service on the policy the issue will carry, including a policy inherited from
+the project or company default, so every create door reaches the same check:
+issue create, child create, accepted-plan decomposition, a `suggest_tasks`
+accept, the runner `create_task` tool, a routine run, and decision, delegation
+and plugin effects. Writes to an existing issue use one shared check:
+`PATCH /api/issues/{id}` (assignee, policy, both, the `monitor` alias, and a
+whole-policy replace), checkout, the runner `reassign_task` tool, the decision
+`assign_issue` effect and the plugin host `issues.update`. An assignee equal
+to the stored one counts as left alone. The server compares agent ids, never
+names: an agent participant against `createdByAgentId` and `assigneeAgentId`.
+User participants are not judged, matching the agent tools' rule. Routine
+create, update and revision restore apply the same rule to the routine's
+policy, its assignee and the agent that created it. A run requested through
+`POST /api/routines/{id}/run` is judged as the issue it would create (the
+stored policy or the inherited default, the effective assignee including a
+per-run override, and a manual runner as creator) and refused before anything
+is created. A producer with no caller to refuse creates the issue and the
+server logs a warning naming the conflict: a scheduled or webhook routine
+dispatch, an inbound email or chat message, a recovery issue and a watchdog
+review issue. A violation is refused with `422` and the code
 `execution_policy_seat_conflict`; `details` names the seat (`reviewer` or
 `approver`), the stage, the participant id and the conflicting role (`creator`
 or `assignee`). The rule applies to agent and board callers alike, and the

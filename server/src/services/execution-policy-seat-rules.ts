@@ -5,12 +5,19 @@
  * Board ruling 2026-11-27. The agent tools enforce the same rule before they
  * write (`exec_policy.assert_lawful_seats` / `assert_lawful_write` in
  * paperclip-agent-tools). An agent that calls the API directly skips those
- * tools, so the server enforces the rule itself on every write path that can
- * seat a participant or move the assignee: issue create, child create,
- * accepted-plan decomposition, PATCH (policy, assignee, or both, including a
- * whole-policy replace and a monitor-alias write) and checkout. Routine
- * create, update and revision restore apply it to the routine's policy and
- * assignee, since every issue the routine dispatches carries them.
+ * tools, so the server enforces the rule itself. Every write runs through one
+ * of two shared entry points:
+ *   - a new issue: `newIssueSeatRuleInput`, judged inside `issueService.create`
+ *     on the policy the issue will carry (its own or the inherited project or
+ *     company default). Every create door reaches it: the issue routes, child
+ *     create, accepted-plan decomposition, suggest_tasks accept, the runner
+ *     `create_task` tool, routine runs, decision and plugin effects.
+ *   - an existing issue: `assertIssueUpdateSeatsLawful`, called by PATCH
+ *     (policy, assignee, or both, including a whole-policy replace and a
+ *     monitor-alias write), checkout, the runner `reassign_task` tool, the
+ *     decision `assign_issue` effect and the plugin host `issues.update`.
+ * Routine create, update and revision restore apply the rule to the routine's
+ * policy and assignee, since every issue the routine dispatches carries them.
  *
  * The rule compares agent ids only, never names: every `review` or
  * `approval` stage participant of type `agent` must differ from
@@ -229,4 +236,67 @@ export function stageHoldsAssignee(issue: {
   const participant = state.currentParticipant;
   if (!isRecord(participant) || participant.type !== "agent") return false;
   return sameId(nonEmptyId(participant.agentId), nonEmptyId(issue.assigneeAgentId));
+}
+
+/**
+ * The seat-rule input for a new issue: the creator and the assignee are both
+ * judged against the policy it will carry.
+ */
+export function newIssueSeatRuleInput(issue: {
+  executionPolicy?: unknown;
+  createdByAgentId?: string | null;
+  assigneeAgentId?: string | null;
+}): ExecutionPolicySeatRuleInput {
+  return {
+    executionPolicy: issue.executionPolicy ?? null,
+    creator: { agentId: issue.createdByAgentId ?? null },
+    assignee: { agentId: issue.assigneeAgentId ?? null },
+    judgeCreator: true,
+    judgeAssignee: true,
+  };
+}
+
+export interface ExecutionPolicySeatRuleIssueRow {
+  createdByAgentId: string | null;
+  assigneeAgentId: string | null;
+  status: string;
+  executionState: unknown;
+  executionPolicy: unknown;
+}
+
+/**
+ * The seat-rule input for a write to an existing issue. `write` holds only the
+ * fields the write sets: an `undefined` policy or assignee is left alone, and
+ * an assignee equal to the stored one counts as left alone.
+ *   - The creator never changes, so it is judged only when the write changes
+ *     the seats.
+ *   - The assignee is judged when the write moves it, or when the write sets
+ *     the policy while no stage holds the issue.
+ *   - A move within the active stage hands the issue to another participant
+ *     of that stage, which is lawful; any other seat conflicts.
+ */
+export function issueUpdateSeatRuleInput(
+  row: ExecutionPolicySeatRuleIssueRow,
+  write: { executionPolicy?: unknown; assigneeAgentId?: string | null },
+): ExecutionPolicySeatRuleInput {
+  const policyWritten = write.executionPolicy !== undefined;
+  const assigneeMoved = write.assigneeAgentId !== undefined && write.assigneeAgentId !== row.assigneeAgentId;
+  const rowPolicy = row.executionPolicy ?? null;
+  const resultingPolicy = policyWritten ? write.executionPolicy : rowPolicy;
+  return {
+    executionPolicy: resultingPolicy,
+    creator: { agentId: row.createdByAgentId },
+    assignee: { agentId: assigneeMoved ? write.assigneeAgentId : row.assigneeAgentId },
+    judgeCreator: policyWritten && executionPolicySeatsChanged(rowPolicy, resultingPolicy),
+    judgeAssignee: assigneeMoved || (policyWritten && !stageHoldsAssignee(row)),
+    assigneeMayHoldStageId: activeExecutionStageId(row),
+  };
+}
+
+/** Refuses a write to an existing issue that seats its creator or assignee. */
+export function assertIssueUpdateSeatsLawful(
+  row: ExecutionPolicySeatRuleIssueRow,
+  write: { executionPolicy?: unknown; assigneeAgentId?: string | null },
+): void {
+  assertExecutionPolicySeatsLawful(issueUpdateSeatRuleInput(row, write));
 }

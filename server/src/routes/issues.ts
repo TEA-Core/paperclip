@@ -497,12 +497,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import {
-  assertExecutionPolicySeatsLawful,
-  activeExecutionStageId,
-  executionPolicySeatsChanged,
-  stageHoldsAssignee,
-} from "../services/execution-policy-seat-rules.js";
+import { assertIssueUpdateSeatsLawful } from "../services/execution-policy-seat-rules.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
@@ -18167,9 +18162,6 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
-        // Board ruling 2026-11-27: the creator and the assignee never hold a
-        // reviewer or approver seat of the policy the issue will carry.
-        enforceExecutionPolicySeatRules: true,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         trustExplicitExecutionPolicy:
@@ -19034,7 +19026,6 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
-        enforceExecutionPolicySeatRules: true,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         actorAgentId: actor.agentId,
@@ -19302,9 +19293,6 @@ export function issueRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           actorRunId: actor.runId,
-          // The decomposition service judges every child's resulting policy
-          // (its own, or the inherited default) before it creates the first one.
-          enforceExecutionPolicySeatRules: true,
           actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
           trustExplicitResponsibleUserId: actor.actorType === "user",
           actorAgentId: actor.agentId,
@@ -20575,31 +20563,11 @@ export function issueRoutes(
     // Board ruling 2026-11-27: the creator and the assignee never hold a
     // reviewer or approver seat. Judged on the client's own fields, before the
     // stage transition below moves the assignee onto a seated participant.
-    const seatAssigneeWritten = normalizedAssigneeAgentId !== undefined;
-    const seatRulesJudged = updateFields.executionPolicy !== undefined || seatAssigneeWritten;
-    const assertPatchSeatsLawful = (
-      row: { createdByAgentId: string | null; assigneeAgentId: string | null; status: string; executionState: unknown },
-      rowPolicy: unknown,
-    ) => {
-      const resultingPolicy = updateFields.executionPolicy !== undefined ? updateFields.executionPolicy : rowPolicy;
-      assertExecutionPolicySeatsLawful({
-        executionPolicy: resultingPolicy,
-        creator: { agentId: row.createdByAgentId },
-        assignee: { agentId: seatAssigneeWritten ? normalizedAssigneeAgentId : row.assigneeAgentId },
-        // The creator never changes: it is judged only when the seats do.
-        judgeCreator:
-          updateFields.executionPolicy !== undefined
-          && executionPolicySeatsChanged(rowPolicy, resultingPolicy),
-        // While a stage holds the card its seated participant is the
-        // assignee by design (in_review, or blocked mid-review).
-        judgeAssignee:
-          (seatAssigneeWritten && normalizedAssigneeAgentId !== row.assigneeAgentId)
-          || !stageHoldsAssignee(row),
-        // A reassign within the active stage hands it to another participant.
-        assigneeMayHoldStageId: activeExecutionStageId(row),
-      });
-    };
-    if (seatRulesJudged) assertPatchSeatsLawful(existing, previousExecutionPolicy);
+    const seatRuleWrite = { executionPolicy: updateFields.executionPolicy, assigneeAgentId: normalizedAssigneeAgentId };
+    const seatRulesJudged = seatRuleWrite.executionPolicy !== undefined || seatRuleWrite.assigneeAgentId !== undefined;
+    if (seatRulesJudged) {
+      assertIssueUpdateSeatsLawful({ ...existing, executionPolicy: previousExecutionPolicy }, seatRuleWrite);
+    }
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -22727,7 +22695,7 @@ export function issueRoutes(
           if (seatRulesJudged) {
             const lockedForSeats = await svc.getByIdForUpdate(id, tx);
             if (!lockedForSeats) return null;
-            assertPatchSeatsLawful(lockedForSeats, lockedForSeats.executionPolicy ?? null);
+            assertIssueUpdateSeatsLawful(lockedForSeats, seatRuleWrite);
           }
 
           if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {
@@ -24807,16 +24775,8 @@ export function issueRoutes(
           assigneeUserId: null,
         });
         // Board ruling 2026-11-27: a checkout that moves the issue onto the
-        // caller makes it the assignee, which never holds a seat. The seats are
-        // unchanged, so only the new assignee is judged.
-        assertExecutionPolicySeatsLawful({
-          executionPolicy: issue.executionPolicy ?? null,
-          creator: { agentId: issue.createdByAgentId },
-          assignee: { agentId: req.body.agentId },
-          judgeCreator: false,
-          judgeAssignee: true,
-          assigneeMayHoldStageId: activeExecutionStageId(issue),
-        });
+        // caller makes it the assignee, which never holds a seat.
+        assertIssueUpdateSeatsLawful(issue, { assigneeAgentId: req.body.agentId });
       }
 
       // SUP-15888 / SUP-15832: a card whose CURRENT status is terminal (done /

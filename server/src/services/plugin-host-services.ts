@@ -93,6 +93,7 @@ import {
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumentation.js";
+import { assertIssueUpdateSeatsLawful } from "./execution-policy-seat-rules.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -2015,6 +2016,9 @@ export function buildHostServices(
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
+        // Board ruling 2026-11-27: a plugin reassign obeys the same seat rule
+        // as a PATCH reassign.
+        assertIssueUpdateSeatsLawful(existing, { assigneeAgentId: patch.assigneeAgentId as string | null | undefined });
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
           actorAgentId,

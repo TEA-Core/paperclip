@@ -1438,6 +1438,60 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(childrenAfterDuplicateAccept).toHaveLength(1);
   });
 
+  it("refuses accepting suggested tasks whose inherited default seats a task's assignee, creating none of them", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: {
+        mode: "normal",
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: assigneeAgentId }] }],
+      },
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Parent issue", status: "in_progress", priority: "medium" });
+
+    const created = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [
+          { clientKey: "lawful", title: "Unassigned follow-up" },
+          { clientKey: "seated", title: "Follow-up its own reviewer would hold", assigneeAgentId },
+        ],
+      },
+    }, { userId: "local-board" });
+
+    await expect(interactionsSvc.acceptSuggestedTasks(
+      { id: issueId, companyId, goalId: null, projectId: null },
+      created.id,
+      {},
+      { userId: "local-board" },
+    )).rejects.toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", seat: "reviewer", participantId: assigneeAgentId, conflictingRole: "assignee" },
+    });
+    expect(await issuesSvc.list(companyId, { parentId: issueId })).toHaveLength(0);
+    const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, created.id));
+    expect(interaction?.status).toBe("pending");
+  });
+
   it("accepts a selected subset of suggested tasks and records the skipped drafts", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

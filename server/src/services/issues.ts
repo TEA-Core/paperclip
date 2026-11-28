@@ -322,7 +322,12 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
-import { activeExecutionStageId, assertExecutionPolicySeatsLawful } from "./execution-policy-seat-rules.js";
+import {
+  assertExecutionPolicySeatsLawful,
+  assertIssueUpdateSeatsLawful,
+  findExecutionPolicySeatConflicts,
+  newIssueSeatRuleInput,
+} from "./execution-policy-seat-rules.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -2228,12 +2233,14 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
   parkDeliberately?: boolean;
   /**
-   * Internal only, never part of an API schema: the API create doors set it so
-   * that the policy the issue will carry (the caller's, or the project or
-   * company default applied below) may not seat the issue's creator or
-   * assignee as reviewer or approver (execution-policy-seat-rules.ts).
+   * Internal only, never part of an API schema. Every create judges the policy
+   * the issue will carry (its own, or the project or company default applied
+   * below): it may not seat the issue's creator or assignee as reviewer or
+   * approver (execution-policy-seat-rules.ts). "enforce" (the default)
+   * refuses with 422. "warn" creates the issue and logs the conflict; only a
+   * producer with no caller to refuse uses it.
    */
-  enforceExecutionPolicySeatRules?: boolean;
+  executionPolicySeatRules?: "enforce" | "warn";
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -2513,7 +2520,6 @@ function normalizeAcceptedPlanDecompositionFingerprintValue(
 
 const ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS = new Set([
   "id",
-  "enforceExecutionPolicySeatRules",
   "companyId",
   "parentId",
   "identifier",
@@ -2574,6 +2580,21 @@ async function resolveDefaultIssueExecutionPolicy(
     normalized = resolveProjectDefaultIssueExecutionPolicy(companyDefaultPolicy);
   }
   return normalized;
+}
+
+/**
+ * The execution policy a new issue will carry, as create() resolves it: its
+ * own policy, normalized, else the project or company default.
+ */
+async function resolveNewIssueExecutionPolicy(
+  dbOrTx: DbReader,
+  companyId: string,
+  input: { executionPolicy?: unknown; trustExplicitExecutionPolicy?: boolean; projectId?: string | null },
+) {
+  return normalizeIssueExecutionPolicy(
+    input.executionPolicy ?? null,
+    { preserveEmptyPolicy: input.trustExplicitExecutionPolicy === true },
+  ) ?? await resolveDefaultIssueExecutionPolicy(dbOrTx, companyId, input.projectId ?? null);
 }
 
 function createAcceptedPlanDecompositionRequestFingerprint(input: {
@@ -10379,6 +10400,28 @@ export function issueService(
       };
     },
 
+    /**
+     * Refuses a planned create whose resulting policy (its own, or the
+     * inherited project or company default) seats its creator or assignee:
+     * the rule create() applies, for a caller that must refuse before it
+     * writes anything else (accepted-plan decomposition, a routine run).
+     */
+    assertNewIssueSeatsLawful: async (
+      companyId: string,
+      input: {
+        executionPolicy?: unknown;
+        trustExplicitExecutionPolicy?: boolean;
+        projectId?: string | null;
+        createdByAgentId?: string | null;
+        assigneeAgentId?: string | null;
+      },
+    ) => {
+      assertExecutionPolicySeatsLawful(newIssueSeatRuleInput({
+        ...input,
+        executionPolicy: await resolveNewIssueExecutionPolicy(db, companyId, input),
+      }));
+    },
+
     createChild: async (parentIssueId: string, data: IssueChildCreateInput) => {
       const parent = await db
         .select()
@@ -10539,22 +10582,9 @@ export function issueService(
       // the first child exists. Children are created one transaction each, so
       // a refusal in create() for child N would leave children 1..N-1 behind.
       for (const child of data.children) {
-        if (child.enforceExecutionPolicySeatRules !== true) continue;
-        const childPolicy = normalizeIssueExecutionPolicy(
-          child.executionPolicy ?? null,
-          { preserveEmptyPolicy: child.trustExplicitExecutionPolicy === true },
-        )
-          ?? await resolveDefaultIssueExecutionPolicy(
-            db,
-            sourceIssue.companyId,
-            child.projectId ?? sourceIssue.projectId ?? null,
-          );
-        assertExecutionPolicySeatsLawful({
-          executionPolicy: childPolicy ?? null,
-          creator: { agentId: child.createdByAgentId },
-          assignee: { agentId: child.assigneeAgentId },
-          judgeCreator: true,
-          judgeAssignee: true,
+        await issueService(db).assertNewIssueSeatsLawful(sourceIssue.companyId, {
+          ...child,
+          projectId: child.projectId ?? sourceIssue.projectId ?? null,
         });
       }
 
@@ -10927,7 +10957,7 @@ export function issueService(
         assertCanReuseIssue,
         onDeduplicated,
         parkDeliberately: _parkDeliberately,
-        enforceExecutionPolicySeatRules,
+        executionPolicySeatRules = "enforce",
         ...issueData
       } = data;
       const explicitTitle = issueData.title?.trim();
@@ -11374,14 +11404,17 @@ export function issueService(
             issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
           }
         }
-        if (enforceExecutionPolicySeatRules === true) {
-          assertExecutionPolicySeatsLawful({
-            executionPolicy: issueData.executionPolicy ?? null,
-            creator: { agentId: issueData.createdByAgentId },
-            assignee: { agentId: issueData.assigneeAgentId },
-            judgeCreator: true,
-            judgeAssignee: true,
-          });
+        const seatRuleInput = newIssueSeatRuleInput(issueData);
+        if (executionPolicySeatRules === "enforce") {
+          assertExecutionPolicySeatsLawful(seatRuleInput);
+        } else {
+          const seatConflicts = findExecutionPolicySeatConflicts(seatRuleInput);
+          if (seatConflicts.length > 0) {
+            logger.warn(
+              { companyId, originKind: issueData.originKind, originId: issueData.originId, conflicts: seatConflicts },
+              "new issue's execution policy seats its creator or assignee as reviewer or approver; no caller to refuse, creating anyway",
+            );
+          }
         }
         await assertIssueExecutionPolicyAgentReferencesResolve(
           tx,
@@ -13601,15 +13634,8 @@ export function issueService(
             code: "checkout_refused_terminal_status", issueId: id, status: lockedIssue.status,
           });
         }
-        if (options.enforceExecutionPolicySeatRules === true && lockedIssue.assigneeAgentId !== agentId) {
-          assertExecutionPolicySeatsLawful({
-            executionPolicy: lockedIssue.executionPolicy ?? null,
-            creator: { agentId: lockedIssue.createdByAgentId },
-            assignee: { agentId },
-            judgeCreator: false,
-            judgeAssignee: true,
-            assigneeMayHoldStageId: activeExecutionStageId(lockedIssue),
-          });
+        if (options.enforceExecutionPolicySeatRules === true) {
+          assertIssueUpdateSeatsLawful(lockedIssue, { assigneeAgentId: agentId });
         }
         // Keep every acquisition read and fallback stamp on this connection.
         const db = tx as unknown as Db;

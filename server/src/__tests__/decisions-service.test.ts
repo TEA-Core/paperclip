@@ -372,6 +372,26 @@ describePg("decisionService", () => {
     expect(result.executions[0]).toMatchObject({ status: "failed", error: "deny_decision_intersection" });
   });
 
+  it("fails the assign_issue effect when it would move the target into a reviewer seat of its policy", async () => {
+    const assigneeAgentId = randomUUID();
+    await db.insert(agents).values({ id: assigneeAgentId, companyId, name: "Reviewer", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.update(issues).set({
+      executionPolicy: { mode: "normal", stages: [{ type: "review", participants: [{ type: "agent", agentId: assigneeAgentId }] }] },
+    }).where(eq(issues.id, targetIssueId));
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Assign?", body: "Body",
+      options: [{ id: "yes", label: "Yes", effects: [{ type: "assign_issue", targetIssueId, staleness: "lenient", assigneeAgentId }] }],
+    });
+    const result = await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    expect(result.executions[0]).toMatchObject({
+      status: "failed",
+      error: "effect_execution_failed",
+      result: expect.objectContaining({ message: expect.stringContaining("Execution policy seat conflict") }),
+    });
+    const [target] = await db.select().from(issues).where(eq(issues.id, targetIssueId));
+    expect(target?.assigneeAgentId).toBeNull();
+  });
+
   it("fails closed when the origin responsible user loses visibility", async () => {
     const created = await createCommentDecision();
     await db.update(companyMemberships).set({ status: "inactive" }).where(eq(companyMemberships.principalId, originResponsibleUserId));

@@ -70,11 +70,7 @@ import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { assertIssueExecutionWorkspaceOverrideAllowed, issueService, logLostFutureMonitorCheck } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import {
-  assertExecutionPolicySeatsLawful,
-  executionPolicySeatsChanged,
-  findExecutionPolicySeatConflicts,
-} from "./execution-policy-seat-rules.js";
+import { assertExecutionPolicySeatsLawful, executionPolicySeatsChanged } from "./execution-policy-seat-rules.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -497,21 +493,6 @@ function assertRoutineExecutionPolicySeatsLawful(
     judgeCreator: seatsChanged,
     judgeAssignee: seatsChanged || assigneeChanged,
   });
-}
-
-function routineDispatchSeatRuleInput(
-  routine: { executionPolicy: unknown },
-  source: "schedule" | "manual" | "api" | "webhook",
-  assigneeAgentId: string | null,
-  actor: Actor | undefined,
-) {
-  return {
-    executionPolicy: routine.executionPolicy ?? null,
-    creator: { agentId: source === "manual" ? actor?.agentId ?? null : null },
-    assignee: { agentId: assigneeAgentId },
-    judgeCreator: true,
-    judgeAssignee: true,
-  };
 }
 
 function normalizeDraftRoutineStatus(status: string, assigneeAgentId: string | null | undefined) {
@@ -2207,7 +2188,6 @@ export function routineService(
       throw unprocessable("Default agent required");
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
-    const seatRuleInput = routineDispatchSeatRuleInput(input.routine, input.source, assigneeAgentId, input.actor);
     const automaticVariables: Record<string, string | number | boolean> = {};
     // SUP-21022: a routine-level preference only applies when the run supplies
     // no workspace selection of its own, so manual/API overrides still win.
@@ -2383,13 +2363,11 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        const seatConflicts = findExecutionPolicySeatConflicts(seatRuleInput);
-        if (seatConflicts.length > 0) {
-          logger.warn(
-            { routineId: input.routine.id, runId: createdRun.id, conflicts: seatConflicts },
-            "routine execution policy seats the dispatched issue's creator or assignee as reviewer or approver; dispatching anyway",
-          );
-        }
+        // A scheduled or webhook dispatch has no caller to refuse: a stored
+        // routine whose policy seats the dispatched issue's creator or
+        // assignee still dispatches, and create() logs the conflict. A manual
+        // or API run was judged by runRoutine before anything was written.
+        const dispatchHasCaller = input.source === "manual" || input.source === "api";
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2401,7 +2379,7 @@ export function routineService(
             status: "todo",
             priority: input.routine.priority,
             assigneeAgentId,
-            createdByAgentId: seatRuleInput.creator.agentId,
+            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
             createdByUserId: manualRunnerUserId,
             responsibleUserId,
             trustExplicitResponsibleUserId: true,
@@ -2422,6 +2400,7 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
             executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
+            executionPolicySeatRules: dispatchHasCaller ? "enforce" : "warn",
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -3449,9 +3428,16 @@ export function routineService(
       await assertProject(routine.companyId, input.projectId ?? null);
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
-      assertExecutionPolicySeatsLawful(
-        routineDispatchSeatRuleInput(routine, input.source, assigneeAgentId, actor),
-      );
+      // A run has a caller: the issue it creates is judged up front, on the
+      // policy it will carry (the routine's, else the inherited project or
+      // company default), before the run or the issue exists.
+      await issueSvc.assertNewIssueSeatsLawful(routine.companyId, {
+        executionPolicy: routine.executionPolicy ?? null,
+        trustExplicitExecutionPolicy: routine.executionPolicy != null,
+        projectId: input.projectId ?? routine.projectId ?? null,
+        createdByAgentId: input.source === "manual" ? actor?.agentId ?? null : null,
+        assigneeAgentId,
+      });
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
       if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
       if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");

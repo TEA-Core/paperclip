@@ -904,10 +904,11 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       expect(issue.assigneeAgentId).toBe(agentId);
       expect(warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          routineId,
+          originKind: "routine_execution",
+          originId: routineId,
           conflicts: [expect.objectContaining({ participantId: agentId, conflictingRole: "assignee" })],
         }),
-        expect.stringContaining("seats the dispatched issue's creator or assignee"),
+        expect.stringContaining("seats its creator or assignee as reviewer or approver; no caller to refuse"),
       );
     } finally {
       warn.mockRestore();
@@ -943,6 +944,44 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
     expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routineId))).toHaveLength(0);
 
+    const accepted = await postRoutineRun(app, routineId, { source: "manual" });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
+    expect(accepted.body.status).toBe("issue_created");
+  }, 15_000);
+
+  it("refuses a manual run whose routine has no policy when the inherited project default seats the assignee", async () => {
+    const { companyId, agentId, projectId } = await seedFixture();
+    const reviewerId = await insertAgent(companyId, "Reviewer");
+    const app = await createApp({ type: "agent", agentId, companyId });
+
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ projectId, title: "Policy-less routine", assigneeAgentId: agentId });
+    expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+    const routineId = createRes.body.id as string;
+    // The project ladder lands after the routine exists, so only the run can
+    // see that the issue it would create inherits a seat for its assignee.
+    await db
+      .update(projects)
+      .set({ defaultExecutionPolicy: selfReviewPolicy(agentId) })
+      .where(eq(projects.id, projectId));
+
+    for (const source of ["manual", "api"]) {
+      const refused = await postRoutineRun(app, routineId, { source });
+      expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+      expect(refused.body.details).toMatchObject({
+        code: "execution_policy_seat_conflict",
+        seat: "reviewer",
+        participantId: agentId,
+      });
+    }
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+    expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routineId))).toHaveLength(0);
+
+    await db
+      .update(projects)
+      .set({ defaultExecutionPolicy: selfReviewPolicy(reviewerId) })
+      .where(eq(projects.id, projectId));
     const accepted = await postRoutineRun(app, routineId, { source: "manual" });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(202);
     expect(accepted.body.status).toBe("issue_created");
@@ -1041,13 +1080,16 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   it("inherits the project default when a routine executionPolicy is PATCHed back to null (SUP-17459)", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
     const reviewerId = await insertAgent(companyId, "Reviewer");
+    // The project ladder seats an agent that neither files nor holds the
+    // card: a run is refused when the inherited ladder seats its assignee.
+    const projectReviewerId = await insertAgent(companyId, "ProjectReviewer");
 
     await db
       .update(projects)
       .set({
         defaultExecutionPolicy: {
           mode: "normal",
-          stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: projectReviewerId }] }],
         },
       })
       .where(eq(projects.id, projectId));
@@ -1103,7 +1145,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const stages = cardPolicy!.stages ?? [];
     expect(stages).toHaveLength(1);
     expect(stages[0]?.type).toBe("review");
-    expect(stages[0]?.participants?.[0]?.agentId ?? null).toBe(agentId);
+    expect(stages[0]?.participants?.[0]?.agentId ?? null).toBe(projectReviewerId);
   }, 15_000);
 
   it("runs routines with variable inputs and interpolates the execution issue description", async () => {

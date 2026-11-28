@@ -11,6 +11,7 @@ import { assertAssignableAgent } from "../agent-assignability.js";
 import { authorizationService } from "../authorization.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
+import { assertIssueUpdateSeatsLawful } from "../execution-policy-seat-rules.js";
 import { buildLowTrustSourceTrust } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
 import { callCreateSkillTool, callUpdateSkillTool } from "../skill-tools.js";
@@ -1193,6 +1194,9 @@ export class PaperclipRunnerToolAuthority {
       if (target.assigneeUserId || target.assigneeAgentId !== expectedOwner || target.statusVersion !== expectedVersion) {
         throw new Error("paperclip_runner_reassignment_conflict: refresh search_tasks before deciding again");
       }
+      // Board ruling 2026-11-27: the same seat rule as a PATCH reassign,
+      // judged before any work is interrupted and again under the lock.
+      assertIssueUpdateSeatsLawful(target, { assigneeAgentId });
     };
     // Stop outside row locks: the runtime needs those locks to acknowledge cancellation.
     // A second locked check below prevents any intervening ownership/version change.

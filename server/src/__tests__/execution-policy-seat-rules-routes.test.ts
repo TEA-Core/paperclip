@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   agents,
@@ -24,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueService } from "../services/issues.js";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -829,5 +830,53 @@ describeEmbeddedPostgres("execution policy seat rules on every write path", () =
     });
     const [after] = await db.select().from(issues).where(eq(issues.id, issue.id));
     expect(after.assigneeAgentId).toBeNull();
+  });
+
+  // ------------------------------------------------- internal producers
+
+  it("internal create: an internal producer reaches the same refusal without opting in", async () => {
+    const { companyId, executorId, reviewerId } = await seed();
+    // The shape of a delegated-issue or decision effect create: an agent files
+    // work for another agent through the issue service, not a route.
+    await expect(issueService(db).create(companyId, {
+      title: "Delegated work its creator would review",
+      status: "todo",
+      assigneeAgentId: reviewerId,
+      createdByAgentId: executorId,
+      deliveryRequirement: "record_only",
+      executionPolicy: policy(agentStage("review", executorId)),
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "execution_policy_seat_conflict", participantId: executorId, conflictingRole: "creator" },
+    });
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+  });
+
+  it("internal create: a producer with no caller to refuse creates the issue and logs the conflict", async () => {
+    const { companyId, reviewerId } = await seed();
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const created = await issueService(db).create(companyId, {
+        title: "Recovery card for a seated owner",
+        status: "todo",
+        assigneeAgentId: reviewerId,
+        deliveryRequirement: "record_only",
+        executionPolicy: policy(agentStage("review", reviewerId)),
+        originKind: "manual",
+        originId: "seat-rule-fixture",
+        executionPolicySeatRules: "warn",
+      });
+      expect(created.assigneeAgentId).toBe(reviewerId);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          companyId,
+          originId: "seat-rule-fixture",
+          conflicts: [expect.objectContaining({ participantId: reviewerId, conflictingRole: "assignee" })],
+        }),
+        expect.stringContaining("no caller to refuse"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

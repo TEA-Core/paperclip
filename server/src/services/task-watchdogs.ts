@@ -1574,6 +1574,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         projectId: input.sourceIssue.projectId,
         goalId: input.sourceIssue.goalId,
         assigneeAgentId: input.watchdog.watchdogAgentId,
+        // A watchdog sweep has no caller to refuse (execution-policy-seat-rules.ts).
+        executionPolicySeatRules: "warn",
         originKind: TASK_WATCHDOG_ORIGIN_KIND,
         originId: input.sourceIssue.id,
         originFingerprint: input.classification.stopFingerprint,
