@@ -4531,6 +4531,51 @@ type IssueRowForLandingDebt = {
   projectId: string | null;
 };
 
+// SUP-25478: refusals that rest on a GitHub read or a timing that can change.
+// Every other final-delivery preflight refusal repeats for the same delivery.
+const TRANSIENT_FINAL_DELIVERY_REASON_PREFIXES = ["head_unverifiable:", "unreadable_mention:", "head_moved:"];
+const TRANSIENT_LANDING_PROOF_CODES: Record<string, true> = {
+  merged_first_pr_unreadable: true,
+  merged_first_merged_after_verdict: true,
+  landing_proof_unverifiable: true,
+};
+
+/**
+ * SUP-25478: whether a final-delivery preflight refusal is deterministic for
+ * this delivery, and the remedy sentence that says so and names the lawful
+ * dispositions, so a retrying agent does not turn a refusal into a
+ * changes_requested bounce or a wake loop.
+ */
+function finalDeliveryRefusalDisposition(
+  reason: string,
+  landingProofCode: string | undefined,
+): { deterministic: boolean; text: string } {
+  const transient =
+    TRANSIENT_FINAL_DELIVERY_REASON_PREFIXES.some((prefix) => reason.startsWith(prefix)) ||
+    (landingProofCode !== undefined && TRANSIENT_LANDING_PROOF_CODES[landingProofCode] === true);
+  if (transient) {
+    return {
+      deterministic: false,
+      text:
+        " This refusal is not deterministic for this delivery: it rests on a GitHub read or a timing that can change, " +
+        "so the same final verdict may be submitted again once. Do not turn it into a changes_requested decision. " +
+        "If it refuses again, the lawful dispositions are: park the card blocked with an unblock descriptor that names " +
+        "this refusal; have a board user close the card through the board route; or re-issue the final verdict after " +
+        "the cause clears or a server fix for it deploys.",
+    };
+  }
+  return {
+    deterministic: true,
+    text:
+      " This refusal is deterministic for this delivery: the same final verdict is refused again until the delivery " +
+      "record or the pull request changes, so do not retry it unchanged and do not turn it into a changes_requested " +
+      "decision or a wake loop. The lawful dispositions are: fix what this refusal names, then submit the final " +
+      "verdict again; park the card blocked with an unblock descriptor that names this refusal; have a board user " +
+      "close the card through the board route (for example with an accepted doneTransitionOverride); or re-issue the " +
+      "final verdict after a server fix for this refusal deploys.",
+  };
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -5014,6 +5059,31 @@ export function issueRoutes(
         // default created_at = now(), the transaction timestamp, so now() here is
         // the decision row's createdAt. The unlocked pre-check defers to it.
         if (options.locked) {
+          // The merge proof was taken before this transaction. Re-read the card's
+          // pull_request work products under the row lock (FOR UPDATE) so one added
+          // or reopened after the proof, still not merged, refuses the verdict.
+          const unmerged = await options.locked.tx
+            .select({ externalId: issueWorkProducts.externalId, title: issueWorkProducts.title, status: issueWorkProducts.status })
+            .from(issueWorkProducts)
+            .where(and(
+              eq(issueWorkProducts.companyId, issue.companyId),
+              eq(issueWorkProducts.issueId, issue.id),
+              eq(issueWorkProducts.type, "pull_request"),
+            ))
+            .for("update")
+            .then((rows) => rows.filter((row) => row.status !== "merged"));
+          if (unmerged.length > 0) {
+            const named = unmerged.map((row) => `${row.externalId ?? row.title} (status ${row.status})`).join(", ");
+            const reason = `pull_request work products not merged at the verdict: ${named}`;
+            const landingProofRefusal = { code: "merged_first_work_product_unmerged", reason };
+            const disposition = finalDeliveryRefusalDisposition(verdict.reason, landingProofRefusal.code);
+            throw conflict("Final repository delivery preflight refused; stage remains pending", {
+              code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId,
+              remedy: `Delivery owner ${deliveryOwnerIssueId}: the merge proof covered every linked pull_request work product, but this card now links ${reason}. A merged-first verdict needs every linked pull request merged: merge it, or remove the work product if it is not this card's delivery, then submit the final verdict again. ${verdict.reason}${disposition.text}`,
+              deterministic: disposition.deterministic,
+              landingProofRefusal,
+            });
+          }
           const [stamp] = await options.locked.tx
             .select({ decidedAtMs: sql<number>`extract(epoch from now()) * 1000`.mapWith(Number) })
             .from(issueRows)
@@ -5022,10 +5092,13 @@ export function issueRoutes(
           if (!stamp || !Number.isFinite(stamp.decidedAtMs) || !(mergedAtMs <= stamp.decidedAtMs)) {
             const decidedAt = stamp && Number.isFinite(stamp.decidedAtMs) ? new Date(stamp.decidedAtMs).toISOString() : "an unreadable time";
             const reason = `the pull request merged at ${mergedAt}, after this final verdict recorded at ${decidedAt}`;
+            const landingProofRefusal = { code: "merged_first_merged_after_verdict", reason };
+            const disposition = finalDeliveryRefusalDisposition(verdict.reason, landingProofRefusal.code);
             throw conflict("Final repository delivery preflight refused; stage remains pending", {
               code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId,
-              remedy: `Delivery owner ${deliveryOwnerIssueId}: every linked pull_request work product is MERGED, but ${reason}. A merged-first verdict must follow every merge; submit the final verdict again. ${verdict.reason}`,
-              landingProofRefusal: { code: "merged_first_merged_after_verdict", reason },
+              remedy: `Delivery owner ${deliveryOwnerIssueId}: every linked pull_request work product is MERGED, but ${reason}. A merged-first verdict must follow every merge; submit the final verdict again. ${verdict.reason}${disposition.text}`,
+              deterministic: disposition.deterministic,
+              landingProofRefusal,
             });
           }
         }
@@ -5042,9 +5115,11 @@ export function issueRoutes(
         };
         return;
       }
-      const remedy = `Delivery owner ${deliveryOwnerIssueId}: ${verdict.remedy ?? "provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again."} ${verdict.reason}`;
+      const disposition = finalDeliveryRefusalDisposition(verdict.reason, verdict.landingProofRefusal?.code);
+      const remedy = `Delivery owner ${deliveryOwnerIssueId}: ${verdict.remedy ?? "provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again."} ${verdict.reason}${disposition.text}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
+        deterministic: disposition.deterministic,
         ...(verdict.landingProofRefusal ? { landingProofRefusal: verdict.landingProofRefusal } : {}),
       });
     }

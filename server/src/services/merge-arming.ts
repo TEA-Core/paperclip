@@ -3920,12 +3920,48 @@ export async function preflightFinalDelivery(
   if (resolved.reason.startsWith("no-pr:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
     if (carrier.kind === "resolved") {
-      return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
+      const verified = await verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
+      if (verified.kind === "unresolvable" && verified.reason === NOT_DELIVERED_LIVE_REASON) {
+        return mergedFirstOverNotDelivered(db, companyId, issueId, resolved, verified, carrier.pr);
+      }
+      return verified;
     }
     if (carrier.kind === "unresolvable") return carrier;
     return resolveMergedBeforeVerdictLanding(db, companyId, issueId, resolved);
   }
   return resolved;
+}
+
+const NOT_DELIVERED_LIVE_REASON = "not_delivered: live PR is not the owner's recorded repo delivery";
+
+/**
+ * SUP-25478: the single live-merged mentioned carrier resolved, but its head
+ * branch is not the card's recorded delivery branch (a merge-first delivery
+ * made from another, now spent branch), so verifyLiveFinalDeliveryHead refuses
+ * with `not_delivered`. The merged-first admission then applies with the same
+ * verification, and only when that carrier is the card's primary
+ * `pull_request` work product. Admission returns the merged-first result;
+ * otherwise the `not_delivered` refusal stands, with the merged-first remedy
+ * when that check ran and refused.
+ */
+async function mergedFirstOverNotDelivered(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  noPr: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+  notDelivered: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+  carrierPr: { owner: string; repo: string; number: number },
+): Promise<DecisionHeadResolution> {
+  const mergedFirst = await resolveMergedBeforeVerdictLanding(db, companyId, issueId, noPr, { carrierPr });
+  if (mergedFirst.kind === "unresolvable" && mergedFirst.mergedBeforeVerdict) return mergedFirst;
+  if (mergedFirst.kind === "unresolvable" && mergedFirst.remedy) {
+    return {
+      ...notDelivered,
+      remedy: mergedFirst.remedy,
+      ...(mergedFirst.landingProofRefusal ? { landingProofRefusal: mergedFirst.landingProofRefusal } : {}),
+    };
+  }
+  return notDelivered;
 }
 
 /**
@@ -3956,6 +3992,8 @@ async function resolveMergedBeforeVerdictLanding(
   companyId: string,
   issueId: string,
   refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+  // Set when a merged mentioned carrier was refused as not_delivered: it must be the primary.
+  options: { carrierPr?: { owner: string; repo: string; number: number } } = {},
 ): Promise<DecisionHeadResolution> {
   const products = await db
     .select({
@@ -4019,6 +4057,8 @@ async function resolveMergedBeforeVerdictLanding(
   }
   const primaryPr = parseWorkProductPullRequest(primary.externalId, primary.metadata)!;
   const primaryKey = `${primaryPr.owner}/${primaryPr.repo}#${primaryPr.pullRequestNumber}`.toLowerCase();
+  const carrier = options.carrierPr;
+  if (carrier && `${carrier.owner}/${carrier.repo}#${carrier.number}`.toLowerCase() !== primaryKey) return refusal;
   const identity = await resolveDeliveryIdentity(db, companyId, issueId);
   const baseRef = await resolveCardDeliveryBaseRef(db, companyId, issueId);
   if (!identity.repo || !baseRef) {
@@ -4289,7 +4329,7 @@ async function verifyLiveFinalDeliveryHead(
     }]);
     if (live.head.repo?.full_name?.toLowerCase() !== `${pr.owner}/${pr.repo}`.toLowerCase() ||
         narrowed.outcome !== "narrowed") {
-      return { kind: "unresolvable", reason: "not_delivered: live PR is not the owner's recorded repo delivery" };
+      return { kind: "unresolvable", reason: NOT_DELIVERED_LIVE_REASON };
     }
     return resolved;
   }

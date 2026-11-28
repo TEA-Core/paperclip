@@ -880,6 +880,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     // into its main branch, before the verdict, with the merge commit its work product records.
     const livePull = (number: number, mergeCommit: string) => ({
       number, state: "closed", draft: false, merged: true, merge_commit_sha: mergeCommit, merged_at: MERGED_AT,
+      title: `Delivery ${number}`,
       head: { ref: `delivery-${number}`, sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
       base: { ref: "main", repo: { id: REPO_ID, node_id: "R_paperclip", full_name: "TEA-Core/paperclip" } },
     });
@@ -889,7 +890,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     async function mergedFirstReview(
       fixture: Awaited<ReturnType<typeof pendingDelivery>>,
       products: Product[],
-      { pulls = {}, boardWritten = true, reviewedHeadSha = HEAD_SHA, reviewedAt = REVIEWED_AT }: {
+      { pulls = {}, boardWritten = true, reviewedHeadSha = HEAD_SHA, reviewedAt = REVIEWED_AT, mention, afterProofRead }: {
         /**
          * Live GitHub answers per PR number; a PR absent here reads as merged with its recorded
          * merge commit. An Error is thrown by the fetch (a network failure or timeout).
@@ -901,6 +902,17 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         reviewedHeadSha?: string | null;
         /** When the control plane recorded that head (approvalStatus.approvedAt); null records none. */
         reviewedAt?: string | null;
+        /**
+         * Also mention this PR on the card, cached as merged. Its live head branch (delivery-N) is not the
+         * card's recorded delivery branch, so the merged-mention carrier refuses it as not_delivered.
+         */
+        mention?: number;
+        /**
+         * Runs on each repository identity read of the board landing proof (1-based index). Each such
+         * read follows the preflight's read of the card's work products and precedes the verdict's
+         * write transaction.
+         */
+        afterProofRead?: (readIndex: number) => Promise<unknown>;
       } = {},
     ) {
       const reviewer = await seedAgent(db, fixture.company.id);
@@ -945,12 +957,29 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           details: { workProductId: row!.id },
         });
       }
+      if (mention !== undefined) {
+        const [object] = await db.insert(externalObjects).values({
+          companyId: fixture.company.id, providerKey: "github", objectType: "pull_request",
+          externalId: `TEA-Core/paperclip#pull/${mention}`, displayKey: String(mention), displayTitle: `Delivery ${mention}`,
+          sanitizedCanonicalUrl: `https://github.com/TEA-Core/paperclip/pull/${mention}`,
+          canonicalIdentityHash: randomUUID(), data: { ...livePull(mention, MERGE_SHA) },
+        }).returning();
+        await db.insert(externalObjectMentions).values({
+          companyId: fixture.company.id, sourceIssueId: fixture.issue.id, sourceKind: "description",
+          objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+          matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+          canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+        });
+      }
       // Every named commit is on the base branch; GitHub serves the live PRs and the repository identity.
       const served = github.getMockImplementation()!;
+      let identityReads = 0;
       github.mockImplementation(async (input, init) => {
         const url = String(input);
         if (url.includes("/compare/")) return Response.json({ status: "behind", ahead_by: 0 });
         if (url.endsWith("/repos/TEA-Core/paperclip")) {
+          identityReads += 1;
+          await afterProofRead?.(identityReads);
           return Response.json({ id: REPO_ID, node_id: "R_paperclip", full_name: "TEA-Core/paperclip" });
         }
         const pull = url.match(/\/repos\/TEA-Core\/paperclip\/pulls\/(\d+)$/);
@@ -975,6 +1004,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const app = createApp(db, agentActor(fixture.company, reviewer, run!.id));
       return {
         approve: (mergeCommit: string) => request(app).patch(`/api/issues/${fixture.issue.id}`).send(body(mergeCommit)),
+        /** How many times the board landing proof read the repository identity. */
+        identityReads: () => identityReads,
         /** The same final verdict from an agent that is not the stage participant. */
         approveAsOutsider: async (mergeCommit: string) => {
           const outsider = await seedAgent(db, fixture.company.id);
@@ -1184,9 +1215,107 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
       ], { pulls: { 4413: answer() } });
 
-      await expectRefused(fixture, await review.approve(MERGE_SHA), {
+      const response = await review.approve(MERGE_SHA);
+      await expectRefused(fixture, response, {
         landingProofRefusal: { code: "merged_first_pr_unreadable", reason: expect.stringContaining(reason) },
+        deterministic: false,
       });
+      // A GitHub read failure may clear, so the remedy allows one retry and names the dispositions after it.
+      expect(response.body.details.remedy).toContain("This refusal is not deterministic for this delivery");
+      expect(response.body.details.remedy).toContain("may be submitted again once");
+      expect(response.body.details.remedy).toContain("Do not turn it into a changes_requested decision");
+      expect(response.body.details.remedy).toContain("park the card blocked with an unblock descriptor");
+      expect(response.body.details.remedy).toContain("close the card through the board route");
+      expect(response.body.details.remedy).toContain("re-issue the final verdict after");
+    });
+
+    it("admits the merged primary when the merged-mention carrier refuses it as not_delivered", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], { mention: 4412 });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      const state = stored.executionState as Record<string, any>;
+      expect(state.approvalStatus.finalDeliveryUncertified).toMatchObject({
+        decisionId: state.lastDecisionId,
+        reason: expect.stringMatching(/^merged-before-verdict: /),
+        mergeCommitSha: MERGE_SHA,
+      });
+      expect(state.approvalStatus.finalDelivery).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    });
+
+    it("keeps the not_delivered refusal when the refused carrier is not the primary work product", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [
+        merged(4412, true, { mergeCommitSha: MERGE_SHA }),
+        merged(4413, false, { mergeCommitSha: OTHER_MERGE_SHA }),
+      ], { mention: 4413 });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight",
+        reason: "not_delivered: live PR is not the owner's recorded repo delivery",
+        deterministic: true,
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("keeps the not_delivered refusal with the merged-first remedy when the carrier's live check refuses", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        mention: 4412, boardWritten: false,
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        reason: "not_delivered: live PR is not the owner's recorded repo delivery",
+        landingProofRefusal: { code: "landing_proof_not_card_delivery" },
+        remedy: expect.stringContaining("writing a pull_request work product"),
+      });
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
+    it("refuses the verdict when an open pull_request work product is added after the merge proof", async () => {
+      const fixture = await pendingDelivery({ missing: true });
+      // This PATCH door (an assigned agent closing its own card) takes the merge proof twice: before
+      // its run stop and again after it. The open work product is added after the last proof, so only
+      // the re-read inside the verdict's write transaction can see it.
+      const PROOF_READS = 2;
+      const review = await mergedFirstReview(fixture, [merged(4412, true, { mergeCommitSha: MERGE_SHA })], {
+        afterProofRead: async (readIndex) => {
+          if (readIndex !== PROOF_READS) return;
+          await db.insert(issueWorkProducts).values({
+            companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
+            externalId: "TEA-Core/paperclip#4499", title: "PR #4499 TEA-Core/paperclip",
+            url: "https://github.com/TEA-Core/paperclip/pull/4499", status: "open",
+            reviewState: "none", isPrimary: false, healthStatus: "unknown", metadata: {},
+          });
+        },
+      });
+
+      const response = await review.approve(MERGE_SHA);
+
+      expect(review.identityReads()).toBe(PROOF_READS);
+      await expectRefused(fixture, response, {
+        landingProofRefusal: { code: "merged_first_work_product_unmerged", reason: expect.stringContaining("TEA-Core/paperclip#4499 (status open)") },
+        deterministic: true,
+      });
+      expect(response.body.details.remedy).toContain("This refusal is deterministic for this delivery");
+      const stored = await fixture.read();
+      expect(stored.completedAt).toBeNull();
+      expect((stored.executionState as Record<string, any>).approvalStatus?.finalDeliveryUncertified).toBeUndefined();
     });
 
     it("records nothing when an agent that is not the stage participant submits the merged-first verdict", async () => {
@@ -1336,7 +1465,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         code: "approval_final_delivery_preflight",
         reason: expect.stringContaining("no-pr"),
         remedy: expect.stringContaining("provide one OPEN, non-draft owned PR"),
+        deterministic: true,
       });
+      // The same verdict refuses again for this delivery, so the remedy says so and names the lawful dispositions.
+      const { remedy } = response.body.details;
+      expect(remedy).toContain("This refusal is deterministic for this delivery");
+      expect(remedy).toContain("do not retry it unchanged and do not turn it into a changes_requested decision or a wake loop");
+      expect(remedy).toContain("park the card blocked with an unblock descriptor that names this refusal");
+      expect(remedy).toContain("close the card through the board route");
+      expect(remedy).toContain("re-issue the final verdict after a server fix for this refusal deploys");
       expect((await fixture.read()).status).toBe("in_review");
       expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
       expect(fixture.writes).toEqual([]);
