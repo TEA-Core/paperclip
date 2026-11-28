@@ -9,6 +9,7 @@ import {
   invites,
   principalPermissionGrants,
 } from "@paperclipai/db";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -124,7 +125,13 @@ describeEmbeddedPostgres("plugin access and authorization host services", () => 
 
   it("filters authorization audit entries by allow or deny decision details", async () => {
     const company = await createCompany(db, "PAU");
-    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+    // The redaction check needs the full details a plugin with issues.read reads.
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub(), undefined, {
+      manifest: {
+        id: "permissions-extension",
+        capabilities: ["authorization.audit.read", "issues.read"],
+      } as unknown as PaperclipPluginManifestV1,
+    });
     await db.insert(activityLog).values([
       {
         companyId: company.id,

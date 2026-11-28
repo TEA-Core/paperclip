@@ -47,7 +47,9 @@ import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import {
   pluginCanReadIssues,
+  pluginEntityPayloadForRecipient,
   pluginEventForRecipient,
+  pluginIssueRecordForRecipient,
   pluginRunPayloadForRecipient,
 } from "./plugin-event-issue-visibility.js";
 import { createRunIssueLookup } from "./run-issue-lookup.js";
@@ -2196,7 +2198,7 @@ export function buildHostServices(
           ]))
           : undefined;
 
-        return {
+        const subtree = {
           rootIssueId: rootIssue.id,
           companyId,
           issueIds,
@@ -2209,6 +2211,41 @@ export function buildHostServices(
                 assignees: Object.fromEntries(assigneeRows.map((agent) => [
                   agent.id,
                   { ...agent, status: agent.status as Agent["status"] } as PluginIssueAssigneeSummary,
+                ])),
+              }
+            : {}),
+        };
+        if (pluginCanReadIssues(options.manifest)) return subtree;
+        // A plugin without issues.read gets issue, relation and document
+        // titles and allow-listed metadata only; run summaries lose their
+        // error text. Assignee summaries describe agents and stay unchanged.
+        return {
+          ...subtree,
+          issues: subtree.issues.map(pluginIssueRecordForRecipient),
+          ...(subtree.relations
+            ? {
+                relations: Object.fromEntries(Object.entries(subtree.relations).map(([issueId, relation]) => [
+                  issueId,
+                  {
+                    blockedBy: relation.blockedBy.map(pluginIssueRecordForRecipient),
+                    blocks: relation.blocks.map(pluginIssueRecordForRecipient),
+                  },
+                ])),
+              }
+            : {}),
+          ...(subtree.documents
+            ? {
+                documents: Object.fromEntries(Object.entries(subtree.documents).map(([issueId, summaries]) => [
+                  issueId,
+                  summaries.map(pluginIssueRecordForRecipient),
+                ])),
+              }
+            : {}),
+          ...(subtree.activeRuns
+            ? {
+                activeRuns: Object.fromEntries(Object.entries(subtree.activeRuns).map(([issueId, runs]) => [
+                  issueId,
+                  runs.map(pluginIssueRecordForRecipient),
                 ])),
               }
             : {}),
@@ -2429,7 +2466,9 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
-        return (await issues.listComments(params.issueId)) as IssueComment[];
+        const comments = (await issues.listComments(params.issueId)) as IssueComment[];
+        // A plugin without issues.read gets comment metadata without bodies.
+        return pluginCanReadIssues(options.manifest) ? comments : comments.map(pluginIssueRecordForRecipient);
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
@@ -3274,12 +3313,13 @@ export function buildHostServices(
           .orderBy(desc(activityLog.createdAt))
           .limit(limit)
           .offset(offset);
-        return rows.map((row) => ({
-          ...row,
-          details: row.details && typeof row.details === "object"
-            ? sanitizeRecord(row.details)
-            : row.details ?? null,
-        }));
+        const canReadIssues = pluginCanReadIssues(options.manifest);
+        return rows.map((row) => {
+          const details = row.details && typeof row.details === "object"
+            ? pluginEntityPayloadForRecipient(row.entityType, sanitizeRecord(row.details), canReadIssues)
+            : row.details ?? null;
+          return { ...row, details };
+        });
       },
     },
 
@@ -3397,8 +3437,10 @@ export function buildHostServices(
 
           // Run output reaches the worker only as this plugin may read it: a
           // plugin with issues.read gets every event unchanged and at once; a
-          // plugin without it gets metadata for a run on an issue, through a
-          // chain that keeps publish order while the run's issue is resolved.
+          // plugin without it gets metadata for a run on an issue, and output
+          // without free-form error and message text for a run with no issue,
+          // through a chain that keeps publish order while the run's issue is
+          // resolved.
           const canReadIssues = pluginCanReadIssues(options.manifest);
           const deliver = (type: string, payload: Record<string, unknown>) => {
             if (type === "heartbeat.run.log" || type === "heartbeat.run.event") {

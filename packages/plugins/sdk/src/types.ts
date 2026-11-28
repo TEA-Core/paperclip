@@ -1524,7 +1524,9 @@ export interface PluginIssuesClient {
   }): Promise<PluginIssueCheckoutOwnership>;
   /**
    * Read a root issue's descendants with optional relation/document/run/assignee
-   * summaries. Requires `issue.subtree.read`.
+   * summaries. Requires `issue.subtree.read`. Without `issues.read`, issues,
+   * relation and document summaries carry only their titles and metadata, and
+   * run summaries only their metadata (see PLUGIN_SPEC.md).
    */
   getSubtree(
     issueId: string,
@@ -1549,6 +1551,11 @@ export interface PluginIssuesClient {
       idempotencyKeyPrefix?: string | null;
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
+  /**
+   * List an issue's comments. Requires `issue.comments.read`. Without
+   * `issues.read`, each comment carries only its metadata, without `body`
+   * (see PLUGIN_SPEC.md).
+   */
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
   /**
    * Post a comment on an issue.
@@ -1965,6 +1972,12 @@ export interface PluginAuthorizationClient {
     previewAssignment(input: PluginAssignmentPreviewInput): Promise<PluginAuthorizationDecisionResult>;
     explainAssignment(input: PluginAssignmentPreviewInput): Promise<PluginAuthorizationDecisionResult>;
   };
+  /**
+   * Search activity entries. Requires `authorization.audit.read`. Without
+   * `issues.read`, an entry about an issue carries only the issue title and
+   * metadata in `details`, and an entry about a run loses its error text (see
+   * PLUGIN_SPEC.md).
+   */
   audit: {
     search(input: {
       companyId: string;
