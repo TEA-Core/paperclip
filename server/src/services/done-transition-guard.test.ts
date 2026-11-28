@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi, beforeEach } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, beforeEach } from "vitest";
 import {
   activityLog as activityLogTable,
   agents as agentsTable,
@@ -47,6 +47,7 @@ import {
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { mechanismACorpus } from "./done-transition-guard-mechanism-a-fixtures.js";
 import { createDoneCloseLandingBackstopService } from "./done-close-landing-backstop.js";
 import type { StorageService } from "../storage/types.js";
@@ -5619,7 +5620,7 @@ describe("evaluateDoneTierDeclaration", () => {
   // replacement of the caller's declaration.
   describe("done-tier dual-source resolution (SUP-25336)", () => {
     const SOURCE_RECORD_ONLY_EVIDENCE =
-      "record-only probe `curl -fsS -H 'Authorization: Bearer sk-live-SECRET' https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+      "record-only probe `curl -fsS -H 'Authorization: Bearer sk-live-SECRET' https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass exit 0 the sweep consumption point served 42 fresh records";
     const SOURCE_RECORD_ONLY_LINE = `Closed at Tier 2 (live): ${SOURCE_RECORD_ONLY_EVIDENCE}`;
     const MERGE_HEAD_EVIDENCE =
       "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: health endpoint reports the fix is live";
@@ -6477,7 +6478,7 @@ describe("evaluateDoneTierDeclaration", () => {
     }
 
     const RECORD_ONLY_EVIDENCE =
-      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass exit 0 the sweep consumption point served 42 fresh records";
 
     beforeEach(() => {
       // A record-only close must resolve nothing on GitHub: no token, no repo,
@@ -6506,6 +6507,7 @@ describe("evaluateDoneTierDeclaration", () => {
         return form
           .replace("<probe command>", "curl -fsS https://ops.example.com/healthz")
           .replace("<observed target>", "https://ops.example.com")
+          .replace("<exit code>", "0")
           .replace("<pass predicate and observed result>", "endpoint healthy")
           .replace(INSTANT_PLACEHOLDER, FIRST_INSTANT)
           .replace(INSTANT_PLACEHOLDER, SECOND_INSTANT);
@@ -6572,6 +6574,173 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     describe("record-only pass contradictions", () => {
+      describe("structured probe-run counters", () => {
+        const SWITCH = "PAPERCLIP_RECORD_ONLY_PROBE_COUNTERS_REQUIRED";
+        const withPredicate = (predicate: string) => RECORD_ONLY_EVIDENCE.replace(
+          /result: pass .+$/, `result: pass ${predicate}`,
+        );
+        const evaluatePredicate = (predicate: string) => evaluateDoneTierDeclaration(
+          mockDb, recordOnlyTierIssue(), tier2Line(withPredicate(predicate)),
+          null, () => Promise.resolve([]),
+        );
+
+        beforeEach(() => {
+          vi.stubEnv(SWITCH, undefined);
+          vi.mocked(logger.warn).mockClear();
+        });
+        afterEach(() => vi.unstubAllEnvs());
+
+        // Verbatim declaration lines from the measured window. The truthful
+        // prose-only record is intentionally undetermined until it adds counts.
+        const windowDeclarations = {
+          "SUP-25216": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform, TEA-Core/paperclip-agent-tools, TEA-Core/paperclip, TEA-Core/paperclip-smart-router observed 2026-11-25T07:02:08Z result: pass fresh read of latest alarm workflow run #45560189666 shows completed success at 2026-11-25T06:23:45Z; scan result from this cycle failed closed across all four repositories due unavailable check-run App token; armed=0, overrides=0. Existing TEA-Core/paperclip #1255 remains unqueued on fold/tea-patches-v2026.722.0. The sweep record is the deliverable.",
+          "SUP-25218": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform main, TEA-Core/paperclip-agent-tools main, TEA-Core/paperclip fold/tea-patches-v2026.722.0 queues and unenqueued-green-pr-alarm observed 2026-11-25T08:02:19Z-2026-11-25T08:02:48Z result: pass queue censuses remained empty and latest alarm run 45566757696 succeeded; scan failed in all four repos for unavailable check-run App token, armed=0, no step-5 overrides.",
+          "SUP-25220": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target GitHub merge queues and unenqueued-green-pr-alarm observed 2026-11-25T09:02:17Z-2026-11-25T09:02:51Z result: pass scan completed; armed=0 due to unavailable check-run App token; queues read; alarm success.",
+          "SUP-25223": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target TEA-Core/Trading-Signal-Platform, TEA-Core/paperclip-agent-tools, TEA-Core/paperclip, TEA-Core/paperclip-smart-router observed 2026-11-25T11:00:28Z-2026-11-25T11:03:15Z result: pass documented the scan failure (all four repos unevaluated: required check-run App token unavailable), armed=0, no step-5 refusals or overrides, alarm latest scheduled run success (2026-11-25T10:14:00Z), and confirmed existing TEA-Core/paperclip #1255 has no mergeQueueEntry and its base queue had zero entries. No arming authorization was inferred from status data; the pre-scan census was omitted because armed=0 and overrides=0.",
+          "SUP-25212": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target GitHub merge queues for TEA-Core/Trading-Signal-Platform/main, TEA-Core/paperclip-agent-tools/main, TEA-Core/paperclip/fold/tea-patches-v2026.722.0 and unenqueued-green-pr-alarm workflow observed 2026-11-25T06:04:00Z-2026-11-25T06:06:03Z result: pass scan exit 0, failed=0, armed=0, all sampled merge queues empty before and after, and latest alarm workflow run completed success",
+          "SUP-25225": "Closed at Tier 2 (live): record-only probe `node scripts/ci/unenqueued-green-pr-scan.mjs --arm` target four configured repositories and all matched heads observed 2026-11-25T12:09:14Z-2026-11-25T12:10:16Z result: pass scan completed across 4 repositories with 0 failures; all 15 matched heads were refused by sanctioned hand-vet and no arms were issued (`armed=0`); all eligible queues were empty before and after; TSP alarm latest run completed success at 11:13:37Z.",
+        };
+
+        it.each([
+          ["SUP-25216", false], ["SUP-25218", false], ["SUP-25220", false],
+          ["SUP-25223", false], ["SUP-25212", true], ["SUP-25225", false],
+        ] as const)("judges verbatim %s using only its asserted probe-run counters", async (card, allowed) => {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), windowDeclarations[card],
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(allowed);
+          if (allowed) {
+            expect(result.tier2Audit?.tierForm).toBe("record-only");
+          } else {
+            expect(result.code).toBe("done_transition_record_only_probe_missing_counter");
+            expect(result.remedy).toContain("exit <exit code>");
+            expect(result.tier2Audit).toBeUndefined();
+          }
+        });
+
+        it("accepts the truthful prose record after it declares its computed probe-run counters", async () => {
+          const declaration = windowDeclarations["SUP-25225"].replace(
+            "result: pass ", "result: pass failed=0 scanned=4 ",
+          );
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), declaration,
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(true);
+          expect(result.tier2Audit?.tierForm).toBe("record-only");
+        });
+
+        it("logs and accepts the verbatim truthful prose record in missing-counter fallback mode", async () => {
+          vi.stubEnv(SWITCH, "off");
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), windowDeclarations["SUP-25225"],
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(true);
+          expect(logger.warn).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: "done_transition_record_only_probe_missing_counter", mode: "log_only",
+            }),
+            expect.stringContaining("undetermined: no probe-run counter"),
+          );
+        });
+
+        it("refuses exit 2 and failed=4 with a counter reason, without failure prose", async () => {
+          const result = await evaluatePredicate("exit 2 failed=4");
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+          expect(result.reason).toContain("probe-run counter exit=2");
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it.each([
+          ["exit 2; failed=4", "exit=2"],
+          ["failed=4", "failed=4"],
+          ["scanned=0", "scanned=0"],
+          ["unevaluated=4", "unevaluated=4"],
+          ["exit 0; exit 2", "exit=2"],
+          ["unevaluated=1e-400", "unevaluated=1e-400"],
+        ])("refuses contradictory counters before prose markers: %s", async (predicate, counter) => {
+          const result = await evaluatePredicate(`${predicate}; REFUSED`);
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+          expect(result.reason).toContain(`probe-run counter ${counter}`);
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it.each(["exit 0", "failed=0", "scanned=4", "unevaluated=0", "UNEVALUATED=-0.0"])(
+          "accepts a consistent probe-run counter alone: %s",
+          async (predicate) => {
+            const result = await evaluatePredicate(predicate);
+            expect(result.allowed).toBe(true);
+            expect(result.tier2Audit?.tierForm).toBe("record-only");
+          },
+        );
+
+        it.each([
+          "endpoint healthy",
+          "overrides=0 armed=0",
+          "scan failed in all four repos for unavailable check-run App token; overrides=0 armed=0",
+          "preexit 0 prescanned=4 unfailed=0 notunevaluated=0",
+        ])("refuses missing probe-run counters through the numeric path: %s", async (predicate) => {
+          const result = await evaluatePredicate(predicate);
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_missing_counter");
+          expect(result.reason).toContain("undetermined: no probe-run counter");
+          expect(result.remedy).toContain("Add at least one observed probe-run counter");
+          expect(result.remedy).toContain("exit <exit code>");
+          expect(result.remedy).toContain(TIER2_RECORD_ONLY_FORM);
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("does not borrow counters from the command, target, or other comment lines", async () => {
+          const evidence = withPredicate("overrides=0 armed=0")
+            .replace("`curl -fsS https://ops.example.com/api/sweep/healthz`", "`echo exit 0`")
+            .replace("target https://ops.example.com", "target scanned=4 failed=0");
+          const result = await evaluateDoneTierDeclaration(
+            mockDb, recordOnlyTierIssue(), `${tier2Line(evidence)}\nScan: exit 0 scanned=4`,
+            null, () => Promise.resolve([]),
+          );
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_missing_counter");
+        });
+
+        it.each(["0", "false", "OFF", " no "])("logs and accepts missing counters when disabled with %s", async (off) => {
+          vi.stubEnv(SWITCH, off);
+          const result = await evaluatePredicate("overrides=0 armed=0");
+          expect(result.allowed).toBe(true);
+          expect(result.tier2Audit?.tierForm).toBe("record-only");
+          expect(logger.warn).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: "done_transition_record_only_probe_missing_counter",
+              mode: "log_only",
+              remedy: expect.stringContaining("exit <exit code>"),
+            }),
+            expect.stringContaining("undetermined: no probe-run counter"),
+          );
+        });
+
+        it("keeps missing-counter enforcement on for an empty switch", async () => {
+          vi.stubEnv(SWITCH, "");
+          const result = await evaluatePredicate("overrides=0 armed=0");
+          expect(result.allowed).toBe(false);
+          expect(result.code).toBe("done_transition_record_only_probe_missing_counter");
+          expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it.each(["exit 2 failed=4", "unevaluated=4", "REFUSED"])(
+          "does not disable numeric or secondary contradictions: %s",
+          async (predicate) => {
+            vi.stubEnv(SWITCH, "false");
+            const result = await evaluatePredicate(predicate);
+            expect(result.allowed).toBe(false);
+            expect(result.code).toBe("done_transition_record_only_probe_contradiction");
+            expect(result.tier2Audit).toBeUndefined();
+          },
+        );
+      });
+
       it.each([
         ["exit_nonzero", "exit 2"],
         ["exited_nonzero", "exited 2"],
@@ -6820,7 +6989,7 @@ describe("evaluateDoneTierDeclaration", () => {
         mockDb,
         recordOnlyTierIssue(),
         tier2Line(
-          `record-only probe \`curl -fsS https://ops.example.com/healthz\` target https://ops.example.com observed ${observation} result: ${verdict} endpoint healthy`,
+          `record-only probe \`curl -fsS https://ops.example.com/healthz\` target https://ops.example.com observed ${observation} result: ${verdict} exit 0 endpoint healthy`,
         ),
         null,
         () => Promise.resolve([]),
@@ -6881,7 +7050,7 @@ describe("evaluateDoneTierDeclaration", () => {
         mockDb,
         recordOnlyTierIssue(),
         tier2Line(
-          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2024-02-29T23:59:59Z result: pass endpoint healthy",
+          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2024-02-29T23:59:59Z result: pass exit 0 endpoint healthy",
         ),
         null,
         () => Promise.resolve([]),
@@ -7050,7 +7219,7 @@ describe("evaluateDoneTierDeclaration", () => {
       }
 
       function evidenceObservedAt(observation: string) {
-        return `record-only probe \`curl -fsS https://ops.example.com/api/sweep/healthz\` target https://ops.example.com observed ${observation} result: pass active recovery action null`;
+        return `record-only probe \`curl -fsS https://ops.example.com/api/sweep/healthz\` target https://ops.example.com observed ${observation} result: pass exit 0 active recovery action null`;
       }
 
       it("refuses an observation predating the closing run's start, naming the run and its start", async () => {
@@ -7209,7 +7378,7 @@ describe("evaluateDoneTierDeclaration", () => {
         const CLOSE_WRITE_AT = "2026-11-14T08:19:28.726Z";
 
         function probeEvidenceObservedAt(observation: string) {
-          return `record-only probe \`git status --porcelain=v1 && git diff --exit-code\` target SUP-24211 execution workspace observed ${observation} result: pass clean worktree with no tracked changes`;
+          return `record-only probe \`git status --porcelain=v1 && git diff --exit-code\` target SUP-24211 execution workspace observed ${observation} result: pass exit 0 clean worktree with no tracked changes`;
         }
 
         async function closeAt(observation: string, runStartedAt = "2026-11-14T08:00:00Z") {
@@ -7614,9 +7783,6 @@ describe("evaluateDoneTierDeclaration", () => {
       // SUP-22801: the record-only classification of the structured forms —
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
-      expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
-      );
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);

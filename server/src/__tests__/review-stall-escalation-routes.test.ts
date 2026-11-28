@@ -1846,7 +1846,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   );
 
   const recordOnlyProbeEvidence =
-    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass exit 0 the sweep consumption point served 42 fresh records";
 
   it("refuses a stale final approval after a board reassign unseats the participant", async () => {
     const seeded = await seedCompany();

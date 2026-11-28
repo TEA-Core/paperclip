@@ -191,7 +191,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
     }).where(eq(issues.id, issue.id));
     const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
       status,
-      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe(status);
@@ -222,7 +222,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
     }).where(eq(issues.id, issue.id));
     const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
       status,
-      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
     });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe(status);
@@ -256,7 +256,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
     };
     const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`).send({
       status: "done",
-      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+      comment: "Closed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
     });
     const clears = (await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id)))
       .filter((row) => row.action === "issue.monitor_cleared");
@@ -307,7 +307,7 @@ describePostgres("monitor PATCH persisted authorization", () => {
       runId: approverRun!.id, source: "agent_jwt",
     };
     const res = await request(await appFor(approverActor)).post(`/api/issues/${issue.id}/comments`).send({
-      body: "## Review: APPROVED\n\nClosed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass verification fixture accepted",
+      body: "## Review: APPROVED\n\nClosed at Tier 2 (live): record-only probe `fixture-check` target fixture observed 2026-11-04T09:15:00Z result: pass exit 0 verification fixture accepted",
     });
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const closed = await stored(issue.id);

@@ -77,7 +77,7 @@ const finish = async (message) => {
     status: "done",
     doneTier: {
       tier: "tier2",
-      probeEvidence: "record-only probe \`GET /api" + path + "\` target " + base + path + " observed " + observed + " result: pass current run's result comment was read back",
+      probeEvidence: "record-only probe \`GET /api" + path + "\` target " + base + path + " observed " + observed + " result: pass exit 0 current run's result comment was read back",
     },
   });
   if (closed.status !== "done") throw new Error("Connection review task did not close");
