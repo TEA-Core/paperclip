@@ -803,7 +803,9 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `project.workspaces.read`
 - `issues.read`
 - `issue.comments.read`
-- `issue.documents.read`
+- `issue.documents.read`: an explicit content grant; the plugin receives issue documents in full, even without `issues.read`
+- `issue.interactions.read`: an explicit content grant; the plugin receives issue interactions in full, even without `issues.read`
+- `issue.attachments.read`: an explicit content grant; the plugin receives issue attachments in full, even without `issues.read`
 - `issue.relations.read`
 - `issue.subtree.read`
 - `agents.read`
@@ -948,7 +950,7 @@ The same rule covers these read paths when a plugin has the path's own capabilit
 - `ctx.authorization.audit.search` (`authorization.audit.read`): the `details` of an entry about an issue carry only the issue title and allow-listed metadata, and the `details` of an entry about a run follow the run rule above. Entries about other entities are unchanged.
 - `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, without `error`. Relations, approvals, costs, budget incidents and invocation blocks are unchanged.
 
-Issue documents, interactions and attachments are governed by their own capabilities (`issue.documents.read`, `issue.interactions.read`, `issue.attachments.read`), pending a separate decision.
+Issue documents, interactions and attachments are governed by their own capabilities (`issue.documents.read`, `issue.interactions.read`, `issue.attachments.read`). Granting one of them is an explicit content grant: a plugin with that capability receives the documents, interactions or attachments in full, even without `issues.read`.
 
 A plugin with `issues.read` receives every read path unchanged.
 
