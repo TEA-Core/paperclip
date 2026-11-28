@@ -640,3 +640,42 @@ reservation cannot silently disappear. Failed cleanup or an ambiguous storage
 write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
+
+## Issue monitor recovery claims
+
+`issue_monitor_recovery_claims` holds one row per exhaustion of an issue's
+external-service monitor, unique per issue and `arm_generation`. The
+`issues_bump_monitor_arm_generation` trigger increments
+`issues.monitor_arm_generation` (`bigint`, never reset) on every monitor arm or
+re-arm. In the same transaction, it deletes the issue's claims for earlier
+generations. Only the current arm's claim is read, so superseded claims do not
+accumulate. The trigger skips a claim that a recovery tick holds locked, so the
+re-arm does not wait on that tick. A skipped claim, and a claim that a tick
+inserts for an arm that a concurrent re-arm has just replaced, stay until a later
+arm of the issue.
+
+`company_id` keeps ON DELETE NO ACTION, like the other issue-keyed bookkeeping
+tables (`issue_recovery_actions`, `issue_read_states`, `issue_relations`). A claim
+is deleted with its issue (`issue_id` cascades), and company deletion deletes
+the company's issues before the company row.
+
+Migration 0335 widens `monitor_arm_generation` to `bigint` without a table
+rewrite. It adds a `bigint` column with a constant default, copies only the
+generations that are not 0, drops the `integer` column, and renames the new
+column. It holds ACCESS EXCLUSIVE on `issues` for its whole transaction. With
+1,000,000 issues, the measured window is 0.33 s when no generation is set yet,
+0.81 s with 1,000 armed issues, and 18.4 s with 50,000 armed issues (about
+0.35 ms per armed issue, with every `issues` index updated). An `ALTER COLUMN ...
+TYPE bigint` rewrote the same table in 86-95 s.
+
+On the same dataset, migration 0333 holds ACCESS EXCLUSIVE on `issues` for
+10-16 ms. It does not rewrite the table and does not backfill rows. The new
+column has a constant default, and `pg_relation_filenode('issues')` does not
+change.
+
+The 1,000,000-row dataset is synthetic. A synthetic dataset is the accepted
+method for a production-size measurement. The operator measured the real
+production scale with read-only queries: 16,408 issues, of which 35 are armed
+(`monitor_next_check_at` is set). Production is far below the 1,000,000-row and
+50,000-armed test sizes. Thus, by extrapolation and not by measurement, the
+0335 window in production is expected to be in the low milliseconds.

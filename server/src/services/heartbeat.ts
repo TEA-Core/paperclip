@@ -12823,7 +12823,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       )
       .limit(1);
-    return existing!;
+    if (!existing) throw new IssueMonitorRearmedDuringRecovery();
+    return existing;
   }
 
   // Records on the claim the part of the effect that committed outside the completion

@@ -29,6 +29,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { activityService } from "../services/activity.ts";
+import { companyService } from "../services/companies.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { logger } from "../middleware/logger.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
@@ -607,7 +608,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     // Applies the owner's policy PATCH the way the issues route does: stamp the
     // actor's scheduledBy, run the policy transition, persist policy + patch.
-    async function rearm(issueId: string, scheduledBy: "assignee" | "board", monitor: Record<string, unknown>) {
+    async function rearm(
+      issueId: string,
+      scheduledBy: "assignee" | "board",
+      monitor: Record<string, unknown>,
+      executor: Pick<typeof db, "update"> = db,
+    ) {
       const issue = await readIssue(issueId);
       const policy = setIssueExecutionPolicyMonitorScheduledBy(
         normalizeIssueExecutionPolicy({ stages: [], monitor: { nextCheckAt: rearmCheckAt, ...monitor } }),
@@ -621,7 +627,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         actor: { agentId: issue.assigneeAgentId },
         monitorExplicitlyUpdated: true,
       });
-      await db
+      await executor
         .update(issues)
         .set({ executionPolicy: policy as unknown as Record<string, unknown>, ...patch })
         .where(eq(issues.id, issueId));
@@ -1393,6 +1399,61 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
     });
 
+    it("a retry whose existing claim is pruned by a concurrent re-arm skips as re-armed", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function test_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'injected completion fault'; end $$;
+        create trigger test_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function test_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_completion_fault on activity_log; drop function if exists test_completion_fault();",
+          ),
+        );
+      }
+      expect(
+        await db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.issueId, issueId)),
+      ).toHaveLength(1);
+
+      await db.execute(sql.raw(`
+        create or replace function test_prune_conflicting_claim() returns trigger language plpgsql as $$
+        begin
+          delete from issue_monitor_recovery_claims
+            where issue_id = new.issue_id and arm_generation = new.arm_generation;
+          return null;
+        end $$;
+        create trigger test_prune_conflicting_claim before insert on issue_monitor_recovery_claims
+          for each row execute function test_prune_conflicting_claim();
+      `));
+      const error = vi.spyOn(logger, "error");
+      try {
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect(error.mock.calls.filter((call) => call[1] === "issue monitor tick failed")).toHaveLength(0);
+      } finally {
+        error.mockRestore();
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_prune_conflicting_claim on issue_monitor_recovery_claims; drop function if exists test_prune_conflicting_claim();",
+          ),
+        );
+      }
+
+      const after = await readIssue(issueId);
+      expect(after.monitorWakeRequestedAt).not.toBeNull();
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
+
     // A re-arm that commits while the recovery effect runs must survive: the completion
     // clear is guarded on the claimed arm and rolls back instead of overwriting it.
     it("a re-arm committed during the recovery effect is kept and the exhaustion is not recorded", async () => {
@@ -1425,6 +1486,54 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
       expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
       expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
+
+    it("escalate_to_board: a concurrent re-arm does not wait on the claim the recovery holds locked", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "escalate_to_board" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      const rearmedAt = "2026-04-11T15:00:00.000Z";
+
+      const gateKey = 731_002;
+      const gateHeld = deferred<void>();
+      const gateRelease = deferred<void>();
+      const gate = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(${gateKey})`);
+        gateHeld.resolve();
+        await gateRelease.promise;
+      });
+      await gateHeld.promise;
+      await db.execute(sql.raw(`
+        create or replace function test_hold_escalation() returns trigger language plpgsql as $$
+        begin perform pg_advisory_xact_lock_shared(${gateKey}); return new; end $$;
+        create trigger test_hold_escalation after insert on issue_comments
+          for each row when (new.issue_id = '${issueId}') execute function test_hold_escalation();
+      `));
+      let tick: Promise<unknown> | undefined;
+      try {
+        tick = heartbeat.tickTimers(recoveryTickAt);
+        await waitForLockWaiters(1);
+        await db.transaction(async (tx) => {
+          await tx.execute(sql`set local lock_timeout = '5s'`);
+          await rearm(issueId, "assignee", { ...monitor, nextCheckAt: rearmedAt }, tx);
+        });
+      } finally {
+        gateRelease.resolve();
+        await gate;
+        await tick;
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_hold_escalation on issue_comments; drop function if exists test_hold_escalation();",
+          ),
+        );
+      }
+      await heartbeat.drainActiveRunExecutions();
+
+      const after = await readIssue(issueId);
+      expect(after.monitorNextCheckAt?.toISOString()).toBe(rearmedAt);
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
     });
 
     it("timeout: an agent re-arm after timeoutAt still reaches the recovery", async () => {
@@ -1479,6 +1588,207 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
       expect(await exhaustionRows(issueId)).toHaveLength(1);
       expect(await recoveryWakeups(agentId)).toHaveLength(1);
+    });
+
+    // A wait inside Postgres emits no event, so poll pg_stat_activity until `count`
+    // sessions wait on a lock, and return the statement each one is running.
+    async function waitForLockWaiters(count: number) {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const waiters = (await db.execute(sql`
+          select wait_event as "waitEvent", query from pg_stat_activity
+          where wait_event_type = 'Lock' and datname = current_database()
+        `)) as unknown as Array<{ waitEvent: string; query: string }>;
+        if (waiters.length >= count) return waiters;
+        if (Date.now() > deadline) throw new Error(`expected ${count} lock waiter(s), saw ${JSON.stringify(waiters)}`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    const claimInsert = 'insert into "issue_monitor_recovery_claims"';
+    // `Promise.withResolvers` is not in this suite's TypeScript lib.
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((settle) => {
+        resolve = settle;
+      });
+      return { promise, resolve };
+    }
+
+    // The per-issue advisory lock keeps two scheduler ticks from reaching the claim
+    // insert together, so the overlapping-tick test above never makes two inserts of
+    // one claim collide. Here a second claimant holds an uncommitted claim for the same
+    // arm while the tick inserts its own: the tick's insert waits on that row, and
+    // exactly one of the two claims survives whichever way the other one ends.
+    it.each(["commit", "rollback"] as const)(
+      "two claim inserts for the same arm collide and exactly one claim wins (competitor %ss)",
+      async (competitorEnd) => {
+        const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+        const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+        await rearm(issueId, "assignee", monitor);
+        const armed = await readIssue(issueId);
+
+        const competitorRelease = deferred<void>();
+        const competitorClaim = deferred<string>();
+        const competitorRolledBack = new Error("competitor rolled back");
+        const competitor = db
+          .transaction(async (tx) => {
+            const [row] = await tx
+              .insert(issueMonitorRecoveryClaims)
+              .values({
+                companyId,
+                issueId,
+                armGeneration: armed.monitorArmGeneration,
+                clearReason: "max_attempts_exhausted",
+                scheduledAt: armed.monitorNextCheckAt!,
+                recoveryPolicy: "create_recovery_issue",
+              })
+              .returning({ id: issueMonitorRecoveryClaims.id });
+            competitorClaim.resolve(row!.id);
+            await competitorRelease.promise;
+            if (competitorEnd === "rollback") throw competitorRolledBack;
+          })
+          .catch((err) => {
+            if (err !== competitorRolledBack) throw err;
+          });
+        const competitorId = await competitorClaim.promise;
+
+        const tick = heartbeat.tickTimers(recoveryTickAt);
+        // Release the competitor only once the tick's own claim insert is blocked on it.
+        try {
+          const [waiter] = await waitForLockWaiters(1);
+          expect(waiter!.query.startsWith(claimInsert)).toBe(true);
+        } finally {
+          competitorRelease.resolve();
+        }
+        await Promise.all([competitor, tick]);
+        await heartbeat.drainActiveRunExecutions();
+
+        const claims = await db
+          .select()
+          .from(issueMonitorRecoveryClaims)
+          .where(eq(issueMonitorRecoveryClaims.issueId, issueId));
+        expect(claims).toHaveLength(1);
+        const [winner] = claims;
+        if (competitorEnd === "commit") expect(winner!.id).toBe(competitorId);
+        else expect(winner!.id).not.toBe(competitorId);
+        // The tick recorded its effect on the winning claim, whichever claimant won it.
+        expect(winner).toMatchObject({
+          armGeneration: armed.monitorArmGeneration,
+          recoveryOutcome: "recovery_issue_created",
+        });
+        expect(winner!.recoveryIssueId).not.toBeNull();
+        expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
+      },
+    );
+
+    // Two overlapping ticks of one due arm, held at the first tick's claim insert: the
+    // second waits on the per-issue lock instead of inserting a second claim, then finds
+    // the monitor cleared and runs nothing.
+    it("an overlapping tick waits for the arm's first claimant and never inserts a second claim", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, agentId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      const gateKey = 731_001;
+      const gateHeld = deferred<void>();
+      const gateRelease = deferred<void>();
+      const gate = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(${gateKey})`);
+        gateHeld.resolve();
+        await gateRelease.promise;
+      });
+      await gateHeld.promise;
+      await db.execute(sql.raw(`
+        create or replace function test_hold_monitor_claim() returns trigger language plpgsql as $$
+        begin perform pg_advisory_xact_lock_shared(${gateKey}); return new; end $$;
+        create trigger test_hold_monitor_claim after insert on issue_monitor_recovery_claims
+          for each row execute function test_hold_monitor_claim();
+      `));
+      const ticks: Promise<unknown>[] = [];
+      try {
+        ticks.push(heartbeat.tickTimers(recoveryTickAt));
+        const [first] = await waitForLockWaiters(1);
+        expect(first!.query.startsWith(claimInsert)).toBe(true);
+        // Past the first dispatch claim's staleness window, so this tick claims the same row.
+        ticks.push(heartbeat.tickTimers(new Date("2026-04-11T13:10:00.000Z")));
+        const waiters = await waitForLockWaiters(2);
+        expect(waiters.filter((waiter) => waiter.query.startsWith(claimInsert))).toHaveLength(1);
+        expect(waiters.some((waiter) => waiter.query.includes("pg_advisory_xact_lock(hashtextextended("))).toBe(true);
+      } finally {
+        gateRelease.resolve();
+        await gate;
+        await Promise.allSettled(ticks);
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_hold_monitor_claim on issue_monitor_recovery_claims; drop function if exists test_hold_monitor_claim();",
+          ),
+        );
+      }
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(
+        await db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.issueId, issueId)),
+      ).toHaveLength(1);
+      expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
+    });
+
+    it("a re-arm deletes the claims of superseded arm generations and keeps the current one", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.drainActiveRunExecutions();
+
+      const claimsFor = () =>
+        db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.issueId, issueId));
+      const recovered = await readIssue(issueId);
+      expect(await claimsFor()).toEqual([expect.objectContaining({ armGeneration: recovered.monitorArmGeneration })]);
+
+      // A write that does not arm keeps the claim of the current generation.
+      await db.update(issues).set({ title: "Watch external deploy (renamed)" }).where(eq(issues.id, issueId));
+      expect(await claimsFor()).toHaveLength(1);
+
+      await rearm(issueId, "board", { maxAttempts: 5, recoveryPolicy: "wake_owner" });
+      const rearmed = await readIssue(issueId);
+      expect(rearmed.monitorArmGeneration).toBe(recovered.monitorArmGeneration + 1);
+      expect(await claimsFor()).toHaveLength(0);
+    });
+
+    it("arms and claims past the 32-bit generation range", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      // Not an arm: the monitor is cleared, so the trigger leaves the generation alone.
+      await db.execute(sql`update issues set monitor_arm_generation = 2147483647 where id = ${issueId}`);
+
+      await rearm(issueId, "assignee", monitor);
+      expect((await readIssue(issueId)).monitorArmGeneration).toBe(2_147_483_648);
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.drainActiveRunExecutions();
+
+      const claims = await db
+        .select()
+        .from(issueMonitorRecoveryClaims)
+        .where(eq(issueMonitorRecoveryClaims.issueId, issueId));
+      expect(claims).toEqual([expect.objectContaining({ armGeneration: 2_147_483_648, recoveryOutcome: "owner_wake_queued" })]);
+      expect(await exhaustionRows(issueId)).toHaveLength(1);
+    });
+
+    // `company_id` keeps ON DELETE NO ACTION: the claim goes with its issue, and company
+    // deletion deletes the issues before the company row.
+    it("deleting the company removes its recovery claims with its issues", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "wake_owner" };
+      const { issueId, companyId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+      await heartbeat.tickTimers(recoveryTickAt);
+      await heartbeat.drainActiveRunExecutions();
+      expect(
+        await db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.companyId, companyId)),
+      ).toHaveLength(1);
+
+      expect(await companyService(db).remove(companyId)).toMatchObject({ id: companyId });
+      expect(
+        await db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.companyId, companyId)),
+      ).toHaveLength(0);
     });
   });
 

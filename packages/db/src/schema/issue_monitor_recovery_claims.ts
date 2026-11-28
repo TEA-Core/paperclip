@@ -1,4 +1,4 @@
-import { boolean, index, integer, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { bigint, boolean, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 
@@ -11,6 +11,16 @@ import { issues } from "./issues.js";
  * monitored issue's `monitor_arm_generation`, which every arm or re-arm of the
  * monitor increments; one arm exhausts at most once, so each later, separate
  * exhaustion gets its own claim.
+ *
+ * Only the current arm's claim is ever read. The arm trigger (migration 0335) deletes
+ * the issue's claims for earlier generations in the same transaction that arms the
+ * new generation, so superseded claims do not accumulate. It skips a claim that a
+ * recovery tick holds locked, so the re-arm never waits on it; a later arm deletes it.
+ *
+ * `company_id` keeps the default ON DELETE NO ACTION, like the other issue-keyed
+ * bookkeeping tables (`issue_recovery_actions`, `issue_read_states`,
+ * `issue_relations`): a claim is removed with its issue (`issue_id` cascades), and
+ * company deletion deletes the company's issues before the company row.
  */
 export const issueMonitorRecoveryClaims = pgTable(
   "issue_monitor_recovery_claims",
@@ -18,7 +28,7 @@ export const issueMonitorRecoveryClaims = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
-    armGeneration: integer("arm_generation").notNull(),
+    armGeneration: bigint("arm_generation", { mode: "number" }).notNull(),
     clearReason: text("clear_reason").notNull(),
     scheduledAt: timestamp("scheduled_at", { withTimezone: true }).notNull(),
     recoveryPolicy: text("recovery_policy").notNull(),
