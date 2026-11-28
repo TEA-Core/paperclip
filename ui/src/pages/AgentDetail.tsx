@@ -993,8 +993,20 @@ export function AgentDetail() {
 
   useEffect(() => {
     if (!agent) return;
+    // The agent query key includes the route reference. Redirecting from the UUID
+    // to the URL key would otherwise start an empty query, so the page would fall
+    // back to its loading skeleton and remount, discarding in-flight action state
+    // such as a retry's feedback. Seed the canonical key with the loaded agent.
+    const seedCanonicalAgent = () => {
+      if (routeAgentRef === canonicalAgentRef) return;
+      queryClient.setQueryData(
+        [...queryKeys.agents.detail(canonicalAgentRef), lookupCompanyId ?? null],
+        agent,
+      );
+    };
     if (urlRunId) {
       if (routeAgentRef !== canonicalAgentRef) {
+        seedCanonicalAgent();
         navigate(`/agents/${canonicalAgentRef}/runs/${urlRunId}`, { replace: true });
       }
       return;
@@ -1002,10 +1014,11 @@ export function AgentDetail() {
     if (legacyAuditSection) return;
     const canonicalTab = activeView === "run-detail" ? "overview" : activeView;
     if (routeAgentRef !== canonicalAgentRef || urlTab !== canonicalTab) {
+      seedCanonicalAgent();
       navigate(agentDetailHref(canonicalAgentRef, canonicalTab), { replace: true });
       return;
     }
-  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, legacyAuditSection, navigate]);
+  }, [agent, routeAgentRef, canonicalAgentRef, lookupCompanyId, queryClient, urlRunId, urlTab, activeView, legacyAuditSection, navigate]);
 
   useEffect(() => {
     if (!agent?.companyId || agent.companyId === selectedCompanyId) return;
