@@ -71,11 +71,14 @@ export function pluginIssueRecordForRecipient<T extends object>(record: T): T {
  * its free-form `error` and `message` text. An entry about an environment
  * lease loses its `failureReason`, which carries the run's error text. A plugin that can read issues
  * receives the payload unchanged, as it does an entry about any other entity.
+ * `runIssueId`, when given, is the run's resolved issue; otherwise the
+ * payload's own `issueId` names it.
  */
 export function pluginEntityPayloadForRecipient(
   entityType: string,
   payload: Record<string, unknown>,
   canReadIssue: boolean,
+  runIssueId?: string | null,
 ): Record<string, unknown> {
   if (canReadIssue) return payload;
   if (entityType === "issue") {
@@ -84,7 +87,9 @@ export function pluginEntityPayloadForRecipient(
     return typeof issueTitle === "string" ? { ...metadata, issueTitle } : metadata;
   }
   if (entityType === "heartbeat_run") {
-    const issueId = typeof payload.issueId === "string" && payload.issueId.length > 0 ? payload.issueId : null;
+    const issueId = runIssueId !== undefined
+      ? runIssueId
+      : typeof payload.issueId === "string" && payload.issueId.length > 0 ? payload.issueId : null;
     return pluginRunPayloadForRecipient(payload, false, issueId);
   }
   if (entityType === "environment_lease" && "failureReason" in payload) {

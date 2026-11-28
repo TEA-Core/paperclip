@@ -302,6 +302,56 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     host.dispose();
   });
 
+  async function seedIssueRunAuditEntry(companyId: string, agentId: string, issueId: string) {
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-01-06T00:00:00Z"),
+      })
+      .returning();
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "user-1",
+      action: "heartbeat_run.watchdog_decision",
+      entityType: "heartbeat_run",
+      entityId: run!.id,
+      details: { status: "running", reason: `${RESTRICTED} watchdog reason` },
+      createdAt: new Date("2026-01-06T00:00:01Z"),
+    });
+    return run!.id;
+  }
+
+  it("resolves an audit entry's run issue from the run context for a plugin without issues.read", async () => {
+    const { companyId, rootId, agentId } = await seedTree();
+    const runId = await seedIssueRunAuditEntry(companyId, agentId, rootId);
+    const host = services(WITHOUT_ISSUES_READ);
+
+    const entries = await host.authorization.searchAudit({ companyId, entityId: runId });
+
+    expect(entries).toHaveLength(1);
+    expect(JSON.stringify(entries)).not.toContain(RESTRICTED);
+    expect(entries[0]?.details).toEqual({ status: "running" });
+    host.dispose();
+  });
+
+  it("returns an issue run's audit entry unchanged to a plugin with issues.read", async () => {
+    const { companyId, rootId, agentId } = await seedTree();
+    const runId = await seedIssueRunAuditEntry(companyId, agentId, rootId);
+    const host = services(WITH_ISSUES_READ);
+
+    const entries = await host.authorization.searchAudit({ companyId, entityId: runId });
+
+    expect(entries[0]?.details).toEqual({ status: "running", reason: `${RESTRICTED} watchdog reason` });
+    host.dispose();
+  });
+
   it("strips run error text from the orchestration summary for a plugin without issues.read", async () => {
     const { companyId, rootId, agentId } = await seedTree();
     const host = services(WITHOUT_ISSUES_READ);

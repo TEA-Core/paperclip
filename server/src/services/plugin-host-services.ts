@@ -3314,12 +3314,17 @@ export function buildHostServices(
           .limit(limit)
           .offset(offset);
         const canReadIssues = pluginCanReadIssues(options.manifest);
-        return rows.map((row) => {
-          const details = row.details && typeof row.details === "object"
-            ? pluginEntityPayloadForRecipient(row.entityType, sanitizeRecord(row.details), canReadIssues)
-            : row.details ?? null;
-          return { ...row, details };
-        });
+        return Promise.all(rows.map(async (row) => {
+          if (!row.details || typeof row.details !== "object") return { ...row, details: row.details ?? null };
+          const details = sanitizeRecord(row.details);
+          const resolvedRunIssueId = !canReadIssues && row.entityType === "heartbeat_run"
+            ? await runIssueId(companyId, { ...details, runId: row.entityId })
+            : undefined;
+          return {
+            ...row,
+            details: pluginEntityPayloadForRecipient(row.entityType, details, canReadIssues, resolvedRunIssueId),
+          };
+        }));
       },
     },
 
