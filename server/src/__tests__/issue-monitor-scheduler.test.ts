@@ -1394,6 +1394,61 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(await recoveryEffects(issueId, agentId, companyId)).toMatchObject({ exhaustions: 1, recoveryIssues: 1 });
     });
 
+    it("a retry whose existing claim is pruned by a concurrent re-arm skips as re-armed", async () => {
+      const monitor = { maxAttempts: 1, recoveryPolicy: "create_recovery_issue" };
+      const { issueId, heartbeat } = await armFireAndSettle(monitor);
+      await rearm(issueId, "assignee", monitor);
+
+      await db.execute(sql.raw(`
+        create or replace function test_completion_fault() returns trigger language plpgsql as $$
+        begin raise exception 'injected completion fault'; end $$;
+        create trigger test_completion_fault before insert on activity_log for each row
+          when (new.action = 'issue.monitor_exhausted') execute function test_completion_fault();
+      `));
+      try {
+        await heartbeat.tickTimers(recoveryTickAt);
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_completion_fault on activity_log; drop function if exists test_completion_fault();",
+          ),
+        );
+      }
+      expect(
+        await db.select().from(issueMonitorRecoveryClaims).where(eq(issueMonitorRecoveryClaims.issueId, issueId)),
+      ).toHaveLength(1);
+
+      await db.execute(sql.raw(`
+        create or replace function test_prune_conflicting_claim() returns trigger language plpgsql as $$
+        begin
+          delete from issue_monitor_recovery_claims
+            where issue_id = new.issue_id and arm_generation = new.arm_generation;
+          return null;
+        end $$;
+        create trigger test_prune_conflicting_claim before insert on issue_monitor_recovery_claims
+          for each row execute function test_prune_conflicting_claim();
+      `));
+      const error = vi.spyOn(logger, "error");
+      try {
+        await heartbeat.tickTimers(new Date("2026-04-11T13:02:00.000Z"));
+        await heartbeat.drainActiveRunExecutions();
+        expect(error.mock.calls.filter((call) => call[1] === "issue monitor tick failed")).toHaveLength(0);
+      } finally {
+        error.mockRestore();
+        await db.execute(
+          sql.raw(
+            "drop trigger if exists test_prune_conflicting_claim on issue_monitor_recovery_claims; drop function if exists test_prune_conflicting_claim();",
+          ),
+        );
+      }
+
+      const after = await readIssue(issueId);
+      expect(after.monitorWakeRequestedAt).not.toBeNull();
+      expect(after.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(await exhaustionRows(issueId)).toHaveLength(0);
+    });
+
     // A re-arm that commits while the recovery effect runs must survive: the completion
     // clear is guarded on the claimed arm and rolls back instead of overwriting it.
     it("a re-arm committed during the recovery effect is kept and the exhaustion is not recorded", async () => {
