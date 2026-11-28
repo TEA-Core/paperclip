@@ -556,6 +556,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 import {
+  deletedIssueActivityDetails,
   issueAccessDecisionInput,
   type IssueAccessAction,
   type IssueAccessTarget,
@@ -24670,6 +24671,7 @@ export function issueRoutes(
       action: "issue.deleted",
       entityType: "issue",
       entityId: issue.id,
+      details: deletedIssueActivityDetails(issue),
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);

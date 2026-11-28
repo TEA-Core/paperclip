@@ -24,6 +24,7 @@ import { logActivity, setPluginEventBus } from "../services/activity-log.js";
 import { publishLiveEvent } from "../services/live-events.js";
 import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { deletedIssueActivityDetails } from "../services/issue-access-input.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -720,6 +721,66 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
     expect(missing?.payload).toMatchObject({ action: "issue.deleted", details: null });
     expect(readerEvents.find((event) => event.payload.entityId === issue.id)?.payload.details)
       .toMatchObject({ description: RESTRICTED_DESCRIPTION });
+  });
+
+  it("keeps a deleted issue's title for a subscriber that could read it and withholds it from one that could not", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { scopedAgent, nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const scopedEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    // The rows are gone before the activity is published, as in DELETE /issues/:id.
+    const deletedDetails = new Map<string, Record<string, unknown>>();
+    for (const issue of [restrictedIssue, ownIssue]) {
+      const details = deletedIssueActivityDetails(issue);
+      deletedDetails.set(issue.id, details);
+      await db.delete(issues).where(eq(issues.id, issue.id));
+      await logActivity(db, {
+        companyId: company.id,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.deleted",
+        entityType: "issue",
+        entityId: issue.id,
+        details,
+      });
+    }
+    await logActivity(db, {
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: scopedAgent.id,
+      details: {},
+    });
+
+    const isAgentActivity = (event: LiveEvent) => event.payload.entityType === "agent";
+    await waitFor(() => scopedEvents.some(isAgentActivity));
+    await waitFor(() => readerEvents.some(isAgentActivity));
+
+    // Each subscriber is decided by the issue as the entry recorded it.
+    expect(readerEvents.find(isActivityFor(restrictedIssue.id))?.payload.details).toEqual(deletedDetails.get(restrictedIssue.id));
+    expect(readerEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual(deletedDetails.get(ownIssue.id));
+    expect(scopedEvents.find(isActivityFor(ownIssue.id))?.payload.details).toMatchObject({ title: ownIssue.title });
+    // A subscriber that could not read the issue keeps the entry's identifiers only.
+    expect(JSON.stringify(scopedEvents)).not.toContain(RESTRICTED_TITLE);
+    expect(scopedEvents.find(isActivityFor(restrictedIssue.id))?.payload).toMatchObject({
+      action: "issue.deleted",
+      entityType: "issue",
+      entityId: restrictedIssue.id,
+      details: null,
+    });
   });
 
   it("withholds the issue description from a plugin that cannot read the issue", async () => {
