@@ -8628,8 +8628,14 @@ registry.registerPath({
     "configured agent participant is unresponsive or absent. Flag-gated: unless " +
     "PAPERCLIP_BOARD_STAGE_OVERRIDE is true/1 the route responds 404 before any read. `approved` " +
     "completes the stage (and re-pends the next stage when one exists) without closing the card; " +
-    "`changes_requested` returns it to the return assignee and resets the round counter. A policy " +
-    "with no undecided stage returns 409 reason no_undecided_stage.",
+    "`changes_requested` returns it to the return assignee and resets the round counter. An `approved` " +
+    "decision on a card whose current stage is still pending although its latest durable decision row is " +
+    "already `approved` acts on that stage before any later stage. When that row is bound to the current " +
+    "delivered head and review round (and to the head the final delivery preflight certifies), the route " +
+    "reconciles the execution state from it: it records the row's id as lastDecisionId, writes no second " +
+    "decision row, logs issue.board_stage_reconciled and responds with `reconciled: true`. An unbound or " +
+    "stale row is never reused: the approval is recorded as a fresh decision by the board user, bound to the " +
+    "current head and round. Any other policy with no undecided stage returns 409 reason no_undecided_stage.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(

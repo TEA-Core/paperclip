@@ -47,6 +47,11 @@ if (!embeddedPostgresSupport.supported) {
 const STAGE_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_STAGE_ID = "22222222-2222-4222-8222-222222222222";
 const USER_ID = "cloud-user-1";
+// SUP-25518: delivered heads and review-round arm times for decision binding.
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+const ROUND_ONE = "2026-11-27T09:00:00.000Z";
+const ROUND_TWO = "2026-11-27T10:01:06.208Z";
 
 describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-15805)", () => {
   let db: Db;
@@ -152,6 +157,8 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     deliveryAuthorUserId?: string;
     /** Seed a changes_requested card parked on this current stage (A2: current-stage precedence). */
     changesRequestedStageId?: string;
+    /** Seed the pending round's delivered head and arm time (SUP-25518 decision binding). */
+    binding?: { headSha: string; round: string };
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -283,6 +290,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             lastDecisionId: null,
             lastDecisionOutcome: null,
             changesRequestedCount: 0,
+            ...(opts.binding ? { deliveredHeadSha: opts.binding.headSha, pendingSince: opts.binding.round } : {}),
           };
 
     await db.insert(issues).values({
@@ -594,6 +602,42 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       const rows = await userComments(issueId);
       expect(rows.map((r) => r.body)).toEqual([note]);
       expect(rows[0]!.id).toBe(approved.body.commentId);
+    });
+
+    it("a reconciled stage approval and the closing PATCH carrying the same note write one comment", async () => {
+      const { companyId, issueId } = await seedIssue({ binding: { headSha: HEAD_A, round: ROUND_ONE } });
+      currentActor = boardActor(companyId);
+      await db.insert(issueExecutionDecisions).values({
+        id: "c2000000-0000-4000-8000-000000000001",
+        companyId,
+        issueId,
+        stageId: STAGE_ID,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: USER_ID,
+        outcome: "approved",
+        body: "prior board approval",
+        createdByRunId: null,
+        deliveredHeadSha: HEAD_A,
+        reviewRoundStartedAt: new Date(ROUND_ONE),
+      });
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      expect(approved.body.reconciled).toBe(true);
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: note });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(true);
+      expect(closed.body.deduplicatedFromCommentId).toBe(approved.body.commentId);
+      expect(closed.body.comment).toBeNull();
+
+      const rows = await userComments(issueId);
+      expect(rows.map((r) => r.body)).toEqual([note]);
     });
 
     it("a closing PATCH with a different note still appends beside the stage decision note", async () => {
@@ -1077,14 +1121,17 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(calls[0]!.issueId).toBe(issueId);
   });
 
-  it("skips a stage that already has a durable approved decision row", async () => {
-    const { companyId, issueId } = await seedIssue({ twoStages: true });
+  it("reconciles a drifted first stage from its durable approved row and re-pends the second stage", async () => {
+    const { companyId, issueId } = await seedIssue({ twoStages: true, binding: { headSha: HEAD_A, round: ROUND_ONE } });
     currentActor = boardActor(companyId);
-    // The projection can lose completedStageIds (a board `done` PATCH clears it)
-    // while the durable approved row survives. The target selector must consult
-    // the row and never re-decide the stage.
+    const secondStageAgentId = "66666666-6666-4666-8666-666666666666";
+    // The drift shape: stage 1 carries a durable approved row bound to the
+    // current head and round while the projection is still pending on it
+    // (lastDecisionId null). The board approval applies that recorded approval
+    // to stage 1 only and hands stage 2 to its own participant.
+    const durableDecisionId = "77777777-7777-4777-8777-777777777777";
     await db.insert(issueExecutionDecisions).values({
-      id: "77777777-7777-4777-8777-777777777777",
+      id: durableDecisionId,
       companyId,
       issueId,
       stageId: STAGE_ID,
@@ -1094,20 +1141,166 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       outcome: "approved",
       body: "prior board approval",
       createdByRunId: null,
+      deliveredHeadSha: HEAD_A,
+      reviewRoundStartedAt: new Date(ROUND_ONE),
     });
 
     const res = await request(app)
       .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-      .send({ decision: "approved", comment: "board: approving on the reviewer's behalf" });
+      .send({ decision: "approved", comment: "board: reconcile the recorded approval" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.stageId).toBe(SECOND_STAGE_ID);
+    expect(res.body.stageId).toBe(STAGE_ID);
+    expect(res.body.decisionId).toBe(durableDecisionId);
+    expect(res.body.reconciled).toBe(true);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    expect(row!.assigneeAgentId).toBe(secondStageAgentId);
+    expect(row!.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: SECOND_STAGE_ID,
+      currentParticipant: { type: "agent", agentId: secondStageAgentId },
+      completedStageIds: [STAGE_ID],
+      lastDecisionId: durableDecisionId,
+    });
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions.map((decision) => decision.id)).toEqual([durableDecisionId]);
+  });
+
+  it("completes a pending stage from its durable approved row instead of refusing no_undecided_stage", async () => {
+    const { companyId, issueId, returnAssigneeAgentId } = await seedIssue({ binding: { headSha: HEAD_A, round: ROUND_ONE } });
+    currentActor = boardActor(companyId);
+    // The drift shape: the stage's latest durable verdict is `approved` and
+    // bound to the current head and round, but a later write re-pended it
+    // (pending, lastDecisionId null). A board approval reconciles the
+    // projection from that row and writes no second row.
+    const durableDecisionId = "c1000000-0000-4000-8000-000000000001";
+    await db.insert(issueExecutionDecisions).values({
+      id: durableDecisionId,
+      companyId,
+      issueId,
+      stageId: STAGE_ID,
+      stageType: "review",
+      actorAgentId: null,
+      actorUserId: USER_ID,
+      outcome: "approved",
+      body: "prior board approval",
+      createdByRunId: null,
+      createdAt: new Date("2026-09-01T00:00:00Z"),
+      deliveredHeadSha: HEAD_A,
+      reviewRoundStartedAt: new Date(ROUND_ONE),
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: reconcile the recorded approval" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(STAGE_ID);
+    expect(res.body.decisionId).toBe(durableDecisionId);
+    expect(res.body.reconciled).toBe(true);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect(row!.assigneeAgentId).toBe(returnAssigneeAgentId);
+    expect(row!.executionState).toMatchObject({
+      status: "completed",
+      currentStageId: null,
+      completedStageIds: [STAGE_ID],
+      lastDecisionId: durableDecisionId,
+      lastDecisionOutcome: "approved",
+    });
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions.map((decision) => decision.id)).toEqual([durableDecisionId]);
+
+    const reconciledActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_reconciled")));
+    expect(reconciledActivity).toHaveLength(1);
+    expect(reconciledActivity[0]!.details).toMatchObject({
+      stageId: STAGE_ID,
+      reconciledDecisionId: durableDecisionId,
+    });
+  });
+
+  it.each([
+    {
+      name: "the head moved after the approval",
+      row: { deliveredHeadSha: HEAD_A, reviewRoundStartedAt: new Date(ROUND_ONE) },
+    },
+    {
+      name: "the approval is an unbound (legacy) row",
+      row: { deliveredHeadSha: null, reviewRoundStartedAt: null },
+    },
+  ])("records a fresh head-bound board approval, never the old id, when $name", async ({ row: binding }) => {
+    // The stage re-armed for a new round on a new head after the old approval.
+    const { companyId, issueId, returnAssigneeAgentId } = await seedIssue({ binding: { headSha: HEAD_B, round: ROUND_TWO } });
+    currentActor = boardActor(companyId);
+    const staleDecisionId = "c1000000-0000-4000-8000-000000000002";
+    await db.insert(issueExecutionDecisions).values({
+      id: staleDecisionId,
+      companyId,
+      issueId,
+      stageId: STAGE_ID,
+      stageType: "review",
+      actorAgentId: "33333333-3333-4333-8333-333333333333",
+      actorUserId: null,
+      outcome: "approved",
+      body: "reviewer approval of the old head",
+      createdByRunId: null,
+      createdAt: new Date("2026-09-01T00:00:00Z"),
+      ...binding,
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+      .send({ decision: "approved", comment: "board: approve the current head" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stageId).toBe(STAGE_ID);
+    expect(res.body.decisionId).not.toBe(staleDecisionId);
+    expect(res.body.reconciled).not.toBe(true);
 
     const decisions = await db
       .select()
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisions).toHaveLength(2);
+    const fresh = decisions.find((decision) => decision.id !== staleDecisionId)!;
+    expect(fresh).toMatchObject({
+      id: res.body.decisionId,
+      stageId: STAGE_ID,
+      outcome: "approved",
+      actorAgentId: null,
+      actorUserId: USER_ID,
+      deliveredHeadSha: HEAD_B,
+      reviewRoundStartedAt: new Date(ROUND_TWO),
+    });
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueRow!.status).toBe("in_progress");
+    expect(issueRow!.assigneeAgentId).toBe(returnAssigneeAgentId);
+    expect(issueRow!.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: [STAGE_ID],
+      lastDecisionId: fresh.id,
+    });
+
+    const reconciledActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_reconciled")));
+    expect(reconciledActivity).toHaveLength(0);
   });
 
   it("wakes the return assignee when a board decision requests changes", async () => {

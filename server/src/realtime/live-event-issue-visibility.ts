@@ -2,8 +2,13 @@ import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issues } from "@paperclipai/db";
 import { isUuidLike, type LiveEvent, type LiveEventType } from "@paperclipai/shared";
+import { logger } from "../middleware/logger.js";
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
-import { issueAccessDecisionInput, type IssueAccessTarget } from "../services/issue-access-input.js";
+import {
+  deletedIssueAccessTarget,
+  issueAccessDecisionInput,
+  type IssueAccessTarget,
+} from "../services/issue-access-input.js";
 import {
   isRecord,
   issueEventMetadata,
@@ -25,6 +30,10 @@ import { createRunIssueLookup } from "../services/run-issue-lookup.js";
  * resolved goes in full only to a subscriber with company-wide read
  * (`company_scope:read`, the check run telemetry applies), and as metadata
  * otherwise. Activity about other entities goes to every subscriber unchanged.
+ *
+ * A lookup that fails (the issue row, the run's issue, or the read decision)
+ * denies: the subscriber receives what a subscriber that cannot read the
+ * issue receives, never the full event.
  */
 const LIVE_EVENT_ISSUE_SCOPE: Record<LiveEventType, "none" | "activity" | "run" | "goal"> = {
   "heartbeat.run.queued": "none",
@@ -110,20 +119,30 @@ export function createLiveEventIssueVisibility(db: Db) {
       const cached = decisions.get(key);
       if (cached && cached.expiresAt > now) return cached.allowed;
       if (decisions.size >= READ_DECISION_CACHE_LIMIT) decisions.clear();
-      const allowed = decide();
-      decisions.set(key, { allowed, expiresAt: now + READ_DECISION_TTL_MS });
-      allowed.catch(() => decisions.delete(key));
-      return allowed;
+      // A decision that fails denies, and is not reused.
+      const entry = {
+        allowed: Promise.resolve()
+          .then(decide)
+          .catch((err) => {
+            if (decisions.get(key) === entry) decisions.delete(key);
+            logger.warn({ err, decisionKey: key }, "live event read decision failed; issue content withheld");
+            return false;
+          }),
+        expiresAt: now + READ_DECISION_TTL_MS,
+      };
+      decisions.set(key, entry);
+      return entry.allowed;
+    }
+
+    async function decideIssueRead(issue: IssueAccessTarget): Promise<boolean> {
+      return (await access.decide({ actor, ...issueAccessDecisionInput(issue, "issue:read") })).allowed;
     }
 
     function canReadIssue(event: LiveEvent, issueId: string): Promise<boolean> {
-      return cachedDecision(issueId, () =>
-        loadIssue(event, issueId).then(async (issue) =>
-          issue
-            ? (await access.decide({ actor, ...issueAccessDecisionInput(issue, "issue:read") })).allowed
-            : false,
-        ),
-      );
+      return cachedDecision(issueId, async () => {
+        const issue = await loadIssue(event, issueId);
+        return issue ? decideIssueRead(issue) : false;
+      });
     }
 
     function canReadCompany(event: LiveEvent): Promise<boolean> {
@@ -141,13 +160,36 @@ export function createLiveEventIssueVisibility(db: Db) {
       return issueId ? canReadIssue(event, issueId) : canReadCompany(event);
     }
 
+    /**
+     * Activity about an issue whose row is gone keeps its identifiers and
+     * loses its details. An `issue.deleted` entry records the issue as it was
+     * (see `deletedIssueAccessTarget`), so a subscriber that could read the
+     * issue then still receives the entry in full.
+     */
+    async function visibleMissingIssueActivity(
+      event: LiveEvent,
+      issueId: string,
+      details: Record<string, unknown>,
+    ): Promise<LiveEvent> {
+      const recorded = event.payload.action === "issue.deleted"
+        ? deletedIssueAccessTarget(details, { id: issueId, companyId: event.companyId })
+        : null;
+      // Its own cache key: a decision cached while the row was already gone
+      // answers "no issue to read", not whether the subscriber could read it.
+      if (recorded && (await cachedDecision(`deleted:${issueId}`, () => decideIssueRead(recorded)))) return event;
+      return { ...event, payload: { ...event.payload, details: null } };
+    }
+
     async function visibleActivity(event: LiveEvent): Promise<LiveEvent> {
       const { entityType, entityId, details } = event.payload;
       if (!isRecord(details)) return event;
       if (entityType !== "issue" || typeof entityId !== "string" || entityId.length === 0) return event;
-      // Without the issue row there is no reader to decide for, so the entry
-      // keeps its identifiers and loses its details.
-      if (!(await loadIssue(event, entityId))) return { ...event, payload: { ...event.payload, details: null } };
+      // A failed lookup leaves the row unconfirmed, which is treated as missing.
+      const issue = await loadIssue(event, entityId).catch((err) => {
+        logger.warn({ err, companyId: event.companyId, issueId: entityId }, "live event issue lookup failed; issue content withheld");
+        return null;
+      });
+      if (!issue) return visibleMissingIssueActivity(event, entityId, details);
       const summarized = summarizedIssueIds(details);
       const [ownIssue, summarizedReadable] = await Promise.all([
         canReadIssue(event, entityId),
@@ -162,7 +204,16 @@ export function createLiveEventIssueVisibility(db: Db) {
     }
 
     async function visibleRunOrGoal(event: LiveEvent, issueId: Promise<string | null>): Promise<LiveEvent> {
-      if (await canReadEventIssue(event, await issueId)) return event;
+      // A run whose issue lookup fails is not a run without an issue, which
+      // would fall back to the company-wide read.
+      const allowed = await issueId.then(
+        (resolved) => canReadEventIssue(event, resolved),
+        (err) => {
+          logger.warn({ err, companyId: event.companyId }, "live event run issue lookup failed; issue content withheld");
+          return false;
+        },
+      );
+      if (allowed) return event;
       return { ...event, payload: issueEventMetadata(event.payload, () => false) };
     }
 

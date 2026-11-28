@@ -31,15 +31,22 @@ export function pluginRunPayloadForRecipient(
 }
 
 /**
- * The domain event as a plugin may receive it. A plugin that cannot read the
- * issue an event concerns receives only the event's metadata (see
- * `issueEventMetadata`): an `issue.*` event, and an `agent.run.*` event about
- * a run on an issue. A plugin that can read issues receives the event unchanged.
+ * The domain event as a plugin may receive it. A plugin without `issues.read`
+ * receives an `issue.*` event about any issue, ordinary or restricted, with
+ * only its metadata (see `issueEventMetadata`) and the issue's title: the
+ * top-level `title` (the document title on a document event) and, on a
+ * comment event, `issueTitle`. Descriptions, comment bodies and snippets,
+ * document bodies, annotation quotes and every other content field are
+ * withheld. An `agent.run.*` event about a run on an issue reaches it with
+ * only its metadata. A plugin that can read issues receives the event
+ * unchanged.
  */
 export function pluginEventForRecipient(event: PluginEvent, canReadIssue: boolean): PluginEvent {
   if (canReadIssue || !isRecord(event.payload)) return event;
   if (event.entityType === "issue") {
-    return { ...event, payload: issueEventMetadata(event.payload, NOTHING_READABLE) };
+    const metadata = issueEventMetadata(event.payload, NOTHING_READABLE);
+    const { issueTitle } = event.payload;
+    return { ...event, payload: typeof issueTitle === "string" ? { ...metadata, issueTitle } : metadata };
   }
   if (event.entityType === "heartbeat_run") {
     const issueId = typeof event.payload.issueId === "string" && event.payload.issueId.length > 0

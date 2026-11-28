@@ -781,6 +781,12 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Set when the exhaustion recovery ran for an agent-armed monitor. Sticky: no clear,
+   * re-arm or bound change resets it; only a board-armed monitor write does. While it
+   * is set the owner agent cannot re-arm this issue's monitor.
+   */
+  exhaustionRecoveredAt?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }
@@ -882,6 +888,10 @@ export interface IssueExecutionDecision {
   outcome: IssueExecutionDecisionOutcome;
   body: string;
   createdByRunId: string | null;
+  /** The delivered head the decision was made on; null when none was recorded. */
+  deliveredHeadSha: string | null;
+  /** The review round (stage `pendingSince`) the decision was made in; null when none was recorded. */
+  reviewRoundStartedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

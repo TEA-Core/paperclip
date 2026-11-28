@@ -5679,6 +5679,7 @@ const issueListSelect = {
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
   monitorAttemptCount: issues.monitorAttemptCount,
+  monitorArmGeneration: issues.monitorArmGeneration,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
   executionWorkspaceId: issues.executionWorkspaceId,

@@ -50,6 +50,7 @@ export { externalObjectMentions } from "./external_object_mentions.js";
 export { issueDeliveryReceipts, ISSUE_DELIVERY_RECEIPT_STATES, ISSUE_DELIVERY_RECEIPT_PROVIDERS, ISSUE_DELIVERY_RECEIPT_ACTOR_TYPES } from "./issue_delivery_receipts.js";
 export { issueDeliveryReceiptLinks } from "./issue_delivery_receipt_links.js";
 export { issueReviewEntryReceipts } from "./issue_review_entry_receipts.js";
+export { issueMonitorRecoveryClaims } from "./issue_monitor_recovery_claims.js";
 export {
   issueChildCarrierAttributions,
   ISSUE_CHILD_CARRIER_ATTRIBUTION_STATES,

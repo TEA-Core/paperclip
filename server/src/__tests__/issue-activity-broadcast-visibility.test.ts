@@ -24,6 +24,7 @@ import { logActivity, setPluginEventBus } from "../services/activity-log.js";
 import { publishLiveEvent } from "../services/live-events.js";
 import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { deletedIssueActivityDetails } from "../services/issue-access-input.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -722,6 +723,66 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
       .toMatchObject({ description: RESTRICTED_DESCRIPTION });
   });
 
+  it("keeps a deleted issue's title for a subscriber that could read it and withholds it from one that could not", async () => {
+    const { company, userId } = await seedCompany(db);
+    const restrictedIssue = await seedIssue(db, company.id, {
+      title: RESTRICTED_TITLE,
+      description: RESTRICTED_DESCRIPTION,
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { scopedAgent, nonReaderToken, readerToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+
+    const port = await startLiveEventsServer();
+    const scopedEvents = await connect(port, company.id, nonReaderToken);
+    const readerEvents = await connect(port, company.id, readerToken);
+
+    // The rows are gone before the activity is published, as in DELETE /issues/:id.
+    const deletedDetails = new Map<string, Record<string, unknown>>();
+    for (const issue of [restrictedIssue, ownIssue]) {
+      const details = deletedIssueActivityDetails(issue);
+      deletedDetails.set(issue.id, details);
+      await db.delete(issues).where(eq(issues.id, issue.id));
+      await logActivity(db, {
+        companyId: company.id,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.deleted",
+        entityType: "issue",
+        entityId: issue.id,
+        details,
+      });
+    }
+    await logActivity(db, {
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: scopedAgent.id,
+      details: {},
+    });
+
+    const isAgentActivity = (event: LiveEvent) => event.payload.entityType === "agent";
+    await waitFor(() => scopedEvents.some(isAgentActivity));
+    await waitFor(() => readerEvents.some(isAgentActivity));
+
+    // Each subscriber is decided by the issue as the entry recorded it.
+    expect(readerEvents.find(isActivityFor(restrictedIssue.id))?.payload.details).toEqual(deletedDetails.get(restrictedIssue.id));
+    expect(readerEvents.find(isActivityFor(ownIssue.id))?.payload.details).toEqual(deletedDetails.get(ownIssue.id));
+    expect(scopedEvents.find(isActivityFor(ownIssue.id))?.payload.details).toMatchObject({ title: ownIssue.title });
+    // A subscriber that could not read the issue keeps the entry's identifiers only.
+    expect(JSON.stringify(scopedEvents)).not.toContain(RESTRICTED_TITLE);
+    expect(scopedEvents.find(isActivityFor(restrictedIssue.id))?.payload).toMatchObject({
+      action: "issue.deleted",
+      entityType: "issue",
+      entityId: restrictedIssue.id,
+      details: null,
+    });
+  });
+
   it("withholds the issue description from a plugin that cannot read the issue", async () => {
     const { company } = await seedCompany(db);
     const restrictedIssue = await seedIssue(db, company.id, {
@@ -766,6 +827,98 @@ describeEmbeddedPostgres("issue activity broadcast visibility", () => {
         title: RESTRICTED_TITLE,
         description: RESTRICTED_DESCRIPTION,
       });
+    } finally {
+      nonReader.services.dispose();
+      reader.services.dispose();
+    }
+  });
+
+  it("gives a plugin without issues.read only the title of an ordinary issue and keeps a restricted comment's title withheld from live-event non-readers", async () => {
+    const { company, userId } = await seedCompany(db);
+    const ordinaryIssue = await seedIssue(db, company.id, {
+      title: "Ordinary issue title",
+      description: "Ordinary issue description body",
+    });
+    const ownIssue = await seedIssue(db, company.id, {
+      title: "Skill-test harness issue",
+      description: "Visible to the scoped key",
+    });
+    const { nonReaderToken } = await seedScopedAndReaderKeys(company.id, userId, ownIssue.id);
+    const port = await startLiveEventsServer();
+    const nonReaderEvents = await connect(port, company.id, nonReaderToken);
+    const bus = createPluginEventBus();
+    setPluginEventBus(bus);
+
+    async function subscribePlugin(pluginKey: string, capabilities: string[]) {
+      const received: PluginEvent[] = [];
+      const services = buildHostServices(
+        db,
+        randomUUID(),
+        pluginKey,
+        bus,
+        (method, params) => {
+          if (method === "onEvent") received.push((params as { event: PluginEvent }).event);
+        },
+        { manifest: pluginManifest(pluginKey, capabilities) },
+      );
+      await services.events.subscribe({ eventPattern: "issue.created" });
+      await services.events.subscribe({ eventPattern: "issue.comment.created" });
+      return { received, services };
+    }
+
+    const nonReader = await subscribePlugin("paperclip.ordinary-non-reader", ["events.subscribe"]);
+    const reader = await subscribePlugin("paperclip.ordinary-reader", ["events.subscribe", "issues.read"]);
+    const commentDetails = {
+      commentId: randomUUID(),
+      bodySnippet: "Ordinary comment body",
+      identifier: ordinaryIssue.identifier,
+      issueTitle: ordinaryIssue.title,
+    };
+
+    try {
+      await logIssueCreated(db, company.id, ordinaryIssue);
+      await logActivity(db, {
+        companyId: company.id,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: ordinaryIssue.id,
+        details: commentDetails,
+      });
+      await logIssueCreated(db, company.id, ownIssue);
+      const isComment = (event: PluginEvent) => event.eventType === "issue.comment.created";
+      await waitFor(() => nonReader.received.some(isComment) && reader.received.some(isComment));
+      await waitFor(() => nonReaderEvents.some(isActivityFor(ownIssue.id)));
+
+      const nonReaderCreated = nonReader.received.find((event) => event.eventType === "issue.created");
+      expect(nonReaderCreated?.payload).toMatchObject({ title: ordinaryIssue.title, identifier: ordinaryIssue.identifier });
+      expect(nonReaderCreated?.payload).not.toHaveProperty("description");
+      const nonReaderComment = nonReader.received.find(isComment);
+      expect(nonReaderComment?.entityId).toBe(ordinaryIssue.id);
+      expect(nonReaderComment?.payload).toMatchObject({
+        commentId: commentDetails.commentId,
+        identifier: ordinaryIssue.identifier,
+        issueTitle: ordinaryIssue.title,
+      });
+      expect(nonReaderComment?.payload).not.toHaveProperty("bodySnippet");
+      expect(JSON.stringify(nonReader.received)).not.toContain("Ordinary issue description body");
+      expect(JSON.stringify(nonReader.received)).not.toContain(commentDetails.bodySnippet);
+
+      // A plugin with issues.read receives the ordinary issue's events unchanged.
+      expect(reader.received.find((event) => event.eventType === "issue.created")?.payload).toMatchObject({
+        title: ordinaryIssue.title,
+        description: ordinaryIssue.description,
+      });
+      expect(reader.received.find(isComment)?.payload).toMatchObject(commentDetails);
+
+      // A live-events subscriber that cannot read the issue keeps the earlier
+      // rule: the top-level title only, without the comment's issueTitle.
+      const nonReaderActivity = nonReaderEvents.filter(isActivityFor(ordinaryIssue.id));
+      expect(nonReaderActivity.map((event) => event.payload.details)).toEqual([
+        { title: ordinaryIssue.title, identifier: ordinaryIssue.identifier },
+        { commentId: commentDetails.commentId, identifier: ordinaryIssue.identifier },
+      ]);
     } finally {
       nonReader.services.dispose();
       reader.services.dispose();
