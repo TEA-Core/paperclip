@@ -104,6 +104,12 @@ describeEmbeddedPostgres("Wiki handoff unassigned-stub cancellation (SUP-24280)"
         adapterConfig: {},
         runtimeConfig: {},
         permissions: {},
+        metadata: {
+          pluginManagedAgent: {
+            pluginKey: "paperclipai.plugin-llm-wiki",
+            agentKey: "wiki-maintainer",
+          },
+        },
       },
       {
         companyId: company!.id,

@@ -497,7 +497,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isFieldlessIssueWrite, isWikiHandoffTitle, resolveCanonicalWikiMaintainerAgentId, resolveLiveCanonicalWikiMaintainerAgentId } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -14141,6 +14141,7 @@ export function issueRoutes(
         ) throw conflict("Pending participant cannot approve their own work");
         await assertWikiHandoffWriteIntegrity({
           db: tx as unknown as Db,
+          lockCanonicalResolution: true,
           companyId: issue.companyId,
           issue: {
             title: issue.title,
@@ -20814,6 +20815,63 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+    // An interrupted wiki-handoff create is repaired by a field write that
+    // sets no assignee and no status. Adopt the live canonical Maintainer in
+    // this same write so the guard sees that assignee. A stale or ambiguous
+    // resolver result does not adopt, and the unassigned refusal stands.
+    let wikiHandoffAutoAdoption = false;
+    const fieldRepairTitle = updateFields.title !== undefined ? updateFields.title : existing.title;
+    const requestOmitsAssignee =
+      normalizedAssigneeAgentId === undefined && req.body.assigneeUserId === undefined;
+    const requestOmitsStatus = req.body.status === undefined;
+    const requestHasRepairField =
+      req.body.description !== undefined ||
+      req.body.projectId !== undefined ||
+      req.body.executionPolicy !== undefined ||
+      req.body.deliveryRequirement !== undefined;
+    const storedUnassigned = existing.assigneeAgentId == null && existing.assigneeUserId == null;
+    const transitionLeftAssigneeUnset =
+      (updateFields.assigneeAgentId === undefined || updateFields.assigneeAgentId === null) &&
+      (updateFields.assigneeUserId === undefined || updateFields.assigneeUserId === null);
+    const fieldRepairActorMayAdopt =
+      req.actor.type === "board" ||
+      (req.actor.type === "agent" &&
+        typeof existing.createdByAgentId === "string" &&
+        existing.createdByAgentId.length > 0 &&
+        req.actor.agentId === existing.createdByAgentId);
+    if (
+      requestOmitsAssignee &&
+      requestOmitsStatus &&
+      requestHasRepairField &&
+      storedUnassigned &&
+      transitionLeftAssigneeUnset &&
+      fieldRepairActorMayAdopt &&
+      isWikiHandoffTitle(fieldRepairTitle)
+    ) {
+      const adoptedMaintainerId = await resolveLiveCanonicalWikiMaintainerAgentId(
+        db,
+        existing.companyId,
+        existing,
+      );
+      if (adoptedMaintainerId) {
+        // The self-assignment check above ran before adoption chose this
+        // assignee; apply the same refusal to the derived one.
+        if (
+          req.body.deliveryRequirement === "record_only" &&
+          req.actor.type === "agent" &&
+          req.actor.agentId === adoptedMaintainerId
+        ) {
+          res.status(403).json({
+            error: "Only the board or an authorized non-assignee may select record_only delivery",
+            details: { reason: "record_only_self_assignee" },
+          });
+          return;
+        }
+        updateFields.assigneeAgentId = adoptedMaintainerId;
+        updateFields.assigneeUserId = null;
+        wikiHandoffAutoAdoption = true;
+      }
+    }
     // Reject a precondition that would otherwise degrade to close, auto-skip or
     // a reviewer decision before any goal/run side effect can occur.
     if (preparedReviewEntry && (transition.patch.status !== "in_review" || transition.decision)) {
@@ -20833,13 +20891,68 @@ export function issueRoutes(
       updateFields.executionState !== undefined
         ? updateFields.executionState
         : existing.executionState;
+    const requestedMaintainerId =
+      typeof normalizedAssigneeAgentId === "string" && normalizedAssigneeAgentId.length > 0
+        ? normalizedAssigneeAgentId
+        : null;
+    const handoffTitle = updateFields.title !== undefined ? updateFields.title : existing.title;
+    let guardedExecutionState = resultingExecutionState;
+    if (
+      transition.workflowControlledAssignment === true &&
+      isWikiHandoffTitle(handoffTitle) &&
+      requestedMaintainerId &&
+      resultingAssigneeAgentId === null &&
+      guardedExecutionState &&
+      typeof guardedExecutionState === "object" &&
+      requestedMaintainerId === await resolveCanonicalWikiMaintainerAgentId(db, existing.companyId, {
+        title: handoffTitle,
+        description:
+          updateFields.description !== undefined
+            ? updateFields.description
+            : existing.description,
+      })
+    ) {
+      const returnAssignee = "returnAssignee" in guardedExecutionState
+        ? guardedExecutionState.returnAssignee
+        : null;
+      const returnAgentId = returnAssignee
+        && typeof returnAssignee === "object"
+        && "type" in returnAssignee
+        && returnAssignee.type === "agent"
+        && "agentId" in returnAssignee
+        && typeof returnAssignee.agentId === "string"
+        ? returnAssignee.agentId
+        : null;
+      if (!returnAgentId) {
+        guardedExecutionState = {
+          ...guardedExecutionState,
+          returnAssignee: { type: "agent", agentId: requestedMaintainerId, userId: null },
+        };
+        updateFields.executionState = guardedExecutionState;
+      }
+    }
+    const stampedReturnAssignee = guardedExecutionState
+      && typeof guardedExecutionState === "object"
+      && "returnAssignee" in guardedExecutionState
+      && guardedExecutionState.returnAssignee
+      && typeof guardedExecutionState.returnAssignee === "object"
+      && "type" in guardedExecutionState.returnAssignee
+      && "agentId" in guardedExecutionState.returnAssignee
+      ? guardedExecutionState.returnAssignee
+      : null;
+    const wikiReviewKeepsRequestedAssignee =
+      transition.workflowControlledAssignment === true &&
+      requestedMaintainerId !== null &&
+      resultingAssigneeAgentId === null &&
+      stampedReturnAssignee?.type === "agent" &&
+      stampedReturnAssignee.agentId === requestedMaintainerId;
     if (
       typeof normalizedAssigneeAgentId === "string" &&
       normalizedAssigneeAgentId.length > 0
     ) {
       assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
         executionPolicy: nextExecutionPolicy,
-        executionState: resultingExecutionState,
+        executionState: guardedExecutionState,
         incomingAssigneeAgentId: resultingAssigneeAgentId,
         refusalContext:
           req.actor.type === "board"
@@ -20862,27 +20975,28 @@ export function issueRoutes(
         db,
         companyId: existing.companyId,
         issue: {
-          title:
-            updateFields.title !== undefined ? updateFields.title : existing.title,
+          title: handoffTitle,
           description:
             updateFields.description !== undefined
               ? updateFields.description
               : existing.description,
           executionPolicy: nextExecutionPolicy,
-          executionState: resultingExecutionState,
+          executionState: guardedExecutionState,
         },
         incomingAssigneeAgentId: resultingAssigneeAgentId,
         actorAgentId: actor.agentId ?? null,
         currentAssigneeAgentId: existing.assigneeAgentId,
         checkReviewStage: false,
         workflowControlledAssignment:
-          transition.workflowControlledAssignment === true &&
-          (normalizedAssigneeAgentId === undefined || (
-            resultingAssigneeAgentId === null &&
-            typeof normalizedAssigneeAgentId === "string" &&
-            normalizedAssigneeAgentId === actor.agentId &&
-            normalizedAssigneeAgentId === existing.assigneeAgentId
-          )),
+          wikiReviewKeepsRequestedAssignee || (
+            transition.workflowControlledAssignment === true &&
+            (normalizedAssigneeAgentId === undefined || (
+              resultingAssigneeAgentId === null &&
+              typeof normalizedAssigneeAgentId === "string" &&
+              normalizedAssigneeAgentId === actor.agentId &&
+              normalizedAssigneeAgentId === existing.assigneeAgentId
+            ))
+          ),
         cancellation: {
           requestedStatus: updateFields.status,
           // updateFields carries the request's assignee keys plus any assignee
@@ -22142,6 +22256,7 @@ export function issueRoutes(
       ...(transition.workflowControlledAssignment
         ? { workflowControlledAssignment: true }
         : {}),
+      ...(wikiHandoffAutoAdoption ? { wikiHandoffAutoAdoption: true } : {}),
       ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
         ? { executionWorkspaceId: existing.executionWorkspaceId }
         : {}),

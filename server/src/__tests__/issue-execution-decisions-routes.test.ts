@@ -133,7 +133,7 @@ async function seedCompany(db: Db, label = "Decisions") {
   const nonce = randomUUID().slice(0, 8);
   const [company] = await db.insert(companies).values({
     name: `${label} ${nonce}`,
-    issuePrefix: `DC${nonce.slice(0, 4).toUpperCase()}`,
+    issuePrefix: `DC${nonce.toUpperCase()}`,
     defaultResponsibleUserId: "board-user",
   }).returning();
   return company!;

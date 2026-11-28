@@ -1,5 +1,6 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -56,6 +57,7 @@ import {
   builtInAgentMarkersEqual,
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
+import { lockWikiMaintainerResolution } from "./issue-assignee-review-gate.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 
 function hashToken(token: string) {
@@ -794,7 +796,15 @@ export function agentService(db: Db) {
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
+    const changesWikiMaintainerMarker = Object.prototype.hasOwnProperty.call(data, "metadata")
+      && !isDeepStrictEqual(
+        isPlainRecord(data.metadata) ? data.metadata.pluginManagedAgent : undefined,
+        isPlainRecord(existing.metadata) ? existing.metadata.pluginManagedAgent : undefined,
+      );
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      if (changesWikiMaintainerMarker) {
+        await lockWikiMaintainerResolution(txDb, existing.companyId, "exclusive");
+      }
       const current = await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null);
       if (!current) return null;
       if (current.status === "deleted") {
@@ -925,6 +935,9 @@ export function agentService(db: Db) {
       });
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        // New rows escape the fallback's row-lock snapshot, even if they only
+        // acquire the Maintainer marker in a later update.
+        await lockWikiMaintainerResolution(txDb, companyId, "exclusive");
         // Consume the stored-session claim and create the fixed definition inside
         // the same transaction that inserts the binding. A rejected claim rolls
         // back the whole transaction and inserts no binding.

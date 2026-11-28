@@ -12083,6 +12083,12 @@ export function issueService(
          * without writing an assignee. Never a column; never from a request body.
          */
         boardStageDecision?: boolean;
+        /**
+         * Internal only. Set by the PATCH route on the write that auto-adopts
+         * the live canonical Wiki Maintainer for an unassigned Wiki handoff
+         * field repair. Never a column; never from a request body.
+         */
+        wikiHandoffAutoAdoption?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -12149,6 +12155,7 @@ export function issueService(
         expectedUpdatedAt,
         workflowControlledAssignment,
         boardStageDecision,
+        wikiHandoffAutoAdoption,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -12616,6 +12623,16 @@ export function issueService(
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Auto-adoption was decided against an unassigned read. A concurrent
+        // owner that landed since must not be overwritten.
+        if (
+          wikiHandoffAutoAdoption === true &&
+          (receiptExisting.assigneeAgentId != null || receiptExisting.assigneeUserId != null)
+        ) {
+          throw conflict("Issue was assigned since it was read; retry the Wiki handoff repair", {
+            reason: "wiki_handoff_adoption_conflict",
+          });
+        }
         // Invalidate creation proof against the assignee this write locks.
         // A pre-lock echo can still change an interleaved writer's assignee.
         if (
@@ -12666,6 +12683,9 @@ export function issueService(
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,
+            lockCanonicalResolution: true,
+            requireAvailableCanonical: wikiHandoffAutoAdoption === true,
+            autoAdoptionSource: wikiHandoffAutoAdoption === true ? receiptExisting : undefined,
             companyId: receiptExisting.companyId,
             issue: {
               title:

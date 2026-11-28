@@ -10038,6 +10038,9 @@ describeEmbeddedPostgres("issueService.update Wiki handoff workflow-controlled r
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
+      metadata: id === canonicalAgentId
+        ? { pluginManagedAgent: { pluginKey: "paperclipai.plugin-llm-wiki", agentKey: "wiki-maintainer" } }
+        : null,
     })));
     await db.insert(pluginManagedResources).values({
       companyId,

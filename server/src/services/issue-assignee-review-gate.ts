@@ -1,7 +1,7 @@
-import type { IssueExecutionStage } from "@paperclipai/shared";
-import { and, eq } from "drizzle-orm";
+import { normalizeAgentUrlKey, type IssueExecutionStage } from "@paperclipai/shared";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginManagedResources } from "@paperclipai/db";
+import { agents, pluginEntities, pluginManagedResources, plugins } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -150,26 +150,184 @@ export function isWikiHandoffTitle(title: unknown): boolean {
   );
 }
 
+const WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY =
+  `${WIKI_LLM_WIKI_PLUGIN_KEY}:agent:${WIKI_MAINTAINER_AGENT_KEY}` as const;
+
+export const AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID = "ambiguous-wiki-maintainer" as const;
+const UNRESOLVED_WIKI_MAINTAINER_AGENT_ID = "unresolved-wiki-maintainer";
+
+function metadataMarksWikiMaintainer(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const record = metadata as Record<string, unknown>;
+  return [record.paperclipManagedResource, record.pluginManagedAgent].some((marker) => {
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
+    const row = marker as Record<string, unknown>;
+    const agentKey = row.agentKey ?? row.resourceKey;
+    const resourceKind = row.resourceKind;
+    return (
+      row.pluginKey === WIKI_LLM_WIKI_PLUGIN_KEY &&
+      agentKey === WIKI_MAINTAINER_AGENT_KEY &&
+      (resourceKind === undefined || resourceKind === "agent")
+    );
+  });
+}
+
+/**
+ * Row locks cannot cover an agent that does not exist yet. The metadata
+ * fallback therefore takes this company-scoped advisory lock (shared) before
+ * it scans agents. Every agent creation, and every agent update that changes
+ * `metadata.pluginManagedAgent`, takes it (exclusive) before writing. No new candidate
+ * can appear before the guarded issue UPDATE commits. Acquire it before any
+ * agent row lock so all writers share one lock order.
+ */
+export async function lockWikiMaintainerResolution(
+  db: Db,
+  companyId: string,
+  mode: "shared" | "exclusive",
+): Promise<void> {
+  const key = `wiki-maintainer-resolution:${companyId}`;
+  await db.execute(
+    mode === "shared"
+      ? sql`select pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`
+      : sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`,
+  );
+}
+
+function bindingAgentId(data: unknown): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const record = data as Record<string, unknown>;
+  if (record.pluginKey !== undefined && record.pluginKey !== WIKI_LLM_WIKI_PLUGIN_KEY) return null;
+  if (record.resourceKey !== undefined && record.resourceKey !== WIKI_MAINTAINER_AGENT_KEY) return null;
+  return typeof record.agentId === "string" && record.agentId.length > 0 ? record.agentId : null;
+}
+
 export async function resolveCanonicalWikiMaintainerAgentId(
   db: Db,
   companyId: string,
   issue: { title?: string | null; description?: string | null } | null | undefined,
+  options?: { lockRows?: boolean; requireAvailable?: boolean },
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
   if (!isWikiHandoffTitle(issue.title)) return null;
-  const rows = await db
-    .select({ resourceId: pluginManagedResources.resourceId })
+  // The service guard holds these locks on its issue-update transaction.
+  // Preflight callers do not lock; the service repeats their check at commit.
+  const resourceQuery = db
+    .select({
+      resourceKey: pluginManagedResources.resourceKey,
+      resourceId: pluginManagedResources.resourceId,
+    })
     .from(pluginManagedResources)
-    .where(
-      and(
-        eq(pluginManagedResources.companyId, companyId),
-        eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
-        eq(pluginManagedResources.resourceKind, "agent"),
-        eq(pluginManagedResources.resourceKey, WIKI_MAINTAINER_AGENT_KEY),
-      ),
-    )
-    .then((found) => found);
-  return rows[0]?.resourceId ?? null;
+    .where(and(
+      eq(pluginManagedResources.companyId, companyId),
+      eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+      eq(pluginManagedResources.resourceKind, "agent"),
+      inArray(pluginManagedResources.resourceKey, [
+        WIKI_MAINTAINER_AGENT_KEY,
+        WIKI_MAINTAINER_QUALIFIED_RESOURCE_KEY,
+      ]),
+    ));
+  const bindingQuery = db
+    .select({ data: pluginEntities.data })
+    .from(pluginEntities)
+    .innerJoin(plugins, eq(pluginEntities.pluginId, plugins.id))
+    .where(and(
+      eq(pluginEntities.companyId, companyId),
+      eq(pluginEntities.entityType, "managed_agent"),
+      eq(pluginEntities.externalId, `managed:agent:${companyId}:${WIKI_MAINTAINER_AGENT_KEY}`),
+      eq(plugins.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+    ));
+  const [resourceRows, bindings] = await Promise.all([
+    options?.lockRows ? resourceQuery.for("share") : resourceQuery,
+    options?.lockRows ? bindingQuery.for("share") : bindingQuery,
+  ]);
+  const resourceId = resourceRows.find((row) => row.resourceKey === WIKI_MAINTAINER_AGENT_KEY)?.resourceId
+    ?? resourceRows[0]?.resourceId
+    ?? null;
+  const boundIds = bindings.map((row) => bindingAgentId(row.data)).filter((id): id is string => id !== null);
+  const candidateIds = [resourceId, ...boundIds].filter((id): id is string => id !== null);
+  const candidateQuery = db
+    .select({ id: agents.id, metadata: agents.metadata, status: agents.status })
+    .from(agents)
+    .where(and(
+      eq(agents.companyId, companyId),
+      ne(agents.status, "terminated"),
+      inArray(agents.id, candidateIds),
+    ));
+  const liveCandidates = candidateIds.length === 0
+    ? []
+    : await (options?.lockRows ? candidateQuery.for("share") : candidateQuery);
+  const isAvailable = (status: string) => !options?.requireAvailable || status !== "paused";
+  if (liveCandidates.length > 0) {
+    const markedById = new Map(liveCandidates
+      .filter((agent) => metadataMarksWikiMaintainer(agent.metadata))
+      .map((agent) => [agent.id, agent]));
+    const resolved = candidateIds.map((id) => markedById.get(id)).find((agent) => agent !== undefined);
+    if (resolved && isAvailable(resolved.status)) return resolved.id;
+    return UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
+  }
+  if (options?.lockRows) await lockWikiMaintainerResolution(db, companyId, "shared");
+  const fallbackQuery = db
+    .select({ id: agents.id, metadata: agents.metadata, status: agents.status })
+    .from(agents)
+    .where(and(
+      eq(agents.companyId, companyId),
+      ne(agents.status, "terminated"),
+    ));
+  const liveAgents = await (options?.lockRows ? fallbackQuery.for("share") : fallbackQuery);
+  const marked = liveAgents.filter((agent) => metadataMarksWikiMaintainer(agent.metadata));
+  if (marked.length === 1) {
+    return isAvailable(marked[0]!.status) ? marked[0]!.id : UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
+  }
+  if (marked.length > 1) return AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID;
+  return candidateIds.length > 0 ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null;
+}
+
+type WikiHandoffSource = {
+  title?: string | null;
+  description?: string | null;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+};
+
+async function isReporterHandoffSource(
+  db: Db,
+  companyId: string,
+  issue: WikiHandoffSource | null | undefined,
+  lockRows = false,
+): Promise<boolean> {
+  if (
+    !issue?.createdByAgentId ||
+    issue.createdByUserId != null ||
+    !isWikiHandoffTitle(issue.title)
+  ) return false;
+  // Legacy Reporter handoffs have manual origins. Resolve the stored creator,
+  // not a caller's title or a hardcoded instance-specific agent id.
+  const query = db.select({ name: agents.name }).from(agents).where(and(
+    eq(agents.companyId, companyId),
+    eq(agents.id, issue.createdByAgentId),
+    eq(agents.role, "pm"),
+  )).limit(1);
+  const [creator] = await (lockRows ? query.for("share") : query);
+  return normalizeAgentUrlKey(creator?.name) === "writer-reporter";
+}
+
+/**
+ * Adoption requires a recognized Reporter-created handoff and a marked,
+ * non-paused live Maintainer. Sentinels must never become an assignee id.
+ */
+export async function resolveLiveCanonicalWikiMaintainerAgentId(
+  db: Db,
+  companyId: string,
+  issue: WikiHandoffSource | null | undefined,
+): Promise<string | null> {
+  if (!await isReporterHandoffSource(db, companyId, issue)) return null;
+  const resolved = await resolveCanonicalWikiMaintainerAgentId(db, companyId, issue, { requireAvailable: true });
+  if (
+    !resolved ||
+    resolved === AMBIGUOUS_WIKI_MAINTAINER_AGENT_ID ||
+    resolved === UNRESOLVED_WIKI_MAINTAINER_AGENT_ID
+  ) return null;
+  return resolved;
 }
 
 function isWorkflowControlledPendingReviewParticipant(input: {
@@ -291,6 +449,17 @@ export function isUnassignedWikiHandoffBoardStageDecision(input: {
   );
 }
 
+function wikiReviewKeepsCanonicalReturnAssignee(input: {
+  canonical: string;
+  executionState: unknown;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (state?.currentParticipant?.type !== "user") return false;
+  return state.returnAssignee?.type === "agent" && state.returnAssignee.agentId === input.canonical;
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -305,6 +474,11 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
+  /** Only set on the transaction that will persist the guarded issue write. */
+  lockCanonicalResolution?: boolean;
+  requireAvailableCanonical?: boolean;
+  /** Persisted pre-write identity, never the caller's proposed fields. */
+  autoAdoptionSource?: WikiHandoffSource;
   /**
    * SUP-24280: the persisted status and assignee shape of this write, so the
    * guard can admit an unassigned-stub cancellation. Omit it at doors that
@@ -326,11 +500,31 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
-  const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
-    input.db as Db,
-    input.companyId,
-    input.issue,
-  );
+  // An auto-adopted assignee was chosen from a Maintainer that the route saw
+  // earlier. If the locked resolution no longer finds one, the adopted id is
+  // stale: fail closed. Ordinary writes keep the no-canonical exception.
+  if (
+    input.lockCanonicalResolution &&
+    (input.requireAvailableCanonical || isWikiHandoffTitle(input.issue?.title))
+  ) await lockWikiMaintainerResolution(input.db as Db, input.companyId, "shared");
+  const adoptionSourceValid = !input.requireAvailableCanonical ||
+    await isReporterHandoffSource(
+      input.db as Db,
+      input.companyId,
+      input.autoAdoptionSource,
+      input.lockCanonicalResolution,
+    );
+  const canonicalMaintainerAgentId = adoptionSourceValid
+    ? (await resolveCanonicalWikiMaintainerAgentId(
+        input.db as Db,
+        input.companyId,
+        input.issue,
+        {
+          lockRows: input.lockCanonicalResolution,
+          requireAvailable: input.requireAvailableCanonical,
+        },
+      )) ?? (input.requireAvailableCanonical ? UNRESOLVED_WIKI_MAINTAINER_AGENT_ID : null)
+    : UNRESOLVED_WIKI_MAINTAINER_AGENT_ID;
   if (!canonicalMaintainerAgentId) return;
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
@@ -410,6 +604,14 @@ export function wikiHandoffWriteWouldViolate(input: {
     ? input.incomingAssigneeAgentId
     : null;
   if (incoming !== canonical) {
+    if (
+      incoming === null &&
+      wikiReviewKeepsCanonicalReturnAssignee({
+        canonical,
+        executionState: input.executionState,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
     if (
       (incoming !== null || (
         input.actorAgentId === canonical &&

@@ -1053,6 +1053,86 @@ when its value is `undefined`, because the update normalizes that value to
 and clears the stored policy, as the paragraph above states. That behavior
 predates the field-less skip, and the field-less skip does not change it.
 
+The canonical Wiki Maintainer must be a live company agent whose metadata
+marks both `pluginKey` `paperclipai.plugin-llm-wiki` and agent key
+`wiki-maintainer`. Among marked agents, the `plugin_managed_resources` row's
+`resourceId` takes precedence, then the
+`managed:agent:<companyId>:wiki-maintainer` plugin entity binding. A live but
+unmarked resource target is not canonical. When a reference resolves to a
+live agent but none of the live referenced agents is marked, the guard fails
+closed and refuses; it never falls back to another agent that only carries the
+metadata marker. Only when no reference exists or every reference is missing
+or terminated does the guard use a unique marked live agent in the company.
+A paused canonical target is not replaced by another agent. More than one
+fallback match is ambiguous and refuses writes, including when no resource
+reference exists. A terminated agent is not live.
+
+A field repair of an unassigned Wiki handoff adopts an available canonical
+Maintainer as `assigneeAgentId` in the same `PATCH /api/issues/:id`. The
+request must contain at least one repair field: `description`, `projectId`,
+`executionPolicy`, or `deliveryRequirement`. It must omit assignee and status,
+both stored assignees must be null, and the actor must be the board or the
+agent that created the card. An empty or comment-only request is not a field
+repair and does not acquire an assignee through this path. An explicit
+non-canonical assignee or a status-only write is not this repair either.
+A paused Maintainer is not available for adoption; the repair returns 422
+without assigning it.
+The stored card must have a handoff title and no user creator, and its
+`createdByAgentId` must resolve within the company to the `writer-Reporter`
+PM (normalized agent URL key `writer-reporter`). Legacy genuine report
+handoffs have `originKind: manual`, so origin alone cannot identify them.
+A board-created card, an unrelated agent's card (including another PM), or a
+title supplied by this PATCH cannot acquire an assignee through this path.
+The service rechecks the persisted creator and holds its row lock through
+the issue UPDATE. Renaming the emitter or changing its role removes repair
+eligibility; no instance-specific agent UUID is hardcoded.
+
+The route's lookup is preliminary. The service repeats the canonical check
+inside the issue-update transaction and holds shared locks on existing
+resource rows, entity bindings, and the candidate agent rows through the
+issue UPDATE. A concurrent repoint or agent metadata change must wait for that
+write to commit. A changed canonical target before the locked check refuses
+the stale assignment instead of persisting it. This includes an adopted
+fallback Maintainer that no longer resolves (for example its marker was
+removed): auto-adoption fails closed with 422, while an ordinary write keeps the
+historical no-canonical exception below.
+
+The metadata fallback also takes a company-scoped advisory lock (shared) before
+it scans agents, and every agent creation takes the same lock (exclusive).
+This includes unmarked agents: a new unmarked row must not escape the scan's
+row locks and then acquire the Maintainer marker before the issue UPDATE.
+Existing candidate rows remain protected by their shared row locks. An agent
+update takes the same exclusive lock only when it changes
+`metadata.pluginManagedAgent`; other updates do not take it. The advisory lock
+serializes those writes and concurrent agent creations within that company; it
+does not block another company's agent writes.
+
+Adoption is decided against an unassigned read. If an agent or user owner lands
+before the locked write, the repair returns 409 `wiki_handoff_adoption_conflict`
+and the concurrent owner is preserved, with no wake. Adoption derives an
+assignee after the `record_only` self-assignment check, so that check is
+repeated for the derived assignee: an agent that is the adopted Maintainer
+cannot select `record_only` (403 `record_only_self_assignee`). The board is
+unaffected.
+
+A stale reference with no marked live agent, or an ambiguous result, cannot
+be adopted and the repair is refused. Historical exception: if there is no
+resource or entity reference and no marked agent, the Wiki guard is inactive;
+a field write can return 200 and leave the card unassigned. This is not a
+successful adoption and does not establish a canonical return assignee.
+
+The repair does not change status, but it is an assignment. Normal assignment
+wakeup rules still apply: a repair of an unassigned `todo`, `in_progress`,
+`blocked`, or `in_review` card can create a Maintainer wake request and run.
+Thus a statusless repair can dispatch work. Repairs of `backlog`, `done`, or
+`cancelled` cards do not request an assignment wake or run.
+
+When a Wiki handoff enters human review in the same write that names the
+canonical Wiki Maintainer, and the workflow seats the user reviewer, that
+Maintainer stays the execution state's `returnAssignee`. The resulting agent
+assignee may be null. A write that names a different agent does not receive
+that return assignee.
+
 The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
 can close the final stage of an unassigned Wiki handoff card. That hand-back
 has no return-to, so the route drops the no-op `assigneeAgentId: null` and

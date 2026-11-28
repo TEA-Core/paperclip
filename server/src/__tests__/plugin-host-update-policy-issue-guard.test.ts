@@ -299,6 +299,7 @@ describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752
         adapterConfig: {},
         runtimeConfig: {},
         permissions: {},
+        metadata: { pluginManagedAgent: { pluginKey: "paperclipai.plugin-llm-wiki", agentKey: "wiki-maintainer" } },
       },
       {
         id: INTRUDER,
