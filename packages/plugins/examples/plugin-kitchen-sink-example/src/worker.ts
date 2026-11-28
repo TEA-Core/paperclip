@@ -358,7 +358,7 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
     if (!issueId || !commentId) return null;
     const comments = await ctx.issues.listComments(issueId, companyId);
     const comment = comments.find((entry) => entry.id === commentId) ?? null;
-    if (!comment) return null;
+    if (!comment || comment.body === null) return null;
     return {
       commentId: comment.id,
       issueId,

@@ -945,10 +945,10 @@ An issue event payload can carry issue content. The host delivers an `issue.*` e
 
 The same rule covers these read paths when a plugin has the path's own capability but not `issues.read`: `getSubtree`, `listComments`, audit search and the orchestration summary. Such a plugin is not refused; it receives the reduced records:
 
-- `ctx.issues.getSubtree` (`issue.subtree.read`): each issue, relation summary and document summary carries only its title and allow-listed metadata, without `description` or any other content field; each active run summary carries only its metadata, without `error`. Assignee summaries describe agents and are unchanged.
-- `ctx.issues.listComments` (`issue.comments.read`): each comment carries only its allow-listed metadata (ids, author, timestamps), without `body`.
+- `ctx.issues.getSubtree` (`issue.subtree.read`): each issue, relation summary and document summary carries only its title and allow-listed metadata, and `description` and every other content field are `null`; each active run summary carries only its metadata, and `error` is `null`. Assignee summaries describe agents and are unchanged.
+- `ctx.issues.listComments` (`issue.comments.read`): each comment carries only its allow-listed metadata (ids, author, timestamps), and `body` and every other content field are `null`.
 - `ctx.authorization.audit.search` (`authorization.audit.read`): the `details` of an entry about an issue carry only the issue title and allow-listed metadata, and the `details` of an entry about a run follow the run rule above. Entries about other entities are unchanged.
-- `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, without `error`. Relations, approvals, costs, budget incidents and invocation blocks are unchanged.
+- `ctx.issues.summaries.getOrchestration` (`issues.orchestration.read`): each run summary carries only its metadata, and `error` is `null`. Relations, approvals, costs, budget incidents and invocation blocks are unchanged.
 
 Issue documents, interactions and attachments are governed by their own capabilities (`issue.documents.read`, `issue.interactions.read`, `issue.attachments.read`). Granting one of them is an explicit content grant: a plugin with that capability receives the documents, interactions or attachments in full, even without `issues.read`.
 

@@ -49,11 +49,14 @@ export function pluginRunPayloadForRecipient(
 /**
  * An issue, or a comment, document or run summary of an issue, as a plugin
  * without `issues.read` may receive it from a read path: its title and
- * allow-listed metadata only (see `issueEventMetadata`).
+ * allow-listed metadata keep their values (see `issueEventMetadata`), and
+ * every other top-level field stays present with the value `null`.
  */
 export function pluginIssueRecordForRecipient<T extends object>(record: T): T {
-  // The reduced record keeps only a subset of the fields the type declares.
-  return issueEventMetadata(record as Record<string, unknown>, NOTHING_READABLE) as T;
+  const visible = issueEventMetadata(record as Record<string, unknown>, NOTHING_READABLE);
+  const reduced: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) reduced[key] = key in visible ? visible[key] : null;
+  return reduced as T;
 }
 
 /**

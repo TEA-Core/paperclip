@@ -1234,6 +1234,12 @@ export interface PluginIssueMutationActor {
   actorRunId?: string | null;
 }
 
+/** A comment as `ctx.issues.listComments` returns it to a plugin. */
+export type PluginIssueComment = Omit<IssueComment, "body"> & {
+  /** `null` when withheld from a plugin without `issues.read`. */
+  body: string | null;
+};
+
 export interface PluginIssueRelationSummary {
   blockedBy: IssueRelationIssueSummary[];
   blocks: IssueRelationIssueSummary[];
@@ -1401,7 +1407,7 @@ export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
    * issue or issue subtree. Requires `issues.orchestration.read`. Without
-   * `issues.read`, run summaries carry only their metadata, without `error`
+   * `issues.read`, run summaries carry only their metadata, and `error` is `null`
    * (see PLUGIN_SPEC.md).
    */
   getOrchestration(input: {
@@ -1528,7 +1534,8 @@ export interface PluginIssuesClient {
    * Read a root issue's descendants with optional relation/document/run/assignee
    * summaries. Requires `issue.subtree.read`. Without `issues.read`, issues,
    * relation and document summaries carry only their titles and metadata, and
-   * run summaries only their metadata (see PLUGIN_SPEC.md).
+   * run summaries only their metadata; every other field, such as an issue's
+   * `description` or a run's `error`, is `null` (see PLUGIN_SPEC.md).
    */
   getSubtree(
     issueId: string,
@@ -1555,10 +1562,11 @@ export interface PluginIssuesClient {
   ): Promise<PluginIssueWakeupBatchResult[]>;
   /**
    * List an issue's comments. Requires `issue.comments.read`. Without
-   * `issues.read`, each comment carries only its metadata, without `body`
+   * `issues.read`, each comment carries only its metadata, and `body` and
+   * every other content field are `null`
    * (see PLUGIN_SPEC.md).
    */
-  listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
+  listComments(issueId: string, companyId: string): Promise<PluginIssueComment[]>;
   /**
    * Post a comment on an issue.
    *

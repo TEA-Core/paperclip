@@ -56,6 +56,7 @@ import type {
   PluginEvent,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
+  PluginIssueComment,
   PluginIssueRelationSummary,
   PluginIssueListRow,
   PluginIssueSubtree,
@@ -1999,7 +2000,7 @@ export interface WorkerToHostMethods {
   ];
   "issues.listComments": [
     params: { issueId: string; companyId: string },
-    result: IssueComment[],
+    result: PluginIssueComment[],
   ];
   "issues.createComment": [
     params: {

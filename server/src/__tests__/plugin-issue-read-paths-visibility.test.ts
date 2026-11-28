@@ -175,7 +175,17 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
   }
 
   it("returns subtree titles and allow-listed metadata only to a plugin without issues.read", async () => {
-    const { companyId, rootId, childId } = await seedTree();
+    const { companyId, rootId, childId, agentId } = await seedTree();
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: childId },
+      error: `${RESTRICTED} active run error`,
+      startedAt: new Date("2026-01-05T00:00:00Z"),
+    });
     const host = services(WITHOUT_ISSUES_READ);
 
     const subtree = await host.issues.getSubtree({
@@ -183,20 +193,24 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
       companyId,
       includeRelations: true,
       includeDocuments: true,
+      includeActiveRuns: true,
     });
 
     expect(JSON.stringify(subtree)).not.toContain(RESTRICTED);
     expect(subtree.issueIds).toEqual([rootId, childId]);
     const root = subtree.issues.find((issue) => issue.id === rootId)!;
     expect(root).toMatchObject({ id: rootId, title: "Root title", identifier: "RP-1", status: "todo", priority: "medium" });
-    expect(root).not.toHaveProperty("description");
-    expect(root).not.toHaveProperty("billingCode");
+    expect(root).toHaveProperty("description", null);
+    expect(root).toHaveProperty("billingCode", null);
     expect(root.createdAt).toBeInstanceOf(Date);
     expect(subtree.relations?.[rootId]?.blocks).toEqual([
       expect.objectContaining({ id: childId, identifier: "RP-2", title: "Child title", status: "blocked" }),
     ]);
     expect(subtree.documents?.[childId]).toEqual([
       expect.objectContaining({ key: "plan", title: "Plan title", format: "markdown" }),
+    ]);
+    expect(subtree.activeRuns?.[childId]).toEqual([
+      expect.objectContaining({ issueId: childId, agentId, status: "running", error: null }),
     ]);
     host.dispose();
   });
@@ -223,7 +237,7 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     expect(comments).toHaveLength(1);
     expect(JSON.stringify(comments)).not.toContain(RESTRICTED);
     expect(comments[0]).toMatchObject({ issueId: rootId, authorType: "user", authorUserId: "user-1" });
-    expect(comments[0]).not.toHaveProperty("body");
+    expect(comments[0]).toHaveProperty("body", null);
     host.dispose();
   });
 
@@ -280,7 +294,7 @@ describeEmbeddedPostgres("plugin issue read paths for plugins without issues.rea
     expect(JSON.stringify(summary.runs)).not.toContain(RESTRICTED);
     expect(summary.runs).toHaveLength(1);
     expect(summary.runs[0]).toMatchObject({ issueId: rootId, agentId, status: "failed", invocationSource: "assignment" });
-    expect(summary.runs[0]).not.toHaveProperty("error");
+    expect(summary.runs[0]).toHaveProperty("error", null);
     host.dispose();
   });
 
