@@ -3011,6 +3011,33 @@ export function executionDecisionBinding(
 }
 
 /**
+ * The binding for a decision whose own request certified a delivered head.
+ * When the written state stamps `approvalStatus.finalDelivery` for this
+ * decision, the decision is bound to that stamped head, the one value the
+ * final delivery preflight read, so the decision and the certification cannot
+ * name different heads. Otherwise the state's recorded head binds it.
+ */
+export function certifiedExecutionDecisionBinding(
+  state: IssueExecutionState | Record<string, unknown> | null | undefined,
+  writtenState: unknown,
+  decisionId: string,
+): ExecutionDecisionBinding {
+  const binding = executionDecisionBinding(state);
+  const approvalStatus =
+    writtenState && typeof writtenState === "object"
+      ? (writtenState as { approvalStatus?: unknown }).approvalStatus
+      : null;
+  const finalDelivery =
+    approvalStatus && typeof approvalStatus === "object"
+      ? (approvalStatus as { finalDelivery?: unknown }).finalDelivery
+      : null;
+  if (!finalDelivery || typeof finalDelivery !== "object") return binding;
+  const { headSha, decisionId: stampedDecisionId } = finalDelivery as { headSha?: unknown; decisionId?: unknown };
+  if (stampedDecisionId !== decisionId || typeof headSha !== "string" || headSha.length === 0) return binding;
+  return { ...binding, deliveredHeadSha: headSha };
+}
+
+/**
  * SUP-25518: whether a durable decision row may be reused for the current
  * round. Both bindings must be recorded and equal, and the head the final
  * delivery preflight would certify (`certifiedHeadSha`, when one resolved)

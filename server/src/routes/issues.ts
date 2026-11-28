@@ -475,6 +475,7 @@ import {
   assertPatchableExecutionPolicyWrite,
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
+  certifiedExecutionDecisionBinding,
   diagnoseMissingApprovalStage,
   executionDecisionBinding,
   executionDecisionBindingMatches,
@@ -15285,7 +15286,7 @@ export function issueRoutes(
                 outcome: transition.decision.outcome,
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
-                ...executionDecisionBinding(lockedIssue.executionState),
+                ...certifiedExecutionDecisionBinding(lockedIssue.executionState, updateFields.executionState, decisionId),
               });
               if (transition.stallEscalation) {
                 await logActivityInTransaction(tx as unknown as Db, {
@@ -22923,7 +22924,7 @@ export function issueRoutes(
               outcome: decision.outcome,
               body: decision.body,
               createdByRunId: actor.runId ?? null,
-              ...executionDecisionBinding(existing.executionState),
+              ...certifiedExecutionDecisionBinding(existing.executionState, updated.executionState, decisionId),
             });
             // R20: the hand-off to the stall arbiter commits with the
             // reviewer's decision that triggered it, never without it.
@@ -28011,7 +28012,7 @@ export function issueRoutes(
               outcome: transition.decision.outcome,
               body: transition.decision.body,
               createdByRunId: actor.runId ?? null,
-              ...executionDecisionBinding(currentExecutionState),
+              ...certifiedExecutionDecisionBinding(currentExecutionState, updated.executionState, decisionId),
             });
           }
 
