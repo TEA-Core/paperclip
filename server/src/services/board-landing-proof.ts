@@ -499,9 +499,9 @@ async function listPullRequestCommits(
 /**
  * The stuck shape this proof exists for. The workflow is completed, no
  * deliveryIdentity is recorded, and the card is not closed. Either at least one
- * completed review stage names only users, or the card is `record_only` and has
- * at least one completed review stage with every stage completed or skipped,
- * whoever its participants are (an agent-reviewed card). Returns null when
+ * completed review stage names only users, or the card is `record_only`, has at
+ * least one completed review stage whose participants include an agent, and has
+ * every stage completed or skipped (an agent-reviewed card). Returns null when
  * eligible, else the refusal reason.
  */
 export function boardLandingProofIneligibility(issue: {
@@ -540,7 +540,11 @@ export function boardLandingProofIneligibility(issue: {
     participants.every((participant) =>
       !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "user"));
   if (userOnlyCompletedReview) return null;
-  if (issue.deliveryRequirement === "record_only" && completedReviewStages.length > 0) {
+  const agentReviewedCompletedStage = completedReviewStages.some(({ participants }) =>
+    Array.isArray(participants) && participants.length > 0 &&
+    participants.some((participant) =>
+      !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "agent"));
+  if (issue.deliveryRequirement === "record_only" && agentReviewedCompletedStage) {
     const everyStageSettled = stages.every((stage) => {
       const id = stage && typeof stage === "object" ? (stage as { id?: unknown }).id : null;
       return typeof id === "string" && (completed.has(id) || skipped.has(id));
@@ -548,7 +552,7 @@ export function boardLandingProofIneligibility(issue: {
     if (everyStageSettled) return null;
     return "the card's review workflow still has a stage that is neither approved nor skipped";
   }
-  return "the card has no completed review stage that names only a user, and is not a record_only card with a completed review workflow";
+  return "the card has no completed review stage that names only a user, and is not a record_only card with a completed agent review stage";
 }
 
 export interface AttachedBoardLandingProof {

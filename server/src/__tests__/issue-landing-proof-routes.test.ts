@@ -600,6 +600,41 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       expect(await proofRows(issueId)).toHaveLength(0);
     });
 
+    it("refuses while a second policy stage is neither approved nor skipped", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const policy = row!.executionPolicy as { stages: unknown[] };
+      await db.update(issues).set({
+        executionPolicy: {
+          ...policy,
+          stages: [
+            ...policy.stages,
+            { id: "cccccccc-0000-4000-8000-000000000002", type: "approval", participants: [{ type: "user", userId: "local-board" }] },
+          ],
+        },
+      }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
+    it("refuses a record_only card whose completed review stage has no participants", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent" });
+      await reclassifyRecordOnly(issueId);
+      await db.update(issues).set({
+        executionPolicy: {
+          mode: "normal", commentRequired: true,
+          stages: [{ id: stageId, type: "review", participants: [] }],
+        },
+      }).where(eq(issues.id, issueId));
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+    });
+
     it("refuses an agent key, including the assignee holding a live run", async () => {
       const card = await seedStuckCard({ participant: "agent" });
       await reclassifyRecordOnly(card.issueId);

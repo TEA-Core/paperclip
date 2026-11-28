@@ -319,8 +319,9 @@ monotonic 15-second budget, so wall-clock adjustments do not cause false timeout
 Board landing proof (SUP-25193). Some delivered cards have no other landing proof.
 Such a card is not done or cancelled. Its execution workflow is completed, and
 either at least one completed review stage names only users, or the card is
-`record_only` with at least one completed review stage and every stage approved
-or skipped, whoever its participants are (an agent-reviewed card). It records no
+`record_only` with at least one completed review stage whose participants
+include an agent and every stage approved or skipped (an agent-reviewed card). A
+completed stage with no participants does not qualify. It records no
 `deliveryIdentity`. For such a card a board actor may call
 `POST /api/issues/:id/landing-proof` with one merged pull request in the card's
 project repository, its merge or head commit, and a reason. An agent key is
