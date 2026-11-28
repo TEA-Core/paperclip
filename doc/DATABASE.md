@@ -640,3 +640,28 @@ reservation cannot silently disappear. Failed cleanup or an ambiguous storage
 write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
+
+## Issue monitor recovery claims
+
+`issue_monitor_recovery_claims` holds one row per exhaustion of an issue's
+external-service monitor, unique per issue and `arm_generation`. The
+`issues_bump_monitor_arm_generation` trigger increments
+`issues.monitor_arm_generation` (`bigint`, never reset) on every monitor arm or
+re-arm. In the same transaction, it deletes the issue's claims for earlier
+generations. Only the current arm's claim is read, so superseded claims do not
+accumulate. A claim that a tick inserts for an arm that a concurrent re-arm has
+just replaced stays until the issue's next arm.
+
+`company_id` keeps ON DELETE NO ACTION, like the other issue-keyed bookkeeping
+tables (`issue_recovery_actions`, `issue_read_states`, `issue_relations`). A claim
+is deleted with its issue (`issue_id` cascades), and company deletion deletes
+the company's issues before the company row.
+
+Migration 0335 widens `monitor_arm_generation` to `bigint` without a table
+rewrite. It adds a `bigint` column with a constant default, copies only the
+generations that are not 0, drops the `integer` column, and renames the new
+column. It holds ACCESS EXCLUSIVE on `issues` for its whole transaction. With
+1,000,000 issues, the measured window is 0.33 s when no generation is set yet,
+0.81 s with 1,000 armed issues, and 18.4 s with 50,000 armed issues (about
+0.35 ms per armed issue, with every `issues` index updated). An `ALTER COLUMN ...
+TYPE bigint` rewrote the same table in 86-95 s.
