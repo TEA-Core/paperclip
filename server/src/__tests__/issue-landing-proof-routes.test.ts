@@ -19,6 +19,7 @@ import {
   externalObjects,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueWorkProducts,
   issues,
   projectWorkspaces,
@@ -279,6 +280,13 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     boardLinkedPr?: number | null;
     /** An `executionState.deliveredHeadSha`, which the active run writes. Default none. */
     deliveredHeadSha?: string | null;
+    /**
+     * For an agent review stage: the durable decision on the completed stage.
+     * `independent` (default) is an approval recorded by a separate reviewer agent
+     * that is a stage participant. The others are the shapes the proof must refuse.
+     */
+    reviewDecision?:
+      | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant";
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
@@ -316,8 +324,16 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     }
     const deliveredHeadSha = options.deliveredHeadSha ?? null;
+    const reviewDecision = options.reviewDecision ?? "independent";
+    const reviewerId = reviewDecision === "executor" ? agentId : randomUUID();
+    if (options.participant === "agent" && reviewerId !== agentId) {
+      await db.insert(agents).values({
+        id: reviewerId, companyId, name: "Reviewer", role: "reviewer", status: "active", adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+    }
     const participant = options.participant === "agent"
-      ? { type: "agent", agentId }
+      ? { type: "agent", agentId: reviewerId }
       : { type: "user", userId: "local-board" };
     await db.insert(issues).values({
       id: issueId, companyId, identifier, title: "Delivered card with a user-only review stage",
@@ -339,6 +355,29 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
           lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
         },
     });
+    if (options.participant === "agent" && options.workflow !== "pending" && reviewDecision !== "none") {
+      const decision = (over: Partial<typeof issueExecutionDecisions.$inferInsert>) => ({
+        companyId, issueId, stageId, stageType: "review", actorAgentId: reviewerId, actorUserId: null,
+        outcome: "approved", body: "Approved.", ...over,
+      });
+      const at = (secondsAgo: number) => new Date(now.getTime() - secondsAgo * 1000);
+      if (reviewDecision === "board_user") {
+        await db.insert(issueExecutionDecisions).values(decision({
+          actorAgentId: null, actorUserId: "local-board", createdAt: at(5),
+        }));
+      } else if (reviewDecision === "board_in_place") {
+        await db.insert(issueExecutionDecisions).values(decision({ actorUserId: "local-board", createdAt: at(5) }));
+      } else if (reviewDecision === "non_participant") {
+        await db.insert(issueExecutionDecisions).values(decision({ actorAgentId: agentId, createdAt: at(5) }));
+      } else if (reviewDecision === "superseded") {
+        await db.insert(issueExecutionDecisions).values([
+          decision({ createdAt: at(10) }),
+          decision({ outcome: "changes_requested", body: "Reopened.", createdAt: at(5) }),
+        ]);
+      } else {
+        await db.insert(issueExecutionDecisions).values(decision({ createdAt: at(5) }));
+      }
+    }
     const card = { companyId, agentId, issueId, identifier };
     const boardLinkedPr = options.boardLinkedPr === undefined ? 501 : options.boardLinkedPr;
     if (boardLinkedPr !== null) await linkPr(card, boardLinkedPr);
@@ -589,6 +628,24 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         landingDebtDisposition: "discharged",
         landingProof: { head: MERGE_ON_BASE, source: "board_merged_pr", pullRequestNumber: 501 },
       });
+    });
+
+    it.each([
+      ["the card's own executor reviewed its own work", "executor" as const],
+      ["only an old board-user approval is recorded on the stage", "board_user" as const],
+      ["the board recorded the approval in the reviewer agent's place", "board_in_place" as const],
+      ["the approval was superseded by a later changes_requested decision", "superseded" as const],
+      ["an agent that is not a stage participant approved", "non_participant" as const],
+      ["no decision is recorded on the completed stage", "none" as const],
+    ])("refuses when %s, and records nothing", async (_label, reviewDecision) => {
+      const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision });
+      await reclassifyRecordOnly(issueId);
+      const refused = await attach(issueId, goodProof());
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.code).toBe("landing_proof_not_applicable");
+      expect(await proofRows(issueId)).toHaveLength(0);
+      expect(await workProducts(issueId)).toHaveLength(0);
+      expect((await patch(issueId, { status: "done" })).status).toBe(409);
     });
 
     it("refuses while the review workflow is not completed", async () => {

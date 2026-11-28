@@ -11304,7 +11304,9 @@ registerCurrentRoute({
   description:
     "Board-only (an agent key, the assignee or lease holder included, gets 403). For a card that is not done or cancelled, whose " +
     "execution workflow is completed and either has at least one completed review stage naming only users, or is `record_only` " +
-    "with at least one completed review stage whose participants include an agent and every stage approved or skipped, " +
+    "with every stage approved or skipped and at least one completed review stage whose latest durable decision is an approval " +
+    "recorded by an agent participant of that stage who is not the card's executor, assignee or author and was not replaced by a " +
+    "board user (an old board-user approval, a self-review and an empty participant list do not qualify), " +
     "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +

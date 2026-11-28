@@ -3,10 +3,13 @@ import {
   activityLog,
   externalObjectMentions,
   externalObjects,
+  heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueWorkProducts,
   type Db,
 } from "@paperclipai/db";
+import { latestDecisionPerStage, resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveGitHubTokenCandidatesForRepo } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
@@ -496,20 +499,31 @@ async function listPullRequestCommits(
   return shas;
 }
 
+type EligibilityIssue = {
+  id: string;
+  companyId: string;
+  status: string;
+  deliveryRequirement?: string | null;
+  assigneeAgentId?: string | null;
+  createdByAgentId?: string | null;
+  executionRunId?: string | null;
+  checkoutRunId?: string | null;
+  executionPolicy: unknown;
+  executionState: unknown;
+};
+
+type ParticipantRef = { type?: unknown; agentId?: unknown };
+
 /**
  * The stuck shape this proof exists for. The workflow is completed, no
  * deliveryIdentity is recorded, and the card is not closed. Either at least one
- * completed review stage names only users, or the card is `record_only`, has at
- * least one completed review stage whose participants include an agent, and has
- * every stage completed or skipped (an agent-reviewed card). Returns null when
+ * completed review stage names only users, or the card is `record_only`, every
+ * stage is completed or skipped, and an agent-reviewed completed review stage
+ * carries a durable independent approval (see
+ * {@link agentReviewedStageHasIndependentApproval}). Returns null when
  * eligible, else the refusal reason.
  */
-export function boardLandingProofIneligibility(issue: {
-  status: string;
-  deliveryRequirement?: string | null;
-  executionPolicy: unknown;
-  executionState: unknown;
-}): string | null {
+export async function boardLandingProofIneligibility(db: Db, issue: EligibilityIssue): Promise<string | null> {
   if (issue.status === "done" || issue.status === "cancelled") {
     return `the card is already ${issue.status}`;
   }
@@ -533,26 +547,97 @@ export function boardLandingProofIneligibility(issue: {
     if (!stage || typeof stage !== "object") return [];
     const { id, type, participants } = stage as { id?: unknown; type?: unknown; participants?: unknown };
     if (type !== "review" || typeof id !== "string" || !completed.has(id)) return [];
-    return [{ participants }];
+    return [{ id, participants }];
   });
   const userOnlyCompletedReview = completedReviewStages.some(({ participants }) =>
     Array.isArray(participants) && participants.length > 0 &&
     participants.every((participant) =>
-      !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "user"));
+      !!participant && typeof participant === "object" && (participant as ParticipantRef).type === "user"));
   if (userOnlyCompletedReview) return null;
-  const agentReviewedCompletedStage = completedReviewStages.some(({ participants }) =>
-    Array.isArray(participants) && participants.length > 0 &&
-    participants.some((participant) =>
-      !!participant && typeof participant === "object" && (participant as { type?: unknown }).type === "agent"));
-  if (issue.deliveryRequirement === "record_only" && agentReviewedCompletedStage) {
-    const everyStageSettled = stages.every((stage) => {
-      const id = stage && typeof stage === "object" ? (stage as { id?: unknown }).id : null;
-      return typeof id === "string" && (completed.has(id) || skipped.has(id));
-    });
-    if (everyStageSettled) return null;
+  const agentParticipantIds = (participants: unknown): Set<string> => new Set(
+    Array.isArray(participants)
+      ? participants.flatMap((participant) => {
+        if (!participant || typeof participant !== "object") return [];
+        const { type, agentId } = participant as ParticipantRef;
+        return type === "agent" && typeof agentId === "string" && agentId.length > 0 ? [agentId] : [];
+      })
+      : [],
+  );
+  const agentReviewedStages = completedReviewStages
+    .map(({ id, participants }) => ({ id, agentIds: agentParticipantIds(participants) }))
+    .filter((stage) => stage.agentIds.size > 0);
+  if (issue.deliveryRequirement !== "record_only" || agentReviewedStages.length === 0) {
+    return "the card has no completed review stage that names only a user, and is not a record_only card with a completed agent review stage";
+  }
+  const everyStageSettled = stages.every((stage) => {
+    const id = stage && typeof stage === "object" ? (stage as { id?: unknown }).id : null;
+    return typeof id === "string" && (completed.has(id) || skipped.has(id));
+  });
+  if (!everyStageSettled) {
     return "the card's review workflow still has a stage that is neither approved nor skipped";
   }
-  return "the card has no completed review stage that names only a user, and is not a record_only card with a completed agent review stage";
+  if (!(await agentReviewedStageHasIndependentApproval(db, issue, policy, rawState, agentReviewedStages))) {
+    return "the card has no completed agent review stage whose latest decision is an approval by an agent participant " +
+      "other than the card's executor, assignee or author, recorded by that agent and not by the board in its place";
+  }
+  return null;
+}
+
+/**
+ * True when some completed agent-reviewed stage was genuinely reviewed: the
+ * stage's LATEST durable decision is `approved`, it names an agent that is a
+ * participant of that stage, the board did not record it in the agent's place
+ * (no `actorUserId`), and that agent is not the card's executor. The executor
+ * set is the self-approval principal union (policy and state return assignee,
+ * delivery author, creating agent) plus the current assignee and the agents of
+ * the card's execution and checkout runs. A stage with no decision row, a
+ * superseded approval and a board-user approval all fail.
+ */
+async function agentReviewedStageHasIndependentApproval(
+  db: Db,
+  issue: EligibilityIssue,
+  policy: { stages?: unknown } | null,
+  rawState: Record<string, unknown> | null,
+  agentReviewedStages: Array<{ id: string; agentIds: Set<string> }>,
+): Promise<boolean> {
+  const decisions = await db
+    .select({
+      id: issueExecutionDecisions.id,
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      actorUserId: issueExecutionDecisions.actorUserId,
+      createdAt: issueExecutionDecisions.createdAt,
+    })
+    .from(issueExecutionDecisions)
+    .where(and(
+      eq(issueExecutionDecisions.issueId, issue.id),
+      eq(issueExecutionDecisions.companyId, issue.companyId),
+    ));
+  const latest = latestDecisionPerStage(decisions);
+  const executors = resolveSelfApprovalPrincipals(
+    (policy ?? {}) as Record<string, unknown>,
+    rawState ?? {},
+    issue.createdByAgentId ?? null,
+  ).agentIds;
+  if (issue.assigneeAgentId) executors.add(issue.assigneeAgentId);
+  const runIds = [issue.executionRunId, issue.checkoutRunId].filter((id): id is string => typeof id === "string");
+  if (runIds.length > 0) {
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, runIds)));
+    for (const run of runs) executors.add(run.agentId);
+  }
+  return agentReviewedStages.some((stage) => {
+    const decision = latest.get(stage.id);
+    return !!decision &&
+      decision.outcome === "approved" &&
+      decision.actorUserId === null &&
+      typeof decision.actorAgentId === "string" &&
+      stage.agentIds.has(decision.actorAgentId) &&
+      !executors.has(decision.actorAgentId);
+  });
 }
 
 export interface AttachedBoardLandingProof {
