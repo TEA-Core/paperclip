@@ -33,7 +33,10 @@ import {
 } from "./issue-continuation-path.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "./successful-run-handoff-state.js";
 import { hasSummaryGenerationToken } from "./summary-slot-finalization.js";
-import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
+import {
+  evaluateDoneTransitionGuardForBackstopClose,
+  getReviewLadderStateKey,
+} from "./done-transition-guard.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -335,6 +338,26 @@ async function reapUnboundSummaryGenerationIssues(
  * so a card that gained a live run, a pending interaction, or a terminal
  * status between scan and write is left to its own owner; a re-run over
  * already-terminal rows matches nothing and is a no-op.
+ *
+ * Blocked cards stay in this population: `blocked` is non-terminal, and the
+ * SUP-17698 contract terminalizes a blocked strand whose continuation paths
+ * have all died. A card that becomes blocked between the scan and the row
+ * lock is skipped for that tick, keeping its slot binding, and left to
+ * whoever blocked it; only a card already blocked at scan time is reaped.
+ *
+ * A previously refused card defers only while its current evaluated ladder
+ * key matches the latest refusal's durable cursor. The key includes the
+ * completed/skipped/unsatisfied sets (with durable decisions folded in), stage
+ * count, and first unsatisfied id/type/index, so a changed refusal re-arms it.
+ * Capped evaluations refresh `lastEvaluatedLadderStateKey` without changing the
+ * original audit evidence, its DB timestamp, or the three-row/hour INSERT cap.
+ * Legacy keyless rows therefore converge on the first refused evaluation even
+ * after the audit cap is exhausted. Keys do not expire or compare clocks.
+ *
+ * Recovery evidence from a decision-only approval is returned with the other
+ * close audits and persisted inside the successful close transaction, after
+ * the settle read. It cannot keep its own close perpetually unsettled. The
+ * quiet-window reference time is read from the database, not the app clock.
  */
 export async function reapStrandedSummaryGenerationIssues(
   db: Db,
@@ -343,10 +366,11 @@ export async function reapStrandedSummaryGenerationIssues(
   // Unbound token-bearing tasks first, so they end `cancelled` rather than
   // `done` by the continuation-path class below.
   const unboundReaping = await reapUnboundSummaryGenerationIssues(db, now);
-  const candidates = await db
+  const scannedCandidates = await db
     .select({
       issueId: issues.id,
       companyId: issues.companyId,
+      status: issues.status,
     })
     .from(issues)
     .where(
@@ -371,6 +395,41 @@ export async function reapStrandedSummaryGenerationIssues(
       ),
     )
     .limit(50);
+
+  // Defer only cards whose latest ladder refusal evaluated exactly the
+  // ladder state the card is still in (see the docblock above). Any state
+  // change re-arms the card; a keyless legacy refusal never defers.
+  const candidates: typeof scannedCandidates = [];
+  for (const candidate of scannedCandidates) {
+    const [latestRefusal] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          eq(activityLog.action, "issue.done_transition_ladder_refused"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1);
+    const cachedKey = latestRefusal?.details?.lastEvaluatedLadderStateKey
+      ?? latestRefusal?.details?.ladderStateKey;
+    const refusedKey = typeof cachedKey === "string" ? cachedKey : null;
+    if (refusedKey === null) {
+      candidates.push(candidate);
+      continue;
+    }
+    const [currentIssue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, candidate.issueId), eq(issues.companyId, candidate.companyId)))
+      .limit(1);
+    if (!currentIssue) continue;
+    const currentKey = await getReviewLadderStateKey(db, currentIssue);
+    if (currentKey !== refusedKey) candidates.push(candidate);
+  }
 
   let terminalized = 0;
   let nextCandidate = 0;
@@ -441,6 +500,7 @@ export async function reapStrandedSummaryGenerationIssues(
             // since the scan belongs to its own owner.
             if (!issue) return false;
             if (issue.status === "done" || issue.status === "cancelled") return false;
+            if (issue.status === "blocked" && candidate.status !== "blocked") return false;
             if (issue.assigneeAgentId !== SUMMARIZER_AGENT_ID) return false;
             // Amended-contract continuation path: an armed monitor.
             if (issue.monitorNextCheckAt) return false;
@@ -589,6 +649,7 @@ export async function reapStrandedSummaryGenerationIssues(
             const [logRow] = await tx
               .select({
                 latestLogAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+                databaseNow: sql<Date>`clock_timestamp()`.mapWith(issues.updatedAt),
               })
               .from(activityLog)
               .where(
@@ -623,7 +684,7 @@ export async function reapStrandedSummaryGenerationIssues(
               activeRecoveryAction,
               successfulRunHandoff,
               lastActivityAt,
-            });
+            }, { now: logRow!.databaseNow });
             if (continuation.ok) return false;
             await guardVerdict.finalizeLandingDebt(tx as unknown as Db, issue, issue.statusVersion + 1);
 

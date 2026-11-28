@@ -267,6 +267,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue(rows.projectWorkspaces ?? []),
   };
+  const activityLogChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue([]),
+    then: vi.fn().mockResolvedValue([]),
+  };
   let issuesCallCount = 0;
   (mockDb.select as any).mockImplementation((_cols?: any) => {
     let callCount = 0;
@@ -283,6 +288,8 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
         if (table === issueWorkProductsTable) return workProductsChain;
+        // Landing-debt probe (prepareLandingDebtClose): an unseeded card owes none.
+        if (table === activityLogTable) return activityLogChain;
         if (table === heartbeatRunsTable) return heartbeatRunsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
@@ -661,6 +668,29 @@ describe("evaluateDoneTransitionGuard", () => {
             unsatisfiedStageIds: [stageA, stageB, stageC],
             completedStageIds: [],
             skippedStageIds: [],
+          }),
+        }),
+      );
+    });
+
+    it("keeps refusal identity stable and records the calling reaper as provenance", async () => {
+      const result = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        actorId: "system:execution-control-reconciliation",
+        closeComment: null,
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(logActivity).toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          actorType: "system",
+          actorId: "done-transition-guard",
+          runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:execution-control-reconciliation",
           }),
         }),
       );
@@ -7423,6 +7453,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(verdict.closeRowAudits).toHaveLength(1);
       expect(verdict.closeRowAudits[0]).toMatchObject({
         action: "issue.done_transition_tier2_close",
+        actorId: "execution-control-reconciliation",
+        runId: null,
         entityType: "issue",
         entityId: "issue-1",
         details: {
@@ -7446,6 +7478,47 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(logActivity).not.toHaveBeenCalledWith(
         mockDb,
         expect.objectContaining({ action: "issue.done_transition_tier2_close" }),
+      );
+    });
+
+    it.each([
+      { tier: "tier1" as const, actorId: "test-backstop" },
+      { tier: "tier2" as const, actorId: "test-backstop" },
+    ])("returns $tier close audit provenance ($actorId) without writing before the close", async ({ tier, actorId }) => {
+      if (tier === "tier1") {
+        setupTier2OriginMocks();
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+        mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+          { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        ]);
+        ghFetchMock.mockImplementation(async (url: string) =>
+          String(url).includes("/compare/")
+            ? new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 })
+            : new Response(JSON.stringify({}), { status: 404 }),
+        );
+      }
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: tier === "tier1" ? "ew-1" : null },
+        actorId,
+        closeComment: null,
+        structuredDoneTier: tier === "tier1"
+          ? { tier: "tier1", reason: "Recorded delivery landed", landing: { mode: "landedAtTip", mergeCommit: T2_MERGE_SHA } }
+          : { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed, JSON.stringify(verdict)).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeRowAudits).toEqual([
+        expect.objectContaining({
+          action: `issue.done_transition_${tier}_close`,
+          actorId,
+          runId: null,
+          details: expect.objectContaining({ systemBackstopActor: actorId }),
+        }),
+      ]);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({ action: `issue.done_transition_${tier}_close` }),
       );
     });
 
