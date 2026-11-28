@@ -200,6 +200,12 @@ function resetGitHub() {
     merge_commit_sha: MENTIONED_MERGE,
     head: { sha: sha("e9"), ref: "mention-only-branch", repo: { full_name: `${OWNER}/${REPO}` } },
   }));
+  // A merged PR whose head branch lives in a fork, on the card's base branch.
+  github.prs.set(510, pr({
+    head: { sha: HEAD_OF_MERGED, ref: "fork-branch", repo: { full_name: "someone-else/paperclip" } },
+  }));
+  // A merged PR whose live base branch is not the card's configured base branch.
+  github.prs.set(511, pr({ base: { ref: "release/1.0", repo: { id: REPO_ID, node_id: `R_${REPO_ID}`, full_name: `${OWNER}/${REPO}` } } }));
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -288,7 +294,9 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
      */
     reviewDecision?:
       | "independent" | "none" | "executor" | "board_user" | "board_in_place" | "superseded" | "non_participant"
-      | "old_head" | "unbound";
+      | "executor_non_participant" | "old_head" | "unbound" | "old_round" | "unbound_round";
+    /** Whether the completed `executionState` carries the review round (`pendingSince`). Default true for agent stages. */
+    roundInState?: boolean;
   } = {}) {
     seq += 1;
     const prefix = `LP${seq}`;
@@ -355,6 +363,9 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
           status: "completed", currentStageId: null, currentStageIndex: null, currentStageType: null,
           currentParticipant: null, returnAssignee: null, completedStageIds: [stageId], skippedStageIds: [],
           lastDecisionId: null, lastDecisionOutcome: "approved", deliveredHeadSha,
+          ...(options.participant === "agent" && options.roundInState !== false
+            ? { pendingSince: new Date(now.getTime() - 8000).toISOString() }
+            : {}),
         },
     });
     if (options.participant === "agent" && options.workflow !== "pending" && reviewDecision !== "none") {
@@ -370,8 +381,15 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         }));
       } else if (reviewDecision === "board_in_place") {
         await db.insert(issueExecutionDecisions).values(decision({ actorUserId: "local-board", createdAt: at(5) }));
-      } else if (reviewDecision === "non_participant") {
+      } else if (reviewDecision === "executor_non_participant") {
         await db.insert(issueExecutionDecisions).values(decision({ actorAgentId: agentId, createdAt: at(5) }));
+      } else if (reviewDecision === "non_participant") {
+        const strangerId = randomUUID();
+        await db.insert(agents).values({
+          id: strangerId, companyId, name: "Stranger", role: "reviewer", status: "active", adapterType: "codex_local",
+          adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        });
+        await db.insert(issueExecutionDecisions).values(decision({ actorAgentId: strangerId, createdAt: at(5) }));
       } else if (reviewDecision === "superseded") {
         await db.insert(issueExecutionDecisions).values([
           decision({ createdAt: at(10) }),
@@ -379,8 +397,9 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
         ]);
       } else {
         const boundHead = reviewDecision === "old_head" ? OTHER_SHA : reviewDecision === "unbound" ? null : HEAD_OF_MERGED;
+        const round = reviewDecision === "unbound_round" ? null : reviewDecision === "old_round" ? at(100) : at(8);
         await db.insert(issueExecutionDecisions).values(decision({
-          createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? at(8) : null,
+          createdAt: at(5), deliveredHeadSha: boundHead, reviewRoundStartedAt: boundHead ? round : null,
         }));
       }
     }
@@ -617,6 +636,19 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
     expect(await proofRows(issueId)).toHaveLength(0);
   });
 
+  it.each([
+    ["a pull request whose head branch is in a fork", 510, "landing_proof_repo_identity_mismatch"],
+    ["a pull request whose live base branch is not the card's base branch", 511, "landing_proof_not_on_base"],
+  ] as const)("refuses %s and records nothing", async (_label, pullRequestNumber, code) => {
+    const { issueId } = await seedStuckCard({ boardLinkedPr: pullRequestNumber });
+    await reclassifyRecordOnly(issueId);
+    const refused = await attach(issueId, goodProof({ pullRequestNumber }));
+    expect(refused.status, JSON.stringify(refused.body)).toBe(422);
+    expect(refused.body.code).toBe(code);
+    expect(await proofRows(issueId)).toHaveLength(0);
+    expect(await workProducts(issueId)).toHaveLength(0);
+  });
+
   describe("an agent-reviewed record_only card whose review stage is completed", () => {
     it("accepts a live-verified merged PR, and the board close then discharges the debt", async () => {
       const { issueId } = await seedStuckCard({ participant: "agent" });
@@ -636,15 +668,25 @@ describeEmbeddedPostgres("SUP-25193 board landing proof route", () => {
       });
     });
 
+    it("accepts an approval bound to the merged head when the completed state keeps no review round", async () => {
+      const { issueId } = await seedStuckCard({ participant: "agent", roundInState: false });
+      await reclassifyRecordOnly(issueId);
+      const attached = await attach(issueId, goodProof());
+      expect(attached.status, JSON.stringify(attached.body)).toBe(201);
+    });
+
     it.each([
       ["the card's own executor reviewed its own work", "executor" as const],
       ["only an old board-user approval is recorded on the stage", "board_user" as const],
       ["the board recorded the approval in the reviewer agent's place", "board_in_place" as const],
       ["the approval was superseded by a later changes_requested decision", "superseded" as const],
-      ["an agent that is not a stage participant approved", "non_participant" as const],
+      ["an executor that is not a stage participant approved", "executor_non_participant" as const],
+      ["a non-executor agent that is not a stage participant approved", "non_participant" as const],
       ["no decision is recorded on the completed stage", "none" as const],
       ["the independent approval is bound to an old head, not the merged PR head", "old_head" as const],
       ["the independent approval is unbound (a legacy decision with no head)", "unbound" as const],
+      ["the independent approval is from an older review round on the same head", "old_round" as const],
+      ["the independent approval records no review round", "unbound_round" as const],
     ])("refuses when %s, and records nothing", async (_label, reviewDecision) => {
       const { issueId } = await seedStuckCard({ participant: "agent", reviewDecision });
       await reclassifyRecordOnly(issueId);

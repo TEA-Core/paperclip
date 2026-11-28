@@ -11313,7 +11313,8 @@ registerCurrentRoute({
     "with every stage approved or skipped and at least one completed review stage whose latest durable decision is an approval " +
     "recorded by an agent participant of that stage who is not the card's executor, assignee or author and was not replaced by a " +
     "board user (an old board-user approval, a self-review and an empty participant list do not qualify), whose recorded " +
-    "`delivered_head_sha` equals the live-verified pull request head (an unbound, legacy or old-head decision does not qualify), " +
+    "`delivered_head_sha` equals the live-verified pull request head and whose recorded `review_round_started_at` is set and " +
+    "equals the current review round when the state carries one (an unbound, legacy, old-head or old-round decision does not qualify), " +
     "and which records no " +
     "`deliveryIdentity` (anything else is 409 `landing_proof_not_applicable`). The proof is debt-only: it answers outstanding " +
     "repository landing debt and never overrides another done-guard refusal, such as an execution-workspace branch ahead of base " +
@@ -11326,7 +11327,8 @@ registerCurrentRoute({
     "for a PR closed without merging), the supplied sha matches its merge or head commit (422 `landing_proof_sha_mismatch`), " +
     "the live repository identity is the card's repository: GitHub resolves the name to the same full name (a renamed or " +
     "transferred repository is refused) and the PR's base repository has the same immutable repository id, which is recorded " +
-    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`), the PR is this card's own delivery " +
+    "with the proof and re-checked at close (422 `landing_proof_repo_identity_mismatch`; a PR opened from a fork of the repository " +
+    "is refused the same way, and a PR whose live base branch is not the card's base branch is 422 `landing_proof_not_on_base`), the PR is this card's own delivery " +
     "shown by evidence the board wrote (a `pull_request` work product whose create and update activity rows all name a board " +
     "user, other than the one the attach creates; the merge sweep's `pr-delivery` merge record does not count against it; " +
     "or a board user's comment on the card naming the PR, or a head or merge " +

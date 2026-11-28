@@ -19,7 +19,7 @@ import {
   resolveIssueRepoContext,
   verifyMergedPullRequestOnBaseBranch,
 } from "./merge-arming.js";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { executionDecisionBinding, parseIssueExecutionState } from "./issue-execution-policy.js";
 
 /**
  * SUP-25193 (option a): a board-attached landing proof.
@@ -220,6 +220,20 @@ export async function verifyBoardLandingProof(
       return refuse(
         "landing_proof_repo_identity_mismatch",
         `pull request #${evidence.pullRequestNumber} targets repository ${pr.baseRepoFullName ?? "(unreadable)"} (id ${pr.baseRepoId ?? "unknown"}), not this card's repository ${owner}/${repo} (id ${identity.id})`,
+      );
+    }
+    if ((pr.headRepoFullName ?? "").toLowerCase() !== cardRepo) {
+      return refuse(
+        "landing_proof_repo_identity_mismatch",
+        `pull request #${evidence.pullRequestNumber} was opened from ${pr.headRepoFullName ?? "an unreadable head repository"}, ` +
+          `not from this card's repository ${owner}/${repo} (a fork's code is not the card's delivery)`,
+      );
+    }
+    if (pr.baseRef !== baseRef) {
+      return refuse(
+        "landing_proof_not_on_base",
+        `pull request #${evidence.pullRequestNumber} was merged into ${pr.baseRef ?? "an unreadable base branch"}, ` +
+          `not into this card's base branch ${baseRef}`,
       );
     }
     if (evidence.repositoryId != null && evidence.repositoryId !== identity.id) {
@@ -602,9 +616,10 @@ export async function boardLandingProofIneligibility(
  * agents of the card's execution and checkout runs. A stage with no decision
  * row, a superseded approval and a board-user approval all fail.
  *
- * When `mergedHeadSha` is given, the approval must also be bound to that head:
- * its `deliveredHeadSha` (the head the decision recorded) equals the merged PR
- * head. An unbound or legacy decision has no head and fails.
+ * When `mergedHeadSha` is given, the approval must also be bound to that head
+ * and to the review round: its `deliveredHeadSha` equals the merged PR head and
+ * its `reviewRoundStartedAt` is recorded, and equals the current round when the
+ * state carries one. An unbound or legacy decision has no head or round and fails.
  */
 async function judgeAgentReviewedStages(
   db: Db,
@@ -622,6 +637,7 @@ async function judgeAgentReviewedStages(
       actorAgentId: issueExecutionDecisions.actorAgentId,
       actorUserId: issueExecutionDecisions.actorUserId,
       deliveredHeadSha: issueExecutionDecisions.deliveredHeadSha,
+      reviewRoundStartedAt: issueExecutionDecisions.reviewRoundStartedAt,
       createdAt: issueExecutionDecisions.createdAt,
     })
     .from(issueExecutionDecisions)
@@ -644,6 +660,7 @@ async function judgeAgentReviewedStages(
       .where(and(eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, runIds)));
     for (const run of runs) executors.add(run.agentId);
   }
+  const currentRoundMs = executionDecisionBinding(rawState).reviewRoundStartedAt?.getTime() ?? null;
   const independentApprovals = agentReviewedStages.flatMap((stage) => {
     const decision = latest.get(stage.id);
     return decision &&
@@ -658,7 +675,14 @@ async function judgeAgentReviewedStages(
   if (independentApprovals.length === 0) return "no_independent_approval";
   if (mergedHeadSha === undefined) return "ok";
   const mergedHead = normalizeSha(mergedHeadSha);
-  return mergedHead !== null && independentApprovals.some((decision) => normalizeSha(decision.deliveredHeadSha) === mergedHead)
+  // Bound to the merged head AND to the review round: an approval from an older
+  // round on the same head is not this review. A decision with no recorded round
+  // never qualifies. When the state still carries the current round
+  // (`pendingSince`), the decision's round must be that round.
+  return mergedHead !== null && independentApprovals.some((decision) =>
+      normalizeSha(decision.deliveredHeadSha) === mergedHead &&
+      decision.reviewRoundStartedAt !== null &&
+      (currentRoundMs === null || decision.reviewRoundStartedAt.getTime() === currentRoundMs))
     ? "ok"
     : "not_bound_to_merged_head";
 }

@@ -327,7 +327,12 @@ agent, and the board must not have recorded the decision in its place. An old
 board-user approval, a self-review and a stage with no participants do not
 qualify. The approving decision must also be bound to the merged pull request:
 its recorded `delivered_head_sha` must equal the pull request head the server
-verified live. An unbound, legacy or old-head decision does not qualify. It records no
+verified live, and its recorded `review_round_started_at` must be set and, when
+the execution state still carries the current review round (`pendingSince`),
+equal to it. An unbound, legacy, old-head or old-round decision does not qualify.
+The pull request must have been opened from the card's own repository, not a
+fork, and its live base branch must be the card's control-plane base branch
+(`landing_proof_repo_identity_mismatch`, `landing_proof_not_on_base`). It records no
 `deliveryIdentity`. For such a card a board actor may call
 `POST /api/issues/:id/landing-proof` with one merged pull request in the card's
 project repository, its merge or head commit, and a reason. An agent key is
